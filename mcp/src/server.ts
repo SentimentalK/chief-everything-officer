@@ -1,5 +1,5 @@
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/express";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { LifeOSWorkspace } from "./workspace.js";
@@ -19,7 +19,7 @@ app.get("/readyz", (_req, res) => {
 
 app.post("/mcp", createHostGuard(config.allowedHosts), createOriginGuard(config.allowedOrigins), createAuthMiddleware(config.mcpApiKey), async (req, res) => {
   const server = createMcpServer(workspace);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   try {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
