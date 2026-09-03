@@ -58,6 +58,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute lowercase image tag
+        run: |
+          echo "IMAGE_TAG=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ceo-state-mcp:latest" >> "$GITHUB_ENV"
+
       - name: Build and push CEO State MCP image
         uses: docker/build-push-action@v6
         with:
@@ -65,4 +69,4 @@ jobs:
           file: ./mcp/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/ceo-state-mcp:latest
+          tags: ${{ env.IMAGE_TAG }}
