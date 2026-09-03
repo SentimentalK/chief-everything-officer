@@ -18,6 +18,8 @@ const cleanupServers: HttpServer[] = [];
 
 afterEach(async () => {
   for (const s of cleanupServers.splice(0)) {
+    s.closeAllConnections?.();
+    s.closeIdleConnections?.();
     await new Promise<void>((resolve) => s.close(() => resolve()));
   }
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
