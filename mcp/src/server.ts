@@ -18,7 +18,9 @@ app.get("/readyz", (_req, res) => {
   res.status(ready ? 200 : 503).json({ ok: ready, state: workspace.readiness });
 });
 
-const mcpHandler = createMcpHandler(() => createMcpServer(workspace));
+const mcpHandler = createMcpHandler(() => createMcpServer(workspace), {
+  legacy: "reject",
+});
 const nodeHandler = toNodeHandler(mcpHandler);
 
 app.all(

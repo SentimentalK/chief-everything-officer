@@ -29,7 +29,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
 
-    const handler = createMcpHandler(() => createMcpServer(workspace));
+    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -64,14 +64,13 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     await client.close();
   });
 
-  it("Test C — Legacy stateless fallback serves 2025-era clients from identical factory", async () => {
+  it("Test C — Legacy 2025 protocol requests are rejected with unsupported protocol version", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
 
-    // Identical factory and handler
-    const handler = createMcpHandler(() => createMcpServer(workspace));
+    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -81,29 +80,10 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       { versionNegotiation: { mode: "legacy" } },
     );
 
-    await client.connect(transport);
-    expect(client.getProtocolEra()).toBe("legacy");
-
-    const toolsResponse = await client.listTools();
-    expect(toolsResponse.tools.map((t) => t.name)).toEqual([
-      "workspace_status",
-      "list_files",
-      "read_files",
-      "search_text",
-      "apply_change_set",
-    ]);
-
-    const statusResult = await client.callTool({ name: "workspace_status" });
-    expect(statusResult.isError).toBeFalsy();
-    expect(statusResult.structuredContent).toMatchObject({
-      ok: true,
-      workspace_state: "READY",
-    });
-
-    await client.close();
+    await expect(client.connect(transport)).rejects.toThrow(/Unsupported protocol version.*-32022|-32022/);
   });
 
-  it("Test D — Security regressions rejected before MCP handler", async () => {
+  it("Test D — Security regressions rejected before MCP handler, modern client succeeds", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
@@ -117,7 +97,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     };
 
     const app = createMcpExpressApp({ host: config.bindHost });
-    const handler = createMcpHandler(() => createMcpServer(workspace));
+    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
     const nodeHandler = toNodeHandler(handler);
 
     app.all(
@@ -191,30 +171,34 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     });
     expect(badOriginRes.status).toBe(403);
 
-    // 5. Valid credentials -> passes security guards to MCP handler
-    const validRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        Host: "127.0.0.1",
-        Origin: "http://localhost",
-        Authorization: "Bearer secret-test-token-123",
-        Accept: "application/json, text/event-stream",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2024-11-05",
-          clientInfo: { name: "test", version: "1.0.0" },
-          capabilities: {},
+    // 5. Valid credentials -> official modern Client connects through real Express endpoint
+    const transport = new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: {
+        headers: {
+          Host: "127.0.0.1",
+          Origin: "http://localhost",
+          Authorization: "Bearer secret-test-token-123",
         },
-      }),
+      },
     });
-    expect(validRes.status).toBe(200);
-    const body = await validRes.text();
-    expect(body).toContain('"protocolVersion":"2024-11-05"');
+    const client = new Client(
+      { name: "authorized-modern-client", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto" } },
+    );
+
+    await client.connect(transport);
+    expect(client.getProtocolEra()).toBe("modern");
+
+    const toolsResponse = await client.listTools();
+    expect(toolsResponse.tools.map((t) => t.name)).toEqual([
+      "workspace_status",
+      "list_files",
+      "read_files",
+      "search_text",
+      "apply_change_set",
+    ]);
+
+    await client.close();
   });
 
   it("Test E — Request-scoped McpServer with shared persistent LifeOSWorkspace", async () => {
@@ -224,10 +208,13 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     await workspace.initialize();
 
     let serverFactoryCallCount = 0;
-    const handler = createMcpHandler(() => {
-      serverFactoryCallCount++;
-      return createMcpServer(workspace);
-    });
+    const handler = createMcpHandler(
+      () => {
+        serverFactoryCallCount++;
+        return createMcpServer(workspace);
+      },
+      { legacy: "reject" },
+    );
 
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
