@@ -1,16 +1,16 @@
-name: Build & Push LifeOS MCP Image
+name: CEO State MCP — Test & Publish Image
 
 on:
   push:
     branches: [main]
     paths:
       - "mcp/**"
-      - ".github/workflows/mcp-image.yaml"
+      - ".github/workflows/ceo-state-mcp-image.yaml"
   workflow_dispatch:
 
 jobs:
-  build-and-push-mcp:
-    name: Build, Test & Push LifeOS MCP Image
+  test-build-publish:
+    name: Test, Build & Publish CEO State MCP
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,12 +27,25 @@ jobs:
           cache: npm
           cache-dependency-path: mcp/package-lock.json
 
-      - name: Typecheck and Test
+      - name: Typecheck, Test and Build
         run: |
           cd mcp
           npm ci
           npm run typecheck
           npm test
+          npm run build
+
+      - name: CI Docker Smoke Build
+        run: |
+          docker build -t ceo-state-mcp:ci -f mcp/Dockerfile mcp
+
+      - name: CI Policy Asset Verification
+        run: |
+          docker run --rm --entrypoint sh ceo-state-mcp:ci -c '
+            test -s /app/policy/bootstrap.md &&
+            test -s /app/policy/router.md &&
+            echo "Policy assets verified successfully"
+          '
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -47,22 +60,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/lifeos-mcp
-          tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build and push Docker image
+      - name: Build and push CEO State MCP image
         uses: docker/build-push-action@v6
         with:
           context: ./mcp
           file: ./mcp/Dockerfile
-          platforms: linux/arm64,linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
+          tags: ghcr.io/${{ github.repository_owner }}/ceo-state-mcp:latest

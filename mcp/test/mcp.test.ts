@@ -1,6 +1,7 @@
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpServer } from "../src/mcp.js";
+import { loadProductPolicy } from "../src/product-policy.js";
 import type { LifeOSWorkspace } from "../src/workspace.js";
 
 const closeables: Array<{ close(): Promise<void> }> = [];
@@ -9,9 +10,10 @@ afterEach(async () => {
 });
 
 describe("MCP contract", () => {
-  it("discovers exactly four read tools and one write transaction", async () => {
+  it("discovers exactly five read tools, one write transaction, and policy_read", async () => {
     const workspace = {} as LifeOSWorkspace;
-    const server = createMcpServer(workspace);
+    const policy = await loadProductPolicy();
+    const server = createMcpServer(workspace, policy);
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     closeables.push(client, server);
@@ -24,8 +26,11 @@ describe("MCP contract", () => {
       "read_files",
       "search_text",
       "apply_change_set",
+      "policy_read",
     ]);
-    expect(response.tools.slice(0, 4).every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
-    expect(response.tools[4]?.annotations).toMatchObject({ readOnlyHint: false, openWorldHint: true });
+    const readTools = response.tools.filter((t) => t.name !== "apply_change_set");
+    expect(readTools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    const writeTool = response.tools.find((t) => t.name === "apply_change_set");
+    expect(writeTool?.annotations).toMatchObject({ readOnlyHint: false, openWorldHint: true });
   });
 });

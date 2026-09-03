@@ -5,6 +5,7 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
+COPY policy ./policy
 RUN npm run build
 
 FROM node:22-bookworm-slim AS runtime
@@ -20,6 +21,7 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY policy ./policy
 
 USER 10001:10001
 EXPOSE 3000

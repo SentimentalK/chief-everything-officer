@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createMcpServer } from "../src/mcp.js";
+import { loadProductPolicy } from "../src/product-policy.js";
 import { LifeOSWorkspace } from "../src/workspace.js";
 import { fixture } from "./helpers.js";
 
@@ -28,8 +29,9 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
+    const policy = await loadProductPolicy();
 
-    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
+    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -49,6 +51,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "read_files",
       "search_text",
       "apply_change_set",
+      "policy_read",
     ]);
 
     const statusResult = await client.callTool({ name: "workspace_status" });
@@ -57,6 +60,10 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       ok: true,
       workspace_state: "READY",
     });
+
+    const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "router" } });
+    expect(policyResult.isError).toBeFalsy();
+    expect(policyResult.structuredContent).toMatchObject({ name: "router" });
 
     // Verify no Mcp-Session-Id is required or held
     expect(transport.sessionId).toBeUndefined();
@@ -69,8 +76,9 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
+    const policy = await loadProductPolicy();
 
-    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
+    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -88,6 +96,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
+    const policy = await loadProductPolicy();
 
     const config = {
       ...item.config,
@@ -97,7 +106,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     };
 
     const app = createMcpExpressApp({ host: config.bindHost });
-    const handler = createMcpHandler(() => createMcpServer(workspace), { legacy: "reject" });
+    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "reject" });
     const nodeHandler = toNodeHandler(handler);
 
     app.all(
@@ -196,7 +205,17 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "read_files",
       "search_text",
       "apply_change_set",
+      "policy_read",
     ]);
+
+    // Real tool call through Express + auth endpoint succeeds
+    const statusCall = await client.callTool({ name: "workspace_status" });
+    expect(statusCall.isError).toBeFalsy();
+    expect(statusCall.structuredContent).toMatchObject({ ok: true, workspace_state: "READY" });
+
+    const routerCall = await client.callTool({ name: "policy_read", arguments: { name: "router" } });
+    expect(routerCall.isError).toBeFalsy();
+    expect(routerCall.structuredContent).toMatchObject({ name: "router" });
 
     await client.close();
   });
@@ -206,12 +225,13 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     cleanupDirs.push(item.root);
     const workspace = new LifeOSWorkspace(item.config);
     await workspace.initialize();
+    const policy = await loadProductPolicy();
 
     let serverFactoryCallCount = 0;
     const handler = createMcpHandler(
       () => {
         serverFactoryCallCount++;
-        return createMcpServer(workspace);
+        return createMcpServer(workspace, policy);
       },
       { legacy: "reject" },
     );
@@ -231,7 +251,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
 
     // Request A: list tools
     const listRes = await client.listTools();
-    expect(listRes.tools).toHaveLength(5);
+    expect(listRes.tools).toHaveLength(6);
     const countAfterReqA = serverFactoryCallCount;
     expect(countAfterReqA).toBeGreaterThan(initialFactoryCount);
 
@@ -247,3 +267,4 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     await client.close();
   });
 });
+

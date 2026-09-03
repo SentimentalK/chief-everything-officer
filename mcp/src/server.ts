@@ -3,12 +3,14 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
+import { loadProductPolicy } from "./product-policy.js";
 import { LifeOSWorkspace } from "./workspace.js";
 import { createAuthMiddleware, createHostGuard, createOriginGuard } from "./auth.js";
 
 const config = loadConfig();
 const workspace = new LifeOSWorkspace(config);
 await workspace.initialize();
+const productPolicy = await loadProductPolicy();
 
 const app = createMcpExpressApp({ host: config.bindHost });
 
@@ -18,7 +20,7 @@ app.get("/readyz", (_req, res) => {
   res.status(ready ? 200 : 503).json({ ok: ready, state: workspace.readiness });
 });
 
-const mcpHandler = createMcpHandler(() => createMcpServer(workspace), {
+const mcpHandler = createMcpHandler(() => createMcpServer(workspace, productPolicy), {
   legacy: "reject",
 });
 const nodeHandler = toNodeHandler(mcpHandler);

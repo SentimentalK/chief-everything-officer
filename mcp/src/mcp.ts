@@ -3,6 +3,7 @@ import * as z from "zod/v4";
 import { safeError } from "./errors.js";
 import { LIMITS } from "./limits.js";
 import type { ChangeOperation, LifeOSWorkspace } from "./workspace.js";
+import { type ProductPolicy, getPolicy } from "./product-policy.js";
 
 function result(value: Record<string, unknown>, isError = false) {
   return {
@@ -43,12 +44,11 @@ const archiveOperation = z.object({
   target: z.string().describe("Destination archive/<path> path"),
 });
 
-export function createMcpServer(workspace: LifeOSWorkspace): McpServer {
+export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: ProductPolicy): McpServer {
   const server = new McpServer(
-    { name: "lifeos-workspace", version: "0.1.0" },
+    { name: "ceo-state-mcp", version: "0.1.0" },
     {
-      instructions:
-        "LifeOS is a Git-backed private planning workspace. Read SYSTEM.md, TODO.md, and relevant tickets before writing. Use one apply_change_set per logical update, pass the base commit and blob OIDs returned by read_files, and retry stale revisions only after re-reading.",
+      instructions: productPolicy.bootstrap,
     },
   );
 
@@ -101,6 +101,15 @@ export function createMcpServer(workspace: LifeOSWorkspace): McpServer {
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   }, handler(async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
     await workspace.applyChangeSet(input)));
+
+  server.registerTool("policy_read", {
+    title: "Read CEO runtime product policy",
+    description: "Use this to read runtime-owned product policy documents such as 'router'. Does not read user workspace files.",
+    inputSchema: {
+      name: z.literal("router").describe("Policy document name. Supported: 'router'"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  }, handler(async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
 
   return server;
 }
