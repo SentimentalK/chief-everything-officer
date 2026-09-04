@@ -52,6 +52,8 @@ export async function fixture(): Promise<{ root: string; remote: string; config:
     mcpApiKey: undefined,
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
+    auditDir: path.join(dataRoot, "audit"),
+    auditDbPath: path.join(dataRoot, "audit", "ceo-trace.sqlite"),
   };
   return { root, remote, config };
 }

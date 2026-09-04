@@ -4,6 +4,7 @@ import { safeError } from "./errors.js";
 import { LIMITS } from "./limits.js";
 import type { ChangeOperation, LifeOSWorkspace } from "./workspace.js";
 import { type ProductPolicy, getPolicy } from "./product-policy.js";
+import type { AuditStore } from "./audit.js";
 
 function result(value: Record<string, unknown>, isError = false) {
   return {
@@ -13,10 +14,75 @@ function result(value: Record<string, unknown>, isError = false) {
   };
 }
 
-function handler<T>(operation: (input: T) => Promise<Record<string, unknown>>) {
+function tracedHandler<T>(
+  auditStore: AuditStore | undefined,
+  toolName: string,
+  operation: (input: T) => Promise<Record<string, unknown>>,
+) {
   return async (input: T) => {
-    try { return result(await operation(input)); }
-    catch (error) { return result(safeError(error), true); }
+    const timestamp_ms = Date.now();
+    const start = performance.now();
+    let res: ReturnType<typeof result>;
+    let status: "success" | "error" = "success";
+    let errorMessage: string | null = null;
+    let rawResult: Record<string, unknown>;
+
+    try {
+      rawResult = await operation(input);
+      res = result(rawResult);
+    } catch (error) {
+      status = "error";
+      rawResult = safeError(error);
+      res = result(rawResult, true);
+      errorMessage = typeof (rawResult as Record<string, unknown>).message === "string"
+        ? ((rawResult as Record<string, unknown>).message as string)
+        : String(error);
+    }
+
+    const latency_ms = Math.round(performance.now() - start);
+
+    if (auditStore) {
+      try {
+        let operationRequestId: string | null = null;
+        if (rawResult && typeof rawResult.request_id === "string") {
+          operationRequestId = rawResult.request_id;
+        } else if (input && typeof (input as Record<string, unknown>).request_id === "string") {
+          operationRequestId = (input as Record<string, unknown>).request_id as string;
+        }
+
+        let affectedPaths: string[] | null = null;
+        let resultingCommit: string | null = null;
+
+        if (toolName === "apply_change_set") {
+          const changeInput = input as { operations?: ChangeOperation[] };
+          if (changeInput && Array.isArray(changeInput.operations)) {
+            affectedPaths = changeInput.operations.map((op) =>
+              op.op === "archive" ? `${op.path} -> ${op.target}` : op.path,
+            );
+          }
+          if (rawResult && typeof rawResult.commit === "string") {
+            resultingCommit = rawResult.commit as string;
+          }
+        }
+
+        auditStore.recordTrace({
+          timestamp_ms,
+          tool_name: toolName,
+          status,
+          error_message: errorMessage,
+          operation_request_id: operationRequestId,
+          input_json: JSON.stringify(input ?? {}),
+          output_json: JSON.stringify(res),
+          latency_ms,
+          affected_paths: affectedPaths,
+          resulting_commit: resultingCommit,
+        });
+      } catch (auditErr) {
+        process.stderr.write(`audit: wrapper failed to dispatch trace: ${auditErr}\n`);
+      }
+    }
+
+    return res;
   };
 }
 
@@ -44,7 +110,11 @@ const archiveOperation = z.object({
   target: z.string().describe("Destination archive/<path> path"),
 });
 
-export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: ProductPolicy): McpServer {
+export function createMcpServer(
+  workspace: LifeOSWorkspace,
+  productPolicy: ProductPolicy,
+  auditStore?: AuditStore,
+): McpServer {
   const server = new McpServer(
     { name: "ceo-state-mcp", version: "0.1.0" },
     {
@@ -57,7 +127,7 @@ export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: Produ
     description: "Use this to verify that the LifeOS Git workspace is clean, synchronized, and ready before a workflow.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, handler(async () => await workspace.workspaceStatus()));
+  }, tracedHandler(auditStore, "workspace_status", async () => await workspace.workspaceStatus()));
 
   server.registerTool("list_files", {
     title: "List LifeOS files",
@@ -67,14 +137,14 @@ export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: Produ
       limit: z.number().int().min(1).max(500).optional().default(LIMITS.maxSearchResults),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, handler(async ({ prefix, limit }: { prefix: string; limit: number }) => await workspace.listFiles(prefix, limit)));
+  }, tracedHandler(auditStore, "list_files", async ({ prefix, limit }: { prefix: string; limit: number }) => await workspace.listFiles(prefix, limit)));
 
   server.registerTool("read_files", {
     title: "Read LifeOS files",
     description: `Use this to read up to ${LIMITS.maxFilesPerRead} related LifeOS Markdown files in one call and obtain the base commit and blob OIDs needed for safe writes.`,
     inputSchema: { paths: z.array(z.string()).min(1).max(LIMITS.maxFilesPerRead) },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, handler(async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
+  }, tracedHandler(auditStore, "read_files", async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
 
   server.registerTool("search_text", {
     title: "Search LifeOS text",
@@ -85,7 +155,7 @@ export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: Produ
       limit: z.number().int().min(1).max(200).optional().default(100),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, handler(async ({ query, prefixes, limit }: { query: string; prefixes: string[]; limit: number }) =>
+  }, tracedHandler(auditStore, "search_text", async ({ query, prefixes, limit }: { query: string; prefixes: string[]; limit: number }) =>
     await workspace.searchText(query, prefixes, limit)));
 
   server.registerTool("apply_change_set", {
@@ -99,7 +169,7 @@ export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: Produ
       operations: z.array(z.discriminatedUnion("op", [createOperation, replaceOperation, appendOperation, archiveOperation])).min(1).max(LIMITS.maxOperationsPerTransaction),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-  }, handler(async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
+  }, tracedHandler(auditStore, "apply_change_set", async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
     await workspace.applyChangeSet(input)));
 
   server.registerTool("policy_read", {
@@ -109,7 +179,7 @@ export function createMcpServer(workspace: LifeOSWorkspace, productPolicy: Produ
       name: z.literal("router").describe("Policy document name. Supported: 'router'"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, handler(async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
+  }, tracedHandler(auditStore, "policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
 
   return server;
 }

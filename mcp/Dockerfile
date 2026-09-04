@@ -1,3 +1,11 @@
+FROM node:22-bookworm-slim AS web-build
+
+WORKDIR /app/audit-web
+COPY audit-web/package.json audit-web/package-lock.json ./
+RUN npm ci
+COPY audit-web/ ./
+RUN npm run build
+
 FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
@@ -21,6 +29,7 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY --from=web-build /app/audit-web/dist ./audit-web
 COPY policy ./policy
 
 USER 10001:10001

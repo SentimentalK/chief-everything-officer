@@ -16,6 +16,8 @@ export interface Config {
   mcpApiKey?: string;
   allowedHosts: string[];
   allowedOrigins: string[];
+  auditDir: string;
+  auditDbPath: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -50,5 +52,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(mcpApiKey ? { mcpApiKey } : {}),
     allowedHosts,
     allowedOrigins,
+    auditDir: path.join(dataRoot, "audit"),
+    auditDbPath: env.CEO_AUDIT_DB_PATH ?? path.join(dataRoot, "audit", "ceo-trace.sqlite"),
   };
 }

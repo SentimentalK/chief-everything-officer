@@ -32,17 +32,23 @@ jobs:
           npm run typecheck
           npm test
           npm run build
+          cd audit-web
+          npm ci --prefer-offline=false --audit=false --fund=false
+          npm run typecheck
+          npm test
+          npm run build
 
       - name: CI Docker Smoke Build
         run: |
           docker build -t ceo-state-mcp:ci -f mcp/Dockerfile mcp
 
-      - name: CI Policy Asset Verification
+      - name: CI Policy & Web Asset Verification
         run: |
           docker run --rm --entrypoint sh ceo-state-mcp:ci -c '
             test -s /app/policy/bootstrap.md &&
             test -s /app/policy/router.md &&
-            echo "Policy assets verified successfully"
+            test -s /app/audit-web/index.html &&
+            echo "Policy and Audit Web assets verified successfully"
           '
 
       - name: Set up QEMU
