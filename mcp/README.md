@@ -1,6 +1,6 @@
-# LifeOS Workspace MCP
+# CEO State MCP
 
-A narrow, Git-backed MCP server for the private `SentimentalK/LifeOS` Markdown workspace. It exposes four read tools and one atomic write transaction; it does not expose a shell, arbitrary filesystem access, raw Git commands, general moves, deletes, rebases, or force pushes.
+A narrow, Git-backed MCP server for the user's durable personal state workspace. It exposes four read tools, one runtime policy read tool, and one atomic write transaction; it does not expose a shell, arbitrary filesystem access, raw Git commands, general moves, deletes, rebases, or force pushes.
 
 ## Tools
 
@@ -9,6 +9,7 @@ A narrow, Git-backed MCP server for the private `SentimentalK/LifeOS` Markdown w
 - `read_files`: batch-read up to 20 files with a base commit.
 - `search_text`: literal search inside allowlisted Markdown.
 - `apply_change_set`: validate, commit, fast-forward push, and verify one logical update.
+- `policy_read`: read runtime product policy documents (e.g., `router`).
 
 Writable content is open to all Markdown (`.md`) files in the workspace, excluding protected system code, workflows, secrets, and Git metadata (`.git/`, `.github/`, `mcp/`, `.env`). `append` is limited to `JOURNAL.md`; `archive` is limited to `tasks/*.md -> archive/<year>/*.md`.
 
@@ -20,13 +21,14 @@ Requires Node.js 22+ and Git.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LIFEOS_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, and `state/` |
-| `LIFEOS_REMOTE` | `git@github.com:SentimentalK/LifeOS.git` | Fixed Git origin |
-| `LIFEOS_BRANCH` | `main` | Fixed writable branch |
-| `LIFEOS_SSH_KEY_PATH` | unset | Read/write deploy key path |
-| `LIFEOS_KNOWN_HOSTS_PATH` | unset | Pinned SSH known-hosts file |
-| `LIFEOS_GIT_AUTHOR_NAME` | `LifeOS MCP` | Commit author name |
-| `LIFEOS_GIT_AUTHOR_EMAIL` | noreply address | Commit author email |
+| `CEO_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, `state/`, and `audit/` |
+| `CEO_REMOTE` | `git@github.com:SentimentalK/ceo-poc-workspace.git` | Fixed Git origin |
+| `CEO_BRANCH` | `main` | Fixed writable branch |
+| `CEO_SSH_KEY_PATH` | unset | Read/write deploy key path |
+| `CEO_KNOWN_HOSTS_PATH` | unset | Pinned SSH known-hosts file |
+| `CEO_GIT_AUTHOR_NAME` | `CEO State MCP` | Commit author name |
+| `CEO_GIT_AUTHOR_EMAIL` | noreply address | Commit author email |
+| `CEO_AUDIT_DB_PATH` | `/data/audit/ceo-trace.sqlite` | SQLite trace database path |
 | `BIND_HOST` | `127.0.0.1` | HTTP bind host; use `0.0.0.0` for K3s Ingress |
 | `PORT` | `3000` | MCP HTTP port |
 | `MCP_API_KEY` | unset | Static Bearer token; **required** when binding to a non-loopback address |
@@ -35,7 +37,7 @@ Requires Node.js 22+ and Git.
 
 ## Authentication
 
-LifeOS uses a deliberately simple static Bearer credential gate rather than implementing MCP OAuth authorization. The server validates:
+CEO uses a deliberately simple static Bearer credential gate rather than implementing MCP OAuth authorization. The server validates:
 
 ```
 Authorization: Bearer <MCP_API_KEY>

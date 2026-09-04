@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LifeOSError } from "../src/errors.js";
+import { CeoError } from "../src/errors.js";
 import { getPolicy, loadProductPolicy } from "../src/product-policy.js";
 
 describe("product-policy", () => {
@@ -24,16 +24,16 @@ describe("product-policy", () => {
   it("rejects unknown policy names with INVALID_OPERATION", async () => {
     const policy = await loadProductPolicy();
 
-    expect(() => getPolicy(policy, "unknown")).toThrow(LifeOSError);
+    expect(() => getPolicy(policy, "unknown")).toThrow(CeoError);
     expect(() => getPolicy(policy, "unknown")).toThrow(/Unknown product policy/);
-    expect(() => getPolicy(policy, "system")).toThrow(LifeOSError);
+    expect(() => getPolicy(policy, "system")).toThrow(CeoError);
   });
 
   it("strictly prevents path traversal and access outside policy allowlist", async () => {
     const policy = await loadProductPolicy();
 
-    expect(() => getPolicy(policy, "../package.json")).toThrow(LifeOSError);
-    expect(() => getPolicy(policy, "../../etc/passwd")).toThrow(LifeOSError);
-    expect(() => getPolicy(policy, "TODO.md")).toThrow(LifeOSError);
+    expect(() => getPolicy(policy, "../package.json")).toThrow(CeoError);
+    expect(() => getPolicy(policy, "../../etc/passwd")).toThrow(CeoError);
+    expect(() => getPolicy(policy, "TODO.md")).toThrow(CeoError);
   });
 });

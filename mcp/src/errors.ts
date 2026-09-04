@@ -11,14 +11,14 @@ export type ErrorCode =
   | "NOT_READY"
   | "INTERNAL_ERROR";
 
-export class LifeOSError extends Error {
+export class CeoError extends Error {
   constructor(
     public readonly code: ErrorCode,
     message: string,
     public readonly details: Record<string, unknown> = {},
   ) {
     super(message);
-    this.name = "LifeOSError";
+    this.name = "CeoError";
   }
 }
 
@@ -28,13 +28,13 @@ export function safeError(error: unknown): {
   message: string;
   details: Record<string, unknown>;
 } {
-  if (error instanceof LifeOSError) {
+  if (error instanceof CeoError) {
     return { ok: false, code: error.code, message: error.message, details: error.details };
   }
   return {
     ok: false,
     code: "INTERNAL_ERROR",
-    message: "The LifeOS workspace operation failed.",
+    message: "The CEO workspace operation failed.",
     details: {},
   };
 }

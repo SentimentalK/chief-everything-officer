@@ -4,7 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { LifeOSWorkspace } from "../src/workspace.js";
+import { CeoWorkspace } from "../src/workspace.js";
 import type { Config } from "../src/config.js";
 
 const exec = promisify(execFile);
@@ -90,7 +90,7 @@ async function createFictionalWorkspaceFixture(): Promise<{ config: Config; root
 describe("Workspace Independence (Zero SYSTEM.md in User Workspace)", () => {
   it("initializes to READY and executes all operations without SYSTEM.md", async () => {
     const { config } = await createFictionalWorkspaceFixture();
-    const workspace = new LifeOSWorkspace(config);
+    const workspace = new CeoWorkspace(config);
     await workspace.initialize();
 
     // 1. Verify readiness

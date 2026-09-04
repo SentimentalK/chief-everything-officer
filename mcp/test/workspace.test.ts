@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { chmod, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { LifeOSError } from "../src/errors.js";
-import { LifeOSWorkspace } from "../src/workspace.js";
+import { CeoError } from "../src/errors.js";
+import { CeoWorkspace } from "../src/workspace.js";
 import { fixture, git } from "./helpers.js";
 
 const cleanup: string[] = [];
@@ -11,11 +11,11 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("LifeOSWorkspace", () => {
+describe("CeoWorkspace", () => {
   it("reads allowlisted files and hides code paths", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const listed = await workspace.listFiles();
     expect(listed.files).toEqual(expect.arrayContaining([
@@ -39,7 +39,7 @@ describe("LifeOSWorkspace", () => {
   it("commits and pushes one atomic, idempotent change set", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const read = await workspace.readFiles(["TODO.md", "JOURNAL.md"]);
     const files = read.files as Array<{ path: string; blob_oid: string }>;
@@ -66,7 +66,7 @@ describe("LifeOSWorkspace", () => {
   it("archives without exposing a general move or delete", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const read = await workspace.readFiles(["tasks/TEST-001.md"]);
     const file = (read.files as Array<{ blob_oid: string }>)[0]!;
@@ -87,7 +87,7 @@ describe("LifeOSWorkspace", () => {
   it("rejects stale revisions after another writer advances main", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const read = await workspace.readFiles(["TODO.md"]);
     const file = (read.files as Array<{ blob_oid: string }>)[0]!;
@@ -104,7 +104,7 @@ describe("LifeOSWorkspace", () => {
       base_commit: read.base_commit as string,
       summary: "Stale update",
       operations: [{ op: "replace", path: "TODO.md", expected_blob_oid: file.blob_oid, content: "stale\n" }],
-    })).rejects.toBeInstanceOf(LifeOSError);
+    })).rejects.toBeInstanceOf(CeoError);
     await expect(workspace.applyChangeSet({
       base_commit: read.base_commit as string,
       summary: "Stale update",
@@ -115,7 +115,7 @@ describe("LifeOSWorkspace", () => {
   it("persists a commit after push failure and safely recovers it", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const read = await workspace.readFiles(["TODO.md"]);
     const file = (read.files as Array<{ blob_oid: string }>)[0]!;
@@ -139,7 +139,7 @@ describe("LifeOSWorkspace", () => {
   it("rejects a mismatched blob without changing remote history", async () => {
     const item = await fixture();
     cleanup.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const status = await workspace.workspaceStatus();
     await expect(workspace.applyChangeSet({

@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import { DatabaseSync } from "node:sqlite";
 import { AuditStore, createAuditRouter } from "../src/audit.js";
-import { LifeOSWorkspace } from "../src/workspace.js";
+import { CeoWorkspace } from "../src/workspace.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
 import { fixture } from "./helpers.js";
@@ -124,7 +124,7 @@ describe("AuditStore & Boundary Tracing", () => {
   it("captures tool invocations at MCP handler boundary", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 
@@ -194,7 +194,7 @@ describe("AuditStore & Boundary Tracing", () => {
   it("never records API key or auth secrets in trace database", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 

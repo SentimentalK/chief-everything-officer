@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import { safeError } from "./errors.js";
 import { LIMITS } from "./limits.js";
-import type { ChangeOperation, LifeOSWorkspace } from "./workspace.js";
+import type { ChangeOperation, CeoWorkspace } from "./workspace.js";
 import { type ProductPolicy, getPolicy } from "./product-policy.js";
 import type { AuditStore } from "./audit.js";
 
@@ -88,7 +88,7 @@ function tracedHandler<T>(
 
 const createOperation = z.object({
   op: z.literal("create"),
-  path: z.string().describe("Allowed LifeOS Markdown path that does not yet exist"),
+  path: z.string().describe("Allowed CEO Markdown path that does not yet exist"),
   content: z.string().describe("Complete UTF-8 file content"),
 });
 const replaceOperation = z.object({
@@ -111,7 +111,7 @@ const archiveOperation = z.object({
 });
 
 export function createMcpServer(
-  workspace: LifeOSWorkspace,
+  workspace: CeoWorkspace,
   productPolicy: ProductPolicy,
   auditStore?: AuditStore,
 ): McpServer {
@@ -123,15 +123,15 @@ export function createMcpServer(
   );
 
   server.registerTool("workspace_status", {
-    title: "LifeOS workspace status",
-    description: "Use this to verify that the LifeOS Git workspace is clean, synchronized, and ready before a workflow.",
+    title: "CEO workspace status",
+    description: "Use this to verify that the CEO Git workspace is clean, synchronized, and ready before a workflow.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, tracedHandler(auditStore, "workspace_status", async () => await workspace.workspaceStatus()));
 
   server.registerTool("list_files", {
-    title: "List LifeOS files",
-    description: "Use this to discover allowed LifeOS Markdown files. It never exposes code, secrets, or Git metadata.",
+    title: "List CEO files",
+    description: "Use this to discover allowed CEO Markdown files. It never exposes code, secrets, or Git metadata.",
     inputSchema: {
       prefix: z.string().max(240).optional().default(""),
       limit: z.number().int().min(1).max(500).optional().default(LIMITS.maxSearchResults),
@@ -140,15 +140,15 @@ export function createMcpServer(
   }, tracedHandler(auditStore, "list_files", async ({ prefix, limit }: { prefix: string; limit: number }) => await workspace.listFiles(prefix, limit)));
 
   server.registerTool("read_files", {
-    title: "Read LifeOS files",
-    description: `Use this to read up to ${LIMITS.maxFilesPerRead} related LifeOS Markdown files in one call and obtain the base commit and blob OIDs needed for safe writes.`,
+    title: "Read CEO files",
+    description: `Use this to read up to ${LIMITS.maxFilesPerRead} related CEO Markdown files in one call and obtain the base commit and blob OIDs needed for safe writes.`,
     inputSchema: { paths: z.array(z.string()).min(1).max(LIMITS.maxFilesPerRead) },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, tracedHandler(auditStore, "read_files", async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
 
   server.registerTool("search_text", {
-    title: "Search LifeOS text",
-    description: "Use this for literal text search inside allowed LifeOS Markdown files. Regular expressions are not supported.",
+    title: "Search CEO text",
+    description: "Use this for literal text search inside allowed CEO Markdown files. Regular expressions are not supported.",
     inputSchema: {
       query: z.string().min(1).max(LIMITS.maxSearchQueryBytes),
       prefixes: z.array(z.string()).max(LIMITS.maxFilesPerRead).optional().default([]),
@@ -159,9 +159,9 @@ export function createMcpServer(
     await workspace.searchText(query, prefixes, limit)));
 
   server.registerTool("apply_change_set", {
-    title: "Apply an atomic LifeOS change set",
+    title: "Apply an atomic CEO change set",
     description:
-      "Use this once for one complete LifeOS update. The server checks optimistic concurrency, edits only allowlisted Markdown, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
+      "Use this once for one complete CEO update. The server checks optimistic concurrency, edits only allowlisted Markdown, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),

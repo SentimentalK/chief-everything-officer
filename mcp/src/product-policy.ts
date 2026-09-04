@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { LifeOSError } from "./errors.js";
+import { CeoError } from "./errors.js";
 
 export interface PolicyDocument {
   name: string;
@@ -49,7 +49,7 @@ export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<Pro
 
 export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDocument {
   if (!ALLOWED_POLICIES.has(name)) {
-    throw new LifeOSError(
+    throw new CeoError(
       "INVALID_OPERATION",
       `Unknown product policy '${name}'. Only 'router' is supported in V0.`,
       { name },
@@ -57,7 +57,7 @@ export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDoc
   }
   const doc = productPolicy.policies.get(name);
   if (!doc) {
-    throw new LifeOSError(
+    throw new CeoError(
       "INTERNAL_ERROR",
       `Policy document '${name}' is missing from cache.`,
       { name },

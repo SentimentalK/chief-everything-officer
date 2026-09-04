@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { Config } from "./config.js";
-import { LifeOSError } from "./errors.js";
+import { CeoError } from "./errors.js";
 
 export interface CommandResult { stdout: string; stderr: string; }
 
@@ -66,7 +66,7 @@ export async function assertExpectedBlob(
 ): Promise<void> {
   const actual = await blobOid(config, cwd, ref, filePath);
   if (actual !== expected) {
-    throw new LifeOSError("BLOB_MISMATCH", "The file changed since it was read.", {
+    throw new CeoError("BLOB_MISMATCH", "The file changed since it was read.", {
       path: filePath,
       expected_blob_oid: expected,
       actual_blob_oid: actual,

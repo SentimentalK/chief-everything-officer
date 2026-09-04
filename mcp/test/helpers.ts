@@ -19,7 +19,7 @@ export function git(cwd: string, ...args: string[]): string {
 }
 
 export async function fixture(): Promise<{ root: string; remote: string; config: Config }> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "lifeos-mcp-test-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-test-"));
   const remote = path.join(root, "remote.git");
   const seed = path.join(root, "seed");
   const dataRoot = path.join(root, "data");
@@ -47,8 +47,8 @@ export async function fixture(): Promise<{ root: string; remote: string; config:
     remoteUrl: remote,
     port: 3000,
     bindHost: "127.0.0.1",
-    gitAuthorName: "LifeOS MCP Test",
-    gitAuthorEmail: "lifeos-test@example.com",
+    gitAuthorName: "CEO State MCP Test",
+    gitAuthorEmail: "ceo-test@example.com",
     mcpApiKey: undefined,
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],

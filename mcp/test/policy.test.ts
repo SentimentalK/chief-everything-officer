@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LifeOSError } from "../src/errors.js";
+import { CeoError } from "../src/errors.js";
 import { validateArchive, validatePath } from "../src/policy.js";
 
 describe("path policy", () => {
@@ -19,15 +19,15 @@ describe("path policy", () => {
     "tasks/not-markdown.txt",
     "tasks/cafe\u0301.md",
   ])("rejects %s", (candidate) => {
-    expect(() => validatePath(candidate)).toThrow(LifeOSError);
+    expect(() => validatePath(candidate)).toThrow(CeoError);
   });
 
   it("only permits valid archive route from tasks/ to archive/ directory", () => {
     expect(() => validateArchive("tasks/TEST-001.md", "archive/2026/TEST-001.md")).not.toThrow();
     expect(() => validateArchive("tasks/group/TEST-001.md", "archive/2026/group/TEST-001.md")).not.toThrow();
-    expect(() => validateArchive("inbox/ARTICLE.md", "archive/2026/ARTICLE.md")).toThrow(LifeOSError);
-    expect(() => validateArchive("SYSTEM.md", "archive/SYSTEM.md")).toThrow(LifeOSError);
-    expect(() => validateArchive("archive/2026/TEST-001.md", "archive/2027/TEST-001.md")).toThrow(LifeOSError);
-    expect(() => validateArchive("tasks/TEST-001.md", "tasks/TEST-002.md")).toThrow(LifeOSError);
+    expect(() => validateArchive("inbox/ARTICLE.md", "archive/2026/ARTICLE.md")).toThrow(CeoError);
+    expect(() => validateArchive("SYSTEM.md", "archive/SYSTEM.md")).toThrow(CeoError);
+    expect(() => validateArchive("archive/2026/TEST-001.md", "archive/2027/TEST-001.md")).toThrow(CeoError);
+    expect(() => validateArchive("tasks/TEST-001.md", "tasks/TEST-002.md")).toThrow(CeoError);
   });
 });

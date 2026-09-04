@@ -1,9 +1,9 @@
 import path from "node:path";
 import { lstat } from "node:fs/promises";
-import { LifeOSError } from "./errors.js";
+import { CeoError } from "./errors.js";
 
 /**
- * Enforces the strict filesystem security boundary for LifeOS MCP.
+ * Enforces the strict filesystem security boundary for CEO MCP.
  * Prevents AI from accessing infrastructure code (.github, mcp),
  * git metadata (.git), system secrets (.env), hidden files, symlinks,
  * and path traversal attempts.
@@ -18,11 +18,11 @@ export function validateContentPath(candidate: string): string {
     /[\u0000-\u001f\u007f]/.test(candidate) ||
     path.posix.isAbsolute(candidate)
   ) {
-    throw new LifeOSError("INVALID_PATH", "Path is not a valid repository-relative POSIX path.", { path: candidate });
+    throw new CeoError("INVALID_PATH", "Path is not a valid repository-relative POSIX path.", { path: candidate });
   }
   const segments = candidate.split("/");
   if (segments.some((segment) => segment === "" || segment === "." || segment === ".." || segment.startsWith("."))) {
-    throw new LifeOSError("INVALID_PATH", "Path contains a forbidden or hidden segment.", { path: candidate });
+    throw new CeoError("INVALID_PATH", "Path contains a forbidden or hidden segment.", { path: candidate });
   }
   const normalized = path.posix.normalize(candidate);
   const lower = normalized.toLowerCase();
@@ -34,12 +34,12 @@ export function validateContentPath(candidate: string): string {
     lower.startsWith("mcp/") ||
     lower.startsWith(".env")
   ) {
-    throw new LifeOSError("INVALID_PATH", "Code, workflows, and hidden metadata are outside the LifeOS content boundary.", { path: candidate });
+    throw new CeoError("INVALID_PATH", "Code, workflows, and hidden metadata are outside the CEO content boundary.", { path: candidate });
   }
 
   // All Markdown (.md) files outside forbidden system paths are allowed
   if (!normalized.endsWith(".md")) {
-    throw new LifeOSError("INVALID_PATH", "Only Markdown (.md) files are writable in LifeOS.", { path: candidate });
+    throw new CeoError("INVALID_PATH", "Only Markdown (.md) files are writable in CEO.", { path: candidate });
   }
 
   return normalized;
@@ -53,7 +53,7 @@ export async function assertNoSymlink(root: string, relativePath: string): Promi
     try {
       const stat = await lstat(current);
       if (stat.isSymbolicLink()) {
-        throw new LifeOSError("INVALID_PATH", "Symlinks are forbidden in LifeOS content paths.", { path: relativePath });
+        throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: relativePath });
       }
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;

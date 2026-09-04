@@ -7,12 +7,12 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
-import { LifeOSWorkspace } from "./workspace.js";
+import { CeoWorkspace } from "./workspace.js";
 import { createAuthMiddleware, createHostGuard, createOriginGuard } from "./auth.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 
 const config = loadConfig();
-const workspace = new LifeOSWorkspace(config);
+const workspace = new CeoWorkspace(config);
 await workspace.initialize();
 const productPolicy = await loadProductPolicy();
 const auditStore = new AuditStore(config.auditDbPath);
@@ -61,7 +61,7 @@ app.all(
 );
 
 const listener = app.listen(config.port, config.bindHost, () => {
-  process.stdout.write(`LifeOS MCP listening on http://${config.bindHost}:${config.port}/mcp\n`);
+  process.stdout.write(`CEO State MCP listening on http://${config.bindHost}:${config.port}/mcp\n`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

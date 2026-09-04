@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
-import { LifeOSWorkspace } from "../src/workspace.js";
+import { CeoWorkspace } from "../src/workspace.js";
 import { fixture } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
@@ -29,7 +29,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
   it("Test B — Modern 2026 protocol succeeds with in-process handler", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 
@@ -76,7 +76,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
   it("Test C — Legacy 2025 protocol requests are rejected with unsupported protocol version", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 
@@ -96,7 +96,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
   it("Test D — Security regressions rejected before MCP handler, modern client succeeds", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 
@@ -222,10 +222,10 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     await client.close();
   });
 
-  it("Test E — Request-scoped McpServer with shared persistent LifeOSWorkspace", async () => {
+  it("Test E — Request-scoped McpServer with shared persistent CeoWorkspace", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
-    const workspace = new LifeOSWorkspace(item.config);
+    const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 

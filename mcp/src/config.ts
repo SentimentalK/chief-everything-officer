@@ -21,7 +21,7 @@ export interface Config {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const dataRoot = path.resolve(env.LIFEOS_DATA_ROOT ?? "/data");
+  const dataRoot = path.resolve(env.CEO_DATA_ROOT ?? "/data");
   const port = Number.parseInt(env.PORT ?? "3000", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("PORT must be an integer from 1 to 65535");
@@ -41,14 +41,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     repoDir: path.join(dataRoot, "repo"),
     txnDir: path.join(dataRoot, "txns"),
     stateDir: path.join(dataRoot, "state"),
-    branch: env.LIFEOS_BRANCH ?? "main",
-    remoteUrl: env.LIFEOS_REMOTE ?? "git@github.com:SentimentalK/LifeOS.git",
+    branch: env.CEO_BRANCH ?? "main",
+    remoteUrl: env.CEO_REMOTE ?? "git@github.com:SentimentalK/ceo-poc-workspace.git",
     port,
     bindHost,
-    gitAuthorName: env.LIFEOS_GIT_AUTHOR_NAME ?? "LifeOS MCP",
-    gitAuthorEmail: env.LIFEOS_GIT_AUTHOR_EMAIL ?? "lifeos-mcp@users.noreply.github.com",
-    ...(env.LIFEOS_SSH_KEY_PATH ? { sshKeyPath: env.LIFEOS_SSH_KEY_PATH } : {}),
-    ...(env.LIFEOS_KNOWN_HOSTS_PATH ? { knownHostsPath: env.LIFEOS_KNOWN_HOSTS_PATH } : {}),
+    gitAuthorName: env.CEO_GIT_AUTHOR_NAME ?? "CEO State MCP",
+    gitAuthorEmail: env.CEO_GIT_AUTHOR_EMAIL ?? "ceo-mcp@users.noreply.github.com",
+    ...(env.CEO_SSH_KEY_PATH ? { sshKeyPath: env.CEO_SSH_KEY_PATH } : {}),
+    ...(env.CEO_KNOWN_HOSTS_PATH ? { knownHostsPath: env.CEO_KNOWN_HOSTS_PATH } : {}),
     ...(mcpApiKey ? { mcpApiKey } : {}),
     allowedHosts,
     allowedOrigins,

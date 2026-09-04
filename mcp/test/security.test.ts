@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LifeOSError } from "../src/errors.js";
+import { CeoError } from "../src/errors.js";
 import { assertNoSymlink, isAllowedTrackedPath, validateContentPath } from "../src/security.js";
 
 describe("security boundary (validateContentPath)", () => {
@@ -28,7 +28,7 @@ describe("security boundary (validateContentPath)", () => {
     "tasks/not-markdown.txt",
     "tasks/cafe\u0301.md", // NFC normalization failure check
   ])("rejects system, code, or traversal path: %s", (candidate) => {
-    expect(() => validateContentPath(candidate)).toThrow(LifeOSError);
+    expect(() => validateContentPath(candidate)).toThrow(CeoError);
   });
 
   it("isAllowedTrackedPath returns true for content files and false for system paths", () => {
