@@ -46,7 +46,9 @@ jobs:
         run: |
           docker run --rm --entrypoint sh ceo-state-mcp:ci -c '
             test -s /app/policy/bootstrap.md &&
-            test -s /app/policy/router.md &&
+            test -s /app/policy/task.md &&
+            test -s /app/policy/personal.md &&
+            test -s /app/policy/journal.md &&
             test -s /app/audit-web/index.html &&
             echo "Policy and Audit Web assets verified successfully"
           '

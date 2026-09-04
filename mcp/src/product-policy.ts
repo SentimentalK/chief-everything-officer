@@ -15,7 +15,7 @@ export interface ProductPolicy {
   policies: Map<string, PolicyDocument>;
 }
 
-const ALLOWED_POLICIES = new Set(["router"]);
+export const ALLOWED_POLICIES = new Set(["task", "personal", "journal"]);
 
 export function getPolicyDir(): string {
   const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -24,22 +24,34 @@ export function getPolicyDir(): string {
 
 export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<ProductPolicy> {
   const bootstrapPath = path.join(policyDir, "bootstrap.md");
-  const routerPath = path.join(policyDir, "router.md");
+  const taskPath = path.join(policyDir, "task.md");
+  const personalPath = path.join(policyDir, "personal.md");
+  const journalPath = path.join(policyDir, "journal.md");
 
-  const [bootstrapRaw, routerRaw] = await Promise.all([
+  const [bootstrapRaw, taskRaw, personalRaw, journalRaw] = await Promise.all([
     readFile(bootstrapPath, "utf8"),
-    readFile(routerPath, "utf8"),
+    readFile(taskPath, "utf8"),
+    readFile(personalPath, "utf8"),
+    readFile(journalPath, "utf8"),
   ]);
 
   const bootstrap = bootstrapRaw.trim();
-  const routerDoc: PolicyDocument = {
-    name: "router",
-    content: routerRaw.trim(),
-    bytes: Buffer.byteLength(routerRaw.trim(), "utf8"),
-  };
-
   const policies = new Map<string, PolicyDocument>();
-  policies.set("router", routerDoc);
+
+  const docNames = [
+    { name: "task", raw: taskRaw },
+    { name: "personal", raw: personalRaw },
+    { name: "journal", raw: journalRaw },
+  ];
+
+  for (const { name, raw } of docNames) {
+    const trimmed = raw.trim();
+    policies.set(name, {
+      name,
+      content: trimmed,
+      bytes: Buffer.byteLength(trimmed, "utf8"),
+    });
+  }
 
   return {
     bootstrap,
@@ -51,7 +63,7 @@ export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDoc
   if (!ALLOWED_POLICIES.has(name)) {
     throw new CeoError(
       "INVALID_OPERATION",
-      `Unknown product policy '${name}'. Only 'router' is supported in V0.`,
+      `Unknown product policy '${name}'. Supported policies: 'task', 'personal', 'journal'.`,
       { name },
     );
   }

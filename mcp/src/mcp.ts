@@ -174,9 +174,9 @@ export function createMcpServer(
 
   server.registerTool("policy_read", {
     title: "Read CEO runtime product policy",
-    description: "Use this to read runtime-owned product policy documents such as 'router'. Does not read user workspace files.",
+    description: "Use this to read runtime-owned product policy documents: 'task', 'personal', or 'journal'. Does not read user workspace files.",
     inputSchema: {
-      name: z.literal("router").describe("Policy document name. Supported: 'router'"),
+      name: z.enum(["task", "personal", "journal"]).describe("Policy document name. Supported: 'task', 'personal', 'journal'"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, tracedHandler(auditStore, "policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));

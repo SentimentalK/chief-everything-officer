@@ -63,9 +63,9 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       workspace_state: "READY",
     });
 
-    const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "router" } });
+    const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "task" } });
     expect(policyResult.isError).toBeFalsy();
-    expect(policyResult.structuredContent).toMatchObject({ name: "router" });
+    expect(policyResult.structuredContent).toMatchObject({ name: "task" });
 
     // Verify no Mcp-Session-Id is required or held
     expect(transport.sessionId).toBeUndefined();
@@ -215,9 +215,9 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     expect(statusCall.isError).toBeFalsy();
     expect(statusCall.structuredContent).toMatchObject({ ok: true, workspace_state: "READY" });
 
-    const routerCall = await client.callTool({ name: "policy_read", arguments: { name: "router" } });
-    expect(routerCall.isError).toBeFalsy();
-    expect(routerCall.structuredContent).toMatchObject({ name: "router" });
+    const policyCall = await client.callTool({ name: "policy_read", arguments: { name: "task" } });
+    expect(policyCall.isError).toBeFalsy();
+    expect(policyCall.structuredContent).toMatchObject({ name: "task" });
 
     await client.close();
   });

@@ -1,11 +1,35 @@
-CEO State MCP provides access to the user's durable personal state.
+# CEO Workspace Bootstrap
 
-Use the user workspace when the task depends on previously stored personal state or when the user wants a durable state change.
+CEO State MCP 是用户拥有的长期个人状态与工作空间。它保存用户自己的事实、经历、偏好、任务和长期积累，使不同 AI 能在需要时理解同一个人并继续之前的工作。
 
-The workspace contains user data; CEO product rules are provided separately by this runtime. When you need to decide where in the user workspace to look, call `policy_read` with `name="router"`.
+## 使用方式
 
-Retrieve only the context needed for the current task. Stop once the task is sufficiently grounded.
+先理解用户当前意图，再只加载完成当前任务所需的最小相关数据。不要因为连接了 MCP 就预先读取整个仓库；需要用户背景时，优先从 `personal/` 的文件名和顶部描述判断相关性，不要让用户重复已经保存的信息。
 
-Discuss and reason normally. Persist only when the user asks to remember/update something or when a meaningful durable state change is clearly established.
+读取已有数据通常不需要先读规则。只有需要创建、更新或归档某类数据时，才使用 `policy_read` 读取对应的数据规则（`task`、`personal`、`journal`）。
 
-Use CEO State MCP for personal canonical-state writes. Do not store secrets.
+## 数据地图
+
+- `personal/` — 用户长期、可跨场景复用的个人状态，包括身份、家庭、经历、偏好、资产、习惯、长期判断等。其他任务需要这些背景时读取这里，而不是在各个 Ticket 中重复维护同一份事实或偏好。
+- `tasks/` — 当前仍有行动、等待、监控、决策或推进需求的事项。保存完成该事项所需的局部工作上下文。
+- `archive/` — 已结束的历史任务。
+- `JOURNAL.md` — 用户时间序列上的独特经历、行为、状态、变化和里程碑，用于让未来的 AI 理解最近发生过什么、是否重复或持续、以及当前问题可能处于什么上下文中。
+- `knowledge/` / `inbox/` — 当前保存外部材料与已有知识整理；这部分长期信息架构仍在演进，不要把其中内容自动当作用户个人事实。
+
+一个现实事件可以同时影响不同数据族，例如结束一个 Task、留下一个 Journal episode，并改变某项长期 Personal state；每一处保存不同语义，同一个事实本身不要复制维护多份 canonical truth。
+
+## 工作原则
+
+会话优先。主要目标是和用户一起理解、探索和解决问题，而不是不断记录。只有当事实已经明确、一个阶段基本收敛、一个事件值得长期保留，或用户明确要求记录时再写入；如果对话显然还在继续，就先继续对话。
+
+同一长期事实只维护一份 canonical truth。Task 可以引用 `personal/` 中的长期背景，但不应为了方便复制并维护另一份。
+
+严格区分用户明确提供或已核验的事实、用户的主观体验，以及 AI 自己的推断。不确定的信息保持不确定；缺失的信息不要编造。
+
+输出保持高信息密度、低仪式感：直接说结论，只有在确实帮助理解、比较或执行时才使用标题、列表和术语；避免重复解释、空洞总结和不必要的框架。保留必要的 nuance，但不要为了显得完整而把简单问题写复杂。
+
+密码、API token、私钥、恢复码等 secret credentials 不进入这个 workspace。
+
+## 规则归属
+
+本 Runtime 内置的 CEO policy 为产品行为的权威规则。用户数据仓库中若存在任何旧版 `SYSTEM.md` 或 `rules/`，仅为历史兼容文件，不具备 Runtime 规则效力。

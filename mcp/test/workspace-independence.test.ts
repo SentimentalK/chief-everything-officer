@@ -31,17 +31,16 @@ async function createFictionalWorkspaceFixture(): Promise<{ config: Config; root
     "utf8",
   );
 
-  await mkdir(path.join(initDir, "records"), { recursive: true });
+  await mkdir(path.join(initDir, "personal"), { recursive: true });
   await writeFile(
-    path.join(initDir, "records", "profile.md"),
-    "# Profile\n\n- Preferred name: Ada\n- Home city: Kingston, Ontario\n",
+    path.join(initDir, "personal", "profile.md"),
+    "# Profile\n\n- Purpose: User identity and basic facts.\n- Read when: Need to know who Ada is.\n- Contains: Name and location.\n\n- Preferred name: Ada\n- Home city: Kingston, Ontario\n",
     "utf8",
   );
 
-  await mkdir(path.join(initDir, "context"), { recursive: true });
   await writeFile(
-    path.join(initDir, "context", "preferences.md"),
-    "# Preferences\n\n- Ada prefers concise, step-by-step plans.\n- Ada prefers simple solutions before adding abstractions.\n",
+    path.join(initDir, "personal", "preferences.md"),
+    "# Preferences\n\n- Purpose: Reusable user preferences.\n- Read when: Planning work or formulating suggestions.\n- Contains: Working style preferences.\n\n- Ada prefers concise, step-by-step plans.\n- Ada prefers simple solutions before adding abstractions.\n",
     "utf8",
   );
 
@@ -103,14 +102,17 @@ describe("Workspace Independence (Zero SYSTEM.md in User Workspace)", () => {
     const files = await workspace.listFiles("", 50);
     const filePaths = files.files.map((f) => f.path);
     expect(filePaths).toContain("README.md");
-    expect(filePaths).toContain("records/profile.md");
-    expect(filePaths).toContain("context/preferences.md");
+    expect(filePaths).toContain("personal/profile.md");
+    expect(filePaths).toContain("personal/preferences.md");
     expect(filePaths).toContain("tasks/TASK-001-home-server.md");
     expect(filePaths).toContain("JOURNAL.md");
     expect(filePaths).not.toContain("SYSTEM.md");
+    expect(filePaths).not.toContain("rules/task.md");
+    expect(filePaths).not.toContain("context/preferences.md");
+    expect(filePaths).not.toContain("records/profile.md");
 
-    // 3. read_files: reads user profile
-    const readProfile = await workspace.readFiles(["records/profile.md"]);
+    // 3. read_files: reads user profile from personal/
+    const readProfile = await workspace.readFiles(["personal/profile.md"]);
     expect(readProfile.files[0].content).toContain("Preferred name: Ada");
     expect(readProfile.files[0].content).toContain("Home city: Kingston, Ontario");
     const baseCommit = readProfile.base_commit;
