@@ -7,9 +7,9 @@ function getPackageVersion(): string {
     const currentDir = path.dirname(fileURLToPath(import.meta.url));
     const pkgPath = path.resolve(currentDir, "../package.json");
     const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-    return pkg.version ?? "0.2.0";
+    return pkg.version ?? "unknown";
   } catch {
-    return "0.2.0";
+    return "unknown";
   }
 }
 

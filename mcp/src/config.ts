@@ -33,6 +33,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("MCP_API_KEY is required when binding to a non-loopback address");
   }
 
+  const remoteUrl = env.CEO_REMOTE?.trim();
+  if (!remoteUrl) {
+    throw new Error("CEO_REMOTE is required");
+  }
+
   const allowedHosts = env.ALLOWED_HOSTS ? env.ALLOWED_HOSTS.split(",").map(s => s.trim()).filter(Boolean) : ["localhost", "127.0.0.1"];
   const allowedOrigins = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : [];
 
@@ -42,7 +47,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     txnDir: path.join(dataRoot, "txns"),
     stateDir: path.join(dataRoot, "state"),
     branch: env.CEO_BRANCH ?? "main",
-    remoteUrl: env.CEO_REMOTE ?? "git@github.com:SentimentalK/ceo-poc-workspace.git",
+    remoteUrl,
     port,
     bindHost,
     gitAuthorName: env.CEO_GIT_AUTHOR_NAME ?? "CEO State MCP",

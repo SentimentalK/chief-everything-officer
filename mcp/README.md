@@ -1,17 +1,17 @@
 # CEO State MCP
 
-A narrow, Git-backed MCP server for the user's durable personal state workspace. It exposes four read tools, one runtime policy read tool, and one atomic write transaction; it does not expose a shell, arbitrary filesystem access, raw Git commands, general moves, deletes, rebases, or force pushes.
+A narrow, Git-backed MCP server for the user's durable personal state workspace. It exposes four read tools, one runtime policy read tool, and one atomic write transaction (`apply_change_set`); it does not expose a shell, arbitrary non-Markdown filesystem access, raw Git commands, branch switching, history rewrites, rebases, or force pushes.
 
 ## Tools
 
 - `workspace_status`: synchronize and report local/remote state.
-- `list_files`: list allowlisted Markdown files and blob OIDs.
+- `list_files`: hierarchical / bounded discovery of allowed CEO Markdown files and directories.
 - `read_files`: batch-read up to 20 files with a base commit.
 - `search_text`: literal search inside allowlisted Markdown.
-- `apply_change_set`: validate, commit, fast-forward push, and verify one logical update.
-- `policy_read`: read runtime product policy documents (e.g., `router`).
+- `apply_change_set`: validate, commit, fast-forward push, and verify one logical update (`create`, `replace`, `append`, `delete`, `move`).
+- `policy_read`: read runtime product policy documents (e.g. `tasks`, `personal`, `journal`).
 
-Writable content is open to all Markdown (`.md`) files in the workspace, excluding protected system code, workflows, secrets, and Git metadata (`.git/`, `.github/`, `mcp/`, `.env`). `append` is limited to `JOURNAL.md`; `archive` is limited to `tasks/*.md -> archive/<year>/*.md`.
+Writable content is open to all Markdown (`.md`) files in the workspace outside runtime security invariants (hidden paths `.*`, symlinks, non-Markdown files) and workspace access boundaries defined in `.ceoignore`. `apply_change_set` provides five generic atomic operations: `create`, `replace`, `append`, `delete`, and `move`. Domain conventions like task archiving or journal appending are governed by workspace rules (`rules/<area>.md`) or runtime default policies (`policy/<area>.md`), not hardcoded into the filesystem engine.
 
 ## Development
 
@@ -22,7 +22,7 @@ Requires Node.js 22+ and Git.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CEO_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, `state/`, and `audit/` |
-| `CEO_REMOTE` | `git@github.com:SentimentalK/ceo-poc-workspace.git` | Fixed Git origin |
+| `CEO_REMOTE` | **(required)** | Fixed Git origin URL (startup fails if missing) |
 | `CEO_BRANCH` | `main` | Fixed writable branch |
 | `CEO_SSH_KEY_PATH` | unset | Read/write deploy key path |
 | `CEO_KNOWN_HOSTS_PATH` | unset | Pinned SSH known-hosts file |

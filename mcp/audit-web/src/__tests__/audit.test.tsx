@@ -166,6 +166,34 @@ describe("Audit Web UI & Component Tests", () => {
     expect(container.textContent).toContain("CallToolResult Output");
     expect(container.textContent).toContain('"name": "router"');
     expect(container.textContent).toContain("# Router Policy");
+
+    // Verify Input is rendered BEFORE Output in DOM order
+    const inputHeading = Array.from(container.querySelectorAll("span")).find((s) => s.textContent?.includes("Tool Input Arguments"));
+    const outputHeading = Array.from(container.querySelectorAll("span")).find((s) => s.textContent?.includes("CallToolResult Output"));
+    expect(inputHeading).toBeDefined();
+    expect(outputHeading).toBeDefined();
+    const pos = inputHeading!.compareDocumentPosition(outputHeading!);
+    // DOCUMENT_POSITION_FOLLOWING is 4
+    expect(pos & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    // Verify copy actions
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText: writeTextMock } });
+
+    const copyButtons = Array.from(container.querySelectorAll("button")).filter((b) => b.textContent?.includes("Copy"));
+    expect(copyButtons.length).toBe(2);
+
+    // Click input copy
+    await act(async () => {
+      copyButtons[0].dispatchEvent(new Event("click", { bubbles: true }));
+    });
+    expect(writeTextMock).toHaveBeenCalledWith(expect.stringContaining('"name": "router"'));
+
+    // Click output copy
+    await act(async () => {
+      copyButtons[1].dispatchEvent(new Event("click", { bubbles: true }));
+    });
+    expect(writeTextMock).toHaveBeenCalledWith(expect.stringContaining("# Router Policy"));
   });
 
   it("renders ConsoleView with metric cards and trace list", async () => {

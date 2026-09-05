@@ -45,6 +45,12 @@ interface CompletedTransaction extends PendingTransaction {
   pushed_at: string;
 }
 
+export function normalizeListPrefix(prefix: string): string {
+  const trimmed = prefix.trim();
+  if (!trimmed) return "";
+  return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
+}
+
 export class CeoWorkspace {
   private state: WorkspaceState = "RECOVERING";
   private lastPushAt: string | null = null;
@@ -115,27 +121,83 @@ export class CeoWorkspace {
     }
   }
 
-  async listFiles(prefix = "", limit = 200): Promise<Record<string, unknown>> {
+  async listFiles(
+    prefix = "",
+    recursive = false,
+    limit = 200,
+  ): Promise<Record<string, unknown>> {
     return await this.withReadyWorkspace(async (base) => {
       if (prefix && (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix))) {
         throw new CeoError("INVALID_PATH", "Prefix must be a safe repository-relative path.", { prefix });
       }
+      const normalizedPrefix = normalizeListPrefix(prefix);
       const matcher = await this.loadIgnoreMatcher();
       const result = await runGit(this.config, this.config.repoDir, ["ls-tree", "-r", "-l", base]);
-      const files = result.stdout.split("\n").filter(Boolean).flatMap((line) => {
+
+      type UnifiedEntry =
+        | { kind: "directory"; path: string }
+        | { kind: "file"; path: string; blob_oid: string; bytes: number };
+
+      const directoryPaths = new Set<string>();
+      const rawFiles: Array<{ path: string; blob_oid: string; bytes: number }> = [];
+
+      for (const line of result.stdout.split("\n")) {
+        if (!line) continue;
         const match = line.match(/^\d+\s+blob\s+([0-9a-f]{40,64})\s+(\d+)\t(.+)$/);
-        if (!match) return [];
-        const [, oid, bytes, filePath] = match;
-        if (!oid || !bytes || !filePath || !isAllowedTrackedPath(filePath) || isPathIgnored(matcher, filePath) || !filePath.startsWith(prefix)) return [];
-        return [{ path: filePath, blob_oid: oid, bytes: Number(bytes) }];
-      });
+        if (!match) continue;
+        const [, oid, bytesStr, filePath] = match;
+        if (!oid || !bytesStr || !filePath || !isAllowedTrackedPath(filePath) || isPathIgnored(matcher, filePath)) {
+          continue;
+        }
+
+        if (normalizedPrefix && !filePath.startsWith(normalizedPrefix)) {
+          continue;
+        }
+
+        if (recursive) {
+          rawFiles.push({ path: filePath, blob_oid: oid, bytes: Number(bytesStr) });
+        } else {
+          const remainder = filePath.slice(normalizedPrefix.length);
+          const slashIdx = remainder.indexOf("/");
+          if (slashIdx === -1) {
+            rawFiles.push({ path: filePath, blob_oid: oid, bytes: Number(bytesStr) });
+          } else {
+            const subDir = remainder.slice(0, slashIdx);
+            const dirPath = `${normalizedPrefix}${subDir}/`;
+            directoryPaths.add(dirPath);
+          }
+        }
+      }
+
+      const unifiedEntries: UnifiedEntry[] = [
+        ...Array.from(directoryPaths).map((p) => ({ kind: "directory" as const, path: p })),
+        ...rawFiles.map((f) => ({ kind: "file" as const, ...f })),
+      ];
+
+      unifiedEntries.sort((a, b) => a.path.localeCompare(b.path));
+
+      const truncated = unifiedEntries.length > limit;
+      const sliced = truncated ? unifiedEntries.slice(0, limit) : unifiedEntries;
+
+      const directories: string[] = [];
+      const files: Array<{ path: string; blob_oid: string; bytes: number }> = [];
+
+      for (const entry of sliced) {
+        if (entry.kind === "directory") {
+          directories.push(entry.path);
+        } else {
+          files.push({ path: entry.path, blob_oid: entry.blob_oid, bytes: entry.bytes });
+        }
+      }
+
       return {
         ok: true,
         request_id: randomUUID(),
         workspace_state: "READY",
         base_commit: base,
-        files: files.slice(0, limit),
-        truncated: files.length > limit,
+        directories,
+        files,
+        truncated,
       };
     });
   }

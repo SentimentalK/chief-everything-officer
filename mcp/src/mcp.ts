@@ -146,13 +146,15 @@ export function createMcpServer(
 
   server.registerTool("list_files", {
     title: "List CEO files",
-    description: "Use this to discover allowed CEO Markdown files. It never exposes code, secrets, or Git metadata.",
+    description: "Use this to discover allowed CEO Markdown files. Prefer the narrowest known prefix. Unscoped listing is for workspace discovery when the relevant area is unknown or ambiguous.",
     inputSchema: {
       prefix: z.string().max(240).optional().default(""),
+      recursive: z.boolean().optional().default(false),
       limit: z.number().int().min(1).max(500).optional().default(LIMITS.maxSearchResults),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "list_files", async ({ prefix, limit }: { prefix: string; limit: number }) => await workspace.listFiles(prefix, limit)));
+  }, tracedHandler(auditStore, "list_files", async ({ prefix, recursive, limit }: { prefix: string; recursive: boolean; limit: number }) =>
+    await workspace.listFiles(prefix, recursive, limit)));
 
   server.registerTool("read_files", {
     title: "Read CEO files",

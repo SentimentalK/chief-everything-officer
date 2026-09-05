@@ -17,7 +17,11 @@ describe("CeoWorkspace", () => {
     cleanup.push(item.root);
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
-    const listed = await workspace.listFiles();
+    const shallow = await workspace.listFiles();
+    expect(shallow.directories).toEqual(["inbox/", "tasks/"]);
+    expect((shallow.files as any[]).map((f) => f.path)).toEqual(expect.arrayContaining(["TODO.md"]));
+
+    const listed = await workspace.listFiles("", true);
     expect(listed.files).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: "TODO.md" }),
       expect.objectContaining({ path: "tasks/TEST-001.md" }),
@@ -193,8 +197,12 @@ describe("CeoWorkspace", () => {
     git(item.config.repoDir, "commit", "-m", "add .ceoignore and ignored files");
     git(item.config.repoDir, "push", "origin", "main");
 
-    // 1. listFiles excludes ignored files
-    const listed = await workspace.listFiles();
+    // 1. listFiles excludes ignored files in both shallow and recursive modes
+    const shallow = await workspace.listFiles();
+    expect(shallow.directories).not.toContain("ignored-notes/");
+    expect((shallow.files as any[]).map((f) => f.path)).not.toContain("secret.md");
+
+    const listed = await workspace.listFiles("", true);
     const paths = (listed.files as any[]).map((f) => f.path);
     expect(paths).not.toContain("ignored-notes/hidden.md");
     expect(paths).not.toContain("secret.md");

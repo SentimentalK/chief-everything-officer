@@ -11,6 +11,7 @@ import { createAuthMiddleware, createHostGuard, createOriginGuard } from "../src
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { CeoWorkspace } from "../src/workspace.js";
+import { BUILD_INFO } from "../src/build-info.js";
 import { fixture } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
@@ -61,7 +62,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     expect(statusResult.structuredContent).toMatchObject({
       ok: true,
       workspace_state: "READY",
-      version: "0.2.0",
+      version: BUILD_INFO.version,
       build: expect.any(String),
     });
 
@@ -218,7 +219,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     expect(statusCall.structuredContent).toMatchObject({
       ok: true,
       workspace_state: "READY",
-      version: "0.2.0",
+      version: BUILD_INFO.version,
       build: expect.any(String),
     });
 

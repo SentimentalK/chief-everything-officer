@@ -99,8 +99,14 @@ describe("Workspace Independence (Zero SYSTEM.md in User Workspace)", () => {
     expect(status.workspace_state).toBe("READY");
 
     // 2. list_files: finds user files, zero SYSTEM.md
-    const files = await workspace.listFiles("", 50);
-    const filePaths = files.files.map((f) => f.path);
+    const shallow = await workspace.listFiles();
+    expect(shallow.directories).toContain("personal/");
+    expect(shallow.directories).toContain("tasks/");
+    expect((shallow.files as any[]).map((f) => f.path)).toContain("README.md");
+    expect((shallow.files as any[]).map((f) => f.path)).toContain("JOURNAL.md");
+
+    const files = await workspace.listFiles("", true, 50);
+    const filePaths = (files.files as any[]).map((f) => f.path);
     expect(filePaths).toContain("README.md");
     expect(filePaths).toContain("personal/profile.md");
     expect(filePaths).toContain("personal/preferences.md");

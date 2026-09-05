@@ -92,7 +92,7 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 min-h-0 p-4 flex flex-col">
         {loading ? (
           <div className="flex h-64 items-center justify-center">
             <Loader2 className="h-6 w-6 animate-spin text-neutral-400" />
@@ -102,10 +102,10 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
             Failed to load trace detail: {error}
           </div>
         ) : detail ? (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 h-full">
+          <div className="flex flex-col gap-4 h-full min-h-0">
             {/* Input / Request */}
-            <div className="flex flex-col rounded-lg border border-neutral-800 bg-neutral-900/40 overflow-hidden">
-              <div className="flex items-center justify-between border-b border-neutral-800/80 bg-neutral-900/90 px-3 py-2">
+            <div className="flex flex-col shrink-0 max-h-[28vh] rounded-lg border border-neutral-800 bg-neutral-900/40 overflow-hidden">
+              <div className="shrink-0 flex items-center justify-between border-b border-neutral-800/80 bg-neutral-900/90 px-3 py-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
                     Tool Input Arguments
@@ -131,14 +131,14 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
                   )}
                 </button>
               </div>
-              <pre className="flex-1 overflow-x-auto p-3 text-xs font-mono text-neutral-300 bg-neutral-950/70 select-text">
+              <pre className="min-h-0 overflow-auto p-3 text-xs font-mono text-neutral-300 bg-neutral-950/70 select-text">
                 <code>{formatJson(detail.input_json)}</code>
               </pre>
             </div>
 
             {/* Output / Response */}
-            <div className="flex flex-col rounded-lg border border-neutral-800 bg-neutral-900/40 overflow-hidden">
-              <div className="flex items-center justify-between border-b border-neutral-800/80 bg-neutral-900/90 px-3 py-2">
+            <div className="flex flex-col flex-1 min-h-0 rounded-lg border border-neutral-800 bg-neutral-900/40 overflow-hidden">
+              <div className="shrink-0 flex items-center justify-between border-b border-neutral-800/80 bg-neutral-900/90 px-3 py-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
                     CallToolResult Output
@@ -164,7 +164,7 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
                   )}
                 </button>
               </div>
-              <pre className="flex-1 overflow-x-auto p-3 text-xs font-mono text-neutral-300 bg-neutral-950/70 select-text">
+              <pre className="flex-1 min-h-0 overflow-auto p-3 text-xs font-mono text-neutral-300 bg-neutral-950/70 select-text">
                 <code>{formatJson(detail.output_json)}</code>
               </pre>
             </div>

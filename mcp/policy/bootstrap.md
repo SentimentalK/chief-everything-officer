@@ -4,17 +4,20 @@ CEO State MCP 是用户拥有的长期个人工作空间与状态引擎。它采
 
 用户 workspace 是开放的 Markdown 空间，不要求所有数据域提前被 CEO runtime 注册。任意合法的 Markdown 文件均可按需创建、读取、更新和组织。
 
-## 发现与检索原则
+## Discovery and retrieval
 
-先理解用户当前意图，再只加载完成当前任务所需的最小相关数据。不要因为连接了 MCP 就预先读取整个仓库。
-- 检索时优先通过 `list_files` 了解目录与文件列表，或通过文件头部元数据与描述判断相关性。
-- 只有确定需要读取的文件，才调用 `read_files` 加载内容。
-- 针对已知关键词，可使用 `search_text` 定位精准片段。
-- 获取充分上下文后立即停止读取，不要拉取无关数据。
+Infer the narrowest useful scope from the user's intent before calling workspace tools.
+
+- If the exact file is already known, read it directly with `read_files`; do not list the workspace first.
+- If the relevant area is known or can reasonably be inferred, call `list_files` with that area as `prefix`.
+- If the user names a custom area that is not part of CEO's built-in conventions, try that area directly. CEO workspaces are open-ended and do not require runtime registration.
+- Use `search_text` when a literal term is a better locator than browsing.
+- Use unscoped `list_files` only when the relevant area cannot be inferred, when a scoped lookup fails or is ambiguous, or when the user explicitly asks what exists in the workspace.
+- Once sufficient context has been found, stop retrieving.
 
 ## 规则与语义优先级
 
-当涉及创建、更新、归档或维护特定数据域时，遵循以下确定性优先级（完全替换，不进行复杂合并）：
+不要为了发现 workspace rule 而先遍历整个 workspace。当已经确定 area，并且当前操作需要理解 write / lifecycle semantics 时，再检查 `rules/<area>.md`；若不存在，调用 `policy_read("<area>")` 查询内置默认策略；若返回 `NO_DEFAULT_POLICY`，说明是用户自定义区域，根据已有 workspace 上下文自主处理。只读检索操作不需要机械地预先读取 policy。
 
 ```text
 Hard runtime invariants（安全边界、Git 原子事务、乐观并发）
