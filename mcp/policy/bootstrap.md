@@ -12,6 +12,7 @@ Choose the locator based on what you know:
 - If the exact path is known, read it directly with `read_files`. Do not list the workspace first.
 - If the directory / area is known, call `list_files` with that directory as `prefix` (e.g. `prefix="tasks/"` or `prefix="inbox/game/"`). Note that `prefix` is a directory scope, not a filename prefix.
 - If a literal ID, filename fragment, or keyword is known but not the exact path (for example, finding "PROJECT-011"), call `search_text` scoped to the relevant area (`query="PROJECT-011", prefixes=["tasks/"]`). Do not call `list_files` with a filename prefix.
+- For external materials (URLs, articles, videos, PDFs, documents), use Resource tools (`resource_capture`, `resource_search`, `resource_get`, `resource_apply`) for saving, finding, reading, or continuing prior discussion of external sources.
 - If the workspace structure is unknown or ambiguous, use shallow unscoped `list_files()` as a fallback to discover top-level areas.
 - If the user names a custom area that is not part of CEO's built-in conventions, try that area directly. CEO workspaces are open-ended and do not require runtime registration.
 - Once sufficient context has been found, stop retrieving.
@@ -41,6 +42,7 @@ Model reasoning（若均无预设策略，根据已有文件上下文与用户�
 - `personal/` — 用户长期、可跨场景复用的个人状态，包括身份、家庭、经历、偏好、资产、习惯等。
 - `tasks/` — 当前仍有行动、等待、监控、决策或推进需求的事项。
 - `archive/` — 已结束的历史事项归档（例如 `archive/<year>/`）。
+- `resources/` — 外部输入与材料库（通过专门的 Resource 工具操作）。
 - `JOURNAL.md` — 时间序列上的事件、行为、状态变化与里程碑流。
 - 其他任意 Markdown 目录（如 `projects/`、`sources/`、`research/`、`health/` 等）均完全合法。
 

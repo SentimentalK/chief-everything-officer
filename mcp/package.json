@@ -1,6 +1,6 @@
 {
-  "name": "@sentimentalk/ceo-state-mcp",
-  "version": "0.2.2",
+  "name": "@sentimentalk/ceo-mcp",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -17,6 +17,7 @@
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "express": "5.2.1",
+    "yaml": "^2.9.0",
     "zod": "4.4.3"
   },
   "devDependencies": {

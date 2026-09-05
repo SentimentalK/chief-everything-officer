@@ -69,7 +69,7 @@ app.all(
 );
 
 const listener = app.listen(config.port, config.bindHost, () => {
-  process.stdout.write(`CEO State MCP listening on http://${config.bindHost}:${config.port}/mcp\n`);
+  process.stdout.write(`CEO MCP listening on http://${config.bindHost}:${config.port}/mcp\n`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

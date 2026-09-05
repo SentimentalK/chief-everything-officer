@@ -22,6 +22,7 @@ import {
   isAllowedTrackedPath,
   validatePath,
 } from "./policy.js";
+import { isAllowedResourceSourcePath } from "./resource/security.js";
 
 export type WorkspaceState = "RECOVERING" | "READY" | "PUSH_PENDING" | "BLOCKED" | "NOT_READY";
 
@@ -245,6 +246,7 @@ export class CeoWorkspace {
       }
       const matches: Array<{ path: string; line: number; snippet: string }> = [];
       for (const filePath of listed) {
+        if (prefixes.length === 0 && filePath.startsWith("resources/")) continue;
         if (!safePrefixes.some((prefix) => filePath.startsWith(prefix))) continue;
         await assertNoSymlink(this.config.repoDir, filePath);
         const content = await this.readUtf8(path.join(this.config.repoDir, filePath), filePath);
@@ -261,21 +263,14 @@ export class CeoWorkspace {
     });
   }
 
-  async applyChangeSet(input: {
-    request_id?: string;
-    base_commit: string;
-    summary: string;
-    operations: ChangeOperation[];
+  async withAtomicWorkspaceTransaction(input: {
+    requestId: string;
+    baseCommit: string;
+    commitMessage: string;
+    allowResourceSourceFiles?: boolean;
+    mutator: (worktree: string, worktreeMatcher: CeoIgnoreMatcher) => Promise<void>;
   }): Promise<Record<string, unknown>> {
-    const requestId = input.request_id ?? randomUUID();
-    if (!/^[0-9a-f-]{36}$/i.test(requestId)) throw new CeoError("VALIDATION_FAILED", "request_id must be a UUID.");
-    if (!input.summary.trim() || input.summary.length > 120 || /[\r\n]/.test(input.summary)) {
-      throw new CeoError("VALIDATION_FAILED", "Summary must be a single line of 1 to 120 characters.");
-    }
-    if (input.operations.length === 0 || input.operations.length > LIMITS.maxOperationsPerTransaction) {
-      throw new CeoError("VALIDATION_FAILED", `Apply between 1 and ${LIMITS.maxOperationsPerTransaction} operations.`);
-    }
-
+    const { requestId, baseCommit, commitMessage, allowResourceSourceFiles = false, mutator } = input;
     return await this.withLock(async () => {
       const completed = await this.readCompleted(requestId);
       if (completed) return this.completedResult(completed);
@@ -283,32 +278,30 @@ export class CeoWorkspace {
       if (await this.readPending()) throw new CeoError("PUSH_PENDING", "A previous commit is awaiting push verification.");
       await this.syncCleanWorkspace();
       const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
-      if (remote !== input.base_commit) {
+      if (remote !== baseCommit) {
         throw new CeoError("STALE_REVISION", "origin/main changed since the files were read.", {
-          expected: input.base_commit,
+          expected: baseCommit,
           remote_head: remote,
         });
       }
 
-      const matcher = await this.loadIgnoreMatcher();
-      this.validateOperations(input.operations, matcher);
       const worktree = path.join(this.config.txnDir, requestId);
       await rm(worktree, { recursive: true, force: true });
-      await runGit(this.config, this.config.repoDir, ["worktree", "add", "--detach", worktree, input.base_commit]);
+      await runGit(this.config, this.config.repoDir, ["worktree", "add", "--detach", worktree, baseCommit]);
       const worktreeMatcher = await this.loadIgnoreMatcher(worktree);
       let committed = false;
       try {
-        await this.applyOperations(worktree, input.base_commit, input.operations);
-        const changed = await this.validateDiff(worktree, worktreeMatcher);
+        await mutator(worktree, worktreeMatcher);
+        const changed = await this.validateDiff(worktree, worktreeMatcher, allowResourceSourceFiles);
         await runGit(this.config, worktree, ["add", "-A"]);
         await runGit(this.config, worktree, ["diff", "--cached", "--check"]);
-        await runGit(this.config, worktree, ["commit", "-m", `CEO: ${input.summary.trim()}`]);
+        await runGit(this.config, worktree, ["commit", "-m", commitMessage]);
         committed = true;
         const commit = await resolveRef(this.config, worktree, "HEAD");
         const diffStat = (await runGit(this.config, worktree, ["show", "--stat", "--format=", "HEAD"])).stdout;
         const pending: PendingTransaction = {
           request_id: requestId,
-          base_commit: input.base_commit,
+          base_commit: baseCommit,
           commit,
           worktree,
           changed_files: changed,
@@ -317,7 +310,7 @@ export class CeoWorkspace {
         await this.writePending(pending);
         await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
         const latest = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
-        if (latest !== input.base_commit) {
+        if (latest !== baseCommit) {
           this.state = "BLOCKED";
           throw new CeoError("STALE_REVISION", "origin/main moved during the transaction; the local commit was not pushed.", {
             remote_head: latest,
@@ -339,7 +332,34 @@ export class CeoWorkspace {
     });
   }
 
-  private async withReadyWorkspace<T>(operation: (base: string) => Promise<T>): Promise<T> {
+  async applyChangeSet(input: {
+    request_id?: string;
+    base_commit: string;
+    summary: string;
+    operations: ChangeOperation[];
+  }): Promise<Record<string, unknown>> {
+    const requestId = input.request_id ?? randomUUID();
+    if (!/^[0-9a-f-]{36}$/i.test(requestId)) throw new CeoError("VALIDATION_FAILED", "request_id must be a UUID.");
+    if (!input.summary.trim() || input.summary.length > 120 || /[\r\n]/.test(input.summary)) {
+      throw new CeoError("VALIDATION_FAILED", "Summary must be a single line of 1 to 120 characters.");
+    }
+    if (input.operations.length === 0 || input.operations.length > LIMITS.maxOperationsPerTransaction) {
+      throw new CeoError("VALIDATION_FAILED", `Apply between 1 and ${LIMITS.maxOperationsPerTransaction} operations.`);
+    }
+
+    return await this.withAtomicWorkspaceTransaction({
+      requestId,
+      baseCommit: input.base_commit,
+      commitMessage: `CEO: ${input.summary.trim()}`,
+      allowResourceSourceFiles: false,
+      mutator: async (worktree, worktreeMatcher) => {
+        this.validateOperations(input.operations, worktreeMatcher);
+        await this.applyOperations(worktree, input.base_commit, input.operations);
+      },
+    });
+  }
+
+  async withReadyWorkspace<T>(operation: (base: string) => Promise<T>): Promise<T> {
     return await this.withLock(async () => {
       await this.recoverPending();
       if (this.state === "BLOCKED") throw new CeoError("WORKSPACE_DIVERGED", "Workspace requires operator repair.");
@@ -380,7 +400,7 @@ export class CeoWorkspace {
     }
   }
 
-  private validateOperations(operations: ChangeOperation[], matcher: CeoIgnoreMatcher): void {
+  validateOperations(operations: ChangeOperation[], matcher: CeoIgnoreMatcher): void {
     let total = 0;
     const touched = new Set<string>();
     for (const operation of operations) {
@@ -407,7 +427,7 @@ export class CeoWorkspace {
     if (total > LIMITS.maxTotalWriteBytes) throw new CeoError("VALIDATION_FAILED", `Transaction content exceeds ${Math.round(LIMITS.maxTotalWriteBytes / (1024 * 1024))} MiB.`);
   }
 
-  private async applyOperations(worktree: string, base: string, operations: ChangeOperation[]): Promise<void> {
+  async applyOperations(worktree: string, base: string, operations: ChangeOperation[]): Promise<void> {
     for (const operation of operations) {
       const filePath = validatePath(operation.path);
       await assertNoSymlink(worktree, filePath);
@@ -441,7 +461,7 @@ export class CeoWorkspace {
     }
   }
 
-  private async validateDiff(worktree: string, matcher: CeoIgnoreMatcher): Promise<string[]> {
+  private async validateDiff(worktree: string, matcher: CeoIgnoreMatcher, allowResourceSourceFiles = false): Promise<string[]> {
     const tracked = (await runGit(this.config, worktree, ["diff", "--name-only", "-z"])).stdout
       .split("\0").filter(Boolean);
     const untracked = (await runGit(this.config, worktree, ["ls-files", "--others", "--exclude-standard", "-z"])).stdout
@@ -449,7 +469,11 @@ export class CeoWorkspace {
     const changed = [...tracked, ...untracked];
     if (changed.length === 0) throw new CeoError("VALIDATION_FAILED", "Change set produces no file changes.");
     for (const filePath of changed) {
-      validatePath(filePath);
+      if (allowResourceSourceFiles && isAllowedResourceSourcePath(filePath)) {
+        // Safe document file in resources/<id>/source/original.<ext>
+      } else {
+        validatePath(filePath);
+      }
       if (isPathIgnored(matcher, filePath)) {
         throw new CeoError("ACCESS_DENIED", "Changed path in diff is excluded by .ceoignore.", { path: filePath });
       }
@@ -561,7 +585,7 @@ export class CeoWorkspace {
     }
   }
 
-  private async readUtf8(filePath: string, displayPath: string): Promise<string> {
+  async readUtf8(filePath: string, displayPath: string): Promise<string> {
     const bytes = await readFile(filePath);
     try {
       return new TextDecoder("utf-8", { fatal: true }).decode(bytes);

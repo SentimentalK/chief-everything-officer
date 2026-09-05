@@ -10,6 +10,11 @@ export type ErrorCode =
   | "PUSHED_LOCAL_REPAIR_NEEDED"
   | "ACCESS_DENIED"
   | "NOT_READY"
+  | "NOT_FOUND"
+  | "DUPLICATE_RESOURCE"
+  | "INVALID_SOURCE_ASSET"
+  | "INVALID_META"
+  | "INVALID_RESOURCE_ID"
   | "INTERNAL_ERROR";
 
 export class CeoError extends Error {
