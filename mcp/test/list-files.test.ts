@@ -61,6 +61,8 @@ async function createHierarchyFixture(): Promise<{ workspace: CeoWorkspace; root
     bindHost: "127.0.0.1",
     gitAuthorName: "Test",
     gitAuthorEmail: "test@example.com",
+    gitCommitterName: "Test Committer",
+    gitCommitterEmail: "committer@example.com",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
     auditDir: path.join(dataRoot, "audit"),

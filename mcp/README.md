@@ -29,10 +29,10 @@ Requires Node.js 22+ and Git.
 | `CEO_REMOTE` | **(required)** | Fixed Git origin URL (startup fails if missing) |
 | `CEO_BRANCH` | `main` | Fixed writable branch |
 | `CEO_SSH_KEY_PATH` | unset | Read/write deploy key path |
-| `CEO_KNOWN_HOSTS_PATH` | unset | Pinned SSH known-hosts file |
-| `CEO_GIT_AUTHOR_NAME` | `CEO State MCP` | Commit author name |
-| `CEO_GIT_AUTHOR_EMAIL` | noreply address | Commit author email |
-| `CEO_AUDIT_DB_PATH` | `/data/audit/ceo-trace.sqlite` | SQLite trace database path |
+| `CEO_GIT_AUTHOR_NAME` | `CEO_GIT_COMMITTER_NAME` | Author name (credited as author of user-directed canonical changes) |
+| `CEO_GIT_AUTHOR_EMAIL` | `CEO_GIT_COMMITTER_EMAIL` | Author email (associated with user GitHub account for contribution credit) |
+| `CEO_GIT_COMMITTER_NAME` | `CEO State MCP` | Runtime identity committing on behalf of the user |
+| `CEO_GIT_COMMITTER_EMAIL` | `ceo-mcp@users.noreply.github.com` | Service identity email |
 | `BIND_HOST` | `127.0.0.1` | HTTP bind host; use `0.0.0.0` for K3s Ingress |
 | `PORT` | `3000` | MCP HTTP port |
 | `MCP_API_KEY` | unset | Static Bearer token; **required** when binding to a non-loopback address |

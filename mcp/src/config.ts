@@ -11,6 +11,8 @@ export interface Config {
   bindHost: string;
   gitAuthorName: string;
   gitAuthorEmail: string;
+  gitCommitterName: string;
+  gitCommitterEmail: string;
   sshKeyPath?: string;
   knownHostsPath?: string;
   mcpApiKey?: string;
@@ -41,6 +43,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const allowedHosts = env.ALLOWED_HOSTS ? env.ALLOWED_HOSTS.split(",").map(s => s.trim()).filter(Boolean) : ["localhost", "127.0.0.1"];
   const allowedOrigins = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : [];
 
+  const gitCommitterName = env.CEO_GIT_COMMITTER_NAME ?? "CEO State MCP";
+  const gitCommitterEmail = env.CEO_GIT_COMMITTER_EMAIL ?? "ceo-mcp@users.noreply.github.com";
+  const gitAuthorName = env.CEO_GIT_AUTHOR_NAME ?? gitCommitterName;
+  const gitAuthorEmail = env.CEO_GIT_AUTHOR_EMAIL ?? gitCommitterEmail;
+
   return {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
@@ -50,8 +57,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     remoteUrl,
     port,
     bindHost,
-    gitAuthorName: env.CEO_GIT_AUTHOR_NAME ?? "CEO State MCP",
-    gitAuthorEmail: env.CEO_GIT_AUTHOR_EMAIL ?? "ceo-mcp@users.noreply.github.com",
+    gitAuthorName,
+    gitAuthorEmail,
+    gitCommitterName,
+    gitCommitterEmail,
     ...(env.CEO_SSH_KEY_PATH ? { sshKeyPath: env.CEO_SSH_KEY_PATH } : {}),
     ...(env.CEO_KNOWN_HOSTS_PATH ? { knownHostsPath: env.CEO_KNOWN_HOSTS_PATH } : {}),
     ...(mcpApiKey ? { mcpApiKey } : {}),

@@ -49,6 +49,8 @@ export async function fixture(): Promise<{ root: string; remote: string; config:
     bindHost: "127.0.0.1",
     gitAuthorName: "CEO State MCP Test",
     gitAuthorEmail: "ceo-test@example.com",
+    gitCommitterName: "CEO State MCP Committer",
+    gitCommitterEmail: "ceo-committer@example.com",
     mcpApiKey: undefined,
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],

@@ -78,6 +78,8 @@ async function createFictionalWorkspaceFixture(): Promise<{ config: Config; root
     bindHost: "127.0.0.1",
     gitAuthorName: "Test User",
     gitAuthorEmail: "test@example.com",
+    gitCommitterName: "Test Committer",
+    gitCommitterEmail: "committer@example.com",
     mcpApiKey: undefined,
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: ["http://localhost"],
