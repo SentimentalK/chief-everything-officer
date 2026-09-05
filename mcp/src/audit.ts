@@ -12,6 +12,7 @@ export interface TraceRecordInput {
   operation_request_id?: string | null;
   input_json: string;
   output_json: string;
+  semantic_output_json?: string | null;
   latency_ms: number;
   affected_paths?: string[] | null;
   resulting_commit?: string | null;
@@ -31,6 +32,9 @@ export interface TraceSummary {
   input_tokens_est: number;
   output_tokens_est: number;
   total_tokens_est: number;
+  semantic_output_bytes: number | null;
+  semantic_output_chars: number | null;
+  semantic_output_tokens_est: number | null;
   latency_ms: number;
   affected_paths: string[] | null;
   resulting_commit: string | null;
@@ -82,6 +86,9 @@ export class AuditStore {
           input_tokens_est INTEGER NOT NULL,
           output_tokens_est INTEGER NOT NULL,
           total_tokens_est INTEGER NOT NULL,
+          semantic_output_bytes INTEGER,
+          semantic_output_chars INTEGER,
+          semantic_output_tokens_est INTEGER,
           latency_ms INTEGER NOT NULL,
           affected_paths_json TEXT,
           resulting_commit TEXT
@@ -90,6 +97,19 @@ export class AuditStore {
         CREATE INDEX IF NOT EXISTS idx_traces_timestamp
         ON traces(timestamp_ms DESC);
       `);
+
+      const columns = this.db.prepare("PRAGMA table_info(traces)").all() as Array<{ name: string }>;
+      const columnNames = new Set(columns.map((c) => c.name));
+
+      if (!columnNames.has("semantic_output_bytes")) {
+        this.db.exec("ALTER TABLE traces ADD COLUMN semantic_output_bytes INTEGER;");
+      }
+      if (!columnNames.has("semantic_output_chars")) {
+        this.db.exec("ALTER TABLE traces ADD COLUMN semantic_output_chars INTEGER;");
+      }
+      if (!columnNames.has("semantic_output_tokens_est")) {
+        this.db.exec("ALTER TABLE traces ADD COLUMN semantic_output_tokens_est INTEGER;");
+      }
     } catch (error) {
       process.stderr.write(`audit: failed to initialize database at ${this.dbPath}: ${error}\n`);
       this.db = null;
@@ -111,6 +131,16 @@ export class AuditStore {
       const outputTokensEst = Math.ceil(outputChars / 4);
       const totalTokensEst = inputTokensEst + outputTokensEst;
 
+      let semanticOutputBytes: number | null = null;
+      let semanticOutputChars: number | null = null;
+      let semanticOutputTokensEst: number | null = null;
+
+      if (record.semantic_output_json != null) {
+        semanticOutputBytes = Buffer.byteLength(record.semantic_output_json, "utf8");
+        semanticOutputChars = record.semantic_output_json.length;
+        semanticOutputTokensEst = Math.ceil(semanticOutputChars / 4);
+      }
+
       const affectedPathsJson = record.affected_paths && record.affected_paths.length > 0
         ? JSON.stringify(record.affected_paths)
         : null;
@@ -120,11 +150,13 @@ export class AuditStore {
           timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_json, output_json, input_bytes, output_bytes,
           input_chars, output_chars, input_tokens_est, output_tokens_est,
-          total_tokens_est, latency_ms, affected_paths_json, resulting_commit
+          total_tokens_est, semantic_output_bytes, semantic_output_chars,
+          semantic_output_tokens_est, latency_ms, affected_paths_json, resulting_commit
         ) VALUES (
           ?, ?, ?, ?, ?,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
+          ?, ?, ?,
           ?, ?, ?, ?
         )
       `);
@@ -144,6 +176,9 @@ export class AuditStore {
         inputTokensEst,
         outputTokensEst,
         totalTokensEst,
+        semanticOutputBytes,
+        semanticOutputChars,
+        semanticOutputTokensEst,
         record.latency_ms,
         affectedPathsJson,
         record.resulting_commit ?? null,
@@ -162,8 +197,9 @@ export class AuditStore {
         SELECT
           id, timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_bytes, output_bytes, input_chars, output_chars,
-          input_tokens_est, output_tokens_est, total_tokens_est, latency_ms,
-          affected_paths_json, resulting_commit
+          input_tokens_est, output_tokens_est, total_tokens_est,
+          semantic_output_bytes, semantic_output_chars, semantic_output_tokens_est,
+          latency_ms, affected_paths_json, resulting_commit
         FROM traces
       `;
       const conditions: string[] = [];
@@ -202,6 +238,9 @@ export class AuditStore {
         input_tokens_est: Number(row.input_tokens_est),
         output_tokens_est: Number(row.output_tokens_est),
         total_tokens_est: Number(row.total_tokens_est),
+        semantic_output_bytes: row.semantic_output_bytes == null ? null : Number(row.semantic_output_bytes),
+        semantic_output_chars: row.semantic_output_chars == null ? null : Number(row.semantic_output_chars),
+        semantic_output_tokens_est: row.semantic_output_tokens_est == null ? null : Number(row.semantic_output_tokens_est),
         latency_ms: Number(row.latency_ms),
         affected_paths: row.affected_paths_json ? JSON.parse(String(row.affected_paths_json)) : null,
         resulting_commit: row.resulting_commit ? String(row.resulting_commit) : null,
@@ -220,8 +259,9 @@ export class AuditStore {
         SELECT
           id, timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_json, output_json, input_bytes, output_bytes, input_chars, output_chars,
-          input_tokens_est, output_tokens_est, total_tokens_est, latency_ms,
-          affected_paths_json, resulting_commit
+          input_tokens_est, output_tokens_est, total_tokens_est,
+          semantic_output_bytes, semantic_output_chars, semantic_output_tokens_est,
+          latency_ms, affected_paths_json, resulting_commit
         FROM traces
         WHERE id = ?
       `);
@@ -244,6 +284,9 @@ export class AuditStore {
         input_tokens_est: Number(row.input_tokens_est),
         output_tokens_est: Number(row.output_tokens_est),
         total_tokens_est: Number(row.total_tokens_est),
+        semantic_output_bytes: row.semantic_output_bytes == null ? null : Number(row.semantic_output_bytes),
+        semantic_output_chars: row.semantic_output_chars == null ? null : Number(row.semantic_output_chars),
+        semantic_output_tokens_est: row.semantic_output_tokens_est == null ? null : Number(row.semantic_output_tokens_est),
         latency_ms: Number(row.latency_ms),
         affected_paths: row.affected_paths_json ? JSON.parse(String(row.affected_paths_json)) : null,
         resulting_commit: row.resulting_commit ? String(row.resulting_commit) : null,

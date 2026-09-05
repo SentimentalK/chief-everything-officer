@@ -179,16 +179,111 @@ describe("AuditStore & Boundary Tracing", () => {
     expect(writeTrace!.operation_request_id).toBe(requestId);
     expect(writeTrace!.affected_paths).toEqual(["tasks/AUDIT-TEST.md"]);
     expect(writeTrace!.resulting_commit).toBeTruthy();
+    expect(writeTrace!.semantic_output_bytes).not.toBeNull();
+    expect(writeTrace!.semantic_output_bytes!).toBeLessThan(writeTrace!.output_bytes);
+    expect(writeTrace!.semantic_output_tokens_est!).toBeLessThanOrEqual(writeTrace!.output_tokens_est);
 
     const policyTrace = traces.find((t) => t.tool_name === "policy_read");
     expect(policyTrace).toBeDefined();
     expect(policyTrace!.status).toBe("success");
+    expect(policyTrace!.semantic_output_bytes).not.toBeNull();
+    expect(policyTrace!.semantic_output_bytes!).toBeLessThan(policyTrace!.output_bytes);
 
     const policyDetail = auditStore.getDetail(policyTrace!.id);
     expect(policyDetail).toBeDefined();
     expect(JSON.parse(policyDetail!.input_json)).toEqual({ name: "tasks" });
     const parsedOutput = JSON.parse(policyDetail!.output_json);
     expect(parsedOutput.structuredContent.name).toBe("tasks");
+  });
+
+  it("migrates pre-existing database without semantic columns and preserves null for legacy traces", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "ceo-audit-migration-test-"));
+    cleanupDirs.push(tmpDir);
+    const dbPath = path.join(tmpDir, "legacy-trace.sqlite");
+
+    // Create legacy table without semantic_output_* columns
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ms INTEGER NOT NULL,
+        tool_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT,
+        operation_request_id TEXT,
+        input_json TEXT NOT NULL,
+        output_json TEXT NOT NULL,
+        input_bytes INTEGER NOT NULL,
+        output_bytes INTEGER NOT NULL,
+        input_chars INTEGER NOT NULL,
+        output_chars INTEGER NOT NULL,
+        input_tokens_est INTEGER NOT NULL,
+        output_tokens_est INTEGER NOT NULL,
+        total_tokens_est INTEGER NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        affected_paths_json TEXT,
+        resulting_commit TEXT
+      );
+    `);
+    legacyDb.prepare(`
+      INSERT INTO traces (
+        timestamp_ms, tool_name, status, input_json, output_json,
+        input_bytes, output_bytes, input_chars, output_chars,
+        input_tokens_est, output_tokens_est, total_tokens_est, latency_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      Date.now(), "list_files", "success", "{}", "{}",
+      2, 2, 2, 2,
+      1, 1, 2, 5
+    );
+    legacyDb.close();
+
+    // Now open via AuditStore
+    const store = new AuditStore(dbPath);
+    cleanupStores.push(store);
+
+    // Verify columns were added
+    const rawDb = new DatabaseSync(dbPath);
+    const cols = rawDb.prepare("PRAGMA table_info(traces)").all() as Array<{ name: string }>;
+    rawDb.close();
+    const colNames = new Set(cols.map((c) => c.name));
+    expect(colNames.has("semantic_output_bytes")).toBe(true);
+    expect(colNames.has("semantic_output_chars")).toBe(true);
+    expect(colNames.has("semantic_output_tokens_est")).toBe(true);
+
+    // Verify legacy summary preserves null (strictly null, not 0)
+    const summaries = store.listSummaries();
+    expect(summaries.length).toBe(1);
+    const legacySummary = summaries[0]!;
+    expect(legacySummary.semantic_output_bytes).toBeNull();
+    expect(legacySummary.semantic_output_chars).toBeNull();
+    expect(legacySummary.semantic_output_tokens_est).toBeNull();
+
+    // Verify legacy detail preserves null
+    const legacyDetail = store.getDetail(legacySummary.id);
+    expect(legacyDetail).not.toBeNull();
+    expect(legacyDetail!.semantic_output_bytes).toBeNull();
+    expect(legacyDetail!.semantic_output_chars).toBeNull();
+    expect(legacyDetail!.semantic_output_tokens_est).toBeNull();
+
+    // Record new trace with semantic output and verify it's populated
+    store.recordTrace({
+      timestamp_ms: Date.now(),
+      tool_name: "read_files",
+      status: "success",
+      input_json: JSON.stringify({ paths: ["foo.md"] }),
+      output_json: JSON.stringify({ content: [{ type: "text", text: "bar" }] }),
+      semantic_output_json: JSON.stringify({ files: [{ path: "foo.md", content: "bar" }] }),
+      latency_ms: 10,
+    });
+
+    const updatedSummaries = store.listSummaries();
+    expect(updatedSummaries.length).toBe(2);
+    const newSummary = updatedSummaries[0]!;
+    expect(newSummary.semantic_output_bytes).not.toBeNull();
+    expect(newSummary.semantic_output_bytes).toBeGreaterThan(0);
+    expect(newSummary.semantic_output_chars).toBeGreaterThan(0);
+    expect(newSummary.semantic_output_tokens_est).toBeGreaterThan(0);
   });
 
   it("never records API key or auth secrets in trace database", async () => {

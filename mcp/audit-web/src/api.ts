@@ -12,6 +12,9 @@ export interface TraceSummary {
   input_tokens_est: number;
   output_tokens_est: number;
   total_tokens_est: number;
+  semantic_output_bytes?: number | null;
+  semantic_output_chars?: number | null;
+  semantic_output_tokens_est?: number | null;
   latency_ms: number;
   affected_paths: string[] | null;
   resulting_commit: string | null;

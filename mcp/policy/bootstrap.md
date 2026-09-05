@@ -8,11 +8,12 @@ CEO State MCP 是用户拥有的长期个人工作空间与状态引擎。它采
 
 Infer the narrowest useful scope from the user's intent before calling workspace tools.
 
-- If the exact file is already known, read it directly with `read_files`; do not list the workspace first.
-- If the relevant area is known or can reasonably be inferred, call `list_files` with that area as `prefix`.
+Choose the locator based on what you know:
+- If the exact path is known, read it directly with `read_files`. Do not list the workspace first.
+- If the directory / area is known, call `list_files` with that directory as `prefix` (e.g. `prefix="tasks/"` or `prefix="inbox/game/"`). Note that `prefix` is a directory scope, not a filename prefix.
+- If a literal ID, filename fragment, or keyword is known but not the exact path (for example, finding "PROJECT-011"), call `search_text` scoped to the relevant area (`query="PROJECT-011", prefixes=["tasks/"]`). Do not call `list_files` with a filename prefix.
+- If the workspace structure is unknown or ambiguous, use shallow unscoped `list_files()` as a fallback to discover top-level areas.
 - If the user names a custom area that is not part of CEO's built-in conventions, try that area directly. CEO workspaces are open-ended and do not require runtime registration.
-- Use `search_text` when a literal term is a better locator than browsing.
-- Use unscoped `list_files` only when the relevant area cannot be inferred, when a scoped lookup fails or is ambiguous, or when the user explicitly asks what exists in the workspace.
 - Once sufficient context has been found, stop retrieving.
 
 ## 规则与语义优先级

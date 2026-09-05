@@ -76,6 +76,7 @@ function tracedHandler<T>(
           operation_request_id: operationRequestId,
           input_json: JSON.stringify(input ?? {}),
           output_json: JSON.stringify(res),
+          semantic_output_json: JSON.stringify(rawResult),
           latency_ms,
           affected_paths: affectedPaths,
           resulting_commit: resultingCommit,
@@ -146,9 +147,16 @@ export function createMcpServer(
 
   server.registerTool("list_files", {
     title: "List CEO files",
-    description: "Use this to discover allowed CEO Markdown files. Prefer the narrowest known prefix. Unscoped listing is for workspace discovery when the relevant area is unknown or ambiguous.",
+    description: "Use this to discover allowed CEO Markdown files. Prefer the narrowest known directory prefix. Unscoped listing is for workspace discovery when the relevant area is unknown or ambiguous.",
     inputSchema: {
-      prefix: z.string().max(240).optional().default(""),
+      prefix: z
+        .string()
+        .max(240)
+        .optional()
+        .default("")
+        .describe(
+          'Directory scope to browse, for example "tasks/" or "inbox/game/". This is not a filename-prefix search. If you know a literal filename fragment, ticket ID, or keyword but not the exact path, prefer search_text scoped to the relevant area.',
+        ),
       recursive: z.boolean().optional().default(false),
       limit: z.number().int().min(1).max(500).optional().default(LIMITS.maxSearchResults),
     },

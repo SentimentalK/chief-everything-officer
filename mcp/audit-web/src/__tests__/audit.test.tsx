@@ -106,10 +106,13 @@ describe("Audit Web UI & Component Tests", () => {
       );
     });
 
+    // Legacy trace (semantic_* is null) renders "Semantic: —", "Protocol Total", and no generic unlabeled "Total:"
     expect(container.textContent).toContain("apply_change_set");
     expect(container.textContent).toContain("ok");
     expect(container.textContent).toContain("45ms");
-    expect(container.textContent).toContain("388 tokens est");
+    expect(container.textContent).toContain("Semantic: —");
+    expect(container.textContent).toContain("Protocol Total: 388 tok");
+    expect(container.textContent).not.toMatch(/Total:\s*\d+\s*tokens est/);
     expect(container.textContent).toContain("tasks/001.md");
     expect(container.textContent).toContain("abcdef1");
 
@@ -119,6 +122,41 @@ describe("Audit Web UI & Component Tests", () => {
       itemCard.dispatchEvent(new Event("click", { bubbles: true }));
     });
     expect(onSelect).toHaveBeenCalled();
+  });
+
+  it("renders new TraceItem with both Semantic and Protocol totals", async () => {
+    const newMockTrace: TraceSummary = {
+      id: 43,
+      timestamp_ms: Date.now(),
+      tool_name: "list_files",
+      status: "success",
+      error_message: null,
+      operation_request_id: null,
+      input_bytes: 20,
+      output_bytes: 1800,
+      input_chars: 20,
+      output_chars: 1800,
+      input_tokens_est: 5,
+      output_tokens_est: 450,
+      total_tokens_est: 455,
+      semantic_output_bytes: 800,
+      semantic_output_chars: 800,
+      semantic_output_tokens_est: 200,
+      latency_ms: 12,
+      affected_paths: null,
+      resulting_commit: null,
+    };
+
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<TraceItem trace={newMockTrace} isSelected={false} onSelect={vi.fn()} />);
+    });
+
+    expect(container.textContent).toContain("list_files");
+    expect(container.textContent).toContain("Semantic: 800 B (~200 tok)");
+    expect(container.textContent).toContain("Protocol: 1.8 KB (450 tok)");
+    expect(container.textContent).toContain("Semantic Total: ~205 tok");
+    expect(container.textContent).toContain("Protocol Total: 455 tok");
   });
 
   it("renders TraceDrawer and loads detail payload", async () => {

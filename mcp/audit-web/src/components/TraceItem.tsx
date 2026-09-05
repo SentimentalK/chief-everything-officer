@@ -85,7 +85,10 @@ export const TraceItem: React.FC<TraceItemProps> = ({ trace, isSelected, onSelec
         </div>
 
         {/* Metrics Row */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-400 font-mono">
+        <div
+          className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-400 font-mono"
+          title="Semantic total estimates tool arguments + CEO semantic result. Protocol total measures the serialized MCP result. Neither represents Host Effective Model Context."
+        >
           <div>
             <span className="text-neutral-500">In: </span>
             <span>{formatBytes(trace.input_bytes)}</span>
@@ -95,15 +98,39 @@ export const TraceItem: React.FC<TraceItemProps> = ({ trace, isSelected, onSelec
           <div className="text-neutral-600">→</div>
 
           <div>
-            <span className="text-neutral-500">Out: </span>
+            <span className="text-neutral-500">Semantic: </span>
+            {trace.semantic_output_bytes != null ? (
+              <>
+                <span className="text-emerald-400">{formatBytes(trace.semantic_output_bytes)}</span>
+                <span className="text-neutral-500"> (~{trace.semantic_output_tokens_est} tok)</span>
+              </>
+            ) : (
+              <span className="text-neutral-500">—</span>
+            )}
+          </div>
+
+          <div>
+            <span className="text-neutral-500">Protocol: </span>
             <span>{formatBytes(trace.output_bytes)}</span>
             <span className="text-neutral-500"> ({trace.output_tokens_est} tok)</span>
           </div>
 
-          <div className="ml-auto text-neutral-400">
-            <span className="text-neutral-500">Total: </span>
-            <span className="text-neutral-200 font-semibold">{trace.total_tokens_est}</span>
-            <span className="text-neutral-500"> tokens est</span>
+          <div className="ml-auto text-neutral-400 flex items-center gap-2">
+            {trace.semantic_output_tokens_est != null ? (
+              <span>
+                <span className="text-neutral-500">Semantic Total: </span>
+                <span className="text-neutral-200 font-semibold">
+                  ~{trace.input_tokens_est + trace.semantic_output_tokens_est}
+                </span>
+                <span className="text-neutral-500"> tok</span>
+                <span className="text-neutral-600"> • </span>
+              </span>
+            ) : null}
+            <span>
+              <span className="text-neutral-500">Protocol Total: </span>
+              <span className="text-neutral-200 font-semibold">{trace.total_tokens_est}</span>
+              <span className="text-neutral-500"> tok</span>
+            </span>
           </div>
         </div>
 

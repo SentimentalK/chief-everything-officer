@@ -13,6 +13,10 @@ A narrow, Git-backed MCP server for the user's durable personal state workspace.
 
 Writable content is open to all Markdown (`.md`) files in the workspace outside runtime security invariants (hidden paths `.*`, symlinks, non-Markdown files) and workspace access boundaries defined in `.ceoignore`. `apply_change_set` provides five generic atomic operations: `create`, `replace`, `append`, `delete`, and `move`. Domain conventions like task archiving or journal appending are governed by workspace rules (`rules/<area>.md`) or runtime default policies (`policy/<area>.md`), not hardcoded into the filesystem engine.
 
+### Host Tool Schema Caching
+
+Some hosts may expose stale MCP tool-discovery metadata even after the server runtime has been updated, and opening a new conversation does not necessarily force schema rediscovery. Use runtime version/build identity (reported in `workspace_status`, `/healthz`, and `/readyz`) and observed server behavior to distinguish host-side discovery metadata from the deployed server.
+
 ## Development
 
 Requires Node.js 22+ and Git.

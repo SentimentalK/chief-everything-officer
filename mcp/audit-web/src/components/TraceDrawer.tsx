@@ -74,9 +74,22 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
               </span>
             </h3>
             {detail && (
-              <p className="text-xs text-neutral-400 font-mono">
-                {formatTime(detail.timestamp_ms)} • {detail.latency_ms}ms • Total:{" "}
-                {detail.total_tokens_est} tokens est
+              <p
+                className="text-xs text-neutral-400 font-mono"
+                title="Semantic total estimates tool arguments + CEO semantic result. Protocol total measures the serialized MCP result. Neither represents Host Effective Model Context."
+              >
+                {formatTime(detail.timestamp_ms)} • {detail.latency_ms}ms •{" "}
+                {detail.semantic_output_tokens_est != null ? (
+                  <>
+                    Semantic Total:{" "}
+                    <span className="text-neutral-200">
+                      ~{detail.input_tokens_est + detail.semantic_output_tokens_est}
+                    </span>{" "}
+                    tok •{" "}
+                  </>
+                ) : null}
+                Protocol Total:{" "}
+                <span className="text-neutral-200">{detail.total_tokens_est}</span> tok
               </p>
             )}
           </div>
@@ -143,8 +156,19 @@ export const TraceDrawer: React.FC<TraceDrawerProps> = ({ traceId, onClose }) =>
                   <span className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
                     CallToolResult Output
                   </span>
-                  <span className="text-[11px] font-mono text-neutral-500">
-                    ({formatBytes(detail.output_bytes)} • {detail.output_tokens_est} tok)
+                  <span
+                    className="text-[11px] font-mono text-neutral-500 cursor-help"
+                    title="Semantic total estimates tool arguments + CEO semantic result. Protocol total measures the serialized MCP result. Neither represents Host Effective Model Context."
+                  >
+                    {detail.semantic_output_bytes != null ? (
+                      <>
+                        [Semantic: {formatBytes(detail.semantic_output_bytes)} • ~{detail.semantic_output_tokens_est} tok | Protocol: {formatBytes(detail.output_bytes)} • ~{detail.output_tokens_est} tok]
+                      </>
+                    ) : (
+                      <>
+                        [Semantic: — | Protocol: {formatBytes(detail.output_bytes)} • ~{detail.output_tokens_est} tok]
+                      </>
+                    )}
                   </span>
                 </div>
                 <button
