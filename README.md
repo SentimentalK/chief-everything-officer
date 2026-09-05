@@ -1,0 +1,130 @@
+# Chief Everything Officer (CEO)
+
+[English](#english) | [中文](#中文)
+
+---
+
+<a name="english"></a>
+## English
+
+Chief Everything Officer (CEO) is a personal long-term system.
+
+It preserves and maintains **what relates to you**: who you are, what you have lived through, what you are currently doing, what you care about, how you make decisions, what you own, and how these states evolve over time.
+
+This context does not belong to any single chat session, nor should it belong to any single AI.
+
+### Goal
+
+CEO's objective is to transform personal long-term state into a continuously compounding asset usable by any AI or tool.
+
+When you switch models, change devices, adopt new apps, or revisit a problem years later, you should never have to explain yourself from scratch. The truly valuable context remains intact and keeps evolving.
+
+Long-term AI memory is part of this problem, but not the goal itself. We do not care how many tokens a model can memorize in theory; we care about:
+
+> **What is worth knowing about this person long-term, how it should be preserved, and when it should be brought back into action.**
+
+### Core Capabilities
+
+- **Universal Git-Backed Markdown Workspace**: Open-ended Markdown storage engine. Safe `.md` files can be organized freely into any structure (`personal/`, `tasks/`, `projects/`, `sources/`, etc.) without requiring runtime schema changes.
+- **Modern Model Context Protocol (MCP)**: Native Streamable HTTP MCP server (2026-07-28 protocol) connecting ChatGPT, Claude, and autonomous host agents directly to your canonical state.
+- **Atomic Git Transactions**: Optimistic concurrency control via Git blob OIDs and isolated worktrees. Zero partial writes, single-line commits, and fast-forward-only pushes.
+- **Security & `.ceoignore` Boundary**: Hard runtime invariants (safe Markdown only, no hidden files, no symlinks, no credentials) paired with user-defined `.ceoignore` access boundaries.
+- **Extensible Semantic Rule Hierarchy**: Decoupled filesystem engine from domain semantics:
+  $$\text{Hard Invariants} \longrightarrow \text{Workspace Rules (rules/)} \longrightarrow \text{Runtime Defaults (policy/)} \longrightarrow \text{Model Reasoning}$$
+- **Full Trace Audit & Observability**: Embedded SQLite audit logging capturing exact tool inputs, outputs, estimated token usage, latencies, affected files, and resulting commit hashes with an accompanying Audit Web UI.
+
+### What Belongs Here
+
+CEO focuses on the relationship between a person and the world, rather than the world itself.
+
+- A company’s public profile is not personal state. That you worked there, what you experienced, and how that chapter shaped your worldview, is.
+- A software tool's documentation is not personal state. Why you chose it, your evaluation after using it, and whether it altered how you work, is.
+- A single life event may produce multiple distinct signals: active state, an ongoing project, an episodic journal entry, or a lasting preference.
+
+CEO does not force a rigid taxonomy onto your life. Structure evolves alongside real-world needs.
+
+### Principles
+
+1. **User Ownership**: You own your canonical data. Models and runtimes are interchangeable; your personal state endures.
+2. **Single Canonical Truth**: One trusted source for any long-term fact. Reference it across tasks rather than maintaining duplicate copies.
+3. **Compounding Value**: Recording is not the goal. Only preserve information that helps understand the person, continue an effort, or make better decisions in the future.
+4. **Epistemic Honesty**: Unknown is unknown, subjective experience is experience, AI deduction is deduction. Never fabricate certainty for the sake of completeness.
+5. **Radical Simplicity**: Markdown, Git, and clear ownership are enough. Only introduce complexity when real-world usage proves necessity.
+
+### Direction
+
+CEO ultimately goes beyond passive recording.
+
+It leverages accumulated state to understand new problems, absorb materials you are reading, continue unfinished work, and orchestrate specialized tools or workers to deliver results.
+
+> **AI knows you, grows with you, and works for you.**
+> *(懂你，陪你成长，替你干活)*
+
+- **Knows you**: Rooted in continuously maintained personal state, not transient chat context.
+- **Grows with you**: Understands what was past, what is present, and what is changing.
+- **Works for you**: Context leads directly into real-world execution.
+
+CEO's enduring value is not giving AI more memory, but enabling a person’s lived experiences, state, judgment, and active pursuits to compound durably and be truly usable in the future.
+
+---
+
+<a name="中文"></a>
+## 中文
+
+Chief Everything Officer（CEO）是一个属于个人的长期系统。
+
+它保存和维护**与你有关的东西**：你是谁、经历过什么、正在做什么、在意什么、如何选择、拥有什么，以及这些状态如何随时间变化。
+
+这些信息不属于某一次聊天，也不应该属于某一个 AI。
+
+### 目标
+
+CEO 的目标是让个人长期状态成为一份持续积累、可以被不同工具和 AI 使用的资产。
+
+当你换模型、换设备、换应用，甚至几年以后重新处理一个问题时，不需要重新从零解释自己。真正有价值的上下文仍然在，并且可以继续演进。
+
+AI 的长期记忆是这个问题的一部分，但不是目标本身。我们不关心一个模型理论上能记住多少内容；我们关心的是：
+
+> **关于这个人，什么值得长期知道，应该怎样保存，以及什么时候应该被重新使用。**
+
+### 核心能力
+
+- **通用 Git-backed Markdown 工作空间**：开放式 Markdown 存储引擎。任意合法的 `.md` 文件均可自由组织（如 `personal/`、`tasks/`、`projects/`、`sources/` 等），无需调整底层 schema。
+- **现代化 Model Context Protocol (MCP)**：原生 Streamable HTTP MCP 服务（2026-07-28 标准），无缝连接 ChatGPT、Claude 及各类 AI Agent 与用户数据。
+- **Git 原子事务与乐观并发**：基于 Git blob OID 与独立 worktree 实现严格乐观并发。零部分写入、单行规范提交、仅限 fast-forward 推送。
+- **硬安全边界与 `.ceoignore`**：Runtime 强制硬边界（纯 Markdown、严禁隐藏路径与 symlink、严禁凭证入库），配合用户级 `.ceoignore` 灵活排除指定子树。
+- **分层规则与语义优先级**：底层文件系统能力与上层业务语义彻底解耦：
+  $$\text{硬安全边界} \longrightarrow \text{Workspace 规则 (rules/)} \longrightarrow \text{内置默认策略 (policy/)} \longrightarrow \text{模型自主推理}$$
+- **全链路 Trace 审计与可观测性**：内嵌 SQLite 审计引擎与 Web 控制台，精准记录每次 tool call 输入、输出、token 估算、耗时及产生之 commit。
+
+### 属于这里的内容
+
+CEO 关注的是人与世界之间的关系，而不是世界本身。
+
+- 一家公司的公开资料不是个人状态；你在那里工作过、有什么体验、这段经历如何影响你的选择，是。
+- 一个软件的功能不是个人状态；你为什么选择它、使用后的判断、它是否改变了你的工作方式，是。
+- 同样，一个事件可能留下不同类型的信息：当前状态、正在推进的事情、一次真实经历，或者一个以后仍然会影响判断的偏好。
+
+CEO 不要求所有这些内容使用固定结构。结构应该跟着真实需求演进。
+
+### 原则
+
+1. **用户拥有数据**：模型和 runtime 可以替换，个人状态应当可以继续使用。
+2. **单一可信源**：同一个长期事实只维护一份可信来源。需要它的地方读取它，而不是到处复制。
+3. **积累未来价值**：保存信息不是目的。只有未来可能帮助理解这个人、继续一件事情或做出更好判断的信息，才值得长期维护。
+4. **诚实认识边界**：未知就是未知，主观体验就是主观体验，AI 的推断就是推断。不要为了让资料显得完整而制造确定性。
+5. **保持极简**：Markdown、Git 和清晰的 ownership 足够时，就继续使用；只有真实使用证明现有方式不够时，再增加复杂度。
+
+### 方向
+
+CEO 最终不只是保存个人状态。
+
+它应该能利用这些状态去理解新的问题、接收用户正在看的材料、继续尚未完成的事情，并调用合适的工具或 worker 完成工作。
+
+> **AI 懂你，陪你成长，替你干活。**
+
+- **“懂你”**：来自持续维护的个人状态，而不是一次聊天里的临时上下文。
+- **“陪你成长”**：意味着系统知道过去是什么、现在是什么，以及什么正在发生变化。
+- **“替你干活”**：意味着这些上下文最终能够进入真实行动，而不只是被保存下来。
+
+CEO 的长期价值不是让 AI 拥有更多记忆，而是让**一个人的经历、状态、判断和正在做的事情能够持续积累，并真正被未来使用。**
