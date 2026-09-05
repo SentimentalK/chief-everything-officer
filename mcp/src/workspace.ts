@@ -103,8 +103,15 @@ export class CeoWorkspace {
     try {
       const content = await readFile(path.join(dir, ".ceoignore"), "utf8");
       return parseCeoIgnore(content);
-    } catch {
-      return { exactFiles: new Set(), directoryPrefixes: [] };
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { exactFiles: new Set(), directoryPrefixes: [] };
+      }
+      throw new CeoError(
+        "NOT_READY",
+        "Failed to read .ceoignore access boundary file.",
+        { code: (error as NodeJS.ErrnoException).code ?? "UNKNOWN" },
+      );
     }
   }
 

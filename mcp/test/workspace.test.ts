@@ -220,6 +220,24 @@ describe("CeoWorkspace", () => {
     })).rejects.toMatchObject({ code: "ACCESS_DENIED" });
   });
 
+  it(".ceoignore fails closed on non-ENOENT read errors without exposing raw error strings", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    // Create .ceoignore as a directory to trigger EISDIR when reading as file
+    const ignoreDir = path.join(item.config.repoDir, ".ceoignore");
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(ignoreDir, { recursive: true }));
+
+    await expect(workspace.listFiles()).rejects.toMatchObject({
+      code: "NOT_READY",
+      message: "Failed to read .ceoignore access boundary file.",
+      details: { code: "EISDIR" },
+    });
+  });
+
   it("rejects stale revisions after another writer advances main", async () => {
     const item = await fixture();
     cleanup.push(item.root);

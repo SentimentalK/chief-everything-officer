@@ -40,7 +40,7 @@ jobs:
 
       - name: CI Docker Smoke Build
         run: |
-          docker build -t ceo-state-mcp:ci -f mcp/Dockerfile mcp
+          docker build -t ceo-state-mcp:ci --build-arg BUILD_SHA=${{ github.sha }} -f mcp/Dockerfile mcp
 
       - name: CI Policy & Web Asset Verification
         run: |
@@ -77,4 +77,6 @@ jobs:
           file: ./mcp/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
           tags: ${{ env.IMAGE_TAG }}

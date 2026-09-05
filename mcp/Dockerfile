@@ -26,6 +26,8 @@ RUN apt-get update \
 
 WORKDIR /app
 ENV NODE_ENV=production
+ARG BUILD_SHA=dev
+ENV CEO_BUILD_SHA=$BUILD_SHA
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist

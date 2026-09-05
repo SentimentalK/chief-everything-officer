@@ -5,6 +5,7 @@ import { LIMITS } from "./limits.js";
 import type { ChangeOperation, CeoWorkspace } from "./workspace.js";
 import { type ProductPolicy, getPolicy } from "./product-policy.js";
 import type { AuditStore } from "./audit.js";
+import { BUILD_INFO } from "./build-info.js";
 
 function result(value: Record<string, unknown>, isError = false) {
   return {
@@ -123,7 +124,7 @@ export function createMcpServer(
   auditStore?: AuditStore,
 ): McpServer {
   const server = new McpServer(
-    { name: "ceo-state-mcp", version: "0.1.0" },
+    { name: "ceo-state-mcp", version: BUILD_INFO.version },
     {
       instructions: productPolicy.bootstrap,
     },
@@ -134,7 +135,14 @@ export function createMcpServer(
     description: "Use this to verify that the CEO Git workspace is clean, synchronized, and ready before a workflow.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "workspace_status", async () => await workspace.workspaceStatus()));
+  }, tracedHandler(auditStore, "workspace_status", async () => {
+    const status = await workspace.workspaceStatus();
+    return {
+      version: BUILD_INFO.version,
+      build: BUILD_INFO.build,
+      ...status,
+    };
+  }));
 
   server.registerTool("list_files", {
     title: "List CEO files",
@@ -168,14 +176,14 @@ export function createMcpServer(
   server.registerTool("apply_change_set", {
     title: "Apply an atomic CEO change set",
     description:
-      "Use this once for one complete CEO update. The server checks optimistic concurrency, edits only allowlisted Markdown, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
+      "Use this once for one complete CEO update. The server checks optimistic concurrency, edits safe Markdown outside runtime- or workspace-excluded paths, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
       summary: z.string().min(1).max(120),
       operations: z.array(z.discriminatedUnion("op", [createOperation, replaceOperation, appendOperation, deleteOperation, moveOperation])).min(1).max(LIMITS.maxOperationsPerTransaction),
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, tracedHandler(auditStore, "apply_change_set", async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
     await workspace.applyChangeSet(input)));
 

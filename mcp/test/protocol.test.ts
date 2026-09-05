@@ -61,6 +61,8 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     expect(statusResult.structuredContent).toMatchObject({
       ok: true,
       workspace_state: "READY",
+      version: "0.2.0",
+      build: expect.any(String),
     });
 
     const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "tasks" } });
@@ -213,7 +215,12 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     // Real tool call through Express + auth endpoint succeeds
     const statusCall = await client.callTool({ name: "workspace_status" });
     expect(statusCall.isError).toBeFalsy();
-    expect(statusCall.structuredContent).toMatchObject({ ok: true, workspace_state: "READY" });
+    expect(statusCall.structuredContent).toMatchObject({
+      ok: true,
+      workspace_state: "READY",
+      version: "0.2.0",
+      build: expect.any(String),
+    });
 
     const policyCall = await client.callTool({ name: "policy_read", arguments: { name: "tasks" } });
     expect(policyCall.isError).toBeFalsy();

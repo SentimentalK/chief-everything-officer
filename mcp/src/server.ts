@@ -10,6 +10,7 @@ import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
 import { createAuthMiddleware, createHostGuard, createOriginGuard } from "./auth.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
+import { BUILD_INFO } from "./build-info.js";
 
 const config = loadConfig();
 const workspace = new CeoWorkspace(config);
@@ -21,10 +22,17 @@ const app = createMcpExpressApp({ host: config.bindHost });
 app.use(express.json());
 
 // Probes
-app.get("/healthz", (_req, res) => { res.status(200).json({ ok: true }); });
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ ok: true, version: BUILD_INFO.version, build: BUILD_INFO.build });
+});
 app.get("/readyz", (_req, res) => {
   const ready = workspace.readiness === "READY";
-  res.status(ready ? 200 : 503).json({ ok: ready, state: workspace.readiness });
+  res.status(ready ? 200 : 503).json({
+    ok: ready,
+    state: workspace.readiness,
+    version: BUILD_INFO.version,
+    build: BUILD_INFO.build,
+  });
 });
 
 // Audit routes
