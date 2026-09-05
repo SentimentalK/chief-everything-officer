@@ -63,9 +63,9 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       workspace_state: "READY",
     });
 
-    const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "task" } });
+    const policyResult = await client.callTool({ name: "policy_read", arguments: { name: "tasks" } });
     expect(policyResult.isError).toBeFalsy();
-    expect(policyResult.structuredContent).toMatchObject({ name: "task" });
+    expect(policyResult.structuredContent).toMatchObject({ name: "tasks", status: "FOUND" });
 
     // Verify no Mcp-Session-Id is required or held
     expect(transport.sessionId).toBeUndefined();
@@ -215,9 +215,13 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     expect(statusCall.isError).toBeFalsy();
     expect(statusCall.structuredContent).toMatchObject({ ok: true, workspace_state: "READY" });
 
-    const policyCall = await client.callTool({ name: "policy_read", arguments: { name: "task" } });
+    const policyCall = await client.callTool({ name: "policy_read", arguments: { name: "tasks" } });
     expect(policyCall.isError).toBeFalsy();
-    expect(policyCall.structuredContent).toMatchObject({ name: "task" });
+    expect(policyCall.structuredContent).toMatchObject({ name: "tasks", status: "FOUND" });
+
+    const unknownCall = await client.callTool({ name: "policy_read", arguments: { name: "projects" } });
+    expect(unknownCall.isError).toBeFalsy();
+    expect(unknownCall.structuredContent).toMatchObject({ name: "projects", status: "NO_DEFAULT_POLICY" });
 
     await client.close();
   });

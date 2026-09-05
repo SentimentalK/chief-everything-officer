@@ -149,7 +149,7 @@ describe("AuditStore & Boundary Tracing", () => {
     const headCommit = (statusRes.structuredContent as { local_commit: string }).local_commit;
 
     // Call policy_read
-    await client.callTool({ name: "policy_read", arguments: { name: "task" } });
+    await client.callTool({ name: "policy_read", arguments: { name: "tasks" } });
 
     // Call apply_change_set with valid arguments
     const requestId = randomUUID();
@@ -186,9 +186,9 @@ describe("AuditStore & Boundary Tracing", () => {
 
     const policyDetail = auditStore.getDetail(policyTrace!.id);
     expect(policyDetail).toBeDefined();
-    expect(JSON.parse(policyDetail!.input_json)).toEqual({ name: "task" });
+    expect(JSON.parse(policyDetail!.input_json)).toEqual({ name: "tasks" });
     const parsedOutput = JSON.parse(policyDetail!.output_json);
-    expect(parsedOutput.structuredContent.name).toBe("task");
+    expect(parsedOutput.structuredContent.name).toBe("tasks");
   });
 
   it("never records API key or auth secrets in trace database", async () => {

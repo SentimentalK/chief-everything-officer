@@ -10,24 +10,6 @@ export {
   validateContentPath as validatePath,
 } from "./security.js";
 
-export function validateArchive(source: string, target: string): void {
-  const from = validateContentPath(source);
-  const to = validateContentPath(target);
-  if (!from.startsWith("tasks/")) {
-    throw new CeoError(
-      "INVALID_OPERATION",
-      "Archive source must be inside tasks/.",
-      { source, target },
-    );
-  }
-  if (!to.startsWith("archive/")) {
-    throw new CeoError(
-      "INVALID_OPERATION",
-      "Archive target must be inside archive/.",
-      { source, target },
-    );
-  }
-}
 
 export function assertContentSize(content: string): number {
   const bytes = Buffer.byteLength(content, "utf8");

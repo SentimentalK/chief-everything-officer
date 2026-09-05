@@ -56,9 +56,11 @@ function tracedHandler<T>(
         if (toolName === "apply_change_set") {
           const changeInput = input as { operations?: ChangeOperation[] };
           if (changeInput && Array.isArray(changeInput.operations)) {
-            affectedPaths = changeInput.operations.map((op) =>
-              op.op === "archive" ? `${op.path} -> ${op.target}` : op.path,
-            );
+            affectedPaths = changeInput.operations.map((op) => {
+              if (op.op === "move") return `${op.path} -> ${op.target}`;
+              if (op.op === "delete") return `${op.path} (deleted)`;
+              return op.path;
+            });
           }
           if (rawResult && typeof rawResult.commit === "string") {
             resultingCommit = rawResult.commit as string;
@@ -93,21 +95,26 @@ const createOperation = z.object({
 });
 const replaceOperation = z.object({
   op: z.literal("replace"),
-  path: z.string(),
+  path: z.string().describe("Allowed CEO Markdown path to replace"),
   expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/),
   content: z.string().describe("Complete replacement UTF-8 content"),
 });
 const appendOperation = z.object({
   op: z.literal("append"),
-  path: z.literal("JOURNAL.md"),
+  path: z.string().describe("Allowed CEO Markdown path to append to"),
   expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/),
   content: z.string().describe("Text to append verbatim"),
 });
-const archiveOperation = z.object({
-  op: z.literal("archive"),
-  path: z.string().describe("Source tasks/ Markdown path"),
+const deleteOperation = z.object({
+  op: z.literal("delete"),
+  path: z.string().describe("Allowed CEO Markdown path to delete"),
   expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/),
-  target: z.string().describe("Destination archive/<path> path"),
+});
+const moveOperation = z.object({
+  op: z.literal("move"),
+  path: z.string().describe("Source CEO Markdown path"),
+  expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/),
+  target: z.string().describe("Destination CEO Markdown path"),
 });
 
 export function createMcpServer(
@@ -166,7 +173,7 @@ export function createMcpServer(
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
       summary: z.string().min(1).max(120),
-      operations: z.array(z.discriminatedUnion("op", [createOperation, replaceOperation, appendOperation, archiveOperation])).min(1).max(LIMITS.maxOperationsPerTransaction),
+      operations: z.array(z.discriminatedUnion("op", [createOperation, replaceOperation, appendOperation, deleteOperation, moveOperation])).min(1).max(LIMITS.maxOperationsPerTransaction),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   }, tracedHandler(auditStore, "apply_change_set", async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
@@ -174,9 +181,9 @@ export function createMcpServer(
 
   server.registerTool("policy_read", {
     title: "Read CEO runtime product policy",
-    description: "Use this to read runtime-owned product policy documents: 'task', 'personal', or 'journal'. Does not read user workspace files.",
+    description: "Use this to read runtime-owned default policy documents (e.g. 'tasks', 'personal', 'journal'). Does not read user workspace files. Returns NO_DEFAULT_POLICY for unknown areas.",
     inputSchema: {
-      name: z.enum(["task", "personal", "journal"]).describe("Policy document name. Supported: 'task', 'personal', 'journal'"),
+      name: z.string().min(1).max(64).describe("Policy document name to look up in runtime defaults, e.g. 'tasks', 'personal', 'journal'"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, tracedHandler(auditStore, "policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));

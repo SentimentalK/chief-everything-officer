@@ -36,7 +36,7 @@ describe("CeoWorkspace", () => {
     await expect(workspace.readFiles(["mcp/package.json"])).rejects.toMatchObject({ code: "INVALID_PATH" });
   });
 
-  it("commits and pushes one atomic, idempotent change set", async () => {
+  it("commits and pushes one atomic, idempotent change set with replace and append", async () => {
     const item = await fixture();
     cleanup.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -63,25 +63,161 @@ describe("CeoWorkspace", () => {
     expect(git(item.remote, "rev-list", "--count", "main")).toBe("2");
   });
 
-  it("archives without exposing a general move or delete", async () => {
+  it("supports create on arbitrary Markdown area and append on non-journal file", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const status = await workspace.workspaceStatus();
+
+    // 1. Create in new area 'projects/'
+    const createRes = await workspace.applyChangeSet({
+      base_commit: status.remote_commit as string,
+      summary: "Create project document",
+      operations: [{
+        op: "create",
+        path: "projects/alpha.md",
+        content: "# Project Alpha\n\nInitial plan.\n",
+      }],
+    });
+    expect(createRes.ok).toBe(true);
+
+    // 2. Read and append to projects/alpha.md
+    const read = await workspace.readFiles(["projects/alpha.md"]);
+    const alphaFile = (read.files as Array<{ path: string; blob_oid: string }>)[0]!;
+
+    const appendRes = await workspace.applyChangeSet({
+      base_commit: read.base_commit as string,
+      summary: "Append milestone to project",
+      operations: [{
+        op: "append",
+        path: "projects/alpha.md",
+        expected_blob_oid: alphaFile.blob_oid,
+        content: "## Milestone 1\nDone.\n",
+      }],
+    });
+    expect(appendRes.ok).toBe(true);
+
+    const reRead = await workspace.readFiles(["projects/alpha.md"]);
+    expect((reRead.files as any[])[0].content).toContain("## Milestone 1\nDone.\n");
+  });
+
+  it("supports generic move of safe Markdown and rejects overwrite or moving to ignored path", async () => {
     const item = await fixture();
     cleanup.push(item.root);
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const read = await workspace.readFiles(["tasks/TEST-001.md"]);
     const file = (read.files as Array<{ blob_oid: string }>)[0]!;
-    await workspace.applyChangeSet({
+
+    // 1. Valid move
+    const moveRes = await workspace.applyChangeSet({
       base_commit: read.base_commit as string,
-      summary: "Archive test ticket",
+      summary: "Archive test ticket via generic move",
       operations: [{
-        op: "archive",
+        op: "move",
         path: "tasks/TEST-001.md",
         expected_blob_oid: file.blob_oid,
         target: "archive/2026/TEST-001.md",
       }],
     });
+    expect(moveRes.ok).toBe(true);
     expect(git(item.remote, "show", "main:archive/2026/TEST-001.md")).toContain("TEST-001");
     expect(() => git(item.remote, "show", "main:tasks/TEST-001.md")).toThrow();
+
+    // 2. Reject moving over existing target
+    const readAgain = await workspace.readFiles(["archive/2026/TEST-001.md", "TODO.md"]);
+    const archived = (readAgain.files as any[]).find((f) => f.path === "archive/2026/TEST-001.md")!;
+    await expect(workspace.applyChangeSet({
+      base_commit: readAgain.base_commit as string,
+      summary: "Try moving over existing TODO.md",
+      operations: [{
+        op: "move",
+        path: "archive/2026/TEST-001.md",
+        expected_blob_oid: archived.blob_oid,
+        target: "TODO.md",
+      }],
+    })).rejects.toMatchObject({ code: "INVALID_OPERATION" });
+  });
+
+  it("supports delete with fresh blob OID and rejects stale blob OID", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const read = await workspace.readFiles(["TODO.md"]);
+    const file = (read.files as Array<{ blob_oid: string }>)[0]!;
+
+    // Reject delete with stale blob OID
+    await expect(workspace.applyChangeSet({
+      base_commit: read.base_commit as string,
+      summary: "Delete with stale oid",
+      operations: [{
+        op: "delete",
+        path: "TODO.md",
+        expected_blob_oid: "0".repeat(40),
+      }],
+    })).rejects.toMatchObject({ code: "BLOB_MISMATCH" });
+
+    // Succeed delete with fresh blob OID
+    const delRes = await workspace.applyChangeSet({
+      base_commit: read.base_commit as string,
+      summary: "Delete TODO.md",
+      operations: [{
+        op: "delete",
+        path: "TODO.md",
+        expected_blob_oid: file.blob_oid,
+      }],
+    });
+    expect(delRes.ok).toBe(true);
+    expect(() => git(item.remote, "show", "main:TODO.md")).toThrow();
+  });
+
+  it("respects .ceoignore: excludes paths from list, read, search, and rejects write operations", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    // Create a .ceoignore and an ignored directory in repo
+    const ignoreFile = path.join(item.config.repoDir, ".ceoignore");
+    await writeFile(ignoreFile, "mcp/\nignored-notes/\nsecret.md\n", "utf8");
+
+    const ignoredDir = path.join(item.config.repoDir, "ignored-notes");
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(ignoredDir, { recursive: true }));
+    await writeFile(path.join(ignoredDir, "hidden.md"), "# Hidden\n", "utf8");
+    await writeFile(path.join(item.config.repoDir, "secret.md"), "# Secret\n", "utf8");
+
+    git(item.config.repoDir, "add", ".");
+    git(item.config.repoDir, "commit", "-m", "add .ceoignore and ignored files");
+    git(item.config.repoDir, "push", "origin", "main");
+
+    // 1. listFiles excludes ignored files
+    const listed = await workspace.listFiles();
+    const paths = (listed.files as any[]).map((f) => f.path);
+    expect(paths).not.toContain("ignored-notes/hidden.md");
+    expect(paths).not.toContain("secret.md");
+
+    // 2. readFiles rejects ignored files with ACCESS_DENIED
+    await expect(workspace.readFiles(["ignored-notes/hidden.md"])).rejects.toMatchObject({ code: "ACCESS_DENIED" });
+    await expect(workspace.readFiles(["secret.md"])).rejects.toMatchObject({ code: "ACCESS_DENIED" });
+
+    // 3. searchText does not match inside ignored files
+    const search = await workspace.searchText("Hidden", [], 10);
+    expect(search.matches).toEqual([]);
+
+    // 4. applyChangeSet rejects create into ignored path
+    const status = await workspace.workspaceStatus();
+    await expect(workspace.applyChangeSet({
+      base_commit: status.remote_commit as string,
+      summary: "Try writing to ignored directory",
+      operations: [{
+        op: "create",
+        path: "ignored-notes/new.md",
+        content: "forbidden",
+      }],
+    })).rejects.toMatchObject({ code: "ACCESS_DENIED" });
   });
 
   it("rejects stale revisions after another writer advances main", async () => {

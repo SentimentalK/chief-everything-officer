@@ -1,12 +1,15 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CeoError } from "./errors.js";
 
 export interface PolicyDocument {
+  ok: boolean;
   name: string;
-  content: string;
+  status: "FOUND" | "NO_DEFAULT_POLICY";
+  content: string | null;
   bytes: number;
+  message?: string;
   [key: string]: unknown;
 }
 
@@ -15,8 +18,6 @@ export interface ProductPolicy {
   policies: Map<string, PolicyDocument>;
 }
 
-export const ALLOWED_POLICIES = new Set(["task", "personal", "journal"]);
-
 export function getPolicyDir(): string {
   const currentDir = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(currentDir, "../policy");
@@ -24,30 +25,22 @@ export function getPolicyDir(): string {
 
 export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<ProductPolicy> {
   const bootstrapPath = path.join(policyDir, "bootstrap.md");
-  const taskPath = path.join(policyDir, "task.md");
-  const personalPath = path.join(policyDir, "personal.md");
-  const journalPath = path.join(policyDir, "journal.md");
-
-  const [bootstrapRaw, taskRaw, personalRaw, journalRaw] = await Promise.all([
-    readFile(bootstrapPath, "utf8"),
-    readFile(taskPath, "utf8"),
-    readFile(personalPath, "utf8"),
-    readFile(journalPath, "utf8"),
-  ]);
-
+  const bootstrapRaw = await readFile(bootstrapPath, "utf8");
   const bootstrap = bootstrapRaw.trim();
+
   const policies = new Map<string, PolicyDocument>();
+  const entries = await readdir(policyDir).catch(() => []);
 
-  const docNames = [
-    { name: "task", raw: taskRaw },
-    { name: "personal", raw: personalRaw },
-    { name: "journal", raw: journalRaw },
-  ];
-
-  for (const { name, raw } of docNames) {
+  for (const entry of entries) {
+    if (!entry.endsWith(".md") || entry === "bootstrap.md") continue;
+    const name = entry.replace(/\.md$/, "");
+    const filePath = path.join(policyDir, entry);
+    const raw = await readFile(filePath, "utf8");
     const trimmed = raw.trim();
     policies.set(name, {
+      ok: true,
       name,
+      status: "FOUND",
       content: trimmed,
       bytes: Buffer.byteLength(trimmed, "utf8"),
     });
@@ -60,20 +53,25 @@ export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<Pro
 }
 
 export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDocument {
-  if (!ALLOWED_POLICIES.has(name)) {
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     throw new CeoError(
-      "INVALID_OPERATION",
-      `Unknown product policy '${name}'. Supported policies: 'task', 'personal', 'journal'.`,
+      "INVALID_PATH",
+      "Policy name contains invalid characters or traversal.",
       { name },
     );
   }
-  const doc = productPolicy.policies.get(name);
-  if (!doc) {
-    throw new CeoError(
-      "INTERNAL_ERROR",
-      `Policy document '${name}' is missing from cache.`,
-      { name },
-    );
+
+  const found = productPolicy.policies.get(name);
+  if (found) {
+    return found;
   }
-  return doc;
+
+  return {
+    ok: true,
+    name,
+    status: "NO_DEFAULT_POLICY",
+    content: null,
+    bytes: 0,
+    message: `No runtime default policy for '${name}'. Check for workspace-specific rules in rules/${name}.md or reason from workspace context.`,
+  };
 }

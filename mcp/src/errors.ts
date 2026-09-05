@@ -8,6 +8,7 @@ export type ErrorCode =
   | "PUSH_PENDING"
   | "WORKSPACE_DIVERGED"
   | "PUSHED_LOCAL_REPAIR_NEEDED"
+  | "ACCESS_DENIED"
   | "NOT_READY"
   | "INTERNAL_ERROR";
 

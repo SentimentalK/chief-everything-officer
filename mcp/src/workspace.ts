@@ -14,12 +14,12 @@ import { constants } from "node:fs";
 import type { Config } from "./config.js";
 import { CeoError } from "./errors.js";
 import { assertExpectedBlob, blobOid, resolveRef, runGit } from "./git.js";
+import { type CeoIgnoreMatcher, isPathIgnored, parseCeoIgnore } from "./ignore.js";
 import { LIMITS } from "./limits.js";
 import {
   assertContentSize,
   assertNoSymlink,
   isAllowedTrackedPath,
-  validateArchive,
   validatePath,
 } from "./policy.js";
 
@@ -29,7 +29,8 @@ export type ChangeOperation =
   | { op: "create"; path: string; content: string }
   | { op: "replace"; path: string; expected_blob_oid: string; content: string }
   | { op: "append"; path: string; expected_blob_oid: string; content: string }
-  | { op: "archive"; path: string; expected_blob_oid: string; target: string };
+  | { op: "delete"; path: string; expected_blob_oid: string }
+  | { op: "move"; path: string; expected_blob_oid: string; target: string };
 
 interface PendingTransaction {
   request_id: string;
@@ -98,17 +99,27 @@ export class CeoWorkspace {
     });
   }
 
+  private async loadIgnoreMatcher(dir: string = this.config.repoDir): Promise<CeoIgnoreMatcher> {
+    try {
+      const content = await readFile(path.join(dir, ".ceoignore"), "utf8");
+      return parseCeoIgnore(content);
+    } catch {
+      return { exactFiles: new Set(), directoryPrefixes: [] };
+    }
+  }
+
   async listFiles(prefix = "", limit = 200): Promise<Record<string, unknown>> {
     return await this.withReadyWorkspace(async (base) => {
       if (prefix && (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix))) {
         throw new CeoError("INVALID_PATH", "Prefix must be a safe repository-relative path.", { prefix });
       }
+      const matcher = await this.loadIgnoreMatcher();
       const result = await runGit(this.config, this.config.repoDir, ["ls-tree", "-r", "-l", base]);
       const files = result.stdout.split("\n").filter(Boolean).flatMap((line) => {
         const match = line.match(/^\d+\s+blob\s+([0-9a-f]{40,64})\s+(\d+)\t(.+)$/);
         if (!match) return [];
         const [, oid, bytes, filePath] = match;
-        if (!oid || !bytes || !filePath || !isAllowedTrackedPath(filePath) || !filePath.startsWith(prefix)) return [];
+        if (!oid || !bytes || !filePath || !isAllowedTrackedPath(filePath) || isPathIgnored(matcher, filePath) || !filePath.startsWith(prefix)) return [];
         return [{ path: filePath, blob_oid: oid, bytes: Number(bytes) }];
       });
       return {
@@ -129,8 +140,12 @@ export class CeoWorkspace {
     return await this.withReadyWorkspace(async (base) => {
       let total = 0;
       const files = [];
+      const matcher = await this.loadIgnoreMatcher();
       for (const candidate of paths) {
         const filePath = validatePath(candidate);
+        if (isPathIgnored(matcher, filePath)) {
+          throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: filePath });
+        }
         await assertNoSymlink(this.config.repoDir, filePath);
         const absolute = path.join(this.config.repoDir, filePath);
         const info = await stat(absolute).catch(() => null);
@@ -151,7 +166,8 @@ export class CeoWorkspace {
       throw new CeoError("VALIDATION_FAILED", "Search query must contain 1 to 512 UTF-8 bytes.");
     }
     return await this.withReadyWorkspace(async (base) => {
-      const listed = await this.listTrackedFiles(base);
+      const matcher = await this.loadIgnoreMatcher();
+      const listed = await this.listTrackedFiles(base, matcher);
       const safePrefixes = prefixes.length ? prefixes : [""];
       for (const prefix of safePrefixes) {
         if (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix)) {
@@ -205,14 +221,16 @@ export class CeoWorkspace {
         });
       }
 
-      this.validateOperations(input.operations);
+      const matcher = await this.loadIgnoreMatcher();
+      this.validateOperations(input.operations, matcher);
       const worktree = path.join(this.config.txnDir, requestId);
       await rm(worktree, { recursive: true, force: true });
       await runGit(this.config, this.config.repoDir, ["worktree", "add", "--detach", worktree, input.base_commit]);
+      const worktreeMatcher = await this.loadIgnoreMatcher(worktree);
       let committed = false;
       try {
         await this.applyOperations(worktree, input.base_commit, input.operations);
-        const changed = await this.validateDiff(worktree);
+        const changed = await this.validateDiff(worktree, worktreeMatcher);
         await runGit(this.config, worktree, ["add", "-A"]);
         await runGit(this.config, worktree, ["diff", "--cached", "--check"]);
         await runGit(this.config, worktree, ["commit", "-m", `CEO: ${input.summary.trim()}`]);
@@ -293,15 +311,23 @@ export class CeoWorkspace {
     }
   }
 
-  private validateOperations(operations: ChangeOperation[]): void {
+  private validateOperations(operations: ChangeOperation[], matcher: CeoIgnoreMatcher): void {
     let total = 0;
     const touched = new Set<string>();
     for (const operation of operations) {
       const source = validatePath(operation.path);
-      const paths = operation.op === "archive" ? [source, validatePath(operation.target)] : [source];
-      if (operation.op === "archive") validateArchive(source, operation.target);
-      if (operation.op === "append" && source !== "JOURNAL.md") {
-        throw new CeoError("INVALID_OPERATION", "Append is only allowed for JOURNAL.md.");
+      if (isPathIgnored(matcher, source)) {
+        throw new CeoError("ACCESS_DENIED", "Operation path is excluded by .ceoignore.", { path: source });
+      }
+      const paths = operation.op === "move" ? [source, validatePath(operation.target)] : [source];
+      if (operation.op === "move") {
+        const target = validatePath(operation.target);
+        if (isPathIgnored(matcher, target)) {
+          throw new CeoError("ACCESS_DENIED", "Move target path is excluded by .ceoignore.", { target });
+        }
+        if (source === target) {
+          throw new CeoError("INVALID_OPERATION", "Move source and target cannot be identical.", { source, target });
+        }
       }
       if ("content" in operation) total += assertContentSize(operation.content);
       for (const filePath of paths) {
@@ -330,33 +356,41 @@ export class CeoWorkspace {
         const current = await this.readUtf8(absolute, filePath);
         assertContentSize(current + operation.content);
         await writeFile(absolute, current + operation.content, "utf8");
-      } else {
+      } else if (operation.op === "delete") {
+        await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
+        await rm(absolute, { force: true });
+      } else if (operation.op === "move") {
         const target = validatePath(operation.target);
         await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
         await assertNoSymlink(worktree, target);
         const targetAbsolute = path.join(worktree, target);
         const exists = await access(targetAbsolute).then(() => true).catch(() => false);
-        if (exists) throw new CeoError("INVALID_OPERATION", "Archive target already exists.", { target });
+        if (exists) throw new CeoError("INVALID_OPERATION", "Move target already exists.", { target });
         await mkdir(path.dirname(targetAbsolute), { recursive: true });
         await rename(absolute, targetAbsolute);
       }
     }
   }
 
-  private async validateDiff(worktree: string): Promise<string[]> {
+  private async validateDiff(worktree: string, matcher: CeoIgnoreMatcher): Promise<string[]> {
     const tracked = (await runGit(this.config, worktree, ["diff", "--name-only", "-z"])).stdout
       .split("\0").filter(Boolean);
     const untracked = (await runGit(this.config, worktree, ["ls-files", "--others", "--exclude-standard", "-z"])).stdout
       .split("\0").filter(Boolean);
     const changed = [...tracked, ...untracked];
     if (changed.length === 0) throw new CeoError("VALIDATION_FAILED", "Change set produces no file changes.");
-    for (const filePath of changed) validatePath(filePath);
+    for (const filePath of changed) {
+      validatePath(filePath);
+      if (isPathIgnored(matcher, filePath)) {
+        throw new CeoError("ACCESS_DENIED", "Changed path in diff is excluded by .ceoignore.", { path: filePath });
+      }
+    }
     return [...new Set(changed)].sort();
   }
 
-  private async listTrackedFiles(base: string): Promise<string[]> {
+  private async listTrackedFiles(base: string, matcher: CeoIgnoreMatcher): Promise<string[]> {
     const result = await runGit(this.config, this.config.repoDir, ["ls-tree", "-r", "--name-only", base]);
-    return result.stdout.split("\n").filter(isAllowedTrackedPath);
+    return result.stdout.split("\n").filter((f) => isAllowedTrackedPath(f) && !isPathIgnored(matcher, f));
   }
 
   private async recoverPending(): Promise<void> {

@@ -25,21 +25,10 @@ export function validateContentPath(candidate: string): string {
     throw new CeoError("INVALID_PATH", "Path contains a forbidden or hidden segment.", { path: candidate });
   }
   const normalized = path.posix.normalize(candidate);
-  const lower = normalized.toLowerCase();
-
-  // Forbidden system directories, hidden files, secrets, and code paths
-  if (
-    lower.startsWith(".git/") || lower === ".git" ||
-    lower.startsWith(".github/") ||
-    lower.startsWith("mcp/") ||
-    lower.startsWith(".env")
-  ) {
-    throw new CeoError("INVALID_PATH", "Code, workflows, and hidden metadata are outside the CEO content boundary.", { path: candidate });
-  }
 
   // All Markdown (.md) files outside forbidden system paths are allowed
   if (!normalized.endsWith(".md")) {
-    throw new CeoError("INVALID_PATH", "Only Markdown (.md) files are writable in CEO.", { path: candidate });
+    throw new CeoError("INVALID_PATH", "Only Markdown (.md) files are supported in CEO.", { path: candidate });
   }
 
   return normalized;
