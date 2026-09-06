@@ -28,7 +28,7 @@ export type Provenance =
   | "trusted_adapter"
   | "worker";
 
-export type NamingSource = "explicit" | "title" | "fallback";
+export type NamingSource = "explicit" | "id";
 
 export type MetadataAttemptStatus =
   | "resolved"
@@ -138,13 +138,14 @@ export type ResourceApplyOperation =
       display_name: string;
     };
 
+export type ResourceCaptureInitialOperation = Exclude<ResourceApplyOperation, { op: "rename" }>;
+
 export interface ResourceCaptureInput {
   request_id?: string;
   source: ResourceSourceInput;
-  display_name?: string;
   note?: string;
   topics?: string[];
-  initial_operations?: ResourceApplyOperation[];
+  initial_operations?: ResourceCaptureInitialOperation[];
   state_changes?: ChangeOperation[];
   summary?: string;
 }

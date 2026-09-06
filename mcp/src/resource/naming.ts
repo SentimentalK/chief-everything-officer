@@ -1,81 +1,8 @@
 import path from "node:path";
 import { access } from "node:fs/promises";
-import type { ResourceSourceInput } from "./types.js";
 
 export const MAX_DIRECTORY_BYTES = 180;
 export const MAX_DISPLAY_NAME_CHARS = 160;
-
-export interface DetermineDisplayNameOptions {
-  inputDisplayName?: string | null;
-  resolverTitle?: string | null;
-  source: ResourceSourceInput;
-  sourceIdentity?: string | null;
-  originalName?: string | null;
-  canonicalRef?: string | null;
-}
-
-/**
- * Derives initial display_name during capture using the priority cascade:
- * 1. explicit input.display_name
- * 2. deterministic resolver title
- * 3. original filename stem
- * 4. meaningful external reference label
- * 5. deterministic source identifier / useful URL path segment
- * 6. "Untitled Resource"
- *
- * Provider prefixes (e.g. "YouTube -", "Bilibili -") are strictly avoided.
- */
-export function determineInitialDisplayName(options: DetermineDisplayNameOptions): string {
-  // 1. Explicit input.display_name
-  if (options.inputDisplayName && options.inputDisplayName.trim()) {
-    const trimmed = cleanDisplayName(options.inputDisplayName);
-    if (trimmed) return trimmed;
-  }
-
-  // 2. Deterministic resolver title
-  if (options.resolverTitle && options.resolverTitle.trim()) {
-    const cleaned = cleanDisplayName(options.resolverTitle);
-    if (cleaned) return cleaned;
-  }
-
-  // 3. Original filename stem
-  if (options.originalName && options.originalName.trim()) {
-    const parsed = path.parse(options.originalName.trim());
-    const stem = cleanDisplayName(parsed.name || options.originalName.trim());
-    if (stem) return stem;
-  }
-
-  // 4. External reference label
-  if (options.source.type === "external_ref" && options.source.ref) {
-    const cleaned = cleanDisplayName(options.source.ref);
-    if (cleaned) return cleaned;
-  }
-
-  // 5. Deterministic source identifier / URL path segment
-  if (options.sourceIdentity && options.sourceIdentity.trim()) {
-    const idParts = options.sourceIdentity.trim().split(":");
-    const ident = idParts.length > 1 ? idParts.slice(1).join(":") : idParts[0]!;
-    if (ident && !ident.startsWith("http://") && !ident.startsWith("https://")) {
-      const cleaned = cleanDisplayName(ident);
-      if (cleaned) return cleaned;
-    }
-  }
-
-  if (options.source.type === "url" && options.source.url) {
-    try {
-      const parsedUrl = new URL(options.source.url);
-      const segments = parsedUrl.pathname.split("/").map((s) => decodeURIComponent(s).trim()).filter(Boolean);
-      if (segments.length > 0) {
-        const last = segments[segments.length - 1]!;
-        const cleaned = cleanDisplayName(last);
-        if (cleaned) return cleaned;
-      }
-    } catch {}
-  }
-
-  // 6. Final fallback
-  return "Untitled Resource";
-}
 
 /**
  * Strips superficial provider prefixes (e.g. "Bilibili - ", "YouTube - ") and collapses whitespace.

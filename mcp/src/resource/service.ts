@@ -48,7 +48,6 @@ import {
   MAX_DISPLAY_NAME_CHARS,
   allocateUniqueDirectoryName,
   cleanDisplayName,
-  determineInitialDisplayName,
   toSafeDirectoryName,
 } from "./naming.js";
 import {
@@ -135,6 +134,17 @@ export class ResourceService {
     // Assert no Resource mutations in state_changes before any resolver/network work
     if (input.state_changes && input.state_changes.length > 0) {
       assertNoResourceMutations(input.state_changes, "state_changes");
+    }
+
+    if (input.initial_operations && input.initial_operations.length > 0) {
+      for (const op of input.initial_operations) {
+        if ((op as { op: string }).op === "rename") {
+          throw new CeoError(
+            "INVALID_OPERATION",
+            "The 'rename' operation is not permitted in capture initial_operations. Resources must be captured first to an ID-based directory; use resource_apply with op 'rename' to set a semantic display_name afterwards.",
+          );
+        }
+      }
     }
 
     // Determine normalized source properties
@@ -381,21 +391,6 @@ export class ResourceService {
                 meta.last_metadata_attempt = { ...currentAttemptRecord };
                 hasSemanticChange = true;
               }
-
-              // Naming on revisit
-              if (input.display_name && input.display_name.trim()) {
-                await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
-                hasSemanticChange = true;
-              } else if (meta.naming_source === "fallback" && resolvedMetadata?.title && resolvedMetadata.title.trim()) {
-                await applyResourceRename(worktree, ctx, meta, resolvedMetadata.title, "title");
-                hasSemanticChange = true;
-              }
-            } else {
-              // Stale attempt: only apply explicit display_name if provided
-              if (input.display_name && input.display_name.trim()) {
-                await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
-                hasSemanticChange = true;
-              }
             }
           } else {
             resourceId = generateResourceId();
@@ -421,11 +416,6 @@ export class ResourceService {
               hasSemanticChange = true;
             }
 
-            if (input.display_name && input.display_name.trim()) {
-              await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
-              hasSemanticChange = true;
-            }
-
             if (input.topics && input.topics.length > 0) {
               const prevSet = new Set(meta.topics);
               const combined = [...new Set([...meta.topics, ...input.topics])];
@@ -445,29 +435,12 @@ export class ResourceService {
         }
 
         if (!isRevisit) {
-          let initialDisplayName: string;
-          let initialNamingSource: NamingSource;
-          if (input.display_name && input.display_name.trim()) {
-            initialDisplayName = cleanDisplayName(input.display_name);
-            initialNamingSource = "explicit";
-          } else if (resolvedMetadata?.title && resolvedMetadata.title.trim()) {
-            initialDisplayName = cleanDisplayName(resolvedMetadata.title);
-            initialNamingSource = "title";
-          } else {
-            initialDisplayName = determineInitialDisplayName({
-              inputDisplayName: input.display_name,
-              resolverTitle: metadataSeed ? metadataSeed.title : null,
-              source: input.source,
-              sourceIdentity: preferredIdentity,
-              originalName,
-              canonicalRef,
-            });
-            initialNamingSource = "fallback";
-          }
+          const dirName = resourceId;
+          const initialDisplayName = resourceId;
+          const initialNamingSource: NamingSource = "id";
 
           const resourcesRoot = path.join(worktree, "resources");
           await mkdir(resourcesRoot, { recursive: true });
-          const dirName = await allocateUniqueDirectoryName(resourcesRoot, initialDisplayName);
           location = {
             resource_id: resourceId,
             directory_name: dirName,

@@ -201,6 +201,15 @@ const renameOp = z.object({
   display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates display_name and renames physical directory."),
 });
 
+const resourceCaptureInitialOperationSchema = z.discriminatedUnion("op", [
+  attachSourceAssetOp,
+  upsertEvidenceOp,
+  upsertContentOp,
+  upsertSummaryOp,
+  appendInteractionOp,
+  patchTopicsOp,
+]);
+
 const resourceApplyOperationSchema = z.discriminatedUnion("op", [
   attachSourceAssetOp,
   upsertEvidenceOp,
@@ -316,7 +325,7 @@ export function createMcpServer(
   server.registerTool("resource_capture", {
     title: "Capture external resource into CEO",
     description:
-      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. Do not first browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles source normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side.",
+      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. New resources are always initially saved under a stable ID directory ('resources/res-...'). Do not browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side. After capture, inspect the returned metadata/receipt; if sufficient context exists, invoke resource_apply with op 'rename' to give the resource a clean, concise, retrieval-friendly semantic display name.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       source: z.discriminatedUnion("type", [
@@ -325,12 +334,9 @@ export function createMcpServer(
         z.object({ type: z.literal("file_inline"), filename: z.string().min(1), mime_type: z.string().min(1), data_base64: z.string().min(1) }),
         z.object({ type: z.literal("external_ref"), provider: z.string().min(1), ref: z.string().min(1), canonical_ref: z.string().nullish() }),
       ]),
-      display_name: z.string().min(1).max(160).optional().describe(
-        "Optional user/AI semantic name for this Resource. Use when the current conversation already provides enough context to give the Resource a meaningful reusable name. Do not invent source contents solely from an opaque URL."
-      ),
       note: z.string().max(2000).optional().describe("User-oriented reason or context for capturing this resource"),
       topics: z.array(z.string().max(60)).max(20).optional().describe("Semantic topic tags for routing and retrieval"),
-      initial_operations: z.array(resourceApplyOperationSchema).optional().describe("Initial semantic artifacts or document attachments to save with this capture"),
+      initial_operations: z.array(resourceCaptureInitialOperationSchema).optional().describe("Initial semantic artifacts or document attachments to save with this capture"),
       state_changes: z.array(changeOperationSchema).max(LIMITS.maxOperationsPerTransaction).optional().describe("Justified State consequences (Personal, Tasks, Journal) to commit atomically in the same transaction"),
       summary: z.string().max(120).optional().describe("Git commit summary for the save transaction"),
     },
@@ -342,7 +348,7 @@ export function createMcpServer(
   server.registerTool("resource_apply", {
     title: "Apply updates to a CEO resource",
     description:
-      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, and source assets. Do not modify Resource artifacts through generic apply_change_set.",
+      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),

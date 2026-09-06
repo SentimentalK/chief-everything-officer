@@ -35,11 +35,12 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     const cap = await service.capture({
       source: { type: "file_descriptor", filename: "initial.pdf" },
-      display_name: "Original Name",
     });
 
     const resourceId = (cap.resource as any).resource_id;
     const baseCommit = cap.commit as string;
+    expect((cap.resource as any).naming_source).toBe("id");
+    expect((cap.resource as any).relative_path).toBe(`resources/${resourceId}`);
 
     const applyRes = await service.apply({
       resource_id: resourceId,
@@ -60,13 +61,13 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     expect(applyRes.ok).toBe(true);
     expect(applyRes.renamed).toBe(true);
-    expect(applyRes.old_path).toBe("resources/Original Name");
+    expect(applyRes.old_path).toBe(`resources/${resourceId}`);
     expect(applyRes.new_path).toBe("resources/Renamed Document");
 
     const changedFiles = applyRes.changed_files as string[];
     expect(changedFiles).toContain("resources/Renamed Document/meta.md");
     expect(changedFiles).toContain("resources/Renamed Document/summary.md");
-    await expect(readFile(path.join(item.config.repoDir, "resources/Original Name/meta.md"))).rejects.toThrow();
+    await expect(readFile(path.join(item.config.repoDir, `resources/${resourceId}/meta.md`))).rejects.toThrow();
 
     // Verify summary file exists in new directory
     const summaryPath = path.join(item.config.repoDir, "resources/Renamed Document/summary.md");
@@ -83,7 +84,6 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     const cap = await service.capture({
       source: { type: "file_descriptor", filename: "test.pdf" },
-      display_name: "Old Directory",
     });
 
     const resourceId = (cap.resource as any).resource_id;
@@ -108,6 +108,7 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     expect(applyRes.ok).toBe(true);
     expect(applyRes.renamed).toBe(true);
+    expect(applyRes.old_path).toBe(`resources/${resourceId}`);
     expect(applyRes.new_path).toBe("resources/New Directory");
 
     const summaryPath = path.join(item.config.repoDir, "resources/New Directory/summary.md");
@@ -124,14 +125,29 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     const cap = await service.capture({
       source: { type: "file_descriptor", filename: "doc.pdf" },
-      display_name: "Stable Label",
     });
 
     const resourceId = (cap.resource as any).resource_id;
     let baseCommit = cap.commit as string;
 
-    // Apply rename to the same label
-    const applyRes = await service.apply({
+    // First rename: moves from ID to Stable Label
+    const applyRes1 = await service.apply({
+      resource_id: resourceId,
+      base_commit: baseCommit,
+      summary: "Initial rename",
+      operations: [
+        {
+          op: "rename",
+          display_name: "Stable Label",
+        },
+      ],
+    });
+    expect(applyRes1.renamed).toBe(true);
+    expect(applyRes1.new_path).toBe("resources/Stable Label");
+    baseCommit = applyRes1.commit as string;
+
+    // Second rename: to the same label (no-op)
+    const applyRes2 = await service.apply({
       resource_id: resourceId,
       base_commit: baseCommit,
       summary: "No-op rename",
@@ -147,12 +163,12 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
       ],
     });
 
-    expect(applyRes.ok).toBe(true);
-    expect(applyRes.renamed).toBe(false);
-    expect(applyRes.old_path).toBe("resources/Stable Label");
-    expect(applyRes.new_path).toBe("resources/Stable Label");
+    expect(applyRes2.ok).toBe(true);
+    expect(applyRes2.renamed).toBe(false);
+    expect(applyRes2.old_path).toBe("resources/Stable Label");
+    expect(applyRes2.new_path).toBe("resources/Stable Label");
 
-    const changedFiles = applyRes.changed_files as string[];
+    const changedFiles = applyRes2.changed_files as string[];
     expect(changedFiles).toContain("resources/Stable Label/meta.md");
     // No Stable Label-2 created!
     expect(changedFiles.some((f) => f.includes("Stable Label-2"))).toBe(false);
@@ -165,22 +181,26 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
     await workspace.initialize();
     const service = new ResourceService(workspace, item.config);
 
-    // Create resource 1 with "Target Name"
-    await service.capture({
+    // Create resource 1 and rename to "Target Name"
+    const cap1 = await service.capture({
       source: { type: "file_descriptor", filename: "doc1.pdf" },
-      display_name: "Target Name",
+    });
+    await service.apply({
+      resource_id: (cap1.resource as any).resource_id,
+      base_commit: cap1.commit as string,
+      summary: "Rename resource 1 to Target Name",
+      operations: [{ op: "rename", display_name: "Target Name" }],
     });
 
-    // Create resource 2 with "Other Name"
+    // Create resource 2
     const cap2 = await service.capture({
       source: { type: "file_descriptor", filename: "doc2.pdf" },
-      display_name: "Other Name",
     });
 
     const resourceId2 = (cap2.resource as any).resource_id;
     const baseCommit2 = cap2.commit as string;
 
-    // Rename resource 2 to "Target Name" (collides with resource 1)
+    // Rename resource 2 to "Target Name" (collides with resource 1 directory)
     const applyRes = await service.apply({
       resource_id: resourceId2,
       base_commit: baseCommit2,
@@ -215,7 +235,6 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
         mime_type: "application/pdf",
         data_base64: pdfBuffer.toString("base64"),
       },
-      display_name: "Original Invoice",
     });
 
     const resourceId = (cap.resource as any).resource_id;
@@ -247,7 +266,7 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
     expect(diskAsset.toString("base64")).toBe(pdfBuffer.toString("base64"));
   });
 
-  it("fallback naming automatically upgrades on revisit when resolver provides title", async () => {
+  it("revisit never auto-renames directory even when resolver provides title; AI explicit rename moves directory", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -265,20 +284,22 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     const service = new ResourceService(workspace, item.config, mockResolver);
 
-    // Initial capture with no display_name: falls back to deterministic fallback
+    // Initial capture: always saves to ID directory
     const cap1 = await service.capture({
       source: { type: "url", url: "https://www.youtube.com/watch?v=upgrade123" },
     });
 
     const resource1 = cap1.resource as any;
-    expect(resource1.naming_source).toBe("fallback");
-    expect(resource1.display_name).toBe("upgrade123");
-    expect(resource1.relative_path).toBe("resources/upgrade123");
+    const resId = resource1.resource_id;
+    expect(resource1.naming_source).toBe("id");
+    expect(resource1.display_name).toBe(resId);
+    expect(resource1.relative_path).toBe(`resources/${resId}`);
 
     // Check meta.md on disk
-    const metaPath1 = path.join(item.config.repoDir, "resources/upgrade123/meta.md");
+    const metaPath1 = path.join(item.config.repoDir, `resources/${resId}/meta.md`);
     const doc1 = parseMetaMarkdown(await readFile(metaPath1, "utf8"));
-    expect(doc1.meta.naming_source).toBe("fallback");
+    expect(doc1.meta.naming_source).toBe("id");
+    expect(doc1.meta.display_name).toBe(resId);
 
     // Second attempt: resolver now resolves successfully with title
     mockResolver.customHandler = () => ({
@@ -306,16 +327,41 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
 
     const resource2 = cap2.resource as any;
     expect(resource2.is_revisit).toBe(true);
-    // Automatic upgrade because naming_source was "fallback"
-    expect(resource2.naming_source).toBe("title");
-    expect(resource2.display_name).toBe("Deep Learning Breakthrough 2026");
-    expect(resource2.relative_path).toBe("resources/Deep Learning Breakthrough 2026");
+    // NEVER auto-rename: preserves ID name and ID directory
+    expect(resource2.naming_source).toBe("id");
+    expect(resource2.display_name).toBe(resId);
+    expect(resource2.relative_path).toBe(`resources/${resId}`);
+    expect(resource2.title).toBe("Deep Learning Breakthrough 2026");
 
-    // Verify old directory is gone and new directory has meta.md
-    const newMetaPath = path.join(item.config.repoDir, "resources/Deep Learning Breakthrough 2026/meta.md");
-    const doc2 = parseMetaMarkdown(await readFile(newMetaPath, "utf8"));
-    expect(doc2.meta.naming_source).toBe("title");
-    expect(doc2.meta.display_name).toBe("Deep Learning Breakthrough 2026");
+    // Disk meta.md has updated title but preserved ID directory
+    const doc2 = parseMetaMarkdown(await readFile(metaPath1, "utf8"));
+    expect(doc2.meta.naming_source).toBe("id");
+    expect(doc2.meta.display_name).toBe(resId);
     expect(doc2.meta.title).toBe("Deep Learning Breakthrough 2026");
+
+    // Now AI performs explicit rename using resource_apply
+    const renameRes = await service.apply({
+      resource_id: resId,
+      base_commit: cap2.commit as string,
+      summary: "AI rename based on resolved title",
+      operations: [
+        {
+          op: "rename",
+          display_name: "Deep Learning Breakthrough 2026",
+        },
+      ],
+    });
+
+    expect(renameRes.renamed).toBe(true);
+    expect(renameRes.old_path).toBe(`resources/${resId}`);
+    expect(renameRes.new_path).toBe("resources/Deep Learning Breakthrough 2026");
+
+    // Verify old ID directory is gone and new directory has meta.md
+    await expect(readFile(metaPath1)).rejects.toThrow();
+    const newMetaPath = path.join(item.config.repoDir, "resources/Deep Learning Breakthrough 2026/meta.md");
+    const doc3 = parseMetaMarkdown(await readFile(newMetaPath, "utf8"));
+    expect(doc3.meta.naming_source).toBe("explicit");
+    expect(doc3.meta.display_name).toBe("Deep Learning Breakthrough 2026");
+    expect(doc3.meta.title).toBe("Deep Learning Breakthrough 2026");
   });
 });

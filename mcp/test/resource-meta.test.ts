@@ -10,6 +10,10 @@ describe("Resource Metadata & Frontmatter Serialization", () => {
   const sampleMeta: ResourceMeta = {
     schema_version: 1,
     resource_id: "res-01234567-89ab-cdef-0123-456789abcdef",
+    display_name: "res-01234567-89ab-cdef-0123-456789abcdef",
+    naming_source: "id",
+    source_aliases: [],
+    last_metadata_attempt: null,
     resource_kind: "document",
     source_type: "file",
     source_identity: null, // Valid for provisional resource

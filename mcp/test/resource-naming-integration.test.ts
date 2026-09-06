@@ -29,7 +29,7 @@ class MockResolver implements UrlMetadataResolver {
 }
 
 describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
-  it("creates readable directory names without UUID under normal conditions", async () => {
+  it("captures to ID directory and renames to readable directory name via resource_apply", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -52,26 +52,43 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
 
     const cap = await service.capture({
       source: { type: "url", url: "https://www.youtube.com/watch?v=cuda123" },
-      display_name: "CUDA生态与NVIDIA软件护城河",
     });
 
     expect(cap.ok).toBe(true);
     const resource = cap.resource as Record<string, unknown>;
-    expect(resource.resource_id).toMatch(/^res-[0-9a-f-]{36}$/);
-    expect(resource.display_name).toBe("CUDA生态与NVIDIA软件护城河");
+    const resId = resource.resource_id as string;
+    expect(resId).toMatch(/^res-[0-9a-f-]{36}$/);
+    expect(resource.display_name).toBe(resId);
+    expect(resource.naming_source).toBe("id");
+    expect(resource.title).toBe("Why CUDA Moat is Unbreakable");
+    expect(cap.changed_files).toContain(`resources/${resId}/meta.md`);
 
-    // Physical directory is readable and does NOT contain UUID
-    const changedFiles = cap.changed_files as string[];
-    expect(changedFiles).toContain("resources/CUDA生态与NVIDIA软件护城河/meta.md");
-    expect(changedFiles.some((f) => f.includes(resource.resource_id as string))).toBe(false);
+    // AI inspects metadata and calls resource_apply.rename
+    const applyRes = await service.apply({
+      resource_id: resId,
+      base_commit: cap.commit as string,
+      summary: "AI semantic rename",
+      operations: [
+        {
+          op: "rename",
+          display_name: "CUDA生态与NVIDIA软件护城河",
+        },
+      ],
+    });
+
+    expect(applyRes.ok).toBe(true);
+    expect(applyRes.renamed).toBe(true);
+    expect(applyRes.old_path).toBe(`resources/${resId}`);
+    expect(applyRes.new_path).toBe("resources/CUDA生态与NVIDIA软件护城河");
 
     // Verify meta.md contents
     const metaPath = path.join(item.config.repoDir, "resources/CUDA生态与NVIDIA软件护城河/meta.md");
     const metaContent = await readFile(metaPath, "utf8");
     const doc = parseMetaMarkdown(metaContent);
 
-    expect(doc.meta.resource_id).toBe(resource.resource_id);
+    expect(doc.meta.resource_id).toBe(resId);
     expect(doc.meta.display_name).toBe("CUDA生态与NVIDIA软件护城河");
+    expect(doc.meta.naming_source).toBe("explicit");
     expect(doc.meta.title).toBe("Why CUDA Moat is Unbreakable");
     expect(doc.heading).toBe("CUDA生态与NVIDIA软件护城河");
   });
@@ -84,36 +101,51 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
 
     const service = new ResourceService(workspace, item.config);
 
-    // Capture 1: "AI Report"
+    // Capture 1: rename to "AI Report"
     const cap1 = await service.capture({
       source: { type: "file_descriptor", filename: "report1.pdf" },
-      display_name: "AI Report",
     });
-    expect(cap1.changed_files).toContain("resources/AI Report/meta.md");
+    const id1 = (cap1.resource as any).resource_id;
+    const ren1 = await service.apply({
+      resource_id: id1,
+      base_commit: cap1.commit as string,
+      summary: "Rename 1",
+      operations: [{ op: "rename", display_name: "AI Report" }],
+    });
+    expect(ren1.new_path).toBe("resources/AI Report");
 
     // Capture 2: Collision on same display_name "AI Report"
     const cap2 = await service.capture({
       source: { type: "file_descriptor", filename: "report2.pdf" },
-      display_name: "AI Report",
     });
-    expect(cap2.changed_files).toContain("resources/AI Report-2/meta.md");
+    const id2 = (cap2.resource as any).resource_id;
+    const ren2 = await service.apply({
+      resource_id: id2,
+      base_commit: cap2.commit as string,
+      summary: "Rename 2",
+      operations: [{ op: "rename", display_name: "AI Report" }],
+    });
+    expect(ren2.new_path).toBe("resources/AI Report-2");
 
     // Capture 3: Another collision
     const cap3 = await service.capture({
       source: { type: "file_descriptor", filename: "report3.pdf" },
-      display_name: "AI Report",
     });
-    expect(cap3.changed_files).toContain("resources/AI Report-3/meta.md");
+    const id3 = (cap3.resource as any).resource_id;
+    const ren3 = await service.apply({
+      resource_id: id3,
+      base_commit: cap3.commit as string,
+      summary: "Rename 3",
+      operations: [{ op: "rename", display_name: "AI Report" }],
+    });
+    expect(ren3.new_path).toBe("resources/AI Report-3");
 
     // All three have distinct resource_ids
-    const id1 = (cap1.resource as any).resource_id;
-    const id2 = (cap2.resource as any).resource_id;
-    const id3 = (cap3.resource as any).resource_id;
     expect(id1).not.toBe(id2);
     expect(id2).not.toBe(id3);
   });
 
-  it("revisit preserves existing display_name unless explicit input.display_name is provided", async () => {
+  it("revisit preserves existing display_name and directory", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -134,16 +166,22 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
 
     const service = new ResourceService(workspace, item.config, mockResolver);
 
-    // 1. First capture with semantic display_name
+    // 1. First capture saves to ID directory
     const cap1 = await service.capture({
       source: { type: "url", url: "https://www.youtube.com/watch?v=vid999" },
-      display_name: "我的专属语义名称",
     });
-    const resource1 = cap1.resource as Record<string, unknown>;
-    expect(resource1.display_name).toBe("我的专属语义名称");
-    expect(cap1.changed_files).toContain("resources/我的专属语义名称/meta.md");
+    const resId = (cap1.resource as any).resource_id;
 
-    // 2. Revisit without display_name: resolver title must NOT overwrite display_name
+    // AI renames to semantic display_name
+    const ren1 = await service.apply({
+      resource_id: resId,
+      base_commit: cap1.commit as string,
+      summary: "Rename to semantic name",
+      operations: [{ op: "rename", display_name: "我的专属语义名称" }],
+    });
+    expect(ren1.new_path).toBe("resources/我的专属语义名称");
+
+    // 2. Revisit: resolver title must NOT overwrite display_name or directory
     const cap2 = await service.capture({
       source: { type: "url", url: "https://www.youtube.com/watch?v=vid999" },
       note: "Second time encountering this video",
@@ -151,18 +189,17 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
     const resource2 = cap2.resource as Record<string, unknown>;
     expect(resource2.is_revisit).toBe(true);
     expect(resource2.display_name).toBe("我的专属语义名称"); // Preserved!
+    expect(resource2.relative_path).toBe("resources/我的专属语义名称"); // Preserved!
 
-    // 3. Revisit with explicit input.display_name: intentionally updates metadata AND renames directory
-    const cap3 = await service.capture({
-      source: { type: "url", url: "https://www.youtube.com/watch?v=vid999" },
-      display_name: "更精炼的语义名称",
+    // 3. Explicit AI rename updates display_name AND renames directory
+    const ren2 = await service.apply({
+      resource_id: resId,
+      base_commit: cap2.commit as string,
+      summary: "Refine name",
+      operations: [{ op: "rename", display_name: "更精炼的语义名称" }],
     });
-    const resource3 = cap3.resource as Record<string, unknown>;
-    expect(resource3.is_revisit).toBe(true);
-    expect(resource3.display_name).toBe("更精炼的语义名称");
-
-    // Directory is renamed to the new display_name!
-    expect(cap3.changed_files).toContain("resources/更精炼的语义名称/meta.md");
+    expect(ren2.new_path).toBe("resources/更精炼的语义名称");
+    expect((ren2.resource as any).display_name).toBe("更精炼的语义名称");
   });
 
   it("resource_apply op:rename updates metadata and renames physical directory", async () => {
@@ -174,7 +211,6 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
 
     const cap = await service.capture({
       source: { type: "file_descriptor", filename: "paper.pdf" },
-      display_name: "Initial Name",
     });
     const resourceId = (cap.resource as any).resource_id;
     const baseCommit = cap.commit as string;
@@ -200,6 +236,7 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
     const metaContent = await readFile(path.join(item.config.repoDir, "resources/Deep Architecture Evolution 2026/meta.md"), "utf8");
     const doc = parseMetaMarkdown(metaContent);
     expect(doc.meta.display_name).toBe("Deep Architecture Evolution 2026");
+    expect(doc.meta.naming_source).toBe("explicit");
     expect(doc.meta.resource_id).toBe(resourceId);
   });
 
@@ -213,10 +250,14 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
     const legacyDir = path.join(item.config.repoDir, "resources", legacyId);
     await mkdir(legacyDir, { recursive: true });
 
-    // Legacy meta.md without display_name field
+    // Legacy meta.md with ID placeholder display_name
     const legacyMetaYaml = `---
 schema_version: 1
 resource_id: ${legacyId}
+display_name: ${legacyId}
+naming_source: id
+source_aliases: []
+last_metadata_attempt: null
 resource_kind: document
 source_type: file
 source_identity: file:legacy-001
@@ -258,10 +299,15 @@ Legacy note
 
     const newCap = await service.capture({
       source: { type: "file_descriptor", filename: "new_file.pdf" },
-      display_name: "Modern Readable Resource",
       topics: ["modern"],
     });
     const newId = (newCap.resource as any).resource_id;
+    await service.apply({
+      resource_id: newId,
+      base_commit: newCap.commit as string,
+      summary: "AI rename modern resource",
+      operations: [{ op: "rename", display_name: "Modern Readable Resource" }],
+    });
 
     // 1. Test enumerateResources discovers both
     const all = await enumerateResources(item.config.repoDir);
@@ -269,14 +315,15 @@ Legacy note
     expect(all.some((r) => r.location.resource_id === legacyId)).toBe(true);
     expect(all.some((r) => r.location.resource_id === newId)).toBe(true);
 
-    // Legacy resource has derived display_name fallback
     const legacyFound = all.find((r) => r.location.resource_id === legacyId)!;
-    expect(legacyFound.meta.display_name).toBe("Legacy Document Title");
+    expect(legacyFound.meta.display_name).toBe(legacyId);
+    expect(legacyFound.meta.title).toBe("Legacy Document Title");
 
     // 2. Test resource_get on legacy resource
     const legacyGet = await retrieval.get({ resource_id: legacyId, view: "metadata" });
     expect(legacyGet.resource_id).toBe(legacyId);
-    expect(legacyGet.display_name).toBe("Legacy Document Title");
+    expect(legacyGet.display_name).toBe(legacyId);
+    expect(legacyGet.title).toBe("Legacy Document Title");
 
     // 3. Test resource_get on modern resource
     const modernGet = await retrieval.get({ resource_id: newId, view: "metadata" });
@@ -316,6 +363,9 @@ Legacy note
       schema_version: 1,
       resource_id: sharedId,
       display_name: "Resource A",
+      naming_source: "explicit",
+      source_aliases: [],
+      last_metadata_attempt: null,
       resource_kind: "document",
       source_type: "file",
       source_identity: "file:1",
@@ -347,6 +397,9 @@ Legacy note
       schema_version: 1,
       resource_id: sharedId, // Duplicate!
       display_name: "Resource B",
+      naming_source: "explicit",
+      source_aliases: [],
+      last_metadata_attempt: null,
       resource_kind: "document",
       source_type: "file",
       source_identity: "file:2",

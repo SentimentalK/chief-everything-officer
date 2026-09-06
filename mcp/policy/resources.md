@@ -32,10 +32,10 @@ The Resource Plane manages durable, structured understanding of external materia
 ## 2. Artifacts & Provenance
 
 - **`resource_id`**: Immutable logical identity (`res-<uuid-v4>`) stored in `meta.md`.
-- **Physical Directory**: Readable storage label (e.g. `resources/CUDA生态与NVIDIA软件护城河/`) independent of identity. Historical UUID directories (`resources/res-<uuid>/`) and new readable directories coexist.
+- **Physical Directory & Naming**: New resources are always captured under their stable ID directory (`resources/res-<uuid>/`) with temporary placeholder `display_name = resource_id` and `naming_source = "id"`. AI subsequently inspects metadata/content and performs semantic naming via `resource_apply` with `op: "rename"`, which renames the directory to a clean, retrieval-friendly storage label.
 
 ```text
-resources/<readable_directory_label>/
+resources/<directory_label>/
   meta.md         -> CAPTURED
   evidence.md     -> EXTRACTED
   content.md      -> NORMALIZED
@@ -43,8 +43,8 @@ resources/<readable_directory_label>/
   interactions.md -> DISCUSSED
 ```
 
-- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, `naming_source` (`explicit` | `title` | `fallback`), `source_aliases`, bounded `last_metadata_attempt`, normalized `source_identity`, source facts, capture note, topics, capture history. Explicit directory renames use `op: "rename"`.
-- **`naming_source`**: Tracks display name provenance (`explicit` | `title` | `fallback`). Fallback names automatically upgrade when provider titles resolve; explicit names are preserved.
+- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, `naming_source` (`explicit` | `id`), `source_aliases`, bounded `last_metadata_attempt`, normalized `source_identity`, source facts, capture note, topics, capture history. Explicit directory renames use `op: "rename"`.
+- **`naming_source`**: Tracks display name provenance (`explicit` | `id`). Initial capture uses `"id"`; semantic renames by AI or user use `"explicit"`.
 - **`last_metadata_attempt`**: Records bounded diagnostic evidence (`attempted_at`, `status`, `code`, `fields_resolved`) of external enrichment attempts. Stale attempts are skipped.
 - **`source_aliases`**: Symmetrical URL/platform aliases ensuring bidirectional deduplication.
 - **`evidence.md`**: Raw/near-raw platform transcripts, ASR, OCR, or exact web text. Provenance must be `host_exact`, `trusted_adapter`, or `worker`. **`host_semantic` is strictly forbidden for evidence**.

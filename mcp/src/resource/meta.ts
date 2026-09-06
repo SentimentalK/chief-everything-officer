@@ -37,19 +37,21 @@ export function parseMetaMarkdown(content: string): ParsedMetaDocument {
 
   const raw = parsed as Record<string, unknown>;
 
-  const rawDisplayName = raw.display_name != null ? String(raw.display_name).trim() : "";
+  if (typeof raw.display_name !== "string" || raw.display_name.trim() === "") {
+    throw new CeoError("INVALID_META", "Resource display_name must be a non-empty string.");
+  }
+  const displayName = raw.display_name.trim();
+
+  const validNamingSources = new Set(["explicit", "id"]);
+  if (typeof raw.naming_source !== "string" || !validNamingSources.has(raw.naming_source)) {
+    throw new CeoError("INVALID_META", `Invalid or missing naming_source: ${String(raw.naming_source)}`);
+  }
+  const namingSource = raw.naming_source as NamingSource;
+
   const rawTitle = raw.title != null ? String(raw.title).trim() : null;
   const rawOriginalName = raw.original_name != null ? String(raw.original_name).trim() : null;
   const rawPlatformId = raw.platform_id != null ? String(raw.platform_id).trim() : null;
   const rawResourceId = String(raw.resource_id ?? "");
-
-  const displayName = rawDisplayName || rawTitle || rawOriginalName || rawPlatformId || "Untitled Resource";
-
-  const validNamingSources = new Set(["explicit", "title", "fallback"]);
-  const namingSource: NamingSource =
-    typeof raw.naming_source === "string" && validNamingSources.has(raw.naming_source)
-      ? (raw.naming_source as NamingSource)
-      : "fallback";
 
   const sourceAliases = Array.isArray(raw.source_aliases)
     ? raw.source_aliases.map(String)
@@ -175,7 +177,7 @@ export function formatMetaMarkdown(
     nullStr: "null",
   });
 
-  const heading = meta.display_name || meta.title || meta.original_name || meta.canonical_ref || meta.resource_id;
+  const heading = meta.display_name;
 
   let doc = `---\n${yamlStr}---\n\n# ${heading}\n\n## Capture Note\n\n`;
   doc += (captureNote && captureNote.trim()) ? `${captureNote.trim()}\n\n` : `\n`;
