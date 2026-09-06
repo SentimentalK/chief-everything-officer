@@ -21,6 +21,12 @@ The Resource Plane manages durable, structured understanding of external materia
    - When metadata acquisition fails, save succeeds with `null` fields; failure is reported honestly.
    - AI only contributes user-semantic fields: `Capture Note`, `topics`, summaries, section mappings, and interaction notes.
 
+4. **Server-Side Deterministic Metadata Enrichment**:
+   - URL capture may automatically perform trusted deterministic metadata enrichment server-side.
+   - The model should not manually shuttle resolver output into Resource metadata.
+   - Resolver failure does not block durable Resource capture.
+   - Metadata enrichment status is operational and must not be persisted as Resource lifecycle state.
+
 ---
 
 ## 2. Artifacts & Provenance

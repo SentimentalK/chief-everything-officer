@@ -20,6 +20,9 @@ export interface Config {
   allowedOrigins: string[];
   auditDir: string;
   auditDbPath: string;
+  contentResolverUrl?: string;
+  contentResolverToken?: string;
+  contentResolverTimeoutMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -48,6 +51,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const gitAuthorName = env.CEO_GIT_AUTHOR_NAME ?? gitCommitterName;
   const gitAuthorEmail = env.CEO_GIT_AUTHOR_EMAIL ?? gitCommitterEmail;
 
+  const contentResolverUrl = env.CONTENT_RESOLVER_URL?.trim() || undefined;
+  const contentResolverToken = env.CONTENT_RESOLVER_TOKEN?.trim() || undefined;
+
+  if ((contentResolverUrl && !contentResolverToken) || (!contentResolverUrl && contentResolverToken)) {
+    throw new Error("Invalid configuration: CONTENT_RESOLVER_URL and CONTENT_RESOLVER_TOKEN must both be set or both be omitted.");
+  }
+
+  let contentResolverTimeoutMs = 5000;
+  if (env.CONTENT_RESOLVER_TIMEOUT_MS) {
+    const parsedTimeout = Number.parseInt(env.CONTENT_RESOLVER_TIMEOUT_MS, 10);
+    if (Number.isInteger(parsedTimeout) && parsedTimeout > 0) {
+      contentResolverTimeoutMs = parsedTimeout;
+    } else {
+      throw new Error("CONTENT_RESOLVER_TIMEOUT_MS must be a positive integer");
+    }
+  }
+
   return {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
@@ -68,5 +88,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowedOrigins,
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: env.CEO_AUDIT_DB_PATH ?? path.join(dataRoot, "audit", "ceo-trace.sqlite"),
+    ...(contentResolverUrl ? { contentResolverUrl } : {}),
+    ...(contentResolverToken ? { contentResolverToken } : {}),
+    contentResolverTimeoutMs,
   };
 }

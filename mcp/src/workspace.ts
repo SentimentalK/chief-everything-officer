@@ -40,10 +40,19 @@ interface PendingTransaction {
   worktree: string;
   changed_files: string[];
   diff_stat: string;
+  operation_result?: Record<string, unknown>;
 }
 
-interface CompletedTransaction extends PendingTransaction {
+interface CompletedTransaction {
+  request_id: string;
+  base_commit: string;
+  commit: string;
+  worktree?: string;
+  changed_files: string[];
+  diff_stat: string;
   pushed_at: string;
+  pushed?: boolean;
+  operation_result?: Record<string, unknown>;
 }
 
 export function normalizeListPrefix(prefix: string): string {
@@ -263,14 +272,32 @@ export class CeoWorkspace {
     });
   }
 
+  async isRequestCompleted(requestId: string): Promise<Record<string, unknown> | null> {
+    const completed = await this.readCompleted(requestId);
+    if (completed) {
+      return this.completedResult(completed);
+    }
+    return null;
+  }
+
   async withAtomicWorkspaceTransaction(input: {
     requestId: string;
     baseCommit: string;
     commitMessage: string;
     allowResourceSourceFiles?: boolean;
+    allowEmpty?: boolean;
+    operationResultProducer?: (changedFiles: string[]) => Record<string, unknown>;
     mutator: (worktree: string, worktreeMatcher: CeoIgnoreMatcher) => Promise<void>;
   }): Promise<Record<string, unknown>> {
-    const { requestId, baseCommit, commitMessage, allowResourceSourceFiles = false, mutator } = input;
+    const {
+      requestId,
+      baseCommit,
+      commitMessage,
+      allowResourceSourceFiles = false,
+      allowEmpty = false,
+      operationResultProducer,
+      mutator,
+    } = input;
     return await this.withLock(async () => {
       const completed = await this.readCompleted(requestId);
       if (completed) return this.completedResult(completed);
@@ -292,13 +319,32 @@ export class CeoWorkspace {
       let committed = false;
       try {
         await mutator(worktree, worktreeMatcher);
-        const changed = await this.validateDiff(worktree, worktreeMatcher, allowResourceSourceFiles);
+        const changed = await this.validateDiff(worktree, worktreeMatcher, allowResourceSourceFiles, allowEmpty);
+
+        if (changed.length === 0) {
+          await this.discardWorktree(worktree);
+          const opRes = operationResultProducer ? operationResultProducer([]) : undefined;
+          const completedNoop: CompletedTransaction = {
+            request_id: requestId,
+            base_commit: baseCommit,
+            commit: baseCommit,
+            changed_files: [],
+            diff_stat: "",
+            pushed: false,
+            pushed_at: new Date().toISOString(),
+            ...(opRes ? { operation_result: opRes } : {}),
+          };
+          await this.writeJson(path.join(this.completedDir, `${requestId}.json`), completedNoop);
+          return this.completedResult(completedNoop);
+        }
+
         await runGit(this.config, worktree, ["add", "-A"]);
         await runGit(this.config, worktree, ["diff", "--cached", "--check"]);
         await runGit(this.config, worktree, ["commit", "-m", commitMessage]);
         committed = true;
         const commit = await resolveRef(this.config, worktree, "HEAD");
         const diffStat = (await runGit(this.config, worktree, ["show", "--stat", "--format=", "HEAD"])).stdout;
+        const opRes = operationResultProducer ? operationResultProducer(changed) : undefined;
         const pending: PendingTransaction = {
           request_id: requestId,
           base_commit: baseCommit,
@@ -306,6 +352,7 @@ export class CeoWorkspace {
           worktree,
           changed_files: changed,
           diff_stat: diffStat,
+          ...(opRes ? { operation_result: opRes } : {}),
         };
         await this.writePending(pending);
         await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
@@ -461,13 +508,21 @@ export class CeoWorkspace {
     }
   }
 
-  private async validateDiff(worktree: string, matcher: CeoIgnoreMatcher, allowResourceSourceFiles = false): Promise<string[]> {
+  private async validateDiff(
+    worktree: string,
+    matcher: CeoIgnoreMatcher,
+    allowResourceSourceFiles = false,
+    allowEmpty = false,
+  ): Promise<string[]> {
     const tracked = (await runGit(this.config, worktree, ["diff", "--name-only", "-z"])).stdout
       .split("\0").filter(Boolean);
     const untracked = (await runGit(this.config, worktree, ["ls-files", "--others", "--exclude-standard", "-z"])).stdout
       .split("\0").filter(Boolean);
     const changed = [...tracked, ...untracked];
-    if (changed.length === 0) throw new CeoError("VALIDATION_FAILED", "Change set produces no file changes.");
+    if (changed.length === 0) {
+      if (allowEmpty) return [];
+      throw new CeoError("VALIDATION_FAILED", "Change set produces no file changes.");
+    }
     for (const filePath of changed) {
       if (allowResourceSourceFiles && isAllowedResourceSourcePath(filePath)) {
         // Safe document file in resources/<id>/source/original.<ext>
@@ -537,7 +592,7 @@ export class CeoWorkspace {
       });
     }
     this.lastPushAt = new Date().toISOString();
-    const completed: CompletedTransaction = { ...pending, pushed_at: this.lastPushAt };
+    const completed: CompletedTransaction = { ...pending, pushed_at: this.lastPushAt, pushed: true };
     await this.writeJson(path.join(this.completedDir, `${pending.request_id}.json`), completed);
     await rm(this.pendingPath, { force: true });
     await this.discardWorktree(pending.worktree);
@@ -551,10 +606,11 @@ export class CeoWorkspace {
       workspace_state: "READY",
       base_commit: completed.base_commit,
       commit: completed.commit,
-      pushed: true,
+      pushed: completed.pushed ?? true,
       changed_files: completed.changed_files,
       diff_stat: completed.diff_stat,
       pushed_at: completed.pushed_at,
+      ...(completed.operation_result ? completed.operation_result : {}),
     };
   }
 

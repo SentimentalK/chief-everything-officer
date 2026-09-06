@@ -11,6 +11,10 @@ import { BUILD_INFO } from "./build-info.js";
 import { ResourceService } from "./resource/service.js";
 import { ResourceRetrievalService } from "./resource/retrieval.js";
 import { parseMetaMarkdown } from "./resource/meta.js";
+import {
+  type UrlMetadataResolver,
+  createContentResolverClient,
+} from "./resource/resolver-client.js";
 import type {
   ResourceApplyInput,
   ResourceCaptureInput,
@@ -205,8 +209,13 @@ export function createMcpServer(
   workspace: CeoWorkspace,
   productPolicy: ProductPolicy,
   auditStore?: AuditStore,
+  resolverClient?: UrlMetadataResolver,
 ): McpServer {
-  const resourceService = new ResourceService(workspace, workspace.config);
+  const resourceService = new ResourceService(
+    workspace,
+    workspace.config,
+    resolverClient ?? createContentResolverClient(workspace.config),
+  );
   const resourceRetrieval = new ResourceRetrievalService(workspace, workspace.config);
 
   const server = new McpServer(
@@ -301,7 +310,7 @@ export function createMcpServer(
   server.registerTool("resource_capture", {
     title: "Capture external resource into CEO",
     description:
-      "Use this to save an external resource (URL, file descriptor, inline file, or provider ref) into CEO durable memory. Reuses existing resources for identical normalized source identities. Supports optional initial operations and state promotions in one atomic transaction.",
+      "Use this to durably capture an external Resource. URL captures automatically attempt trusted deterministic source metadata enrichment server-side when the internal resolver capability is available. Metadata resolution is best-effort: unsupported or temporarily unavailable enrichment does not prevent Resource capture. Do not separately reconstruct or copy source metadata when the server can resolve it.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       source: z.discriminatedUnion("type", [

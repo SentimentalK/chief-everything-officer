@@ -30,12 +30,28 @@ import {
   parseMetaMarkdown,
   type ParsedMetaDocument,
 } from "./meta.js";
+import {
+  type UrlMetadataResolver,
+  createContentResolverClient,
+} from "./resolver-client.js";
+import {
+  type ResolvedMetadataSeed,
+  applyResolverRevisitUpdates,
+  buildResolvedMetadataSeed,
+  derivePreferredIdentity,
+} from "./resolver-mapping.js";
+import type { ContentMetadataV1 } from "./resolver-contract.js";
 
 export class ResourceService {
+  private readonly resolverClient: UrlMetadataResolver;
+
   constructor(
     private readonly workspace: CeoWorkspace,
     private readonly config: Config,
-  ) {}
+    resolverClient?: UrlMetadataResolver,
+  ) {
+    this.resolverClient = resolverClient ?? createContentResolverClient(config);
+  }
 
   async capture(input: ResourceCaptureInput): Promise<Record<string, unknown>> {
     const requestId = input.request_id ?? randomUUID();
@@ -43,8 +59,15 @@ export class ResourceService {
       throw new CeoError("VALIDATION_FAILED", "request_id must be a UUID.");
     }
 
+    // Return completed transaction if already processed (replay-safe idempotency)
+    const cached = await this.workspace.isRequestCompleted(requestId);
+    if (cached) {
+      return cached;
+    }
+
     // Determine normalized source properties
-    let sourceIdentity: string | null = null;
+    let baselineIdentity: string | null = null;
+    let preferredIdentity: string | null = null;
     let sourceType: SourceType = "url";
     let resourceKind: ResourceKind = "other";
     let canonicalRef: string | null = null;
@@ -57,20 +80,40 @@ export class ResourceService {
     let sourceHash: string | null = null;
     let sourceAssetBuffer: Buffer | null = null;
     let sourceAssetExt: string | null = null;
+    let enrichmentReceipt: Record<string, unknown> = { status: "disabled" };
+    let metadataSeed: ResolvedMetadataSeed | null = null;
+    let resolvedMetadata: ContentMetadataV1 | null = null;
 
     if (input.source.type === "url") {
       const norm = normalizeUrlSource(input.source.url);
-      sourceIdentity = norm.source_identity;
+      baselineIdentity = norm.source_identity;
       sourceType = "url";
-      resourceKind = norm.resource_kind;
-      canonicalRef = norm.canonical_ref;
       sourceRef = input.source.url;
-      platform = norm.platform;
-      platformId = norm.platform_id;
+
+      // Synchronous metadata resolution OUTSIDE atomic Git transaction
+      const outcome = await this.resolverClient.resolve(input.source.url);
+      if (outcome.status === "resolved") {
+        resolvedMetadata = outcome.metadata;
+        enrichmentReceipt = { status: "resolved" };
+      } else if (outcome.status === "unsupported") {
+        enrichmentReceipt = { status: "unsupported", code: outcome.code };
+      } else if (outcome.status === "unavailable") {
+        enrichmentReceipt = { status: "unavailable", code: outcome.code };
+      } else {
+        enrichmentReceipt = { status: "disabled" };
+      }
+
+      preferredIdentity = derivePreferredIdentity(baselineIdentity, resolvedMetadata);
+      metadataSeed = buildResolvedMetadataSeed(norm, resolvedMetadata);
+      resourceKind = metadataSeed.resource_kind;
+      canonicalRef = metadataSeed.canonical_ref;
+      platform = metadataSeed.platform;
+      platformId = metadataSeed.platform_id;
     } else if (input.source.type === "file_descriptor") {
       sourceType = "file";
       resourceKind = "document";
-      sourceIdentity = null; // Provisional!
+      baselineIdentity = null;
+      preferredIdentity = null;
       canonicalRef = null;
       sourceRef = input.source.host_ref ?? null;
       originalName = path.basename(input.source.filename);
@@ -89,7 +132,8 @@ export class ResourceService {
       originalName = path.basename(input.source.filename);
 
       const idInfo = computeFileIdentity(sourceAssetBuffer);
-      sourceIdentity = idInfo.source_identity;
+      baselineIdentity = idInfo.source_identity;
+      preferredIdentity = idInfo.source_identity;
       sourceHash = idInfo.source_hash;
       sourceType = "file";
       resourceKind = "document";
@@ -99,7 +143,8 @@ export class ResourceService {
       platformId = null;
     } else if (input.source.type === "external_ref") {
       sourceType = "external_ref";
-      sourceIdentity = `${input.source.provider}:${input.source.ref}`;
+      baselineIdentity = `${input.source.provider}:${input.source.ref}`;
+      preferredIdentity = baselineIdentity;
       canonicalRef = input.source.canonical_ref ?? null;
       sourceRef = input.source.ref;
       platform = input.source.provider;
@@ -108,22 +153,48 @@ export class ResourceService {
     }
 
     const currentBase = await this.workspace.withReadyWorkspace(async (base) => base);
+    let capturedResourceReceipt: Record<string, unknown> | null = null;
 
     return await this.workspace.withAtomicWorkspaceTransaction({
       requestId,
       baseCommit: currentBase,
       commitMessage: `CEO: ${input.summary?.trim() || `Capture resource`}`,
       allowResourceSourceFiles: true,
+      allowEmpty: true,
+      operationResultProducer: (_changedFiles) => {
+        return {
+          resource: capturedResourceReceipt,
+          metadata_enrichment: enrichmentReceipt,
+        };
+      },
       mutator: async (worktree, worktreeMatcher) => {
         let resourceId: string;
         let isRevisit = false;
         let meta!: ResourceMeta;
         let captureHistory: string[] = [];
         let captureNote: string | null = input.note ?? null;
+        let hasSemanticChange = false;
 
-        // Atomic deduplication if sourceIdentity is known
-        if (sourceIdentity !== null) {
-          const existing = await this.findResourceByIdentity(worktree, sourceIdentity);
+        // Deduplication
+        if (input.source.type === "url" && preferredIdentity && baselineIdentity) {
+          const byPreferred = await this.findResourceByIdentity(worktree, preferredIdentity);
+          let byBaseline: { meta: ResourceMeta; doc: ParsedMetaDocument } | null = null;
+          if (preferredIdentity !== baselineIdentity) {
+            byBaseline = await this.findResourceByIdentity(worktree, baselineIdentity);
+          }
+
+          if (byPreferred && byBaseline && byPreferred.meta.resource_id !== byBaseline.meta.resource_id) {
+            throw new CeoError(
+              "DUPLICATE_RESOURCE",
+              "Identity conflict: preferred identity and baseline identity match different resources.",
+              {
+                preferred_resource_id: byPreferred.meta.resource_id,
+                baseline_resource_id: byBaseline.meta.resource_id,
+              },
+            );
+          }
+
+          const existing = byPreferred ?? byBaseline;
           if (existing) {
             isRevisit = true;
             resourceId = existing.meta.resource_id;
@@ -131,20 +202,61 @@ export class ResourceService {
             captureHistory = [...existing.doc.capture_history];
             captureNote = input.note ?? existing.doc.capture_note;
 
-            // Append revisit to history only if meaningful note or context is provided
-            if (input.note && input.note.trim()) {
+            // Revisit note
+            if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
+              hasSemanticChange = true;
             }
 
-            // Model input can ONLY update model-owned semantic fields (topics, note)
+            // Topics union
             if (input.topics && input.topics.length > 0) {
-              meta.topics = [...new Set([...meta.topics, ...input.topics])];
+              const prevSet = new Set(meta.topics);
+              const combined = [...new Set([...meta.topics, ...input.topics])];
+              if (combined.length > prevSet.size) {
+                meta.topics = combined;
+                hasSemanticChange = true;
+              }
+            }
+
+            // Resolver revisit update (non-erasure)
+            const metadataChanged = applyResolverRevisitUpdates(meta, resolvedMetadata);
+            if (metadataChanged) {
+              hasSemanticChange = true;
             }
           } else {
             resourceId = generateResourceId();
+            hasSemanticChange = true;
+          }
+        } else if (preferredIdentity !== null) {
+          const existing = await this.findResourceByIdentity(worktree, preferredIdentity);
+          if (existing) {
+            isRevisit = true;
+            resourceId = existing.meta.resource_id;
+            meta = existing.meta;
+            captureHistory = [...existing.doc.capture_history];
+            captureNote = input.note ?? existing.doc.capture_note;
+
+            if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
+              captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
+              hasSemanticChange = true;
+            }
+
+            if (input.topics && input.topics.length > 0) {
+              const prevSet = new Set(meta.topics);
+              const combined = [...new Set([...meta.topics, ...input.topics])];
+              if (combined.length > prevSet.size) {
+                meta.topics = combined;
+                hasSemanticChange = true;
+              }
+            }
+          } else {
+            resourceId = generateResourceId();
+            hasSemanticChange = true;
           }
         } else {
+          // Provisional file descriptor
           resourceId = generateResourceId();
+          hasSemanticChange = true;
         }
 
         const resDir = path.join(worktree, "resources", resourceId);
@@ -155,7 +267,7 @@ export class ResourceService {
             resource_id: resourceId,
             resource_kind: resourceKind,
             source_type: sourceType,
-            source_identity: sourceIdentity,
+            source_identity: preferredIdentity,
             source_ref: sourceRef,
             canonical_ref: canonicalRef,
             platform,
@@ -165,14 +277,14 @@ export class ResourceService {
             format,
             asset_ref: sourceAssetBuffer && sourceAssetExt ? `source/original${sourceAssetExt}` : null,
             source_hash: sourceHash,
-            title: null,
-            author: null,
-            published_at: null,
+            title: metadataSeed ? metadataSeed.title : null,
+            author: metadataSeed ? metadataSeed.author : null,
+            published_at: metadataSeed ? metadataSeed.published_at : null,
             first_captured_at: new Date().toISOString(),
-            language: null,
+            language: metadataSeed ? metadataSeed.language : null,
             topics: input.topics ? [...input.topics] : [],
-            metadata_method: input.source.type === "url" ? "deterministic_adapter" : "user_provided",
-            metadata_fetched_at: null,
+            metadata_method: metadataSeed ? metadataSeed.metadata_method : (input.source.type === "url" ? null : "user_provided"),
+            metadata_fetched_at: metadataSeed ? metadataSeed.metadata_fetched_at : null,
             capture_surface: "mcp",
           };
 
@@ -194,17 +306,39 @@ export class ResourceService {
         // Apply initial operations if provided
         if (input.initial_operations && input.initial_operations.length > 0) {
           await this.executeResourceOperations(worktree, resourceId, meta, input.initial_operations);
+          hasSemanticChange = true;
         }
 
-        // Write meta.md
-        const metaMarkdown = formatMetaMarkdown(meta!, captureNote, captureHistory);
-        await writeFile(path.join(resDir, "meta.md"), metaMarkdown, "utf8");
+        // Write meta.md only if semantic changes exist (or on first capture)
+        if (hasSemanticChange) {
+          const metaMarkdown = formatMetaMarkdown(meta!, captureNote, captureHistory);
+          await writeFile(path.join(resDir, "meta.md"), metaMarkdown, "utf8");
+        }
 
         // Apply optional state_changes atomically
         if (input.state_changes && input.state_changes.length > 0) {
           this.workspace.validateOperations(input.state_changes, worktreeMatcher);
           await this.workspace.applyOperations(worktree, currentBase, input.state_changes);
         }
+
+        // Calculate stage
+        const dirFiles = await readdir(resDir).catch(() => []);
+        const artifactSet = new Set(dirFiles);
+        let interactionsText: string | null = null;
+        if (artifactSet.has("interactions.md")) {
+          interactionsText = await readFile(path.join(resDir, "interactions.md"), "utf8").catch(() => null);
+        }
+        const stage = deriveResourceStage(artifactSet, interactionsText);
+
+        capturedResourceReceipt = {
+          resource_id: resourceId,
+          is_revisit: isRevisit,
+          source_identity: meta.source_identity,
+          title: meta.title,
+          platform: meta.platform,
+          resource_kind: meta.resource_kind,
+          stage,
+        };
       },
     });
   }

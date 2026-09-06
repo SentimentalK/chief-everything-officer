@@ -80,5 +80,51 @@ describe("Config Validation", () => {
       expect(config.gitCommitterEmail).toBe("committer@example.com");
     });
   });
+
+  describe("Content Resolver Configuration", () => {
+    it("disables resolver when both URL and token are omitted", () => {
+      const config = loadConfig({
+        CEO_REMOTE: "git@github.com:foo/bar.git",
+      } as any);
+      expect(config.contentResolverUrl).toBeUndefined();
+      expect(config.contentResolverToken).toBeUndefined();
+      expect(config.contentResolverTimeoutMs).toBe(5000);
+    });
+
+    it("enables resolver when both URL and token are provided", () => {
+      const config = loadConfig({
+        CEO_REMOTE: "git@github.com:foo/bar.git",
+        CONTENT_RESOLVER_URL: "http://content-resolver.local:8000",
+        CONTENT_RESOLVER_TOKEN: "internal-secret-token",
+        CONTENT_RESOLVER_TIMEOUT_MS: "3000",
+      } as any);
+      expect(config.contentResolverUrl).toBe("http://content-resolver.local:8000");
+      expect(config.contentResolverToken).toBe("internal-secret-token");
+      expect(config.contentResolverTimeoutMs).toBe(3000);
+    });
+
+    it("throws when only URL is provided", () => {
+      expect(() => loadConfig({
+        CEO_REMOTE: "git@github.com:foo/bar.git",
+        CONTENT_RESOLVER_URL: "http://content-resolver.local:8000",
+      } as any)).toThrow("Invalid configuration: CONTENT_RESOLVER_URL and CONTENT_RESOLVER_TOKEN must both be set or both be omitted.");
+    });
+
+    it("throws when only token is provided", () => {
+      expect(() => loadConfig({
+        CEO_REMOTE: "git@github.com:foo/bar.git",
+        CONTENT_RESOLVER_TOKEN: "internal-secret-token",
+      } as any)).toThrow("Invalid configuration: CONTENT_RESOLVER_URL and CONTENT_RESOLVER_TOKEN must both be set or both be omitted.");
+    });
+
+    it("throws when timeout is invalid", () => {
+      expect(() => loadConfig({
+        CEO_REMOTE: "git@github.com:foo/bar.git",
+        CONTENT_RESOLVER_URL: "http://content-resolver.local:8000",
+        CONTENT_RESOLVER_TOKEN: "token",
+        CONTENT_RESOLVER_TIMEOUT_MS: "-50",
+      } as any)).toThrow("CONTENT_RESOLVER_TIMEOUT_MS must be a positive integer");
+    });
+  });
 });
 
