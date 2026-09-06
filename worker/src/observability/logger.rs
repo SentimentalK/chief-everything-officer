@@ -17,6 +17,9 @@ pub enum LogSource {
     Agent,
     Script,
     System,
+    Doctor,
+    Setup,
+    Verifier,
 }
 
 impl LogSource {
@@ -26,10 +29,14 @@ impl LogSource {
             LogSource::Agent => "agent",
             LogSource::Script => "script",
             LogSource::System => "system",
+            LogSource::Doctor => "doctor",
+            LogSource::Setup => "setup",
+            LogSource::Verifier => "verifier",
         }
     }
 }
 
+#[derive(Clone)]
 pub struct ProcessLogger {
     log_path: PathBuf,
     source: LogSource,
@@ -126,19 +133,35 @@ impl ProcessLogger {
         file.flush()
     }
 
-    pub fn log_line(&self, raw_line: &str) {
+    pub fn log_line_with_source(&self, source: LogSource, raw_line: &str) {
         let sanitized = self.sanitize(raw_line);
         let timestamp = Utc::now().to_rfc3339();
-        let formatted = format!("{} [{}] {}\n", timestamp, self.source.as_tag(), sanitized);
+        let formatted = format!("{} [{}] {}\n", timestamp, source.as_tag(), sanitized);
 
         let _ = self.write_to_file(&formatted);
 
         // Send to echo channel without blocking
         if let Some(tx) = &self.echo_tx {
-            let display_line = format!("[{}] {}", self.source.as_tag(), sanitized);
+            let display_line = format!("[{}] {}", source.as_tag(), sanitized);
             if tx.try_send(display_line).is_err() {
                 self.dropped_lines.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    pub fn log_line(&self, raw_line: &str) {
+        self.log_line_with_source(self.source, raw_line);
+    }
+
+    pub fn get_tail_snippet(&self, max_lines: usize) -> String {
+        if let Ok(content) = fs::read_to_string(&self.log_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() <= max_lines {
+                return content;
+            }
+            lines[lines.len() - max_lines..].join("\n")
+        } else {
+            String::new()
         }
     }
 

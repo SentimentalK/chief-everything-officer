@@ -1,5 +1,6 @@
 pub mod config;
 pub mod doctor;
+pub mod executor;
 pub mod manifest;
 pub mod observability;
 pub mod receipt;

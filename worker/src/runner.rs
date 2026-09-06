@@ -1,5 +1,6 @@
-use crate::config::WorkerConfig;
+use crate::config::{validate_id, WorkerConfig};
 use crate::doctor::{run_doctor, DoctorStatus};
+use crate::executor::{create_executor, ExecutionRequest, ExecutorError};
 use crate::manifest::{CapabilityManifest, TaskInput, TaskInputParams};
 use crate::observability::{EventLogger, JobStage, LogSource, ProcessLogger, StatusTracker};
 use crate::receipt::{
@@ -8,34 +9,71 @@ use crate::receipt::{
 };
 use crate::setup::run_setup;
 use crate::verifier::{BusinessOutcome, Verifier};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fs;
-use std::process::Stdio;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 #[derive(Error, Debug)]
 pub enum RunnerError {
-    #[error("Job ID {0} already exists. Refusing to overwrite or re-execute.")]
+    #[error("Job ID '{0}' already exists. Refusing to overwrite or re-execute.")]
     JobAlreadyExists(String),
-    #[error("Failed to initialize job directory: {0}")]
+    #[error("Configuration error: {0}")]
+    ConfigError(#[from] crate::config::ConfigError),
+    #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("Preflight check failed: {0}")]
-    PreflightError(String),
-    #[error("Manifest error: {0}")]
-    ManifestError(#[from] crate::manifest::ManifestError),
-    #[error("Capability environment check failed: {0}")]
-    EnvironmentBlocked(String),
-    #[error("Setup failed: {0}")]
-    SetupFailed(#[from] crate::setup::SetupError),
-    #[error("Execution timeout: reached {0} seconds")]
-    Timeout(u64),
-    #[error("Verification error: {0}")]
-    VerificationError(#[from] crate::verifier::VerificationError),
+    #[error("Failed to persist task receipt to disk: {0}")]
+    ReceiptPersistFailed(std::io::Error),
+}
+
+struct FinalizeParams<'a> {
+    job_id: &'a str,
+    attempt_id: &'a str,
+    capability_id: &'a str,
+    manifest_revision: u32,
+    started_at: DateTime<Utc>,
+    attempt_dir: &'a Path,
+    status_tracker: &'a StatusTracker,
+    event_logger: &'a EventLogger,
+    stdout_logger: &'a ProcessLogger,
+    stderr_logger: &'a ProcessLogger,
+    log_paths: HashMap<String, String>,
+}
+
+enum AttemptOutcome {
+    Success {
+        executor: ExecutorInfo,
+        submission: SubmissionInfo,
+        script: ScriptInfo,
+        artifacts: Vec<ArtifactRef>,
+        verification: VerificationSummary,
+        business_outcome: BusinessOutcome,
+    },
+    Blocked {
+        stage: String,
+        code: String,
+        message: String,
+        executor: ExecutorInfo,
+    },
+    Failed {
+        stage: String,
+        code: String,
+        message: String,
+        business_outcome: BusinessOutcome,
+        executor: ExecutorInfo,
+        submission: SubmissionInfo,
+        script: ScriptInfo,
+        artifacts: Vec<ArtifactRef>,
+        verification: Option<VerificationSummary>,
+    },
+    Timeout {
+        duration_secs: u64,
+        executor: ExecutorInfo,
+        submission: SubmissionInfo,
+    },
 }
 
 pub struct Runner {
@@ -48,18 +86,241 @@ impl Runner {
         Self { config, echo_tx }
     }
 
+    fn finalize_attempt(
+        &self,
+        params: FinalizeParams<'_>,
+        outcome: AttemptOutcome,
+    ) -> Result<TaskReceipt, RunnerError> {
+        let finished_at = Utc::now();
+        let duration_ms = (finished_at - params.started_at).num_milliseconds().max(0) as u64;
+
+        let stdout_snippet = params.stdout_logger.get_tail_snippet(10);
+        let stderr_snippet = params.stderr_logger.get_tail_snippet(10);
+        let dropped_lines_count =
+            params.stdout_logger.dropped_lines_count() + params.stderr_logger.dropped_lines_count();
+        let log_truncated =
+            params.stdout_logger.is_truncated() || params.stderr_logger.is_truncated();
+
+        let logs = LogSummary {
+            events_path: params
+                .attempt_dir
+                .join("events.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            stdout_path: params
+                .attempt_dir
+                .join("stdout.log")
+                .to_string_lossy()
+                .to_string(),
+            stderr_path: params
+                .attempt_dir
+                .join("stderr.log")
+                .to_string_lossy()
+                .to_string(),
+            stdout_snippet,
+            stderr_snippet,
+            dropped_lines_count,
+            log_truncated,
+        };
+
+        let (
+            exec_status,
+            agent_session_state,
+            business_outcome,
+            executor,
+            submission,
+            script,
+            artifacts,
+            artifact_paths,
+            verification,
+            receipt_error,
+            job_stage,
+        ) = match outcome {
+            AttemptOutcome::Success {
+                executor,
+                submission,
+                script,
+                artifacts,
+                verification,
+                business_outcome,
+            } => {
+                let paths = artifacts.iter().map(|a| a.path.clone()).collect();
+                (
+                    "COMPLETED".to_string(),
+                    "Completed".to_string(),
+                    business_outcome,
+                    executor,
+                    submission,
+                    script,
+                    artifacts,
+                    paths,
+                    Some(verification),
+                    None,
+                    JobStage::Completed,
+                )
+            }
+            AttemptOutcome::Blocked {
+                stage,
+                code,
+                message,
+                executor,
+            } => {
+                let err = ReceiptError {
+                    stage,
+                    code,
+                    message,
+                };
+                (
+                    "BLOCKED".to_string(),
+                    "NotStarted".to_string(),
+                    BusinessOutcome::NotStarted,
+                    executor,
+                    SubmissionInfo {
+                        status: "RejectedPreflight".to_string(),
+                        exit_code: None,
+                    },
+                    ScriptInfo { exit_code: None },
+                    vec![],
+                    vec![],
+                    None,
+                    Some(err),
+                    JobStage::Blocked,
+                )
+            }
+            AttemptOutcome::Failed {
+                stage,
+                code,
+                message,
+                business_outcome,
+                executor,
+                submission,
+                script,
+                artifacts,
+                verification,
+            } => {
+                let paths = artifacts.iter().map(|a| a.path.clone()).collect();
+                let err = ReceiptError {
+                    stage,
+                    code,
+                    message,
+                };
+                (
+                    "FAILED".to_string(),
+                    "Completed".to_string(),
+                    business_outcome,
+                    executor,
+                    submission,
+                    script,
+                    artifacts,
+                    paths,
+                    verification,
+                    Some(err),
+                    JobStage::Failed,
+                )
+            }
+            AttemptOutcome::Timeout {
+                duration_secs,
+                executor,
+                submission,
+            } => {
+                let err = ReceiptError {
+                    stage: "execution".to_string(),
+                    code: "TIMEOUT".to_string(),
+                    message: format!("Execution timed out after {} seconds", duration_secs),
+                };
+                (
+                    "FAILED".to_string(),
+                    "TimedOut".to_string(),
+                    BusinessOutcome::Interrupted,
+                    executor,
+                    submission,
+                    ScriptInfo { exit_code: None },
+                    vec![],
+                    vec![],
+                    None,
+                    Some(err),
+                    JobStage::Failed,
+                )
+            }
+        };
+
+        let receipt = TaskReceipt {
+            job_id: params.job_id.to_string(),
+            attempt_id: params.attempt_id.to_string(),
+            capability_id: params.capability_id.to_string(),
+            manifest_revision: params.manifest_revision,
+            execution_status: exec_status.clone(),
+            agent_session_state,
+            business_outcome,
+            executor,
+            submission,
+            script,
+            timestamps: TimestampsInfo {
+                started_at: params.started_at,
+                finished_at,
+                duration_ms,
+            },
+            artifacts,
+            logs,
+            verification,
+            error: receipt_error.clone(),
+        };
+
+        let receipt_path = params.attempt_dir.join("receipt.json");
+        if let Err(e) = receipt.persist_to_file(&receipt_path) {
+            eprintln!(
+                "FATAL: Failed to write receipt.json to {:?}: {}",
+                receipt_path, e
+            );
+            let _ = params.status_tracker.update_stage(
+                JobStage::Failed,
+                Some(format!("Failed to persist receipt: {}", e)),
+                params.log_paths,
+                vec![],
+            );
+            return Err(RunnerError::ReceiptPersistFailed(e));
+        }
+
+        let latest_error = receipt_error.map(|e| e.message);
+        let _ = params.status_tracker.update_stage(
+            job_stage,
+            latest_error,
+            params.log_paths,
+            artifact_paths,
+        );
+
+        params.event_logger.log(
+            "completion",
+            "receipt_finalized",
+            "system",
+            serde_json::json!({
+                "status": exec_status,
+                "outcome": format!("{:?}", business_outcome),
+            }),
+        );
+
+        Ok(receipt)
+    }
+
     pub async fn run_job(
         &self,
         capability_id: &str,
         url: &str,
         custom_job_id: Option<String>,
     ) -> Result<TaskReceipt, RunnerError> {
-        let job_id = custom_job_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // 1. Strict ID validation
+        validate_id("capability_id", capability_id)?;
+        let job_id = if let Some(ref id) = custom_job_id {
+            validate_id("job_id", id)?;
+            id.clone()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let started_at = Utc::now();
 
-        // 1. Atomic job directory registration (prevent concurrent duplicate job_id)
-        let job_dir = self.config.job_dir(&job_id);
+        // 2. Atomic job directory registration
+        let job_dir = self.config.safe_job_dir(&job_id)?;
         fs::create_dir_all(&self.config.workspace_dir)?;
         let jobs_root = self.config.workspace_dir.join("jobs");
         fs::create_dir_all(&jobs_root)?;
@@ -72,11 +333,10 @@ impl Runner {
             Err(e) => return Err(RunnerError::IoError(e)),
         }
 
-        // Create attempt directory
-        let attempt_dir = self.config.attempt_dir(&job_id, &attempt_id);
+        let attempt_dir = self.config.safe_attempt_dir(&job_id, &attempt_id)?;
         fs::create_dir_all(&attempt_dir)?;
 
-        // Initialize status and observability
+        // 3. Initialize observability
         let status_tracker = StatusTracker::new(&job_dir, &job_id, &attempt_id);
         let event_logger = EventLogger::new(&attempt_dir, &job_id, &attempt_id);
         let stdout_logger = ProcessLogger::new(
@@ -122,8 +382,16 @@ impl Runner {
 
         let _ = status_tracker.update_stage(JobStage::Doctor, None, log_paths.clone(), vec![]);
 
-        // 2. Load and validate capability manifest
-        let cap_dir = self.config.capability_dir(capability_id);
+        // 4. Instantiate executor
+        let executor = create_executor(&self.config);
+        let mut executor_info = ExecutorInfo {
+            executor_type: executor.executor_type().to_string(),
+            version: executor.default_version().to_string(),
+            conversation_id: None,
+        };
+
+        // 5. Load and validate capability manifest
+        let cap_dir = self.config.safe_capability_dir(capability_id)?;
         let manifest = match CapabilityManifest::load_from_dir(&cap_dir) {
             Ok(m) => m,
             Err(e) => {
@@ -134,13 +402,28 @@ impl Runner {
                     "system",
                     serde_json::json!({"error": &err_msg}),
                 );
-                let _ = status_tracker.update_stage(
-                    JobStage::Failed,
-                    Some(err_msg.clone()),
-                    log_paths.clone(),
-                    vec![],
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: 0,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "manifest".to_string(),
+                        code: "MANIFEST_LOAD_ERROR".to_string(),
+                        message: err_msg,
+                        executor: executor_info,
+                    },
                 );
-                return Err(RunnerError::ManifestError(e));
             }
         };
 
@@ -162,102 +445,180 @@ impl Runner {
                 "system",
                 serde_json::json!({"error": &err_msg}),
             );
-            let _ = status_tracker.update_stage(
-                JobStage::Failed,
-                Some(err_msg.clone()),
-                log_paths.clone(),
-                vec![],
+            let params = FinalizeParams {
+                job_id: &job_id,
+                attempt_id: &attempt_id,
+                capability_id,
+                manifest_revision: manifest.manifest_revision,
+                started_at,
+                attempt_dir: &attempt_dir,
+                status_tracker: &status_tracker,
+                event_logger: &event_logger,
+                stdout_logger: &stdout_logger,
+                stderr_logger: &stderr_logger,
+                log_paths,
+            };
+            return self.finalize_attempt(
+                params,
+                AttemptOutcome::Blocked {
+                    stage: "input_validation".to_string(),
+                    code: "INPUT_INVALID".to_string(),
+                    message: err_msg,
+                    executor: executor_info,
+                },
             );
-            return Err(RunnerError::ManifestError(e));
         }
 
-        // 3. Write input.json to attempt dir
+        // 6. Write input.json to attempt dir
         let input_json_path = attempt_dir.join("input.json");
         let input_bytes = serde_json::to_vec_pretty(&task_input)
             .map_err(|e| RunnerError::IoError(std::io::Error::other(e)))?;
         fs::write(&input_json_path, input_bytes)?;
 
-        // 4. Preflight adapter check: If configured with agentapi, reject immediately without side effects!
-        let agent_bin_str = self.config.agent_executable.to_string_lossy();
-        if agent_bin_str.ends_with("agentapi") {
-            let err_msg = "ADAPTER_UNSUPPORTED: Antigravity agentapi lacks workspace binding, status querying, and targeted cancellation. Submission rejected before process creation.".to_string();
-            event_logger.log(
-                "preflight",
-                "adapter_unsupported",
-                "system",
-                serde_json::json!({"error": &err_msg}),
-            );
-            let _ = status_tracker.update_stage(
-                JobStage::Failed,
-                Some(err_msg.clone()),
-                log_paths.clone(),
-                vec![],
-            );
-
-            let receipt = TaskReceipt {
-                job_id: job_id.clone(),
-                attempt_id: attempt_id.clone(),
-                capability_id: capability_id.to_string(),
-                manifest_revision: manifest.manifest_revision,
-                execution_status: "BLOCKED".to_string(),
-                agent_session_state: "Unsupported".to_string(),
-                business_outcome: BusinessOutcome::Interrupted,
-                executor: ExecutorInfo {
-                    executor_type: "antigravity-agentapi".to_string(),
-                    version: "2.11.0".to_string(),
-                    conversation_id: None,
-                },
-                submission: SubmissionInfo {
-                    status: "RejectedPreflight".to_string(),
-                    exit_code: None,
-                },
-                script: ScriptInfo { exit_code: None },
-                timestamps: TimestampsInfo {
+        // 7. Executor preflight check
+        match executor.preflight_check() {
+            Ok(meta) => {
+                executor_info.version = meta.version;
+            }
+            Err(ExecutorError::Unsupported(msg)) => {
+                event_logger.log(
+                    "preflight",
+                    "adapter_unsupported",
+                    "system",
+                    serde_json::json!({"error": &msg}),
+                );
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
                     started_at,
-                    finished_at: Utc::now(),
-                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                },
-                artifacts: vec![],
-                logs: LogSummary {
-                    events_path: attempt_dir
-                        .join("events.jsonl")
-                        .to_string_lossy()
-                        .to_string(),
-                    stdout_path: attempt_dir.join("stdout.log").to_string_lossy().to_string(),
-                    stderr_path: attempt_dir.join("stderr.log").to_string_lossy().to_string(),
-                    stdout_snippet: "".to_string(),
-                    stderr_snippet: "".to_string(),
-                    dropped_lines_count: 0,
-                    log_truncated: false,
-                },
-                verification: None,
-                error: Some(ReceiptError {
-                    stage: "preflight".to_string(),
-                    code: "ADAPTER_UNSUPPORTED".to_string(),
-                    message: err_msg.clone(),
-                }),
-            };
-
-            let receipt_path = attempt_dir.join("receipt.json");
-            receipt.persist_to_file(&receipt_path)?;
-            return Ok(receipt);
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "preflight".to_string(),
+                        code: "ADAPTER_UNSUPPORTED".to_string(),
+                        message: msg,
+                        executor: executor_info,
+                    },
+                );
+            }
+            Err(ExecutorError::NeedsUserAction {
+                message,
+                action_required,
+            }) => {
+                let full_msg = format!("{} Action required: {}", message, action_required);
+                event_logger.log(
+                    "preflight",
+                    "needs_user_action",
+                    "system",
+                    serde_json::json!({"error": &full_msg}),
+                );
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "preflight".to_string(),
+                        code: "NEEDS_USER_ACTION".to_string(),
+                        message: full_msg,
+                        executor: executor_info,
+                    },
+                );
+            }
+            Err(e) => {
+                let err_msg = format!("Executor preflight failed: {}", e);
+                event_logger.log(
+                    "preflight",
+                    "preflight_failed",
+                    "system",
+                    serde_json::json!({"error": &err_msg}),
+                );
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "preflight".to_string(),
+                        code: "PREFLIGHT_FAILED".to_string(),
+                        message: err_msg,
+                        executor: executor_info,
+                    },
+                );
+            }
         }
 
-        // 5. Doctor evaluation
-        stdout_logger.log_line(&format!(
-            "Running doctor checks for capability '{}'...",
-            capability_id
-        ));
-        let doctor_report = run_doctor(&cap_dir).await.map_err(|e| {
-            let msg = format!("Doctor script error: {}", e);
-            event_logger.log(
-                "doctor",
-                "doctor_failed",
-                "doctor",
-                serde_json::json!({"error": &msg}),
-            );
-            RunnerError::EnvironmentBlocked(msg)
-        })?;
+        // 8. Doctor evaluation
+        stdout_logger.log_line_with_source(
+            LogSource::Doctor,
+            &format!(
+                "Running doctor checks for capability '{}'...",
+                capability_id
+            ),
+        );
+        let doctor_report = match run_doctor(&cap_dir).await {
+            Ok(rep) => rep,
+            Err(e) => {
+                let msg = format!("Doctor script error: {}", e);
+                event_logger.log(
+                    "doctor",
+                    "doctor_failed",
+                    "doctor",
+                    serde_json::json!({"error": &msg}),
+                );
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "DOCTOR_FAILED".to_string(),
+                        message: msg,
+                        executor: executor_info,
+                    },
+                );
+            }
+        };
 
         event_logger.log(
             "doctor",
@@ -270,45 +631,73 @@ impl Runner {
             if self.config.auto_setup {
                 let _ =
                     status_tracker.update_stage(JobStage::Setup, None, log_paths.clone(), vec![]);
-                stdout_logger.log_line("Environment needs setup. Running capability setup...");
+                stdout_logger.log_line_with_source(
+                    LogSource::Setup,
+                    "Environment needs setup. Running capability setup...",
+                );
                 event_logger.log("setup", "setup_started", "setup", serde_json::json!({}));
 
-                run_setup(&cap_dir, self.config.setup_timeout_secs)
-                    .await
-                    .map_err(|e| {
-                        let msg = format!("Setup failed: {}", e);
-                        event_logger.log(
-                            "setup",
-                            "setup_failed",
-                            "setup",
-                            serde_json::json!({"error": &msg}),
-                        );
-                        let _ = status_tracker.update_stage(
-                            JobStage::Failed,
-                            Some(msg.clone()),
-                            log_paths.clone(),
-                            vec![],
-                        );
-                        RunnerError::SetupFailed(e)
-                    })?;
+                if let Err(e) = run_setup(&cap_dir, self.config.setup_timeout_secs).await {
+                    let msg = format!("Setup failed: {}", e);
+                    event_logger.log(
+                        "setup",
+                        "setup_failed",
+                        "setup",
+                        serde_json::json!({"error": &msg}),
+                    );
+                    let params = FinalizeParams {
+                        job_id: &job_id,
+                        attempt_id: &attempt_id,
+                        capability_id,
+                        manifest_revision: manifest.manifest_revision,
+                        started_at,
+                        attempt_dir: &attempt_dir,
+                        status_tracker: &status_tracker,
+                        event_logger: &event_logger,
+                        stdout_logger: &stdout_logger,
+                        stderr_logger: &stderr_logger,
+                        log_paths,
+                    };
+                    return self.finalize_attempt(
+                        params,
+                        AttemptOutcome::Blocked {
+                            stage: "setup".to_string(),
+                            code: "SETUP_FAILED".to_string(),
+                            message: msg,
+                            executor: executor_info,
+                        },
+                    );
+                }
 
                 event_logger.log("setup", "setup_completed", "setup", serde_json::json!({}));
-                stdout_logger.log_line("Capability setup completed successfully.");
+                stdout_logger.log_line_with_source(
+                    LogSource::Setup,
+                    "Capability setup completed successfully.",
+                );
             } else {
                 let msg = "Capability requires setup but auto_setup is disabled.".to_string();
-                event_logger.log(
-                    "doctor",
-                    "setup_required",
-                    "doctor",
-                    serde_json::json!({"actions": doctor_report.actions}),
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "SETUP_REQUIRED".to_string(),
+                        message: msg,
+                        executor: executor_info,
+                    },
                 );
-                let _ = status_tracker.update_stage(
-                    JobStage::Failed,
-                    Some(msg.clone()),
-                    log_paths.clone(),
-                    vec![],
-                );
-                return Err(RunnerError::EnvironmentBlocked(msg));
             }
         } else if doctor_report.status != DoctorStatus::Ready {
             let msg = format!(
@@ -316,168 +705,174 @@ impl Runner {
                 doctor_report.status, doctor_report.actions
             );
             event_logger.log("doctor", "environment_blocked", "doctor", serde_json::json!({"status": format!("{:?}", doctor_report.status), "actions": doctor_report.actions}));
-            let _ = status_tracker.update_stage(
-                JobStage::Failed,
-                Some(msg.clone()),
-                log_paths.clone(),
-                vec![],
+            let params = FinalizeParams {
+                job_id: &job_id,
+                attempt_id: &attempt_id,
+                capability_id,
+                manifest_revision: manifest.manifest_revision,
+                started_at,
+                attempt_dir: &attempt_dir,
+                status_tracker: &status_tracker,
+                event_logger: &event_logger,
+                stdout_logger: &stdout_logger,
+                stderr_logger: &stderr_logger,
+                log_paths,
+            };
+            return self.finalize_attempt(
+                params,
+                AttemptOutcome::Blocked {
+                    stage: "doctor".to_string(),
+                    code: "ENVIRONMENT_BLOCKED".to_string(),
+                    message: msg,
+                    executor: executor_info,
+                },
             );
-            return Err(RunnerError::EnvironmentBlocked(msg));
         }
 
-        // 6. Submission & Execution
+        // 9. Launch process via adapter
         let _ = status_tracker.update_stage(JobStage::Submission, None, log_paths.clone(), vec![]);
         event_logger.log(
             "submission",
             "launching_process",
             "launcher",
             serde_json::json!({
-                "executable": self.config.agent_executable.to_string_lossy(),
+                "executor": executor_info.executor_type,
             }),
         );
 
         let run_script = cap_dir.join("run");
-        let mut child = Command::new(&self.config.agent_executable)
-            .arg("--input")
-            .arg(&input_json_path)
-            .arg("--output-dir")
-            .arg(&attempt_dir)
-            .arg("--run-script")
-            .arg(&run_script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
-
-        // Spawn async reader tasks for stdout & stderr (draining pipes continuously to avoid deadlock)
-        let stdout_handle = {
-            let logger = stdout_logger;
-            tokio::spawn(async move {
-                if let Some(stream) = child_stdout {
-                    logger.drain_stream(stream).await;
-                }
-            })
+        let request = ExecutionRequest {
+            job_id: &job_id,
+            attempt_id: &attempt_id,
+            capability_id,
+            attempt_dir: &attempt_dir,
+            input_json_path: &input_json_path,
+            run_script_path: &run_script,
+            model: self.config.agent_model.as_deref(),
         };
 
-        let stderr_handle = {
-            let logger = stderr_logger;
-            tokio::spawn(async move {
-                if let Some(stream) = child_stderr {
-                    logger.drain_stream(stream).await;
-                }
-            })
-        };
-
-        // Wait for submission launcher
-        let submission_res = tokio::time::timeout(
-            Duration::from_secs(self.config.submission_timeout_secs),
-            child.wait(),
-        )
-        .await;
-
-        let submission_exit_code = match submission_res {
-            Ok(Ok(status)) => status.code().unwrap_or(0),
-            Ok(Err(_)) => -1,
-            Err(_) => {
-                let _ = child.kill().await;
-                -2 // Timeout
+        let mut process = match executor.spawn_execution(&request) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("Failed to spawn process: {}", e);
+                event_logger.log(
+                    "submission",
+                    "spawn_failed",
+                    "launcher",
+                    serde_json::json!({"error": &msg}),
+                );
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Failed {
+                        stage: "submission".to_string(),
+                        code: "SPAWN_FAILED".to_string(),
+                        message: msg,
+                        business_outcome: BusinessOutcome::NotStarted,
+                        executor: executor_info,
+                        submission: SubmissionInfo {
+                            status: "SpawnFailed".to_string(),
+                            exit_code: None,
+                        },
+                        script: ScriptInfo { exit_code: None },
+                        artifacts: vec![],
+                        verification: None,
+                    },
+                );
             }
         };
 
-        event_logger.log(
-            "submission",
-            "launcher_exited",
-            "launcher",
-            serde_json::json!({ "exit_code": submission_exit_code }),
-        );
+        let child_stdout = process.take_stdout();
+        let child_stderr = process.take_stderr();
+
+        let stdout_logger_clone = stdout_logger.clone();
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(stream) = child_stdout {
+                stdout_logger_clone.drain_stream(stream).await;
+            }
+        });
+
+        let stderr_logger_clone = stderr_logger.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(stream) = child_stderr {
+                stderr_logger_clone.drain_stream(stream).await;
+            }
+        });
 
         let _ = status_tracker.update_stage(JobStage::Execution, None, log_paths.clone(), vec![]);
 
-        // 7. Wait/poll for completion.json up to execution_timeout_secs
-        let completion_path = attempt_dir.join("completion.json");
-        let start_exec_wait = Utc::now();
+        // 10. Monotonic execution wait with process group lifecycle
         let timeout_duration = Duration::from_secs(self.config.execution_timeout_secs);
-        let mut completed = false;
+        let wait_res = tokio::time::timeout(timeout_duration, process.wait()).await;
 
-        while Utc::now() - start_exec_wait < chrono::Duration::from_std(timeout_duration).unwrap() {
-            if completion_path.exists() {
-                completed = true;
-                break;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
+        let exit_code = match wait_res {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                // Timeout! Send SIGTERM to process group, wait grace period, then SIGKILL
+                let _ = process.kill_group();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = process.force_kill_group();
 
-        let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
+                // Bounded pipe drain (max 2 seconds)
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let _ = tokio::join!(stdout_handle, stderr_handle);
+                })
+                .await;
 
-        if !completed {
-            let msg = format!(
-                "Execution timed out after {} seconds waiting for completion.json",
-                self.config.execution_timeout_secs
-            );
-            event_logger.log(
-                "execution",
-                "timeout",
-                "system",
-                serde_json::json!({"error": &msg}),
-            );
-            let _ = status_tracker.update_stage(
-                JobStage::Failed,
-                Some(msg.clone()),
-                log_paths.clone(),
-                vec![],
-            );
-
-            let receipt = TaskReceipt {
-                job_id: job_id.clone(),
-                attempt_id: attempt_id.clone(),
-                capability_id: capability_id.to_string(),
-                manifest_revision: manifest.manifest_revision,
-                execution_status: "FAILED".to_string(),
-                agent_session_state: "TimeoutBackgroundActive".to_string(),
-                business_outcome: BusinessOutcome::Interrupted,
-                executor: ExecutorInfo {
-                    executor_type: "mock-stub".to_string(),
-                    version: "0.1.0".to_string(),
-                    conversation_id: None,
-                },
-                submission: SubmissionInfo {
-                    status: "Submitted".to_string(),
-                    exit_code: Some(submission_exit_code),
-                },
-                script: ScriptInfo { exit_code: None },
-                timestamps: TimestampsInfo {
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
+                    manifest_revision: manifest.manifest_revision,
                     started_at,
-                    finished_at: Utc::now(),
-                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                },
-                artifacts: vec![],
-                logs: LogSummary {
-                    events_path: attempt_dir
-                        .join("events.jsonl")
-                        .to_string_lossy()
-                        .to_string(),
-                    stdout_path: attempt_dir.join("stdout.log").to_string_lossy().to_string(),
-                    stderr_path: attempt_dir.join("stderr.log").to_string_lossy().to_string(),
-                    stdout_snippet: "".to_string(),
-                    stderr_snippet: "".to_string(),
-                    dropped_lines_count: 0,
-                    log_truncated: false,
-                },
-                verification: None,
-                error: Some(ReceiptError {
-                    stage: "execution".to_string(),
-                    code: "TIMEOUT".to_string(),
-                    message: msg,
-                }),
-            };
-            receipt.persist_to_file(&attempt_dir.join("receipt.json"))?;
-            return Ok(receipt);
-        }
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Timeout {
+                        duration_secs: self.config.execution_timeout_secs,
+                        executor: executor_info,
+                        submission: SubmissionInfo {
+                            status: "TimedOut".to_string(),
+                            exit_code: None,
+                        },
+                    },
+                );
+            }
+        };
 
-        // 8. Verification
+        // Bounded pipe drain for normal termination (max 2 seconds)
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = tokio::join!(stdout_handle, stderr_handle);
+        })
+        .await;
+
+        event_logger.log(
+            "execution",
+            "process_exited",
+            "launcher",
+            serde_json::json!({ "exit_code": exit_code }),
+        );
+
+        // 11. Verification
         let _ =
             status_tracker.update_stage(JobStage::Verification, None, log_paths.clone(), vec![]);
         event_logger.log(
@@ -487,13 +882,15 @@ impl Runner {
             serde_json::json!({}),
         );
 
-        let (completion_report, raw_resolved, business_outcome) = match Verifier::verify_completion(
+        let completion_res = Verifier::verify_completion(
             &attempt_dir,
             &job_id,
             &attempt_id,
             url,
             &manifest.output_schema,
-        ) {
+        );
+
+        let (completion_report, raw_resolved, business_outcome) = match completion_res {
             Ok(res) => res,
             Err(e) => {
                 let msg = format!("Verification failed: {}", e);
@@ -503,64 +900,40 @@ impl Runner {
                     "verifier",
                     serde_json::json!({"error": &msg}),
                 );
-                let _ = status_tracker.update_stage(
-                    JobStage::Failed,
-                    Some(msg.clone()),
-                    log_paths.clone(),
-                    vec![],
-                );
-
-                let receipt = TaskReceipt {
-                    job_id: job_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    capability_id: capability_id.to_string(),
+                let params = FinalizeParams {
+                    job_id: &job_id,
+                    attempt_id: &attempt_id,
+                    capability_id,
                     manifest_revision: manifest.manifest_revision,
-                    execution_status: "FAILED".to_string(),
-                    agent_session_state: "Completed".to_string(),
-                    business_outcome: BusinessOutcome::VerificationFailed,
-                    executor: ExecutorInfo {
-                        executor_type: "mock-stub".to_string(),
-                        version: "0.1.0".to_string(),
-                        conversation_id: None,
-                    },
-                    submission: SubmissionInfo {
-                        status: "Submitted".to_string(),
-                        exit_code: Some(submission_exit_code),
-                    },
-                    script: ScriptInfo { exit_code: None },
-                    timestamps: TimestampsInfo {
-                        started_at,
-                        finished_at: Utc::now(),
-                        duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                    },
-                    artifacts: vec![],
-                    logs: LogSummary {
-                        events_path: attempt_dir
-                            .join("events.jsonl")
-                            .to_string_lossy()
-                            .to_string(),
-                        stdout_path: attempt_dir.join("stdout.log").to_string_lossy().to_string(),
-                        stderr_path: attempt_dir.join("stderr.log").to_string_lossy().to_string(),
-                        stdout_snippet: "".to_string(),
-                        stderr_snippet: "".to_string(),
-                        dropped_lines_count: 0,
-                        log_truncated: false,
-                    },
-                    verification: None,
-                    error: Some(ReceiptError {
+                    started_at,
+                    attempt_dir: &attempt_dir,
+                    status_tracker: &status_tracker,
+                    event_logger: &event_logger,
+                    stdout_logger: &stdout_logger,
+                    stderr_logger: &stderr_logger,
+                    log_paths,
+                };
+                return self.finalize_attempt(
+                    params,
+                    AttemptOutcome::Failed {
                         stage: "verification".to_string(),
                         code: "VERIFICATION_FAILED".to_string(),
                         message: msg,
-                    }),
-                };
-                receipt.persist_to_file(&attempt_dir.join("receipt.json"))?;
-                return Ok(receipt);
+                        business_outcome: BusinessOutcome::VerificationFailed,
+                        executor: executor_info,
+                        submission: SubmissionInfo {
+                            status: "Submitted".to_string(),
+                            exit_code,
+                        },
+                        script: ScriptInfo { exit_code },
+                        artifacts: vec![],
+                        verification: None,
+                    },
+                );
             }
         };
 
-        // 9. Build final TaskReceipt
         let mut artifacts = vec![];
-        let mut artifact_paths = vec![];
         if let Some(art) = &completion_report.artifact {
             let art_path = attempt_dir.join(&art.file_name);
             artifacts.push(ArtifactRef {
@@ -569,20 +942,7 @@ impl Runner {
                 size_bytes: art.size_bytes,
                 sha256: art.sha256.clone(),
             });
-            artifact_paths.push(art_path.to_string_lossy().to_string());
         }
-
-        let exec_status = if business_outcome == BusinessOutcome::ExtractionFailed {
-            "FAILED".to_string()
-        } else {
-            "COMPLETED".to_string()
-        };
-
-        let receipt_err = completion_report.error.map(|e| ReceiptError {
-            stage: e.stage,
-            code: e.code,
-            message: e.message,
-        });
 
         let verification_summary = raw_resolved.map(|r| VerificationSummary {
             valid: true,
@@ -592,68 +952,72 @@ impl Runner {
             transcript_status: r.transcript_status,
         });
 
-        let receipt = TaskReceipt {
-            job_id: job_id.clone(),
-            attempt_id: attempt_id.clone(),
-            capability_id: capability_id.to_string(),
+        let params = FinalizeParams {
+            job_id: &job_id,
+            attempt_id: &attempt_id,
+            capability_id,
             manifest_revision: manifest.manifest_revision,
-            execution_status: exec_status.clone(),
-            agent_session_state: "Completed".to_string(),
-            business_outcome,
-            executor: ExecutorInfo {
-                executor_type: "mock-stub".to_string(),
-                version: "0.1.0".to_string(),
-                conversation_id: None,
-            },
-            submission: SubmissionInfo {
-                status: "Submitted".to_string(),
-                exit_code: Some(submission_exit_code),
-            },
-            script: ScriptInfo {
-                exit_code: Some(completion_report.script_exit_code),
-            },
-            timestamps: TimestampsInfo {
-                started_at,
-                finished_at: Utc::now(),
-                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-            },
-            artifacts,
-            logs: LogSummary {
-                events_path: attempt_dir
-                    .join("events.jsonl")
-                    .to_string_lossy()
-                    .to_string(),
-                stdout_path: attempt_dir.join("stdout.log").to_string_lossy().to_string(),
-                stderr_path: attempt_dir.join("stderr.log").to_string_lossy().to_string(),
-                stdout_snippet: "".to_string(),
-                stderr_snippet: "".to_string(),
-                dropped_lines_count: 0,
-                log_truncated: false,
-            },
-            verification: verification_summary,
-            error: receipt_err,
+            started_at,
+            attempt_dir: &attempt_dir,
+            status_tracker: &status_tracker,
+            event_logger: &event_logger,
+            stdout_logger: &stdout_logger,
+            stderr_logger: &stderr_logger,
+            log_paths,
         };
 
-        let receipt_path = attempt_dir.join("receipt.json");
-        receipt.persist_to_file(&receipt_path)?;
+        if business_outcome == BusinessOutcome::ExtractionFailed {
+            let (code, err_msg) = if let Some(ref err) = completion_report.error {
+                (err.code.clone(), err.message.clone())
+            } else {
+                (
+                    "EXTRACTION_FAILED".to_string(),
+                    "Capability script failed during extraction".to_string(),
+                )
+            };
 
-        let final_stage = if exec_status == "COMPLETED" {
-            JobStage::Completed
+            self.finalize_attempt(
+                params,
+                AttemptOutcome::Failed {
+                    stage: "execution".to_string(),
+                    code,
+                    message: err_msg,
+                    business_outcome,
+                    executor: executor_info,
+                    submission: SubmissionInfo {
+                        status: "Submitted".to_string(),
+                        exit_code,
+                    },
+                    script: ScriptInfo {
+                        exit_code: Some(completion_report.script_exit_code),
+                    },
+                    artifacts,
+                    verification: verification_summary,
+                },
+            )
         } else {
-            JobStage::Failed
-        };
-
-        let _ = status_tracker.update_stage(final_stage, None, log_paths, artifact_paths);
-        event_logger.log(
-            "completion",
-            "receipt_finalized",
-            "receipt",
-            serde_json::json!({
-                "status": exec_status,
-                "outcome": format!("{:?}", business_outcome),
-            }),
-        );
-
-        Ok(receipt)
+            self.finalize_attempt(
+                params,
+                AttemptOutcome::Success {
+                    executor: executor_info,
+                    submission: SubmissionInfo {
+                        status: "Submitted".to_string(),
+                        exit_code,
+                    },
+                    script: ScriptInfo {
+                        exit_code: Some(completion_report.script_exit_code),
+                    },
+                    artifacts,
+                    verification: verification_summary.unwrap_or(VerificationSummary {
+                        valid: true,
+                        url_matched: true,
+                        schema_conforming: true,
+                        artifact_fresh: true,
+                        transcript_status: "unknown".to_string(),
+                    }),
+                    business_outcome,
+                },
+            )
+        }
     }
 }

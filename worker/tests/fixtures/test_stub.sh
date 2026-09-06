@@ -147,6 +147,7 @@ if [[ "$MODE" == "half_write" ]]; then
     echo "=== Test Stub Simulating Half Written File (No completion.json) ==="
     ATTEMPT_ID=$(python3 -c "import json, sys; d=json.load(open(sys.argv[1])); print(d.get('attempt_id'))" "$INPUT_FILE")
     echo '{"partial": true' > "$OUTPUT_DIR/.${ATTEMPT_ID}_result.json.tmp"
+    sleep 30
     exit 0
 fi
 

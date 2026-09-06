@@ -173,6 +173,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonschema",
+ "libc",
  "regex",
  "serde",
  "serde_json",

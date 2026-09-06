@@ -20,6 +20,7 @@ async fn test_adapter_unsupported_preflight_rejection() {
     config.workspace_dir = dir.path().join("workspace");
     // Explicitly set agent_executable to agentapi
     config.agent_executable = PathBuf::from("/home/sentimentalk/.gemini/antigravity/bin/agentapi");
+    config.executor_type = ceo_worker::config::ExecutorType::Agentapi;
     config.execution_timeout_secs = 5;
 
     let runner = Runner::new(config, None);
@@ -33,8 +34,8 @@ async fn test_adapter_unsupported_preflight_rejection() {
         .unwrap();
 
     assert_eq!(receipt.execution_status, "BLOCKED");
-    assert_eq!(receipt.agent_session_state, "Unsupported");
-    assert_eq!(receipt.business_outcome, BusinessOutcome::Interrupted);
+    assert_eq!(receipt.agent_session_state, "NotStarted");
+    assert_eq!(receipt.business_outcome, BusinessOutcome::NotStarted);
     let err = receipt.error.unwrap();
     assert_eq!(err.code, "ADAPTER_UNSUPPORTED");
     assert!(err.message.contains("lacks workspace binding"));
@@ -46,6 +47,7 @@ async fn test_duplicate_job_id_rejection() {
     let mut config = WorkerConfig::default();
     config.workspace_dir = dir.path().join("workspace");
     config.agent_executable = get_test_stub_path("test_stub.sh");
+    config.executor_type = ceo_worker::config::ExecutorType::TestStub;
     config.execution_timeout_secs = 5;
 
     let runner = Runner::new(config, None);
@@ -79,6 +81,7 @@ async fn test_normal_execution_with_test_stub() {
     let mut config = WorkerConfig::default();
     config.workspace_dir = dir.path().join("workspace");
     config.agent_executable = get_test_stub_path("test_stub.sh");
+    config.executor_type = ceo_worker::config::ExecutorType::TestStub;
     config.execution_timeout_secs = 5;
 
     let runner = Runner::new(config, None);
@@ -110,6 +113,7 @@ async fn test_script_failure_with_completion_report() {
     let mut config = WorkerConfig::default();
     config.workspace_dir = dir.path().join("workspace");
     config.agent_executable = get_test_stub_path("test_stub_fail.sh");
+    config.executor_type = ceo_worker::config::ExecutorType::TestStub;
     config.execution_timeout_secs = 5;
 
     let runner = Runner::new(config, None);
@@ -136,6 +140,7 @@ async fn test_half_write_file_timeout_protection() {
     let mut config = WorkerConfig::default();
     config.workspace_dir = dir.path().join("workspace");
     config.agent_executable = get_test_stub_path("test_stub_half_write.sh");
+    config.executor_type = ceo_worker::config::ExecutorType::TestStub;
     config.execution_timeout_secs = 2; // short timeout for testing
 
     let runner = Runner::new(config, None);
@@ -149,7 +154,7 @@ async fn test_half_write_file_timeout_protection() {
         .unwrap();
 
     assert_eq!(receipt.execution_status, "FAILED");
-    assert_eq!(receipt.agent_session_state, "TimeoutBackgroundActive");
+    assert_eq!(receipt.agent_session_state, "TimedOut");
     assert_eq!(receipt.business_outcome, BusinessOutcome::Interrupted);
     let err = receipt.error.unwrap();
     assert_eq!(err.code, "TIMEOUT");

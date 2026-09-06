@@ -16,6 +16,8 @@ pub enum JobStage {
     Verification,
     Completed,
     Failed,
+    Blocked,
+    Cancelled,
     UnknownInterrupted,
 }
 
@@ -29,6 +31,8 @@ impl std::fmt::Display for JobStage {
             JobStage::Verification => write!(f, "Verification"),
             JobStage::Completed => write!(f, "Completed"),
             JobStage::Failed => write!(f, "Failed"),
+            JobStage::Blocked => write!(f, "Blocked"),
+            JobStage::Cancelled => write!(f, "Cancelled"),
             JobStage::UnknownInterrupted => write!(f, "UnknownInterrupted"),
         }
     }
@@ -134,7 +138,11 @@ impl StatusTracker {
         // check if the runner process is actually still running and matches start time.
         if !matches!(
             report.stage,
-            JobStage::Completed | JobStage::Failed | JobStage::UnknownInterrupted
+            JobStage::Completed
+                | JobStage::Failed
+                | JobStage::Blocked
+                | JobStage::Cancelled
+                | JobStage::UnknownInterrupted
         ) {
             let is_alive = check_process_alive(report.runner_pid, report.runner_start_time);
             if !is_alive {

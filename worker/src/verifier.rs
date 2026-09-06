@@ -95,6 +95,7 @@ pub enum BusinessOutcome {
     ExtractionFailed,
     VerificationFailed,
     Interrupted,
+    NotStarted,
 }
 
 impl BusinessOutcome {
@@ -106,6 +107,7 @@ impl BusinessOutcome {
             BusinessOutcome::ExtractionFailed => "提取执行失败",
             BusinessOutcome::VerificationFailed => "产物校验失败",
             BusinessOutcome::Interrupted => "任务中断或未完成",
+            BusinessOutcome::NotStarted => "任务未开始",
         }
     }
 }
