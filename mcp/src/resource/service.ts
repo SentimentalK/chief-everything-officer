@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import {
   type ChangeOperation,
   type CeoWorkspace,
@@ -10,6 +10,9 @@ import type { Config } from "../config.js";
 import { CeoError } from "../errors.js";
 import { resolveRef } from "../git.js";
 import type {
+  MetadataAttemptRecord,
+  MetadataAttemptStatus,
+  NamingSource,
   ResourceApplyInput,
   ResourceApplyOperation,
   ResourceCaptureInput,
@@ -38,11 +41,13 @@ import {
   type ResourceLocation,
   findResourceByHash,
   findResourceByIdentity,
+  findResourceByUrlOrIdentities,
   resolveResourceLocation,
 } from "./locator.js";
 import {
   MAX_DISPLAY_NAME_CHARS,
   allocateUniqueDirectoryName,
+  cleanDisplayName,
   determineInitialDisplayName,
   toSafeDirectoryName,
 } from "./naming.js";
@@ -57,6 +62,52 @@ import {
   derivePreferredIdentity,
 } from "./resolver-mapping.js";
 import type { ContentMetadataV1 } from "./resolver-contract.js";
+
+export interface ResourceExecutionContext {
+  location: ResourceLocation;
+  getResDir(): string;
+  getMetaPath(): string;
+}
+
+export async function applyResourceRename(
+  worktree: string,
+  ctx: ResourceExecutionContext,
+  meta: ResourceMeta,
+  newDisplayName: string,
+  namingSource: NamingSource,
+): Promise<{ renamed: boolean; old_path: string; new_path: string }> {
+  const trimmed = cleanDisplayName(newDisplayName);
+  if (!trimmed) {
+    throw new CeoError("VALIDATION_FAILED", "display_name cannot be empty.");
+  }
+  const resourcesRoot = path.join(worktree, "resources");
+  const allocatedDir = await allocateUniqueDirectoryName(
+    resourcesRoot,
+    trimmed,
+    ctx.location.directory_name,
+  );
+
+  const oldRelative = ctx.location.relative_path;
+  const newRelative = path.posix.join("resources", allocatedDir);
+
+  if (allocatedDir === ctx.location.directory_name) {
+    meta.display_name = trimmed;
+    meta.naming_source = namingSource;
+    return { renamed: false, old_path: oldRelative, new_path: newRelative };
+  }
+
+  const oldAbsolute = ctx.getResDir();
+  const newAbsolute = path.join(resourcesRoot, allocatedDir);
+  await rename(oldAbsolute, newAbsolute);
+
+  ctx.location.directory_name = allocatedDir;
+  ctx.location.relative_path = newRelative;
+
+  meta.display_name = trimmed;
+  meta.naming_source = namingSource;
+
+  return { renamed: true, old_path: oldRelative, new_path: newRelative };
+}
 
 export class ResourceService {
   private readonly resolverClient: UrlMetadataResolver;
@@ -101,6 +152,7 @@ export class ResourceService {
     let sourceHash: string | null = null;
     let sourceAssetBuffer: Buffer | null = null;
     let sourceAssetExt: string | null = null;
+    let currentAttemptRecord: MetadataAttemptRecord | null = null;
     let enrichmentReceipt: Record<string, unknown> = { status: "disabled" };
     let metadataSeed: ResolvedMetadataSeed | null = null;
     let resolvedMetadata: ContentMetadataV1 | null = null;
@@ -112,16 +164,67 @@ export class ResourceService {
       sourceRef = input.source.url;
 
       // Synchronous metadata resolution OUTSIDE atomic Git transaction
-      const outcome = await this.resolverClient.resolve(input.source.url);
+      const outcome = await this.resolverClient.resolve(input.source.url, requestId);
+
+      let enrichmentStatus: MetadataAttemptStatus = outcome.status;
+      let enrichmentCode: string | null = null;
+      let fieldsResolved: string[] = [];
+      let strategy: string | null = null;
+      let httpStatus: number | null = null;
+
       if (outcome.status === "resolved") {
         resolvedMetadata = outcome.metadata;
-        enrichmentReceipt = { status: "resolved" };
-      } else if (outcome.status === "unsupported") {
-        enrichmentReceipt = { status: "unsupported", code: outcome.code };
+        fieldsResolved = outcome.fields_resolved ?? [];
+        strategy = outcome.diagnostics?.strategy ?? null;
+        httpStatus = outcome.diagnostics?.http_status ?? null;
+        enrichmentCode = outcome.diagnostics?.code ?? null;
       } else if (outcome.status === "unavailable") {
-        enrichmentReceipt = { status: "unavailable", code: outcome.code };
+        fieldsResolved = outcome.fields_resolved ?? [];
+        strategy = outcome.diagnostics?.strategy ?? null;
+        httpStatus = outcome.diagnostics?.http_status ?? null;
+        enrichmentCode = outcome.code;
+      } else if (outcome.status === "unsupported") {
+        enrichmentCode = outcome.code;
+      }
+
+      if (outcome.status !== "disabled") {
+        currentAttemptRecord = {
+          attempted_at: outcome.attempted_at ?? new Date().toISOString(),
+          status: enrichmentStatus,
+          code: enrichmentCode,
+          fields_resolved: fieldsResolved,
+          strategy,
+          http_status: httpStatus,
+          request_id: requestId,
+        };
+
+        enrichmentReceipt = {
+          status: currentAttemptRecord.status,
+          code: currentAttemptRecord.code,
+          fields_resolved: currentAttemptRecord.fields_resolved,
+          strategy: currentAttemptRecord.strategy,
+          http_status: currentAttemptRecord.http_status,
+          request_id: currentAttemptRecord.request_id,
+          applied: true,
+        };
       } else {
-        enrichmentReceipt = { status: "disabled" };
+        enrichmentReceipt = {
+          status: "disabled",
+        };
+      }
+
+      // Conflict check: if URL deterministically provided platform_id and resolver returned source_id
+      if (norm.platform_id && resolvedMetadata && resolvedMetadata.source_id) {
+        if (norm.platform_id.toLowerCase() !== resolvedMetadata.source_id.toLowerCase()) {
+          throw new CeoError(
+            "DUPLICATE_RESOURCE",
+            `Provider ID conflict between input URL platform_id '${norm.platform_id}' and resolver source_id '${resolvedMetadata.source_id}'.`,
+            {
+              url_platform_id: norm.platform_id,
+              resolver_source_id: resolvedMetadata.source_id,
+            },
+          );
+        }
       }
 
       preferredIdentity = derivePreferredIdentity(baselineIdentity, resolvedMetadata);
@@ -193,35 +296,31 @@ export class ResourceService {
         let isRevisit = false;
         let meta!: ResourceMeta;
         let location!: ResourceLocation;
+        let ctx!: ResourceExecutionContext;
+        let isStaleAttempt = false;
         let captureHistory: string[] = [];
         let captureNote: string | null = input.note ?? null;
         let hasSemanticChange = false;
 
         // Deduplication
         if (input.source.type === "url" && preferredIdentity && baselineIdentity) {
-          const byPreferred = await findResourceByIdentity(worktree, preferredIdentity);
-          let byBaseline: LocatedResource | null = null;
-          if (preferredIdentity !== baselineIdentity) {
-            byBaseline = await findResourceByIdentity(worktree, baselineIdentity);
-          }
+          const norm = normalizeUrlSource(input.source.url);
+          const existing = await findResourceByUrlOrIdentities(worktree, {
+            preferredIdentity,
+            baselineIdentity,
+            normalizedUrl: norm.canonical_ref,
+          });
 
-          if (byPreferred && byBaseline && byPreferred.meta.resource_id !== byBaseline.meta.resource_id) {
-            throw new CeoError(
-              "DUPLICATE_RESOURCE",
-              "Identity conflict: preferred identity and baseline identity match different resources.",
-              {
-                preferred_resource_id: byPreferred.meta.resource_id,
-                baseline_resource_id: byBaseline.meta.resource_id,
-              },
-            );
-          }
-
-          const existing = byPreferred ?? byBaseline;
           if (existing) {
             isRevisit = true;
-            location = existing.location;
+            location = { ...existing.location };
             resourceId = existing.meta.resource_id;
             meta = existing.meta;
+            ctx = {
+              location,
+              getResDir: () => path.join(worktree, ctx.location.relative_path),
+              getMetaPath: () => path.join(ctx.getResDir(), "meta.md"),
+            };
             captureHistory = [...existing.doc.capture_history];
             captureNote = input.note ?? existing.doc.capture_note;
 
@@ -229,15 +328,6 @@ export class ResourceService {
             if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
               hasSemanticChange = true;
-            }
-
-            // Explicit input.display_name on revisit updates metadata (preserves existing if not provided)
-            if (input.display_name && input.display_name.trim()) {
-              const explicitName = input.display_name.trim();
-              if (explicitName !== meta.display_name) {
-                meta.display_name = explicitName;
-                hasSemanticChange = true;
-              }
             }
 
             // Topics union
@@ -250,10 +340,62 @@ export class ResourceService {
               }
             }
 
-            // Resolver revisit update (non-erasure, never alters display_name)
-            const metadataChanged = applyResolverRevisitUpdates(meta, resolvedMetadata);
-            if (metadataChanged) {
-              hasSemanticChange = true;
+            // Check stale attempt
+            if (
+              meta.last_metadata_attempt &&
+              currentAttemptRecord &&
+              meta.last_metadata_attempt.attempted_at >= currentAttemptRecord.attempted_at
+            ) {
+              isStaleAttempt = true;
+            }
+
+            if (!isStaleAttempt && currentAttemptRecord) {
+              // Update aliases
+              const aliasSet = new Set(meta.source_aliases || []);
+              let aliasChanged = false;
+              if (preferredIdentity && preferredIdentity !== meta.source_identity && !aliasSet.has(preferredIdentity)) {
+                aliasSet.add(preferredIdentity);
+                aliasChanged = true;
+              }
+              if (baselineIdentity && baselineIdentity !== meta.source_identity && !aliasSet.has(baselineIdentity)) {
+                aliasSet.add(baselineIdentity);
+                aliasChanged = true;
+              }
+              if (aliasChanged) {
+                meta.source_aliases = Array.from(aliasSet);
+                hasSemanticChange = true;
+              }
+
+              // Apply metadata updates
+              const metadataChanged = applyResolverRevisitUpdates(meta, resolvedMetadata);
+              if (metadataChanged) {
+                hasSemanticChange = true;
+              }
+
+              const attemptStatusChanged =
+                !meta.last_metadata_attempt ||
+                meta.last_metadata_attempt.status !== currentAttemptRecord.status ||
+                meta.last_metadata_attempt.code !== currentAttemptRecord.code;
+
+              if (metadataChanged || attemptStatusChanged || aliasChanged) {
+                meta.last_metadata_attempt = { ...currentAttemptRecord };
+                hasSemanticChange = true;
+              }
+
+              // Naming on revisit
+              if (input.display_name && input.display_name.trim()) {
+                await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
+                hasSemanticChange = true;
+              } else if (meta.naming_source === "fallback" && resolvedMetadata?.title && resolvedMetadata.title.trim()) {
+                await applyResourceRename(worktree, ctx, meta, resolvedMetadata.title, "title");
+                hasSemanticChange = true;
+              }
+            } else {
+              // Stale attempt: only apply explicit display_name if provided
+              if (input.display_name && input.display_name.trim()) {
+                await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
+                hasSemanticChange = true;
+              }
             }
           } else {
             resourceId = generateResourceId();
@@ -263,9 +405,14 @@ export class ResourceService {
           const existing = await findResourceByIdentity(worktree, preferredIdentity);
           if (existing) {
             isRevisit = true;
-            location = existing.location;
+            location = { ...existing.location };
             resourceId = existing.meta.resource_id;
             meta = existing.meta;
+            ctx = {
+              location,
+              getResDir: () => path.join(worktree, ctx.location.relative_path),
+              getMetaPath: () => path.join(ctx.getResDir(), "meta.md"),
+            };
             captureHistory = [...existing.doc.capture_history];
             captureNote = input.note ?? existing.doc.capture_note;
 
@@ -274,13 +421,9 @@ export class ResourceService {
               hasSemanticChange = true;
             }
 
-            // Explicit input.display_name on revisit updates metadata
             if (input.display_name && input.display_name.trim()) {
-              const explicitName = input.display_name.trim();
-              if (explicitName !== meta.display_name) {
-                meta.display_name = explicitName;
-                hasSemanticChange = true;
-              }
+              await applyResourceRename(worktree, ctx, meta, input.display_name, "explicit");
+              hasSemanticChange = true;
             }
 
             if (input.topics && input.topics.length > 0) {
@@ -301,17 +444,26 @@ export class ResourceService {
           hasSemanticChange = true;
         }
 
-        let resDir: string;
-
         if (!isRevisit) {
-          const initialDisplayName = determineInitialDisplayName({
-            inputDisplayName: input.display_name,
-            resolverTitle: metadataSeed ? metadataSeed.title : null,
-            source: input.source,
-            sourceIdentity: preferredIdentity,
-            originalName,
-            canonicalRef,
-          });
+          let initialDisplayName: string;
+          let initialNamingSource: NamingSource;
+          if (input.display_name && input.display_name.trim()) {
+            initialDisplayName = cleanDisplayName(input.display_name);
+            initialNamingSource = "explicit";
+          } else if (resolvedMetadata?.title && resolvedMetadata.title.trim()) {
+            initialDisplayName = cleanDisplayName(resolvedMetadata.title);
+            initialNamingSource = "title";
+          } else {
+            initialDisplayName = determineInitialDisplayName({
+              inputDisplayName: input.display_name,
+              resolverTitle: metadataSeed ? metadataSeed.title : null,
+              source: input.source,
+              sourceIdentity: preferredIdentity,
+              originalName,
+              canonicalRef,
+            });
+            initialNamingSource = "fallback";
+          }
 
           const resourcesRoot = path.join(worktree, "resources");
           await mkdir(resourcesRoot, { recursive: true });
@@ -321,12 +473,32 @@ export class ResourceService {
             directory_name: dirName,
             relative_path: path.posix.join("resources", dirName),
           };
-          resDir = path.join(worktree, location.relative_path);
+          ctx = {
+            location,
+            getResDir: () => path.join(worktree, ctx.location.relative_path),
+            getMetaPath: () => path.join(ctx.getResDir(), "meta.md"),
+          };
+          const resDir = ctx.getResDir();
+          await mkdir(resDir, { recursive: true });
+
+          const initialAttemptRecord: MetadataAttemptRecord | null =
+            input.source.type === "url" && currentAttemptRecord
+              ? { ...currentAttemptRecord }
+              : null;
 
           meta = {
             schema_version: 1,
             resource_id: resourceId,
             display_name: initialDisplayName,
+            naming_source: initialNamingSource,
+            source_aliases:
+              input.source.type === "url" &&
+              preferredIdentity &&
+              baselineIdentity &&
+              preferredIdentity !== baselineIdentity
+                ? [baselineIdentity]
+                : [],
+            last_metadata_attempt: initialAttemptRecord,
             resource_kind: resourceKind,
             source_type: sourceType,
             source_identity: preferredIdentity,
@@ -337,7 +509,10 @@ export class ResourceService {
             original_name: originalName,
             media_type: mediaType,
             format,
-            asset_ref: sourceAssetBuffer && sourceAssetExt ? `source/original${sourceAssetExt}` : null,
+            asset_ref:
+              sourceAssetBuffer && sourceAssetExt
+                ? `source/original${sourceAssetExt}`
+                : null,
             source_hash: sourceHash,
             title: metadataSeed ? metadataSeed.title : null,
             author: metadataSeed ? metadataSeed.author : null,
@@ -345,8 +520,14 @@ export class ResourceService {
             first_captured_at: new Date().toISOString(),
             language: metadataSeed ? metadataSeed.language : null,
             topics: input.topics ? [...input.topics] : [],
-            metadata_method: metadataSeed ? metadataSeed.metadata_method : (input.source.type === "url" ? null : "user_provided"),
-            metadata_fetched_at: metadataSeed ? metadataSeed.metadata_fetched_at : null,
+            metadata_method: metadataSeed
+              ? metadataSeed.metadata_method
+              : input.source.type === "url"
+                ? null
+                : "user_provided",
+            metadata_fetched_at: metadataSeed
+              ? metadataSeed.metadata_fetched_at
+              : null,
             capture_surface: "mcp",
           };
 
@@ -355,28 +536,24 @@ export class ResourceService {
             captureHistory[0] += ` — ${input.note.trim()}`;
           }
 
-          await mkdir(resDir, { recursive: true });
-
           // Save source asset if provided
           if (sourceAssetBuffer && sourceAssetExt) {
             const sourceDir = path.join(resDir, "source");
             await mkdir(sourceDir, { recursive: true });
             await writeFile(path.join(sourceDir, `original${sourceAssetExt}`), sourceAssetBuffer);
           }
-        } else {
-          resDir = path.join(worktree, location.relative_path);
         }
 
         // Apply initial operations if provided
         if (input.initial_operations && input.initial_operations.length > 0) {
-          await this.executeResourceOperations(worktree, location, meta, input.initial_operations);
+          await this.executeResourceOperations(worktree, ctx, meta, input.initial_operations);
           hasSemanticChange = true;
         }
 
         // Write meta.md only if semantic changes exist (or on first capture)
         if (hasSemanticChange) {
           const metaMarkdown = formatMetaMarkdown(meta!, captureNote, captureHistory);
-          await writeFile(path.join(resDir, "meta.md"), metaMarkdown, "utf8");
+          await writeFile(ctx.getMetaPath(), metaMarkdown, "utf8");
         }
 
         // Apply optional state_changes atomically
@@ -386,17 +563,27 @@ export class ResourceService {
         }
 
         // Calculate stage
-        const dirFiles = await readdir(resDir).catch(() => []);
+        const dirFiles = await readdir(ctx.getResDir()).catch(() => []);
         const artifactSet = new Set(dirFiles);
         let interactionsText: string | null = null;
         if (artifactSet.has("interactions.md")) {
-          interactionsText = await readFile(path.join(resDir, "interactions.md"), "utf8").catch(() => null);
+          interactionsText = await readFile(path.join(ctx.getResDir(), "interactions.md"), "utf8").catch(() => null);
         }
         const stage = deriveResourceStage(artifactSet, interactionsText);
+
+        if (enrichmentReceipt.status !== "disabled") {
+          enrichmentReceipt = {
+            ...enrichmentReceipt,
+            applied: !isStaleAttempt,
+            ...(isStaleAttempt ? { skip_reason: "stale_attempt" } : {}),
+          };
+        }
 
         capturedResourceReceipt = {
           resource_id: resourceId,
           display_name: meta.display_name,
+          naming_source: meta.naming_source,
+          relative_path: ctx.location.relative_path,
           is_revisit: isRevisit,
           source_identity: meta.source_identity,
           title: meta.title,
@@ -426,11 +613,23 @@ export class ResourceService {
       assertNoResourceMutations(input.state_changes, "state_changes");
     }
 
+    let initialRelativePath = "";
+    let appliedResourceReceipt: Record<string, unknown> | null = null;
+    let finalCtx: ResourceExecutionContext | null = null;
+
     return await this.workspace.withAtomicWorkspaceTransaction({
       requestId,
       baseCommit: input.base_commit,
       commitMessage: `CEO: ${input.summary.trim()}`,
       allowResourceSourceFiles: true,
+      operationResultProducer: (_changedFiles) => {
+        return {
+          resource: appliedResourceReceipt,
+          renamed: finalCtx ? finalCtx.location.relative_path !== initialRelativePath : false,
+          old_path: initialRelativePath,
+          new_path: finalCtx ? finalCtx.location.relative_path : initialRelativePath,
+        };
+      },
       mutator: async (worktree, worktreeMatcher) => {
         const location = await resolveResourceLocation(worktree, input.resource_id);
         if (!location) {
@@ -439,10 +638,16 @@ export class ResourceService {
           });
         }
 
-        const resDir = path.join(worktree, location.relative_path);
-        const metaPath = path.join(resDir, "meta.md");
+        initialRelativePath = location.relative_path;
 
-        const metaContent = await readFile(metaPath, "utf8").catch(() => null);
+        const ctx: ResourceExecutionContext = {
+          location: { ...location },
+          getResDir: () => path.join(worktree, ctx.location.relative_path),
+          getMetaPath: () => path.join(ctx.getResDir(), "meta.md"),
+        };
+        finalCtx = ctx;
+
+        const metaContent = await readFile(ctx.getMetaPath(), "utf8").catch(() => null);
         if (!metaContent) {
           throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' meta.md not found.`, {
             resource_id: input.resource_id,
@@ -452,39 +657,59 @@ export class ResourceService {
         const doc = parseMetaMarkdown(metaContent);
         const meta = doc.meta;
 
-        await this.executeResourceOperations(worktree, location, meta, input.operations);
+        await this.executeResourceOperations(worktree, ctx, meta, input.operations);
 
         // Update meta.md
         const metaMarkdown = formatMetaMarkdown(meta, doc.capture_note, doc.capture_history);
-        await writeFile(metaPath, metaMarkdown, "utf8");
+        await writeFile(ctx.getMetaPath(), metaMarkdown, "utf8");
 
         // Apply optional state changes
         if (input.state_changes && input.state_changes.length > 0) {
           this.workspace.validateOperations(input.state_changes, worktreeMatcher);
           await this.workspace.applyOperations(worktree, input.base_commit, input.state_changes);
         }
+
+        const dirFiles = await readdir(ctx.getResDir()).catch(() => []);
+        const artifactSet = new Set(dirFiles);
+        let interactionsText: string | null = null;
+        if (artifactSet.has("interactions.md")) {
+          interactionsText = await readFile(path.join(ctx.getResDir(), "interactions.md"), "utf8").catch(() => null);
+        }
+        const stage = deriveResourceStage(artifactSet, interactionsText);
+
+        appliedResourceReceipt = {
+          resource_id: meta.resource_id,
+          display_name: meta.display_name,
+          naming_source: meta.naming_source,
+          relative_path: ctx.location.relative_path,
+          source_identity: meta.source_identity,
+          title: meta.title,
+          platform: meta.platform,
+          resource_kind: meta.resource_kind,
+          stage,
+        };
       },
     });
   }
 
   private async executeResourceOperations(
     worktree: string,
-    location: ResourceLocation,
+    ctx: ResourceExecutionContext,
     meta: ResourceMeta,
     operations: ResourceApplyOperation[],
   ): Promise<void> {
-    const resDir = path.join(worktree, location.relative_path);
-
     for (const op of operations) {
-      if (op.op === "set_display_name") {
-        const trimmed = op.display_name.trim();
+      const resDir = ctx.getResDir();
+
+      if (op.op === "rename") {
+        const trimmed = cleanDisplayName(op.display_name);
         if (!trimmed || Array.from(trimmed).length > MAX_DISPLAY_NAME_CHARS) {
           throw new CeoError(
             "VALIDATION_FAILED",
             `display_name must be between 1 and ${MAX_DISPLAY_NAME_CHARS} characters.`,
           );
         }
-        meta.display_name = trimmed;
+        await applyResourceRename(worktree, ctx, meta, trimmed, "explicit");
       } else if (op.op === "attach_source_asset") {
         const buf = Buffer.from(op.data_base64, "base64");
         const asset = validateSourceAsset(op.filename, op.mime_type, buf);

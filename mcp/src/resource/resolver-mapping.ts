@@ -100,6 +100,12 @@ export function buildResolvedMetadataSeed(
     ? metadata.canonical_url!
     : baseline.canonical_ref;
 
+  const isVideo =
+    baseline.resource_kind === "video" ||
+    validPlatform === "youtube" ||
+    validPlatform === "bilibili" ||
+    (metadata.duration_seconds != null && metadata.duration_seconds > 0 && validPlatform !== "weixin");
+
   return {
     canonical_ref: validCanonicalRef,
     platform: validPlatform,
@@ -110,7 +116,7 @@ export function buildResolvedMetadataSeed(
     language: metadata.language?.trim() || null,
     metadata_fetched_at: metadata.captured_at?.trim() || new Date().toISOString(),
     metadata_method: "deterministic_adapter",
-    resource_kind: "video", // Current content.resolve_url capability resolves media/video sources
+    resource_kind: isVideo ? "video" : baseline.resource_kind,
   };
 }
 

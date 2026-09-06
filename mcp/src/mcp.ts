@@ -196,9 +196,9 @@ const patchTopicsOp = z.object({
   remove: z.array(z.string()).optional(),
   set: z.array(z.string()).optional(),
 });
-const setDisplayNameOp = z.object({
-  op: z.literal("set_display_name"),
-  display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates metadata only; does not rename directory."),
+const renameOp = z.object({
+  op: z.literal("rename"),
+  display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates display_name and renames physical directory."),
 });
 
 const resourceApplyOperationSchema = z.discriminatedUnion("op", [
@@ -208,7 +208,7 @@ const resourceApplyOperationSchema = z.discriminatedUnion("op", [
   upsertSummaryOp,
   appendInteractionOp,
   patchTopicsOp,
-  setDisplayNameOp,
+  renameOp,
 ]);
 
 export function createMcpServer(

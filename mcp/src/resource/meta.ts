@@ -1,5 +1,11 @@
 import yaml from "yaml";
-import type { ResourceMeta, ResourceStage } from "./types.js";
+import type {
+  MetadataAttemptRecord,
+  MetadataAttemptStatus,
+  NamingSource,
+  ResourceMeta,
+  ResourceStage,
+} from "./types.js";
 import { CeoError } from "../errors.js";
 
 export interface ParsedMetaDocument {
@@ -37,19 +43,45 @@ export function parseMetaMarkdown(content: string): ParsedMetaDocument {
   const rawPlatformId = raw.platform_id != null ? String(raw.platform_id).trim() : null;
   const rawResourceId = String(raw.resource_id ?? "");
 
-  // Backward compatibility fallback for historical resources lacking display_name
-  const displayName =
-    rawDisplayName ||
-    rawTitle ||
-    rawOriginalName ||
-    rawPlatformId ||
-    rawResourceId ||
-    "Untitled Resource";
+  const displayName = rawDisplayName || rawTitle || rawOriginalName || rawPlatformId || "Untitled Resource";
+
+  const validNamingSources = new Set(["explicit", "title", "fallback"]);
+  const namingSource: NamingSource =
+    typeof raw.naming_source === "string" && validNamingSources.has(raw.naming_source)
+      ? (raw.naming_source as NamingSource)
+      : "fallback";
+
+  const sourceAliases = Array.isArray(raw.source_aliases)
+    ? raw.source_aliases.map(String)
+    : [];
+
+  let lastMetadataAttempt: MetadataAttemptRecord | null = null;
+  if (raw.last_metadata_attempt && typeof raw.last_metadata_attempt === "object") {
+    const lma = raw.last_metadata_attempt as Record<string, unknown>;
+    const statusStr = String(lma.status || "unavailable");
+    const validStatuses = new Set(["resolved", "unavailable", "unsupported", "disabled"]);
+    const status = validStatuses.has(statusStr)
+      ? (statusStr as MetadataAttemptStatus)
+      : "unavailable";
+
+    lastMetadataAttempt = {
+      attempted_at: String(lma.attempted_at || new Date().toISOString()),
+      status,
+      code: lma.code != null ? String(lma.code) : null,
+      fields_resolved: Array.isArray(lma.fields_resolved) ? lma.fields_resolved.map(String) : [],
+      strategy: lma.strategy != null ? String(lma.strategy) : null,
+      http_status: typeof lma.http_status === "number" ? lma.http_status : null,
+      request_id: lma.request_id != null ? String(lma.request_id) : null,
+    };
+  }
 
   const meta: ResourceMeta = {
     schema_version: 1,
     resource_id: rawResourceId,
     display_name: displayName,
+    naming_source: namingSource,
+    source_aliases: sourceAliases,
+    last_metadata_attempt: lastMetadataAttempt,
     resource_kind: (raw.resource_kind as ResourceMeta["resource_kind"]) ?? "other",
     source_type: (raw.source_type as ResourceMeta["source_type"]) ?? "url",
     source_identity: raw.source_identity != null ? String(raw.source_identity) : null,
@@ -113,6 +145,9 @@ export function formatMetaMarkdown(
     schema_version: 1,
     resource_id: meta.resource_id,
     display_name: meta.display_name,
+    naming_source: meta.naming_source,
+    source_aliases: meta.source_aliases ?? [],
+    last_metadata_attempt: meta.last_metadata_attempt ?? null,
     resource_kind: meta.resource_kind,
     source_type: meta.source_type,
     source_identity: meta.source_identity,

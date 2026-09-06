@@ -152,7 +152,7 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
     expect(resource2.is_revisit).toBe(true);
     expect(resource2.display_name).toBe("我的专属语义名称"); // Preserved!
 
-    // 3. Revisit with explicit input.display_name: intentionally updates metadata, preserves directory
+    // 3. Revisit with explicit input.display_name: intentionally updates metadata AND renames directory
     const cap3 = await service.capture({
       source: { type: "url", url: "https://www.youtube.com/watch?v=vid999" },
       display_name: "更精炼的语义名称",
@@ -161,11 +161,11 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
     expect(resource3.is_revisit).toBe(true);
     expect(resource3.display_name).toBe("更精炼的语义名称");
 
-    // Directory remains the original snapshot path!
-    expect(cap3.changed_files).toContain("resources/我的专属语义名称/meta.md");
+    // Directory is renamed to the new display_name!
+    expect(cap3.changed_files).toContain("resources/更精炼的语义名称/meta.md");
   });
 
-  it("resource_apply op:set_display_name updates metadata without renaming physical directory", async () => {
+  it("resource_apply op:rename updates metadata and renames physical directory", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -185,18 +185,19 @@ describe("CEO Resource Identity & Physical Naming V0 Integration", () => {
       summary: "Refine display name",
       operations: [
         {
-          op: "set_display_name",
+          op: "rename",
           display_name: "Deep Architecture Evolution 2026",
         },
       ],
     });
 
     expect(applyRes.ok).toBe(true);
-    // Modified the existing directory's meta.md
-    expect(applyRes.changed_files).toContain("resources/Initial Name/meta.md");
+    expect(applyRes.renamed).toBe(true);
+    expect(applyRes.new_path).toBe("resources/Deep Architecture Evolution 2026");
+    expect(applyRes.changed_files).toContain("resources/Deep Architecture Evolution 2026/meta.md");
 
-    // Check meta.md
-    const metaContent = await readFile(path.join(item.config.repoDir, "resources/Initial Name/meta.md"), "utf8");
+    // Check meta.md at new directory
+    const metaContent = await readFile(path.join(item.config.repoDir, "resources/Deep Architecture Evolution 2026/meta.md"), "utf8");
     const doc = parseMetaMarkdown(metaContent);
     expect(doc.meta.display_name).toBe("Deep Architecture Evolution 2026");
     expect(doc.meta.resource_id).toBe(resourceId);

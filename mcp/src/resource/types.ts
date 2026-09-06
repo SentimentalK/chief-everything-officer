@@ -28,10 +28,31 @@ export type Provenance =
   | "trusted_adapter"
   | "worker";
 
+export type NamingSource = "explicit" | "title" | "fallback";
+
+export type MetadataAttemptStatus =
+  | "resolved"
+  | "unavailable"
+  | "unsupported"
+  | "disabled";
+
+export interface MetadataAttemptRecord {
+  attempted_at: string;
+  status: MetadataAttemptStatus;
+  code: string | null;
+  fields_resolved: string[];
+  strategy: string | null;
+  http_status: number | null;
+  request_id: string | null;
+}
+
 export interface ResourceMeta {
   schema_version: 1;
   resource_id: string;
   display_name: string;
+  naming_source: NamingSource;
+  source_aliases: string[];
+  last_metadata_attempt: MetadataAttemptRecord | null;
   resource_kind: ResourceKind;
   source_type: SourceType;
   source_identity: string | null;
@@ -113,7 +134,7 @@ export type ResourceApplyOperation =
       set?: string[];
     }
   | {
-      op: "set_display_name";
+      op: "rename";
       display_name: string;
     };
 
@@ -153,6 +174,8 @@ export interface ResourceSearchInput {
 export interface ResourceCard {
   resource_id: string;
   display_name: string;
+  naming_source: NamingSource;
+  relative_path: string;
   title: string | null;
   stage: ResourceStage;
   resource_kind: ResourceKind;

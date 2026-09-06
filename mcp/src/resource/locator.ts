@@ -89,15 +89,92 @@ export async function resolveResourceLocation(
 }
 
 /**
- * Finds an existing Resource by its deterministic source_identity.
+ * Finds an existing Resource by its deterministic source_identity or source_aliases.
  * Returns the LocatedResource including physical location for revisit flows.
+ * Throws DUPLICATE_RESOURCE if multiple distinct resources match.
  */
 export async function findResourceByIdentity(
   root: string,
   sourceIdentity: string,
 ): Promise<LocatedResource | null> {
   const all = await enumerateResources(root);
-  return all.find((r) => r.meta.source_identity === sourceIdentity) ?? null;
+  const matches = all.filter(
+    (r) =>
+      r.meta.source_identity === sourceIdentity ||
+      (r.meta.source_aliases && r.meta.source_aliases.includes(sourceIdentity)),
+  );
+  const uniqueIds = new Set(matches.map((m) => m.meta.resource_id));
+  if (uniqueIds.size > 1) {
+    throw new CeoError(
+      "DUPLICATE_RESOURCE",
+      `Identity conflict: multiple distinct resources match identity '${sourceIdentity}': ${Array.from(uniqueIds).join(", ")}.`,
+      { matched_resource_ids: Array.from(uniqueIds) },
+    );
+  }
+  return matches[0] ?? null;
+}
+
+export interface ResourceLookupCriteria {
+  preferredIdentity?: string | null;
+  baselineIdentity?: string | null;
+  normalizedUrl?: string | null;
+}
+
+/**
+ * Finds an existing Resource by preferred identity, baseline identity, source aliases,
+ * or normalized URL references. Symmetrically finds existing resources across success/fail directions.
+ * Throws DUPLICATE_RESOURCE fail-closed if matches point to multiple distinct resource_ids.
+ */
+export async function findResourceByUrlOrIdentities(
+  root: string,
+  criteria: ResourceLookupCriteria,
+): Promise<LocatedResource | null> {
+  const all = await enumerateResources(root);
+  const matches: LocatedResource[] = [];
+
+  for (const r of all) {
+    let matched = false;
+
+    if (
+      criteria.preferredIdentity &&
+      (r.meta.source_identity === criteria.preferredIdentity ||
+        (r.meta.source_aliases && r.meta.source_aliases.includes(criteria.preferredIdentity)))
+    ) {
+      matched = true;
+    }
+
+    if (
+      !matched &&
+      criteria.baselineIdentity &&
+      (r.meta.source_identity === criteria.baselineIdentity ||
+        (r.meta.source_aliases && r.meta.source_aliases.includes(criteria.baselineIdentity)))
+    ) {
+      matched = true;
+    }
+
+    if (!matched && criteria.normalizedUrl && r.meta.source_type === "url") {
+      if (r.meta.canonical_ref && r.meta.canonical_ref.trim() === criteria.normalizedUrl) {
+        matched = true;
+      } else if (r.meta.source_ref && r.meta.source_ref.trim() === criteria.normalizedUrl) {
+        matched = true;
+      }
+    }
+
+    if (matched) {
+      matches.push(r);
+    }
+  }
+
+  const uniqueIds = new Set(matches.map((m) => m.meta.resource_id));
+  if (uniqueIds.size > 1) {
+    throw new CeoError(
+      "DUPLICATE_RESOURCE",
+      `Identity conflict: multiple distinct resources match lookup criteria: ${Array.from(uniqueIds).join(", ")}.`,
+      { matched_resource_ids: Array.from(uniqueIds) },
+    );
+  }
+
+  return matches[0] ?? null;
 }
 
 /**

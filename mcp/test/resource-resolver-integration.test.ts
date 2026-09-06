@@ -71,7 +71,7 @@ describe("Resource Resolver Integration V0", () => {
     expect(mockResolver.lastResolvedUrl).toBe("https://youtu.be/dQw4w9WgXcQ?si=tracking123");
 
     expect(capture.ok).toBe(true);
-    expect(capture.metadata_enrichment).toEqual({ status: "resolved" });
+    expect(capture.metadata_enrichment).toMatchObject({ status: "resolved", applied: true });
 
     const resource = capture.resource as Record<string, unknown>;
     expect(resource.resource_id).toMatch(/^res-[0-9a-f-]{36}$/);
@@ -122,7 +122,7 @@ describe("Resource Resolver Integration V0", () => {
     });
 
     expect(capture.ok).toBe(true);
-    expect(capture.metadata_enrichment).toEqual({ status: "unsupported", code: "unsupported_url" });
+    expect(capture.metadata_enrichment).toMatchObject({ status: "unsupported", code: "unsupported_url", applied: true });
 
     const resource = capture.resource as Record<string, unknown>;
     expect(resource.title).toBeNull();
@@ -159,7 +159,7 @@ describe("Resource Resolver Integration V0", () => {
     });
 
     expect(capture.ok).toBe(true);
-    expect(capture.metadata_enrichment).toEqual({ status: "unavailable", code: "timeout" });
+    expect(capture.metadata_enrichment).toMatchObject({ status: "unavailable", code: "timeout", applied: true });
 
     const resource = capture.resource as Record<string, unknown>;
     expect(resource.title).toBeNull();
@@ -224,7 +224,7 @@ describe("Resource Resolver Integration V0", () => {
     const resource = capture.resource as Record<string, unknown>;
     expect(resource.source_identity).toBe("weixin:ABC123456");
     expect(resource.platform).toBe("weixin");
-    expect(resource.resource_kind).toBe("video");
+    expect(resource.resource_kind).toBe("webpage");
 
     const loc = await resolveResourceLocation(item.config.repoDir, resource.resource_id as string);
     const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
@@ -355,7 +355,7 @@ describe("Resource Resolver Integration V0", () => {
       service.capture({
         source: { type: "url", url: "https://example.com/split" },
       }),
-    ).rejects.toThrow("Identity conflict: preferred identity and baseline identity match different resources.");
+    ).rejects.toThrow(/Identity conflict:/);
   });
 
   it("revisit non-erasure: resolver null does not erase existing non-null metadata", async () => {

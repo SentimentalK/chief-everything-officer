@@ -80,7 +80,7 @@ export function determineInitialDisplayName(options: DetermineDisplayNameOptions
 /**
  * Strips superficial provider prefixes (e.g. "Bilibili - ", "YouTube - ") and collapses whitespace.
  */
-function cleanDisplayName(candidate: string): string {
+export function cleanDisplayName(candidate: string): string {
   let cleaned = candidate.trim();
   // Strip known provider prefix patterns
   cleaned = cleaned.replace(/^(?:bilibili|youtube|web|pdf|resource)\s*[-:—]\s*/i, "");
@@ -99,10 +99,10 @@ function cleanDisplayName(candidate: string): string {
  * - Unicode NFC normalization (preserves Chinese and international characters)
  * - Replaces path separators and forbidden/control characters
  * - Strips leading dots (avoids hidden directories), avoids '.' and '..'
- * - Bounded by UTF-8 bytes (<= 180 bytes), never splitting Unicode code points
- * - Leaves room for collision suffixes like '-2' under standard 255-byte limits
+ * - Bounded by UTF-8 bytes (<= maxBytes), never splitting Unicode code points
+ * - Leaves room for collision suffixes under standard limits
  */
-export function toSafeDirectoryName(displayName: string): string {
+export function toSafeDirectoryName(displayName: string, maxBytes = MAX_DIRECTORY_BYTES): string {
   if (!displayName || !displayName.trim()) {
     return "Untitled Resource";
   }
@@ -125,11 +125,11 @@ export function toSafeDirectoryName(displayName: string): string {
     return "Untitled Resource";
   }
 
-  // Enforce UTF-8 byte boundary <= MAX_DIRECTORY_BYTES without splitting code points
+  // Enforce UTF-8 byte boundary <= maxBytes without splitting code points
   let bounded = "";
   for (const codePoint of normalized) {
     const candidate = bounded + codePoint;
-    if (Buffer.byteLength(candidate, "utf8") > MAX_DIRECTORY_BYTES) {
+    if (Buffer.byteLength(candidate, "utf8") > maxBytes) {
       break;
     }
     bounded = candidate;
@@ -142,13 +142,20 @@ export function toSafeDirectoryName(displayName: string): string {
 
 /**
  * Allocates a unique directory name inside resourcesRoot (e.g. worktree/resources).
- * If baseDirName already exists, sequentially probes baseDirName-2, baseDirName-3, etc.
+ * - If candidate matches currentDirName, returns currentDirName (no-op, avoids adding -2).
+ * - Bounded strictly to MAX_DIRECTORY_BYTES (180 bytes) including suffix.
+ * - Sequentially probes candidate, candidate-2, candidate-3, etc.
  */
 export async function allocateUniqueDirectoryName(
   resourcesRoot: string,
-  baseDirName: string,
+  baseDisplayName: string,
+  currentDirName?: string,
 ): Promise<string> {
-  const safeBase = toSafeDirectoryName(baseDirName);
+  const safeBase = toSafeDirectoryName(baseDisplayName, MAX_DIRECTORY_BYTES);
+
+  if (currentDirName && safeBase === currentDirName) {
+    return safeBase;
+  }
 
   const initialPath = path.join(resourcesRoot, safeBase);
   const initialExists = await access(initialPath).then(() => true).catch(() => false);
@@ -158,7 +165,16 @@ export async function allocateUniqueDirectoryName(
 
   let counter = 2;
   while (counter < 10000) {
-    const candidateName = `${safeBase}-${counter}`;
+    const suffix = `-${counter}`;
+    const suffixBytes = Buffer.byteLength(suffix, "utf8");
+    const allowedBaseBytes = Math.max(10, MAX_DIRECTORY_BYTES - suffixBytes);
+    const truncatedBase = toSafeDirectoryName(baseDisplayName, allowedBaseBytes);
+    const candidateName = `${truncatedBase}${suffix}`;
+
+    if (currentDirName && candidateName === currentDirName) {
+      return candidateName;
+    }
+
     const candidatePath = path.join(resourcesRoot, candidateName);
     const candidateExists = await access(candidatePath).then(() => true).catch(() => false);
     if (!candidateExists) {

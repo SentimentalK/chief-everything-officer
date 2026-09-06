@@ -43,7 +43,10 @@ resources/<readable_directory_label>/
   interactions.md -> DISCUSSED
 ```
 
-- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, normalized `source_identity`, source facts, capture note, topics, capture history.
+- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, `naming_source` (`explicit` | `title` | `fallback`), `source_aliases`, bounded `last_metadata_attempt`, normalized `source_identity`, source facts, capture note, topics, capture history. Explicit directory renames use `op: "rename"`.
+- **`naming_source`**: Tracks display name provenance (`explicit` | `title` | `fallback`). Fallback names automatically upgrade when provider titles resolve; explicit names are preserved.
+- **`last_metadata_attempt`**: Records bounded diagnostic evidence (`attempted_at`, `status`, `code`, `fields_resolved`) of external enrichment attempts. Stale attempts are skipped.
+- **`source_aliases`**: Symmetrical URL/platform aliases ensuring bidirectional deduplication.
 - **`evidence.md`**: Raw/near-raw platform transcripts, ASR, OCR, or exact web text. Provenance must be `host_exact`, `trusted_adapter`, or `worker`. **`host_semantic` is strictly forbidden for evidence**.
 - **`content.md`**: Lossless, normalized readable content structured with stable section IDs (`S001`, `S002`, ...).
 - **`summary.md`**: High-level overview, TOC / section map, section summaries, key claims, caveats, and topic tags. Acceptable with `host_semantic` provenance.
