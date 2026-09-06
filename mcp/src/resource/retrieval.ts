@@ -14,6 +14,10 @@ import {
   deriveResourceStage,
   parseMetaMarkdown,
 } from "./meta.js";
+import {
+  enumerateResources,
+  resolveResourceLocation,
+} from "./locator.js";
 
 export class ResourceRetrievalService {
   constructor(
@@ -23,27 +27,14 @@ export class ResourceRetrievalService {
 
   async search(input: ResourceSearchInput = {}): Promise<Record<string, unknown>> {
     return await this.workspace.withReadyWorkspace(async (base) => {
-      const resourcesRoot = path.join(this.config.repoDir, "resources");
-      const entries = await readdir(resourcesRoot, { withFileTypes: true }).catch(() => []);
+      const all = await enumerateResources(this.config.repoDir);
 
       const cards: ResourceCard[] = [];
 
-      for (const entry of entries) {
-        if (!entry.isDirectory() || !entry.name.startsWith("res-")) continue;
-
-        const resDir = path.join(resourcesRoot, entry.name);
-        const metaPath = path.join(resDir, "meta.md");
-        const metaContent = await readFile(metaPath, "utf8").catch(() => null);
-        if (!metaContent) continue;
-
-        let parsed;
-        try {
-          parsed = parseMetaMarkdown(metaContent);
-        } catch {
-          continue;
-        }
-
-        const { meta, title, capture_note } = parsed;
+      for (const item of all) {
+        const { meta, doc, location } = item;
+        const { capture_note } = doc;
+        const resDir = path.join(this.config.repoDir, location.relative_path);
 
         // Check artifact existence
         const dirFiles: string[] = await readdir(resDir).catch(() => []);
@@ -81,24 +72,26 @@ export class ResourceRetrievalService {
         if (input.captured_from && meta.first_captured_at < input.captured_from) continue;
         if (input.captured_to && meta.first_captured_at > input.captured_to) continue;
 
-        // Filter: query
+        // Filter: query (matches display_name, title, note, ref, name, id, topics)
         if (input.query && input.query.trim()) {
           const q = input.query.trim().toLowerCase();
-          const matchTitle = title?.toLowerCase().includes(q);
+          const matchDisplayName = meta.display_name?.toLowerCase().includes(q);
+          const matchTitle = meta.title?.toLowerCase().includes(q);
           const matchNote = capture_note?.toLowerCase().includes(q);
           const matchRef = meta.canonical_ref?.toLowerCase().includes(q) || meta.source_ref?.toLowerCase().includes(q);
           const matchName = meta.original_name?.toLowerCase().includes(q);
           const matchId = meta.source_identity?.toLowerCase().includes(q);
           const matchTopics = meta.topics.some((t) => t.toLowerCase().includes(q));
 
-          if (!matchTitle && !matchNote && !matchRef && !matchName && !matchId && !matchTopics) {
+          if (!matchDisplayName && !matchTitle && !matchNote && !matchRef && !matchName && !matchId && !matchTopics) {
             continue;
           }
         }
 
         cards.push({
           resource_id: meta.resource_id,
-          title,
+          display_name: meta.display_name,
+          title: meta.title,
           stage,
           resource_kind: meta.resource_kind,
           source_type: meta.source_type,
@@ -137,18 +130,25 @@ export class ResourceRetrievalService {
 
   async get(input: ResourceGetInput): Promise<Record<string, unknown>> {
     return await this.workspace.withReadyWorkspace(async (base) => {
-      const resDir = path.join(this.config.repoDir, "resources", input.resource_id);
-      const metaPath = path.join(resDir, "meta.md");
-
-      const exists = await access(metaPath).then(() => true).catch(() => false);
-      if (!exists) {
+      const location = await resolveResourceLocation(this.config.repoDir, input.resource_id);
+      if (!location) {
         throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
           resource_id: input.resource_id,
         });
       }
 
-      const metaContent = await readFile(metaPath, "utf8");
-      const { meta, title, capture_note, capture_history } = parseMetaMarkdown(metaContent);
+      const resDir = path.join(this.config.repoDir, location.relative_path);
+      const metaPath = path.join(resDir, "meta.md");
+
+      const metaContent = await readFile(metaPath, "utf8").catch(() => null);
+      if (!metaContent) {
+        throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' meta.md not found.`, {
+          resource_id: input.resource_id,
+        });
+      }
+
+      const doc = parseMetaMarkdown(metaContent);
+      const { meta, heading, capture_note, capture_history } = doc;
 
       const dirFiles: string[] = await readdir(resDir).catch(() => []);
       const artifactSet = new Set(dirFiles);
@@ -184,7 +184,9 @@ export class ResourceRetrievalService {
           ...commonHeader,
           view: "metadata",
           metadata: meta,
-          title,
+          display_name: meta.display_name,
+          title: meta.title,
+          heading,
           capture_note,
           capture_history,
         };

@@ -11,6 +11,7 @@ import { BUILD_INFO } from "./build-info.js";
 import { ResourceService } from "./resource/service.js";
 import { ResourceRetrievalService } from "./resource/retrieval.js";
 import { parseMetaMarkdown } from "./resource/meta.js";
+import { resolveResourceLocation } from "./resource/locator.js";
 import {
   type UrlMetadataResolver,
   createContentResolverClient,
@@ -195,6 +196,10 @@ const patchTopicsOp = z.object({
   remove: z.array(z.string()).optional(),
   set: z.array(z.string()).optional(),
 });
+const setDisplayNameOp = z.object({
+  op: z.literal("set_display_name"),
+  display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates metadata only; does not rename directory."),
+});
 
 const resourceApplyOperationSchema = z.discriminatedUnion("op", [
   attachSourceAssetOp,
@@ -203,6 +208,7 @@ const resourceApplyOperationSchema = z.discriminatedUnion("op", [
   upsertSummaryOp,
   appendInteractionOp,
   patchTopicsOp,
+  setDisplayNameOp,
 ]);
 
 export function createMcpServer(
@@ -319,6 +325,9 @@ export function createMcpServer(
         z.object({ type: z.literal("file_inline"), filename: z.string().min(1), mime_type: z.string().min(1), data_base64: z.string().min(1) }),
         z.object({ type: z.literal("external_ref"), provider: z.string().min(1), ref: z.string().min(1), canonical_ref: z.string().nullish() }),
       ]),
+      display_name: z.string().min(1).max(160).optional().describe(
+        "Optional user/AI semantic name for this Resource. Use when the current conversation already provides enough context to give the Resource a meaningful reusable name. Do not invent source contents solely from an opaque URL."
+      ),
       note: z.string().max(2000).optional().describe("User-oriented reason or context for capturing this resource"),
       topics: z.array(z.string().max(60)).max(20).optional().describe("Semantic topic tags for routing and retrieval"),
       initial_operations: z.array(resourceApplyOperationSchema).optional().describe("Initial semantic artifacts or document attachments to save with this capture"),
@@ -396,16 +405,21 @@ export function createMcpServer(
       if (!/^res-[0-9a-f-]{36}$/i.test(resId)) {
         throw new Error(`Invalid resource_id format: ${resId}`);
       }
-      const metaPath = path.join(workspace.config.repoDir, "resources", resId, "meta.md");
+      const location = await resolveResourceLocation(workspace.config.repoDir, resId);
+      if (!location) {
+        throw new Error(`Resource '${resId}' not found.`);
+      }
+      const resDir = path.join(workspace.config.repoDir, location.relative_path);
+      const metaPath = path.join(resDir, "meta.md");
       const metaContent = await readFile(metaPath, "utf8").catch(() => null);
       if (!metaContent) {
-        throw new Error(`Resource '${resId}' not found.`);
+        throw new Error(`Resource '${resId}' meta.md not found.`);
       }
       const { meta } = parseMetaMarkdown(metaContent);
       if (!meta.asset_ref) {
         throw new Error(`Resource '${resId}' does not have a stored source asset.`);
       }
-      const sourceFilePath = path.join(workspace.config.repoDir, "resources", resId, meta.asset_ref);
+      const sourceFilePath = path.join(resDir, meta.asset_ref);
       const data = await readFile(sourceFilePath);
       return {
         contents: [

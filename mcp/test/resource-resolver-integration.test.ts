@@ -6,6 +6,7 @@ import { ResourceService } from "../src/resource/service.js";
 import { fixture } from "./helpers.js";
 import { CeoError } from "../src/errors.js";
 import { parseMetaMarkdown } from "../src/resource/meta.js";
+import { resolveResourceLocation } from "../src/resource/locator.js";
 import type {
   ResolveOutcome,
   UrlMetadataResolver,
@@ -81,7 +82,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(resource.stage).toBe("CAPTURED");
 
     // Check meta.md on disk
-    const metaPath = path.join(item.config.repoDir, "resources", resource.resource_id as string, "meta.md");
+    const loc = await resolveResourceLocation(item.config.repoDir, resource.resource_id as string);
+    const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
     const metaContent = await readFile(metaPath, "utf8");
     const parsed = parseMetaMarkdown(metaContent);
 
@@ -126,7 +128,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(resource.title).toBeNull();
     expect(resource.resource_kind).toBe("webpage");
 
-    const metaPath = path.join(item.config.repoDir, "resources", resource.resource_id as string, "meta.md");
+    const loc = await resolveResourceLocation(item.config.repoDir, resource.resource_id as string);
+    const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
     const parsed = parseMetaMarkdown(await readFile(metaPath, "utf8"));
 
     expect(parsed.meta.title).toBeNull();
@@ -162,7 +165,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(resource.title).toBeNull();
     expect(resource.resource_id).toBeDefined();
 
-    const metaPath = path.join(item.config.repoDir, "resources", resource.resource_id as string, "meta.md");
+    const loc = await resolveResourceLocation(item.config.repoDir, resource.resource_id as string);
+    const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
     const parsed = parseMetaMarkdown(await readFile(metaPath, "utf8"));
     expect(parsed.meta.metadata_method).toBeNull();
   });
@@ -222,7 +226,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(resource.platform).toBe("weixin");
     expect(resource.resource_kind).toBe("video");
 
-    const metaPath = path.join(item.config.repoDir, "resources", resource.resource_id as string, "meta.md");
+    const loc = await resolveResourceLocation(item.config.repoDir, resource.resource_id as string);
+    const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
     const parsed = parseMetaMarkdown(await readFile(metaPath, "utf8"));
     expect(parsed.meta.source_identity).toBe("weixin:ABC123456");
     expect(parsed.meta.platform_id).toBe("ABC123456");
@@ -305,7 +310,8 @@ describe("Resource Resolver Integration V0", () => {
     // Metadata is enriched
     expect(resource2.title).toBe("Enriched Custom Title");
 
-    const metaPath = path.join(item.config.repoDir, "resources", resource1.resource_id as string, "meta.md");
+    const loc = await resolveResourceLocation(item.config.repoDir, resource1.resource_id as string);
+    const metaPath = path.join(item.config.repoDir, loc!.relative_path, "meta.md");
     const parsed = parseMetaMarkdown(await readFile(metaPath, "utf8"));
     expect(parsed.meta.source_identity).toBe("web:https://example.com/video/123");
     expect(parsed.meta.title).toBe("Enriched Custom Title");
@@ -402,7 +408,8 @@ describe("Resource Resolver Integration V0", () => {
 
     expect((cap2.resource as Record<string, unknown>).title).toBe("Updated Title");
 
-    const metaPath = path.join(item.config.repoDir, "resources", resourceId, "meta.md");
+    const loc1 = await resolveResourceLocation(item.config.repoDir, resourceId);
+    const metaPath = path.join(item.config.repoDir, loc1!.relative_path, "meta.md");
     const parsed = parseMetaMarkdown(await readFile(metaPath, "utf8"));
     expect(parsed.meta.title).toBe("Updated Title");
     // Existing non-null author and published_at were NOT erased!
@@ -442,7 +449,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(cap1.changed_files).toHaveLength(1);
 
     const resourceId = (cap1.resource as Record<string, unknown>).resource_id as string;
-    const metaPath = path.join(item.config.repoDir, "resources", resourceId, "meta.md");
+    const loc2 = await resolveResourceLocation(item.config.repoDir, resourceId);
+    const metaPath = path.join(item.config.repoDir, loc2!.relative_path, "meta.md");
     const meta1 = await readFile(metaPath, "utf8");
 
     // Identical revisit: same URL, same note, same metadata

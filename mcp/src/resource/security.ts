@@ -120,17 +120,14 @@ export function validateSourceAsset(
   };
 }
 
-export function getCanonicalSourcePath(resourceId: string, ext: string): string {
-  if (!/^res-[0-9a-f-]{36}$/i.test(resourceId)) {
-    throw new CeoError("INVALID_RESOURCE_ID", "Invalid resource_id format.", { resourceId });
-  }
-  return `resources/${resourceId}/source/original${ext}`;
-}
-
 export function isAllowedResourceSourcePath(filePath: string): boolean {
   const normalized = path.posix.normalize(filePath);
-  const match = normalized.match(/^resources\/(res-[0-9a-f-]{36})\/source\/original(\.[a-z0-9]+)$/i);
-  if (!match || !match[2]) return false;
+  const match = normalized.match(/^resources\/([^/]+)\/source\/original(\.[a-z0-9]+)$/i);
+  if (!match || !match[1] || !match[2]) return false;
+  const dirName = match[1];
+  if (dirName === "." || dirName === ".." || dirName.startsWith(".") || dirName.includes("\\")) {
+    return false;
+  }
   const ext = match[2].toLowerCase();
   return ALLOWED_EXTENSIONS.has(ext);
 }

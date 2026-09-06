@@ -4,7 +4,7 @@ import { CeoError } from "../errors.js";
 
 export interface ParsedMetaDocument {
   meta: ResourceMeta;
-  title: string | null;
+  heading: string | null;
   capture_note: string | null;
   capture_history: string[];
 }
@@ -31,22 +31,38 @@ export function parseMetaMarkdown(content: string): ParsedMetaDocument {
 
   const raw = parsed as Record<string, unknown>;
 
+  const rawDisplayName = raw.display_name != null ? String(raw.display_name).trim() : "";
+  const rawTitle = raw.title != null ? String(raw.title).trim() : null;
+  const rawOriginalName = raw.original_name != null ? String(raw.original_name).trim() : null;
+  const rawPlatformId = raw.platform_id != null ? String(raw.platform_id).trim() : null;
+  const rawResourceId = String(raw.resource_id ?? "");
+
+  // Backward compatibility fallback for historical resources lacking display_name
+  const displayName =
+    rawDisplayName ||
+    rawTitle ||
+    rawOriginalName ||
+    rawPlatformId ||
+    rawResourceId ||
+    "Untitled Resource";
+
   const meta: ResourceMeta = {
     schema_version: 1,
-    resource_id: String(raw.resource_id ?? ""),
+    resource_id: rawResourceId,
+    display_name: displayName,
     resource_kind: (raw.resource_kind as ResourceMeta["resource_kind"]) ?? "other",
     source_type: (raw.source_type as ResourceMeta["source_type"]) ?? "url",
     source_identity: raw.source_identity != null ? String(raw.source_identity) : null,
     source_ref: raw.source_ref != null ? String(raw.source_ref) : null,
     canonical_ref: raw.canonical_ref != null ? String(raw.canonical_ref) : null,
     platform: raw.platform != null ? String(raw.platform) : null,
-    platform_id: raw.platform_id != null ? String(raw.platform_id) : null,
-    original_name: raw.original_name != null ? String(raw.original_name) : null,
+    platform_id: rawPlatformId,
+    original_name: rawOriginalName,
     media_type: raw.media_type != null ? String(raw.media_type) : null,
     format: raw.format != null ? String(raw.format) : null,
     asset_ref: raw.asset_ref != null ? String(raw.asset_ref) : null,
     source_hash: raw.source_hash != null ? String(raw.source_hash) : null,
-    title: raw.title != null ? String(raw.title) : null,
+    title: rawTitle,
     author: raw.author != null ? String(raw.author) : null,
     published_at: raw.published_at != null ? String(raw.published_at) : null,
     first_captured_at: String(raw.first_captured_at ?? new Date().toISOString()),
@@ -57,11 +73,11 @@ export function parseMetaMarkdown(content: string): ParsedMetaDocument {
     capture_surface: String(raw.capture_surface ?? "mcp"),
   };
 
-  // Parse title from '# Title'
-  let title: string | null = meta.title;
-  const titleMatch = body.match(/^#\s+(.+)$/m);
-  if (titleMatch && titleMatch[1]) {
-    title = titleMatch[1].trim();
+  // Parse presentation heading from '# Heading' (never overwrites deterministic source meta.title)
+  let heading: string | null = null;
+  const headingMatch = body.match(/^#\s+(.+)$/m);
+  if (headingMatch && headingMatch[1]) {
+    heading = headingMatch[1].trim();
   }
 
   // Parse Capture Note
@@ -85,7 +101,7 @@ export function parseMetaMarkdown(content: string): ParsedMetaDocument {
     }
   }
 
-  return { meta, title, capture_note, capture_history };
+  return { meta, heading, capture_note, capture_history };
 }
 
 export function formatMetaMarkdown(
@@ -96,6 +112,7 @@ export function formatMetaMarkdown(
   const frontmatterData: Record<string, unknown> = {
     schema_version: 1,
     resource_id: meta.resource_id,
+    display_name: meta.display_name,
     resource_kind: meta.resource_kind,
     source_type: meta.source_type,
     source_identity: meta.source_identity,
@@ -123,7 +140,7 @@ export function formatMetaMarkdown(
     nullStr: "null",
   });
 
-  const heading = meta.title || meta.original_name || meta.canonical_ref || meta.resource_id;
+  const heading = meta.display_name || meta.title || meta.original_name || meta.canonical_ref || meta.resource_id;
 
   let doc = `---\n${yamlStr}---\n\n# ${heading}\n\n## Capture Note\n\n`;
   doc += (captureNote && captureNote.trim()) ? `${captureNote.trim()}\n\n` : `\n`;

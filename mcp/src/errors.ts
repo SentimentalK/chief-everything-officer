@@ -16,6 +16,7 @@ export type ErrorCode =
   | "INVALID_META"
   | "INVALID_RESOURCE_ID"
   | "RESOURCE_API_REQUIRED"
+  | "CORRUPTION"
   | "INTERNAL_ERROR";
 
 export class CeoError extends Error {

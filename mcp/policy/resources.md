@@ -8,7 +8,7 @@ The Resource Plane manages durable, structured understanding of external materia
 
 1. **Markdown Understanding is the V0 Core**:
    - The primary value of a Resource is structured Markdown memory: `meta.md`, `evidence.md`, `content.md`, `summary.md`, and `interactions.md`.
-   - Original document file storage (`resources/<resource_id>/source/original.<ext>`) is an optional, capability-dependent enhancement.
+   - Original document file storage (`resources/<dir>/source/original.<ext>`) is an optional, capability-dependent enhancement.
    - A Resource is completely valid and valuable even when original source bytes cannot be stored.
 
 2. **Save Intent vs Temporary Reading**:
@@ -19,7 +19,7 @@ The Resource Plane manages durable, structured understanding of external materia
    - **Source facts** (`canonical_ref`, `platform`, `platform_id`, `source_hash`, `title`, `author`, `published_at`) must come from deterministic adapters, parsers, or file ingestion.
    - AI must NEVER guess, infer, or use model knowledge to invent canonical source metadata.
    - When metadata acquisition fails, save succeeds with `null` fields; failure is reported honestly.
-   - AI only contributes user-semantic fields: `Capture Note`, `topics`, summaries, section mappings, and interaction notes.
+   - AI only contributes user-semantic fields: `display_name`, `Capture Note`, `topics`, summaries, section mappings, and interaction notes.
 
 4. **Server-Side Deterministic Metadata Enrichment**:
    - URL capture may automatically perform trusted deterministic metadata enrichment server-side.
@@ -31,8 +31,11 @@ The Resource Plane manages durable, structured understanding of external materia
 
 ## 2. Artifacts & Provenance
 
+- **`resource_id`**: Immutable logical identity (`res-<uuid-v4>`) stored in `meta.md`.
+- **Physical Directory**: Readable storage label (e.g. `resources/CUDA生态与NVIDIA软件护城河/`) independent of identity. Historical UUID directories (`resources/res-<uuid>/`) and new readable directories coexist.
+
 ```text
-resources/<resource_id>/
+resources/<readable_directory_label>/
   meta.md         -> CAPTURED
   evidence.md     -> EXTRACTED
   content.md      -> NORMALIZED
@@ -40,7 +43,7 @@ resources/<resource_id>/
   interactions.md -> DISCUSSED
 ```
 
-- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), normalized `source_identity`, source facts, capture note, topics, capture history.
+- **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, normalized `source_identity`, source facts, capture note, topics, capture history.
 - **`evidence.md`**: Raw/near-raw platform transcripts, ASR, OCR, or exact web text. Provenance must be `host_exact`, `trusted_adapter`, or `worker`. **`host_semantic` is strictly forbidden for evidence**.
 - **`content.md`**: Lossless, normalized readable content structured with stable section IDs (`S001`, `S002`, ...).
 - **`summary.md`**: High-level overview, TOC / section map, section summaries, key claims, caveats, and topic tags. Acceptable with `host_semantic` provenance.

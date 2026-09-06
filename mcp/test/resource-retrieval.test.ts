@@ -105,7 +105,7 @@ describe("Resource Retrieval & Progressive Reading", () => {
       ],
     });
 
-    const resourceId = (capture.changed_files as string[]).find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
+    const resourceId = (capture as any).resource.resource_id;
 
     // 1. Metadata view
     const metaView = await retrieval.get({ resource_id: resourceId, view: "metadata" });

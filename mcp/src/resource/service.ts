@@ -25,7 +25,6 @@ import {
   normalizeUrlSource,
 } from "./identity.js";
 import {
-  getCanonicalSourcePath,
   validateSourceAsset,
 } from "./security.js";
 import {
@@ -34,6 +33,19 @@ import {
   parseMetaMarkdown,
   type ParsedMetaDocument,
 } from "./meta.js";
+import {
+  type LocatedResource,
+  type ResourceLocation,
+  findResourceByHash,
+  findResourceByIdentity,
+  resolveResourceLocation,
+} from "./locator.js";
+import {
+  MAX_DISPLAY_NAME_CHARS,
+  allocateUniqueDirectoryName,
+  determineInitialDisplayName,
+  toSafeDirectoryName,
+} from "./naming.js";
 import {
   type UrlMetadataResolver,
   createContentResolverClient,
@@ -180,16 +192,17 @@ export class ResourceService {
         let resourceId: string;
         let isRevisit = false;
         let meta!: ResourceMeta;
+        let location!: ResourceLocation;
         let captureHistory: string[] = [];
         let captureNote: string | null = input.note ?? null;
         let hasSemanticChange = false;
 
         // Deduplication
         if (input.source.type === "url" && preferredIdentity && baselineIdentity) {
-          const byPreferred = await this.findResourceByIdentity(worktree, preferredIdentity);
-          let byBaseline: { meta: ResourceMeta; doc: ParsedMetaDocument } | null = null;
+          const byPreferred = await findResourceByIdentity(worktree, preferredIdentity);
+          let byBaseline: LocatedResource | null = null;
           if (preferredIdentity !== baselineIdentity) {
-            byBaseline = await this.findResourceByIdentity(worktree, baselineIdentity);
+            byBaseline = await findResourceByIdentity(worktree, baselineIdentity);
           }
 
           if (byPreferred && byBaseline && byPreferred.meta.resource_id !== byBaseline.meta.resource_id) {
@@ -206,6 +219,7 @@ export class ResourceService {
           const existing = byPreferred ?? byBaseline;
           if (existing) {
             isRevisit = true;
+            location = existing.location;
             resourceId = existing.meta.resource_id;
             meta = existing.meta;
             captureHistory = [...existing.doc.capture_history];
@@ -215,6 +229,15 @@ export class ResourceService {
             if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
               hasSemanticChange = true;
+            }
+
+            // Explicit input.display_name on revisit updates metadata (preserves existing if not provided)
+            if (input.display_name && input.display_name.trim()) {
+              const explicitName = input.display_name.trim();
+              if (explicitName !== meta.display_name) {
+                meta.display_name = explicitName;
+                hasSemanticChange = true;
+              }
             }
 
             // Topics union
@@ -227,7 +250,7 @@ export class ResourceService {
               }
             }
 
-            // Resolver revisit update (non-erasure)
+            // Resolver revisit update (non-erasure, never alters display_name)
             const metadataChanged = applyResolverRevisitUpdates(meta, resolvedMetadata);
             if (metadataChanged) {
               hasSemanticChange = true;
@@ -237,9 +260,10 @@ export class ResourceService {
             hasSemanticChange = true;
           }
         } else if (preferredIdentity !== null) {
-          const existing = await this.findResourceByIdentity(worktree, preferredIdentity);
+          const existing = await findResourceByIdentity(worktree, preferredIdentity);
           if (existing) {
             isRevisit = true;
+            location = existing.location;
             resourceId = existing.meta.resource_id;
             meta = existing.meta;
             captureHistory = [...existing.doc.capture_history];
@@ -248,6 +272,15 @@ export class ResourceService {
             if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
               hasSemanticChange = true;
+            }
+
+            // Explicit input.display_name on revisit updates metadata
+            if (input.display_name && input.display_name.trim()) {
+              const explicitName = input.display_name.trim();
+              if (explicitName !== meta.display_name) {
+                meta.display_name = explicitName;
+                hasSemanticChange = true;
+              }
             }
 
             if (input.topics && input.topics.length > 0) {
@@ -268,12 +301,32 @@ export class ResourceService {
           hasSemanticChange = true;
         }
 
-        const resDir = path.join(worktree, "resources", resourceId);
+        let resDir: string;
 
         if (!isRevisit) {
+          const initialDisplayName = determineInitialDisplayName({
+            inputDisplayName: input.display_name,
+            resolverTitle: metadataSeed ? metadataSeed.title : null,
+            source: input.source,
+            sourceIdentity: preferredIdentity,
+            originalName,
+            canonicalRef,
+          });
+
+          const resourcesRoot = path.join(worktree, "resources");
+          await mkdir(resourcesRoot, { recursive: true });
+          const dirName = await allocateUniqueDirectoryName(resourcesRoot, initialDisplayName);
+          location = {
+            resource_id: resourceId,
+            directory_name: dirName,
+            relative_path: path.posix.join("resources", dirName),
+          };
+          resDir = path.join(worktree, location.relative_path);
+
           meta = {
             schema_version: 1,
             resource_id: resourceId,
+            display_name: initialDisplayName,
             resource_kind: resourceKind,
             source_type: sourceType,
             source_identity: preferredIdentity,
@@ -310,11 +363,13 @@ export class ResourceService {
             await mkdir(sourceDir, { recursive: true });
             await writeFile(path.join(sourceDir, `original${sourceAssetExt}`), sourceAssetBuffer);
           }
+        } else {
+          resDir = path.join(worktree, location.relative_path);
         }
 
         // Apply initial operations if provided
         if (input.initial_operations && input.initial_operations.length > 0) {
-          await this.executeResourceOperations(worktree, resourceId, meta, input.initial_operations);
+          await this.executeResourceOperations(worktree, location, meta, input.initial_operations);
           hasSemanticChange = true;
         }
 
@@ -341,6 +396,7 @@ export class ResourceService {
 
         capturedResourceReceipt = {
           resource_id: resourceId,
+          display_name: meta.display_name,
           is_revisit: isRevisit,
           source_identity: meta.source_identity,
           title: meta.title,
@@ -376,21 +432,27 @@ export class ResourceService {
       commitMessage: `CEO: ${input.summary.trim()}`,
       allowResourceSourceFiles: true,
       mutator: async (worktree, worktreeMatcher) => {
-        const resDir = path.join(worktree, "resources", input.resource_id);
-        const metaPath = path.join(resDir, "meta.md");
-
-        const exists = await access(metaPath).then(() => true).catch(() => false);
-        if (!exists) {
+        const location = await resolveResourceLocation(worktree, input.resource_id);
+        if (!location) {
           throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
             resource_id: input.resource_id,
           });
         }
 
-        const metaContent = await readFile(metaPath, "utf8");
+        const resDir = path.join(worktree, location.relative_path);
+        const metaPath = path.join(resDir, "meta.md");
+
+        const metaContent = await readFile(metaPath, "utf8").catch(() => null);
+        if (!metaContent) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' meta.md not found.`, {
+            resource_id: input.resource_id,
+          });
+        }
+
         const doc = parseMetaMarkdown(metaContent);
         const meta = doc.meta;
 
-        await this.executeResourceOperations(worktree, input.resource_id, meta, input.operations);
+        await this.executeResourceOperations(worktree, location, meta, input.operations);
 
         // Update meta.md
         const metaMarkdown = formatMetaMarkdown(meta, doc.capture_note, doc.capture_history);
@@ -407,25 +469,34 @@ export class ResourceService {
 
   private async executeResourceOperations(
     worktree: string,
-    resourceId: string,
+    location: ResourceLocation,
     meta: ResourceMeta,
     operations: ResourceApplyOperation[],
   ): Promise<void> {
-    const resDir = path.join(worktree, "resources", resourceId);
+    const resDir = path.join(worktree, location.relative_path);
 
     for (const op of operations) {
-      if (op.op === "attach_source_asset") {
+      if (op.op === "set_display_name") {
+        const trimmed = op.display_name.trim();
+        if (!trimmed || Array.from(trimmed).length > MAX_DISPLAY_NAME_CHARS) {
+          throw new CeoError(
+            "VALIDATION_FAILED",
+            `display_name must be between 1 and ${MAX_DISPLAY_NAME_CHARS} characters.`,
+          );
+        }
+        meta.display_name = trimmed;
+      } else if (op.op === "attach_source_asset") {
         const buf = Buffer.from(op.data_base64, "base64");
         const asset = validateSourceAsset(op.filename, op.mime_type, buf);
         const idInfo = computeFileIdentity(buf);
 
         // Late identity collision check: search if any other resource has identical hash
-        const colliding = await this.findResourceByHash(worktree, idInfo.source_hash, resourceId);
+        const colliding = await findResourceByHash(worktree, idInfo.source_hash, meta.resource_id);
         if (colliding) {
           throw new CeoError(
             "DUPLICATE_RESOURCE",
-            `File asset matches existing resource '${colliding}'. Automatic merge is not supported.`,
-            { collision_resource_id: colliding, source_hash: idInfo.source_hash },
+            `File asset matches existing resource '${colliding.location.resource_id}'. Automatic merge is not supported.`,
+            { collision_resource_id: colliding.location.resource_id, source_hash: idInfo.source_hash },
           );
         }
 
@@ -463,7 +534,7 @@ export class ResourceService {
         const timestamp = new Date().toISOString();
         let formattedEntry = `\n## ${timestamp} (${op.provenance})\n\n${op.entry.trim()}\n`;
         if (!interactionExists) {
-          formattedEntry = `# Interactions — ${resourceId}\n${formattedEntry}`;
+          formattedEntry = `# Interactions — ${meta.resource_id}\n${formattedEntry}`;
           await writeFile(interactionPath, formattedEntry, "utf8");
         } else {
           const current = await readFile(interactionPath, "utf8");
@@ -481,49 +552,5 @@ export class ResourceService {
         }
       }
     }
-  }
-
-  private async findResourceByIdentity(
-    worktree: string,
-    sourceIdentity: string,
-  ): Promise<{ meta: ResourceMeta; doc: ParsedMetaDocument } | null> {
-    const resourcesRoot = path.join(worktree, "resources");
-    const entries = await readdir(resourcesRoot, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !entry.name.startsWith("res-")) continue;
-      const metaPath = path.join(resourcesRoot, entry.name, "meta.md");
-      const metaContent = await readFile(metaPath, "utf8").catch(() => null);
-      if (!metaContent) continue;
-      try {
-        const doc = parseMetaMarkdown(metaContent);
-        if (doc.meta.source_identity === sourceIdentity) {
-          return { meta: doc.meta, doc };
-        }
-      } catch {}
-    }
-    return null;
-  }
-
-  private async findResourceByHash(
-    worktree: string,
-    hash: string,
-    excludeResourceId?: string,
-  ): Promise<string | null> {
-    const resourcesRoot = path.join(worktree, "resources");
-    const entries = await readdir(resourcesRoot, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !entry.name.startsWith("res-")) continue;
-      if (entry.name === excludeResourceId) continue;
-      const metaPath = path.join(resourcesRoot, entry.name, "meta.md");
-      const metaContent = await readFile(metaPath, "utf8").catch(() => null);
-      if (!metaContent) continue;
-      try {
-        const doc = parseMetaMarkdown(metaContent);
-        if (doc.meta.source_hash === hash) {
-          return entry.name;
-        }
-      } catch {}
-    }
-    return null;
   }
 }

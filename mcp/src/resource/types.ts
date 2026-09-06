@@ -31,6 +31,7 @@ export type Provenance =
 export interface ResourceMeta {
   schema_version: 1;
   resource_id: string;
+  display_name: string;
   resource_kind: ResourceKind;
   source_type: SourceType;
   source_identity: string | null;
@@ -110,11 +111,16 @@ export type ResourceApplyOperation =
       add?: string[];
       remove?: string[];
       set?: string[];
+    }
+  | {
+      op: "set_display_name";
+      display_name: string;
     };
 
 export interface ResourceCaptureInput {
   request_id?: string;
   source: ResourceSourceInput;
+  display_name?: string;
   note?: string;
   topics?: string[];
   initial_operations?: ResourceApplyOperation[];
@@ -146,6 +152,7 @@ export interface ResourceSearchInput {
 
 export interface ResourceCard {
   resource_id: string;
+  display_name: string;
   title: string | null;
   stage: ResourceStage;
   resource_kind: ResourceKind;

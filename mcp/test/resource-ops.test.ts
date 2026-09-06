@@ -32,10 +32,11 @@ describe("Resource Operations & Atomic Closures", () => {
     const changedFiles = capture1.changed_files as string[];
     expect(changedFiles.some((f) => f.endsWith("meta.md"))).toBe(true);
 
-    const resourceId = changedFiles.find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
+    const resourceId = (capture1.resource as any).resource_id;
+    const metaRelPath = changedFiles.find((f) => f.endsWith("meta.md"))!;
 
     // 2. Read meta.md
-    const metaPath = path.join(item.config.repoDir, "resources", resourceId, "meta.md");
+    const metaPath = path.join(item.config.repoDir, metaRelPath);
     const metaContent1 = await readFile(metaPath, "utf8");
     const doc1 = parseMetaMarkdown(metaContent1);
     expect(doc1.meta.source_identity).toBe("youtube:dQw4w9WgXcQ");
@@ -51,9 +52,9 @@ describe("Resource Operations & Atomic Closures", () => {
     });
 
     expect(capture2.ok).toBe(true);
-    // Verified that it deduped to the exact same resourceId
+    // Verified that it deduped to the exact same resourceId and directory
     const changedFiles2 = capture2.changed_files as string[];
-    expect(changedFiles2[0]).toBe(`resources/${resourceId}/meta.md`);
+    expect(changedFiles2[0]).toBe(metaRelPath);
 
     const metaContent2 = await readFile(metaPath, "utf8");
     const doc2 = parseMetaMarkdown(metaContent2);
@@ -94,9 +95,10 @@ describe("Resource Operations & Atomic Closures", () => {
 
     expect(capture.ok).toBe(true);
     const changed = capture.changed_files as string[];
-    const resourceId = changed.find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
+    const resourceId = (capture.resource as any).resource_id;
+    const metaRelPath = changed.find((f) => f.endsWith("meta.md"))!;
+    const resDir = path.join(item.config.repoDir, path.dirname(metaRelPath));
 
-    const resDir = path.join(item.config.repoDir, "resources", resourceId);
     const metaContent = await readFile(path.join(resDir, "meta.md"), "utf8");
     const doc = parseMetaMarkdown(metaContent);
 
@@ -137,10 +139,11 @@ describe("Resource Operations & Atomic Closures", () => {
 
     expect(capture.ok).toBe(true);
     const changed = capture.changed_files as string[];
-    const resourceId = changed.find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
-    expect(changed).toContain(`resources/${resourceId}/source/original.pdf`);
+    const resourceId = (capture.resource as any).resource_id;
+    const metaRelPath = changed.find((f) => f.endsWith("meta.md"))!;
+    const resDir = path.join(item.config.repoDir, path.dirname(metaRelPath));
+    expect(changed.some((f) => f.endsWith("source/original.pdf"))).toBe(true);
 
-    const resDir = path.join(item.config.repoDir, "resources", resourceId);
     const metaContent = await readFile(path.join(resDir, "meta.md"), "utf8");
     const doc = parseMetaMarkdown(metaContent);
 
@@ -180,7 +183,7 @@ describe("Resource Operations & Atomic Closures", () => {
       summary: "Provisional resource",
     });
     expect(res2.ok).toBe(true);
-    const res2Id = (res2.changed_files as string[]).find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
+    const res2Id = (res2.resource as any).resource_id;
 
     // 3. Late attach exact same bytes to res2 -> must throw DUPLICATE_RESOURCE!
     const baseCommit = res2.commit as string;
@@ -211,7 +214,7 @@ describe("Resource Operations & Atomic Closures", () => {
     const res = await service.capture({
       source: { type: "url", url: "https://example.com/test-article" },
     });
-    const resId = (res.changed_files as string[]).find((f) => f.endsWith("meta.md"))!.split("/")[1]!;
+    const resId = (res.resource as any).resource_id;
     const baseCommit = res.commit as string;
 
     // Reject upsert_evidence with host_semantic
@@ -249,7 +252,7 @@ describe("Resource Operations & Atomic Closures", () => {
     });
 
     expect(validApply.ok).toBe(true);
-    expect(validApply.changed_files).toContain(`resources/${resId}/evidence.md`);
+    expect(validApply.changed_files.some((f: string) => f.endsWith("evidence.md"))).toBe(true);
   });
 
   it("atomically commits Resource updates and State consequences in a single Git transaction", async () => {
@@ -284,7 +287,7 @@ describe("Resource Operations & Atomic Closures", () => {
     const changed = capture.changed_files as string[];
 
     // Both resource artifact and task file are in the SAME commit!
-    expect(changed.some((f) => f.startsWith("resources/res-"))).toBe(true);
+    expect(changed.some((f) => f.startsWith("resources/"))).toBe(true);
     expect(changed).toContain("tasks/TASK-AI-01.md");
 
     const taskContent = await readFile(path.join(item.config.repoDir, "tasks/TASK-AI-01.md"), "utf8");

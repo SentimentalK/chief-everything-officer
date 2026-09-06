@@ -168,10 +168,11 @@ describe("Resource Authority & Namespace Hardening", () => {
     const cap = await service.capture({
       source: { type: "url", url: "https://example.com/test1" },
     });
-    const resourceId = (cap.resource as any)?.resource_id || (cap.changed_files as string[])[0].split("/")[1];
+    const resourceId = (cap.resource as any)?.resource_id;
+    const metaFile = (cap.changed_files as string[]).find((f) => f.endsWith("meta.md"))!;
 
     // 2. Attempt resource_apply with smuggled resources/** mutation in state_changes
-    const read = await workspace.readFiles([`resources/${resourceId}/meta.md`]);
+    const read = await workspace.readFiles([metaFile]);
     await expect(
       service.apply({
         resource_id: resourceId,

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  getCanonicalSourcePath,
   isAllowedResourceSourcePath,
   validateSourceAsset,
 } from "../src/resource/security.js";
@@ -63,15 +62,15 @@ describe("Resource Security & Source Asset Validation", () => {
     );
   });
 
-  describe("Canonical path validation", () => {
-    it("builds canonical source path", () => {
-      const resId = "res-01234567-89ab-cdef-0123-456789abcdef";
-      const canonical = getCanonicalSourcePath(resId, ".pdf");
-      expect(canonical).toBe(`resources/${resId}/source/original.pdf`);
-      expect(isAllowedResourceSourcePath(canonical)).toBe(true);
+  describe("Canonical source path validation", () => {
+    it("validates allowed source paths across readable and legacy UUID directory names", () => {
+      const legacyPath = "resources/res-01234567-89ab-cdef-0123-456789abcdef/source/original.pdf";
+      const readablePath = "resources/CUDA生态与NVIDIA软件护城河/source/original.pdf";
+      expect(isAllowedResourceSourcePath(legacyPath)).toBe(true);
+      expect(isAllowedResourceSourcePath(readablePath)).toBe(true);
     });
 
-    it("rejects non-canonical or media source paths", () => {
+    it("rejects non-canonical, media, unsafe, or non-resource paths", () => {
       expect(
         isAllowedResourceSourcePath(
           "resources/res-01234567-89ab-cdef-0123-456789abcdef/source/original.mp4",
@@ -79,7 +78,17 @@ describe("Resource Security & Source Asset Validation", () => {
       ).toBe(false);
       expect(
         isAllowedResourceSourcePath(
-          "resources/res-01234567-89ab-cdef-0123-456789abcdef/arbitrary.pdf",
+          "resources/CUDA/arbitrary.pdf",
+        ),
+      ).toBe(false);
+      expect(
+        isAllowedResourceSourcePath(
+          "resources/../source/original.pdf",
+        ),
+      ).toBe(false);
+      expect(
+        isAllowedResourceSourcePath(
+          "resources/.hidden/source/original.pdf",
         ),
       ).toBe(false);
       expect(isAllowedResourceSourcePath("personal/test.pdf")).toBe(false);

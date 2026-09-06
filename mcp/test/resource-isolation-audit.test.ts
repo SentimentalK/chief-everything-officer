@@ -65,7 +65,7 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     });
     const scopedMatches = (scopedSearch.structuredContent as any).matches;
     expect(scopedMatches).toHaveLength(1);
-    expect(scopedMatches[0].path).toMatch(/^resources\/res-.*\/summary\.md$/);
+    expect(scopedMatches[0].path).toMatch(/^resources\/.*\/summary\.md$/);
 
     // 4. list_files at root still discovers resources/ directory
     const listRes = await client.callTool({
