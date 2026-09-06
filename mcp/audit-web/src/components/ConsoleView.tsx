@@ -1,7 +1,8 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { RefreshCw, LogOut, Calendar, Activity, AlertCircle, Database } from "lucide-react";
 import { fetchTraces, logout, type TraceSummary } from "../api";
-import { TraceItem } from "./TraceItem";
+import { groupTracesIntoRuns } from "../lib/groupTraces";
+import { RunItem } from "./RunItem";
 import { TraceDrawer } from "./TraceDrawer";
 
 interface ConsoleViewProps {
@@ -61,9 +62,12 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({ onLogout }) => {
     onLogout();
   };
 
+  // Group traces into Runs using 5m temporal gap heuristic
+  const runs = useMemo(() => groupTracesIntoRuns(traces), [traces]);
+
   // Metrics summary
+  const runsCount = runs.length;
   const totalCalls = traces.length;
-  const totalTokens = traces.reduce((acc, t) => acc + t.total_tokens_est, 0);
   const errorCount = traces.filter((t) => t.status === "error").length;
   const avgLatency =
     totalCalls > 0
@@ -135,16 +139,16 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({ onLogout }) => {
         {/* Metric Bar */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
-            <span className="text-xs text-neutral-500 font-medium">Invocations</span>
+            <span className="text-xs text-neutral-500 font-medium">Runs</span>
             <p className="text-xl font-mono font-semibold text-neutral-200 mt-0.5">
-              {totalCalls}
+              {runsCount}
             </p>
           </div>
 
           <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
-            <span className="text-xs text-neutral-500 font-medium">Tokens Est</span>
+            <span className="text-xs text-neutral-500 font-medium">Tool Calls</span>
             <p className="text-xl font-mono font-semibold text-neutral-200 mt-0.5">
-              {totalTokens.toLocaleString()}
+              {totalCalls}
             </p>
           </div>
 
@@ -167,6 +171,14 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({ onLogout }) => {
           </div>
         </div>
 
+        {/* 200-trace limit warning boundary */}
+        {traces.length === 200 && (
+          <div className="rounded-md border border-amber-900/50 bg-amber-950/40 p-3 text-xs text-amber-300 flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-amber-400" />
+            <span>Latest 200 calls loaded. Oldest Run may be incomplete.</span>
+          </div>
+        )}
+
         {error && (
           <div className="rounded-md border border-red-900/50 bg-red-950/40 p-3 text-xs text-red-300 flex items-center gap-2">
             <AlertCircle className="h-4 w-4 shrink-0" />
@@ -176,30 +188,28 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({ onLogout }) => {
 
         {/* Content Layout: Split or List */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 min-h-[500px]">
-          {/* Traces List */}
+          {/* Runs List */}
           <div
             className={`flex flex-col gap-2 ${
               selectedId ? "lg:col-span-5" : "lg:col-span-12"
             }`}
           >
-            {traces.length === 0 ? (
+            {runs.length === 0 ? (
               <div className="flex flex-col items-center justify-center p-12 text-center rounded-lg border border-dashed border-neutral-800 bg-neutral-950/40">
                 <Database className="h-8 w-8 text-neutral-600 mb-2" />
-                <p className="text-sm font-medium text-neutral-400">No traces recorded</p>
+                <p className="text-sm font-medium text-neutral-400">No runs recorded</p>
                 <p className="text-xs text-neutral-500 mt-1 max-w-sm">
-                  Invocations from ChatGPT to CEO State MCP will automatically appear here.
+                  Invocations from ChatGPT to CEO MCP will automatically appear here grouped into Runs.
                 </p>
               </div>
             ) : (
-              <div className="space-y-2">
-                {traces.map((trace) => (
-                  <TraceItem
-                    key={trace.id}
-                    trace={trace}
-                    isSelected={selectedId === trace.id}
-                    onSelect={() =>
-                      setSelectedId(selectedId === trace.id ? null : trace.id)
-                    }
+              <div className="space-y-3">
+                {runs.map((run) => (
+                  <RunItem
+                    key={run.id}
+                    run={run}
+                    selectedId={selectedId}
+                    onSelectTrace={setSelectedId}
                   />
                 ))}
               </div>

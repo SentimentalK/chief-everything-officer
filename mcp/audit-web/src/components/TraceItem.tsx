@@ -7,9 +7,15 @@ interface TraceItemProps {
   trace: TraceSummary;
   isSelected: boolean;
   onSelect: () => void;
+  stepIndex?: number;
 }
 
-export const TraceItem: React.FC<TraceItemProps> = ({ trace, isSelected, onSelect }) => {
+export const TraceItem: React.FC<TraceItemProps> = ({
+  trace,
+  isSelected,
+  onSelect,
+  stepIndex,
+}) => {
   const isError = trace.status === "error";
   const isWrite = trace.tool_name === "apply_change_set";
 
@@ -40,6 +46,11 @@ export const TraceItem: React.FC<TraceItemProps> = ({ trace, isSelected, onSelec
       <div className="p-3.5 space-y-2.5">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 flex-wrap">
+            {stepIndex !== undefined && (
+              <span className="font-mono text-xs font-semibold text-neutral-500 bg-neutral-900 border border-neutral-800 rounded px-1.5 py-0.5">
+                {String(stepIndex).padStart(2, "0")}
+              </span>
+            )}
             <span className="font-mono text-xs font-medium text-neutral-400">
               {formatTime(trace.timestamp_ms)}
             </span>

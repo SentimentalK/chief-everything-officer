@@ -234,7 +234,7 @@ describe("Audit Web UI & Component Tests", () => {
     expect(writeTextMock).toHaveBeenCalledWith(expect.stringContaining("# Router Policy"));
   });
 
-  it("renders ConsoleView with metric cards and trace list", async () => {
+  it("renders ConsoleView with metric cards and runs list", async () => {
     const mockTraces: TraceSummary[] = [
       {
         id: 1,
@@ -269,7 +269,130 @@ describe("Audit Web UI & Component Tests", () => {
     });
 
     expect(container.textContent).toContain("CEO Context Trace");
-    expect(container.textContent).toContain("Invocations");
+    expect(container.textContent).toContain("Runs");
+    expect(container.textContent).toContain("Tool Calls");
+    expect(container.textContent).toContain("Avg Latency");
+    expect(container.textContent).toContain("Errors");
     expect(container.textContent).toContain("workspace_status");
+    expect(container.textContent).toContain("Copy All");
+  });
+
+  it("shows 200-trace warning when traces length reaches 200 limit", async () => {
+    const mockTraces: TraceSummary[] = Array.from({ length: 200 }, (_, i) => ({
+      id: i + 1,
+      timestamp_ms: Date.now() + i * 1000,
+      tool_name: "workspace_status",
+      status: "success",
+      error_message: null,
+      operation_request_id: null,
+      input_bytes: 2,
+      output_bytes: 10,
+      input_chars: 2,
+      output_chars: 10,
+      input_tokens_est: 1,
+      output_tokens_est: 2,
+      total_tokens_est: 3,
+      latency_ms: 10,
+      affected_paths: null,
+      resulting_commit: null,
+    }));
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, traces: mockTraces }),
+    } as any);
+
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(<ConsoleView onLogout={vi.fn()} />);
+    });
+
+    expect(container.textContent).toContain(
+      "Latest 200 calls loaded. Oldest Run may be incomplete."
+    );
+  });
+
+  it("expands RunItem on click, but prevents Copy All from toggling expansion", async () => {
+    const trace1: TraceSummary = {
+      id: 5,
+      timestamp_ms: 1700000000000,
+      tool_name: "policy_read",
+      status: "success",
+      error_message: null,
+      operation_request_id: null,
+      input_bytes: 10,
+      output_bytes: 20,
+      input_chars: 10,
+      output_chars: 20,
+      input_tokens_est: 2,
+      output_tokens_est: 5,
+      total_tokens_est: 7,
+      latency_ms: 30,
+      affected_paths: null,
+      resulting_commit: null,
+    };
+
+    const run = {
+      id: "run-5-5",
+      start_timestamp_ms: 1700000000000,
+      end_timestamp_ms: 1700000000030,
+      traces: [trace1],
+    };
+
+    // Mock clipboard and fetch for trace detail
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText: writeTextMock } });
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        trace: {
+          ...trace1,
+          input_json: "{}",
+          output_json: "{}",
+        },
+      }),
+    } as any);
+
+    const { RunItem } = await import("../components/RunItem");
+    const onSelectTrace = vi.fn();
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <RunItem
+          run={run}
+          selectedId={null}
+          onSelectTrace={onSelectTrace}
+          defaultExpanded={false}
+        />
+      );
+    });
+
+    // Default collapsed: child trace details (like latency "30ms") not visible yet in child list
+    const copyBtn = container.querySelector("button[title*='Copy complete run']") as HTMLButtonElement;
+    expect(copyBtn).not.toBeNull();
+    expect(copyBtn.textContent).toContain("Copy All");
+
+    // Click Copy All -> must NOT toggle expand
+    await act(async () => {
+      copyBtn.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
+    });
+
+    expect(writeTextMock).toHaveBeenCalled();
+    // Run should remain collapsed (no child TraceItem rendered)
+    expect(container.querySelectorAll("span").length).toBeGreaterThan(0);
+    expect(copyBtn.textContent).toContain("Copied ✓");
+
+    // Click header outside Copy All button -> toggles expand
+    const header = container.firstElementChild?.firstElementChild as HTMLElement;
+    await act(async () => {
+      header.dispatchEvent(new Event("click", { bubbles: true }));
+    });
+
+    // Expanded now: child trace item with step badge "01" should be visible
+    expect(container.textContent).toContain("01");
   });
 });
