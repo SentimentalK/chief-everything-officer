@@ -285,7 +285,7 @@ export function createMcpServer(
   server.registerTool("apply_change_set", {
     title: "Apply an atomic CEO change set",
     description:
-      "Use this once for one complete CEO update. The server checks optimistic concurrency, edits safe Markdown outside runtime- or workspace-excluded paths, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
+      "Use this for generic CEO State/workspace Markdown updates outside Resource semantic storage. This tool cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources. The server checks optimistic concurrency, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
@@ -310,7 +310,7 @@ export function createMcpServer(
   server.registerTool("resource_capture", {
     title: "Capture external resource into CEO",
     description:
-      "Use this to durably capture an external Resource. URL captures automatically attempt trusted deterministic source metadata enrichment server-side when the internal resolver capability is available. Metadata resolution is best-effort: unsupported or temporarily unavailable enrichment does not prevent Resource capture. Do not separately reconstruct or copy source metadata when the server can resolve it.",
+      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. Do not first browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles source normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       source: z.discriminatedUnion("type", [
@@ -333,7 +333,7 @@ export function createMcpServer(
   server.registerTool("resource_apply", {
     title: "Apply updates to a CEO resource",
     description:
-      "Use this to update an existing Resource incrementally (attach source document asset, upsert evidence/content/summary, append interaction, or patch topics) along with optional justified State consequences in a single atomic Git transaction.",
+      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, and source assets. Do not modify Resource artifacts through generic apply_change_set.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),
@@ -350,7 +350,7 @@ export function createMcpServer(
   server.registerTool("resource_search", {
     title: "Search CEO resources",
     description:
-      "Use this for metadata-first discovery of captured external resources. Filters by query, topics, stage, platform, kind, and date. Returns lightweight resource summary cards without dumping full bodies.",
+      "Use resource_search to FIND resources for user retrieval/discovery. Filters by query, topics, stage, platform, kind, and date. Returns lightweight resource summary cards without dumping full bodies. Do not call resource_search merely to check whether a source already exists before resource_capture; capture performs dedupe itself.",
     inputSchema: {
       query: z.string().max(512).optional().describe("Text query matching title, note, topics, or reference"),
       topics: z.array(z.string()).optional().describe("Filter resources containing any of these topics"),

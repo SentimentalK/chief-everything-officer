@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import type { CeoWorkspace, ChangeOperation } from "../workspace.js";
+import {
+  type ChangeOperation,
+  type CeoWorkspace,
+  assertNoResourceMutations,
+} from "../workspace.js";
 import type { Config } from "../config.js";
 import { CeoError } from "../errors.js";
 import { resolveRef } from "../git.js";
@@ -63,6 +67,11 @@ export class ResourceService {
     const cached = await this.workspace.isRequestCompleted(requestId);
     if (cached) {
       return cached;
+    }
+
+    // Assert no Resource mutations in state_changes before any resolver/network work
+    if (input.state_changes && input.state_changes.length > 0) {
+      assertNoResourceMutations(input.state_changes, "state_changes");
     }
 
     // Determine normalized source properties
@@ -355,6 +364,10 @@ export class ResourceService {
     }
     if (input.operations.length === 0) {
       throw new CeoError("VALIDATION_FAILED", "At least one operation is required.");
+    }
+
+    if (input.state_changes && input.state_changes.length > 0) {
+      assertNoResourceMutations(input.state_changes, "state_changes");
     }
 
     return await this.workspace.withAtomicWorkspaceTransaction({

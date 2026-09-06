@@ -61,6 +61,53 @@ export function normalizeListPrefix(prefix: string): string {
   return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
 }
 
+export function isResourcePath(candidate: string): boolean {
+  try {
+    const normalized = validatePath(candidate);
+    return normalized === "resources" || normalized.startsWith("resources/");
+  } catch {
+    const trimmed = candidate.replace(/\\/g, "/").replace(/^\/+/, "").trim();
+    return trimmed === "resources" || trimmed.startsWith("resources/");
+  }
+}
+
+export function assertNoResourceMutations(
+  operations: ChangeOperation[],
+  context: "apply_change_set" | "state_changes",
+): void {
+  for (const operation of operations) {
+    if (isResourcePath(operation.path)) {
+      const details: Record<string, unknown> = {
+        path: operation.path,
+        op: operation.op,
+        context,
+      };
+      if (operation.op === "move") {
+        details.target = operation.target;
+      }
+      const message =
+        context === "apply_change_set"
+          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources."
+          : "Resource state_changes cannot mutate resources/**. Use typed Resource operations for Resource artifacts.";
+      throw new CeoError("RESOURCE_API_REQUIRED", message, details);
+    }
+
+    if (operation.op === "move" && isResourcePath(operation.target)) {
+      const details: Record<string, unknown> = {
+        path: operation.path,
+        target: operation.target,
+        op: operation.op,
+        context,
+      };
+      const message =
+        context === "apply_change_set"
+          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources."
+          : "Resource state_changes cannot mutate resources/**. Use typed Resource operations for Resource artifacts.";
+      throw new CeoError("RESOURCE_API_REQUIRED", message, details);
+    }
+  }
+}
+
 export class CeoWorkspace {
   private state: WorkspaceState = "RECOVERING";
   private lastPushAt: string | null = null;
@@ -393,6 +440,8 @@ export class CeoWorkspace {
     if (input.operations.length === 0 || input.operations.length > LIMITS.maxOperationsPerTransaction) {
       throw new CeoError("VALIDATION_FAILED", `Apply between 1 and ${LIMITS.maxOperationsPerTransaction} operations.`);
     }
+
+    assertNoResourceMutations(input.operations, "apply_change_set");
 
     return await this.withAtomicWorkspaceTransaction({
       requestId,

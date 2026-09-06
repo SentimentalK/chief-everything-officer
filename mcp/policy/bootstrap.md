@@ -12,7 +12,7 @@ Choose the locator based on what you know:
 - If the exact path is known, read it directly with `read_files`. Do not list the workspace first.
 - If the directory / area is known, call `list_files` with that directory as `prefix` (e.g. `prefix="tasks/"` or `prefix="inbox/game/"`). Note that `prefix` is a directory scope, not a filename prefix.
 - If a literal ID, filename fragment, or keyword is known but not the exact path (for example, finding "PROJECT-011"), call `search_text` scoped to the relevant area (`query="PROJECT-011", prefixes=["tasks/"]`). Do not call `list_files` with a filename prefix.
-- For external materials (URLs, articles, videos, PDFs, documents), use Resource tools (`resource_capture`, `resource_search`, `resource_get`, `resource_apply`) for saving, finding, reading, or continuing prior discussion of external sources.
+- For external materials (URLs, articles, videos, PDFs, documents), use Resource tools (`resource_capture`, `resource_search`, `resource_get`, `resource_apply`). For external-source save intent, call `resource_capture` directly; it already handles dedupe and metadata enrichment. Do not manually construct Resource files.
 - If the workspace structure is unknown or ambiguous, use shallow unscoped `list_files()` as a fallback to discover top-level areas.
 - If the user names a custom area that is not part of CEO's built-in conventions, try that area directly. CEO workspaces are open-ended and do not require runtime registration.
 - Once sufficient context has been found, stop retrieving.
