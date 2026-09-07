@@ -284,7 +284,7 @@ describe("Resource Authority & Namespace Hardening", () => {
 
     // bootstrap policy
     expect(policy.bootstrap).toContain(
-      "For external-source save intent, call `resource_capture` directly; it already handles dedupe and metadata enrichment. Do not manually construct Resource files."
+      "对于外部来源的保存意图，直接调用 `resource_capture`；它已经包含了查重与元数据丰富逻辑。不要手动构造 Resource 文件。"
     );
   });
 });

@@ -4,18 +4,18 @@ CEO State MCP 是用户拥有的长期个人工作空间与状态引擎。它采
 
 用户 workspace 是开放的 Markdown 空间，不要求所有数据域提前被 CEO runtime 注册。任意合法的 Markdown 文件均可按需创建、读取、更新和组织。
 
-## Discovery and retrieval
+## 发现与检索
 
-Infer the narrowest useful scope from the user's intent before calling workspace tools.
+在调用工作空间工具之前，根据用户意图推断出最窄的有用范围。
 
-Choose the locator based on what you know:
-- If the exact path is known, read it directly with `read_files`. Do not list the workspace first.
-- If the directory / area is known, call `list_files` with that directory as `prefix` (e.g. `prefix="tasks/"` or `prefix="inbox/game/"`). Note that `prefix` is a directory scope, not a filename prefix.
-- If a literal ID, filename fragment, or keyword is known but not the exact path (for example, finding "PROJECT-011"), call `search_text` scoped to the relevant area (`query="PROJECT-011", prefixes=["tasks/"]`). Do not call `list_files` with a filename prefix.
-- For external materials (URLs, articles, videos, PDFs, documents), use Resource tools (`resource_capture`, `resource_search`, `resource_get`, `resource_apply`). For external-source save intent, call `resource_capture` directly; it already handles dedupe and metadata enrichment. Do not manually construct Resource files.
-- If the workspace structure is unknown or ambiguous, use shallow unscoped `list_files()` as a fallback to discover top-level areas.
-- If the user names a custom area that is not part of CEO's built-in conventions, try that area directly. CEO workspaces are open-ended and do not require runtime registration.
-- Once sufficient context has been found, stop retrieving.
+根据你已知的信息选择定位方式：
+- 如果确切路径已知，直接使用 `read_files` 读取，不要先列出工作空间。
+- 如果目录/区域已知，以该目录作为 `prefix` 调用 `list_files`（例如 `prefix="tasks/"` 或 `prefix="inbox/game/"`）。注意 `prefix` 是目录范围，而不是文件名匹配前缀。
+- 如果已知具体 ID、文件名片段或关键词，但不知道确切路径（例如寻找 "PROJECT-011"），针对相关区域调用 `search_text`（例如 `query="PROJECT-011", prefixes=["tasks/"]`）。不要使用文件名作为前缀去调用 `list_files`。
+- 对于外部材料（URL、文章、视频、PDF、文档），使用 Resource 工具（`resource_capture`、`resource_search`、`resource_get`、`resource_apply`）。对于外部来源的保存意图，直接调用 `resource_capture`；它已经包含了查重与元数据丰富逻辑。不要手动构造 Resource 文件。
+- 如果工作空间结构未知或模糊，使用浅层无范围限制的 `list_files()` 作为回退方案以发现顶层区域。
+- 如果用户提到了不属于 CEO 内置约定的自定义区域，直接尝试该区域。CEO 工作空间是开放式的，无需在 runtime 预先注册。
+- 一旦找到足够的上下文，立即停止检索。
 
 ## 规则与语义优先级
 

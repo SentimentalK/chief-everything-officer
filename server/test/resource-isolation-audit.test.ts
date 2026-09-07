@@ -99,8 +99,8 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     const res = policyCall.structuredContent as any;
     expect(res.ok).toBe(true);
     expect(res.status).toBe("FOUND");
-    expect(res.content).toContain("# CEO Resource Policy");
-    expect(res.content).toContain("Markdown Understanding is the V0 Core");
+    expect(res.content).toContain("# CEO 资源策略 (Resource Policy)");
+    expect(res.content).toContain("Markdown 理解是 V0 的核心");
   });
 
   it("sanitizes data_base64 from audit log while recording affected paths and commit hash", async () => {
