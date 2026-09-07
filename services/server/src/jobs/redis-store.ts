@@ -6,7 +6,15 @@ import {
   type RequestPlaceholder,
   type PersistedJobRecord,
 } from "./schema.js";
-import type { RedisClientType } from "redis";
+import {
+  ClientClosedError,
+  ClientOfflineError,
+  ConnectionTimeoutError,
+  DisconnectsClientError,
+  ReconnectStrategyError,
+  SocketClosedUnexpectedlyError,
+  type RedisClientType,
+} from "redis";
 
 export interface AuthScope {
   user_id: string;
@@ -290,92 +298,269 @@ function normalizeDecision(res: unknown): CommitDecision {
 
 export interface RedisRunnerOptions {
   opTimeoutMs?: number;
+  /** Invoked for transport-level client/connect/factory errors (never for RESP reply errors). */
+  onClientError?: (err: unknown) => void;
 }
 
 export const DEFAULT_REDIS_OP_TIMEOUT_MS = 2500;
 
-/** Builds a real node-redis v5 adapter (offline queue disabled) with bounded per-command timeout. */
+/**
+ * Production node-redis v5 adapter (offline queue disabled) with a bounded
+ * per-command deadline that does NOT depend on node-redis abort support:
+ * node-redis honors `abortSignal`/`timeout` only while a command is queued
+ * pre-write; once written it waits for the reply forever (verified in the
+ * installed @redis/client@5.12.1 commands-queue.js). This runner enforces its
+ * own deadline and, on expiry, destroys and re-creates the shared connection
+ * so no commands accumulate, in-flight siblings fail explicitly with
+ * QUEUE_UNAVAILABLE, and a fresh connection recovers.
+ *
+ * The argument is a FACTORY because the runner owns the connection lifecycle
+ * (initial + post-timeout replacement). Every call MUST return a NEW,
+ * unconnected node-redis client; the runner connects it. No pre-connected
+ * instances are accepted.
+ */
 export function createRedisRunnerFromClient(
-  client: RedisClientType,
+  createClientFn: () => RedisClientType,
   runnerOptions: RedisRunnerOptions = {},
-): RedisRunner {
+): RedisRunner & { dispose(): Promise<void> } {
   const opTimeoutMs = runnerOptions.opTimeoutMs ?? DEFAULT_REDIS_OP_TIMEOUT_MS;
-  const ready = (): boolean => (typeof client.isReady === "boolean" ? client.isReady : client.isOpen);
+  const onClientError = runnerOptions.onClientError ?? (() => void 0);
 
-  async function execute<T>(fn: (cmdOpts: { abortSignal: AbortSignal }) => Promise<T>): Promise<T> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      controller.abort();
-    }, opTimeoutMs);
+  const OP_TIMEOUT_MESSAGE =
+    "Redis command timed out; outcome may be unknown. Retry with the original request_id.";
+  const TRANSPORT_FAULT_MESSAGE =
+    "Redis connection fault; the operation may have been executed. Retry with the original request_id.";
+  const NOT_AVAILABLE_MESSAGE = "Redis is not available.";
+
+  interface Connection {
+    client: RedisClientType;
+    /** Set when THIS runner tears the client down (reset or dispose). Every
+     *  rejection the teardown produces (node-redis destroy() flushes the queue
+     *  with a DisconnectsClientError, which never passes through the client's
+     *  'error' listener and reports name === "Error") maps to QUEUE_UNAVAILABLE. */
+    invalidated: boolean;
+  }
+
+  // Errors node-redis surfaces on a client's 'error' event are emitted BEFORE
+  // the queue is flushed with the same object (client/index.js
+  // #attachListeners), so marking here catches genuine socket faults. This is
+  // a SUPPLEMENT: the authoritative signals are connection.invalidated (our
+  // own teardown), instanceof of the real exported classes, and OS codes.
+  const transportFaults = new WeakSet<object>();
+
+  let current: Connection | null = null;
+  let disposed = false;
+
+  /** A user logging callback must never break the runner or leak a rejection. */
+  function reportClientError(err: unknown): void {
     try {
-      return await fn({ abortSignal: controller.signal });
-    } catch (error: any) {
-      if (controller.signal.aborted || error?.name === "AbortError") {
-        throw new StoreError(
-          "QUEUE_UNAVAILABLE",
-          "Redis command timed out. Please retry with the original request_id.",
-          { timeoutMs: opTimeoutMs, cause: String(error) },
-        );
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
+      onClientError(err);
+    } catch {
+      /* ignore user callback failures */
     }
+  }
+
+  /** Mandatory 'error' listener (an unhandled 'error' event would crash the
+   *  process) + log callback wiring. */
+  function wire(client: RedisClientType): void {
+    client.on("error", (err: unknown) => {
+      if (err && typeof err === "object") transportFaults.add(err);
+      reportClientError(err);
+    });
+  }
+
+  /** Create the next connection and start its background connect. A factory
+   *  throw is reported via onClientError and returns null: the runner stays
+   *  unavailable (current === null -> ready() false -> QUEUE_UNAVAILABLE) and
+   *  factory failures are NOT auto-retried. Recovery from network connect
+   *  failures is delegated to the client's own reconnectStrategy (production
+   *  bridge). The connect() rejection is always caught, so a failed connect —
+   *  or a destroy while connecting — can never become an unhandled rejection. */
+  function spawn(): Connection | null {
+    let client: RedisClientType;
+    try {
+      client = createClientFn();
+    } catch (err) {
+      reportClientError(err);
+      return null;
+    }
+    wire(client);
+    const connection: Connection = { client, invalidated: false };
+    current = connection;
+    client.connect().catch((err: unknown) => reportClientError(err));
+    return connection;
+  }
+
+  spawn(); // initial connection (a synchronous factory throw is reported, not propagated)
+
+  function ready(): boolean {
+    if (disposed) return false;
+    return current?.client.isReady === true;
+  }
+
+  function isTransportFault(connection: Connection, error: unknown): boolean {
+    if (connection.invalidated) return true; // torn down by this runner
+    if (!error || typeof error !== "object") return false;
+    if (transportFaults.has(error)) return true;
+    if (
+      error instanceof ClientClosedError ||
+      error instanceof ClientOfflineError ||
+      error instanceof DisconnectsClientError ||
+      error instanceof ConnectionTimeoutError ||
+      error instanceof ReconnectStrategyError ||
+      error instanceof SocketClosedUnexpectedlyError
+    ) {
+      return true;
+    }
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" && /^(ECONN|ENET|EHOST|ETIMEDOUT|EPIPE|EAI_)/.test(code);
+  }
+
+  /** Tear down one stuck connection and bring up a fresh one. SYNCHRONOUS and
+   *  idempotent by connection identity: a later deadline callback observes
+   *  current !== connection (or disposed) and is a no-op. Never respawns after
+   *  dispose. */
+  function resetTransport(connection: Connection): void {
+    if (disposed || current !== connection) return;
+    current = null; // new ops fail fast ("Redis is not available.") meanwhile
+    connection.invalidated = true; // destroy-flush rejections map below
+    try {
+      connection.client.destroy(); // flushAll rejects every in-flight command
+    } catch {
+      /* already closed */
+    }
+    spawn();
+  }
+
+  async function execute<T>(
+    operation: string,
+    run: (client: RedisClientType) => Promise<T>,
+  ): Promise<T> {
+    const connection = current;
+    if (disposed || !connection || !connection.client.isReady) {
+      throw new StoreError("QUEUE_UNAVAILABLE", NOT_AVAILABLE_MESSAGE);
+    }
+    const client = connection.client;
+    let settled = false;
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new StoreError("QUEUE_UNAVAILABLE", OP_TIMEOUT_MESSAGE, {
+            timeoutMs: opTimeoutMs,
+            operation,
+          }),
+        );
+        resetTransport(connection);
+      }, opTimeoutMs);
+      let runPromise: Promise<T>;
+      try {
+        // Hand the command to the client before any interleaving can reset the
+        // connection; a synchronous sendCommand throw must not leak the timer
+        // or spuriously reset a healthy connection.
+        runPromise = run(client);
+      } catch (error) {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+        return;
+      }
+      runPromise.then(
+        (value) => {
+          if (settled) return; // late success after the deadline: ignored
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return; // late failure after the deadline: already reported
+          settled = true;
+          clearTimeout(timer);
+          if (isTransportFault(connection, error)) {
+            reject(
+              new StoreError("QUEUE_UNAVAILABLE", TRANSPORT_FAULT_MESSAGE, {
+                operation,
+                cause: String(error),
+              }),
+            );
+          } else {
+            reject(error); // RESP reply errors (e.g. NOSCRIPT) keep flowing through
+          }
+        },
+      );
+    });
   }
 
   return {
     ready,
     async get(key) {
-      return execute(async (cmdOpts) => {
-        const v = await client.sendCommand(["GET", key], cmdOpts);
+      return execute("GET", async (client) => {
+        const v = await client.sendCommand(["GET", key]);
         return v === null ? null : String(v);
       });
     },
     async set(key, value) {
-      await execute(async (cmdOpts) => {
-        await client.sendCommand(["SET", key, value], cmdOpts);
+      await execute("SET", async (client) => {
+        await client.sendCommand(["SET", key, value]);
       });
     },
     async xaddStream(payload) {
       const parts: string[] = [];
       for (const [k, v] of Object.entries(payload)) parts.push(k, String(v));
-      if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for XADD.");
-      return execute(async (cmdOpts) => {
-        const out = await client.sendCommand(["XADD", KEY_STREAM, "*", ...parts], cmdOpts);
+      return execute("XADD", async (client) => {
+        const out = await client.sendCommand(["XADD", KEY_STREAM, "*", ...parts]);
         return String(out);
       });
     },
     async xlen() {
-      if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for XLEN.");
-      return execute(async (cmdOpts) => {
-        const out = await client.sendCommand(["XLEN", KEY_STREAM], cmdOpts);
+      return execute("XLEN", async (client) => {
+        const out = await client.sendCommand(["XLEN", KEY_STREAM]);
         return typeof out === "number" ? out : Number(out);
       });
     },
     async scriptLoad(script) {
-      if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for SCRIPT LOAD.");
-      return execute(async (cmdOpts) => {
-        const out = await client.sendCommand(["SCRIPT", "LOAD", script], cmdOpts);
+      return execute("SCRIPT LOAD", async (client) => {
+        const out = await client.sendCommand(["SCRIPT", "LOAD", script]);
         return String(out);
       });
     },
     async evalsha(sha, keyCount, keys, args) {
-      return execute(async (cmdOpts) => {
-        const out = await client.sendCommand(["EVALSHA", sha, String(keyCount), ...keys, ...args], cmdOpts);
+      return execute("EVALSHA", async (client) => {
+        const out = await client.sendCommand([
+          "EVALSHA",
+          sha,
+          String(keyCount),
+          ...keys,
+          ...args,
+        ]);
         return String(out);
       });
     },
     async scriptExists(sha) {
-      return execute(async (cmdOpts) => {
-        const res = await client.sendCommand(["SCRIPT", "EXISTS", sha], cmdOpts);
+      return execute("SCRIPT EXISTS", async (client) => {
+        const res = await client.sendCommand(["SCRIPT", "EXISTS", sha]);
         const arr = Array.isArray(res) ? res.map(String) : [String(res)];
         return arr.includes("1");
       });
     },
     async flush() {
-      await execute(async (cmdOpts) => {
-        await client.sendCommand(["FLUSHALL"], cmdOpts);
+      await execute("FLUSHALL", async (client) => {
+        await client.sendCommand(["FLUSHALL"]);
       });
+    },
+    async dispose(): Promise<void> {
+      disposed = true;
+      const connection = current;
+      current = null;
+      if (connection) {
+        connection.invalidated = true; // any pending op now rejects QUEUE_UNAVAILABLE
+        try {
+          connection.client.destroy();
+        } catch {
+          /* already closed */
+        }
+      }
     },
   };
 }

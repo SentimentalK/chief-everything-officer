@@ -24,6 +24,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY policy ./policy
+# Operator acceptance script for the Redis op-timeout fix; run inside the pod
+# via `kubectl exec` -> node /app/scripts/verify-redis-op-timeout.mjs.
+COPY scripts/verify-redis-op-timeout.mjs ./scripts/verify-redis-op-timeout.mjs
 
 USER 10001:10001
 EXPOSE 3000

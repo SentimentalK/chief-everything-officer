@@ -147,59 +147,28 @@ describe("isNoScriptError helper", () => {
   });
 });
 
-describe("createRedisRunnerFromClient bounded timeout", () => {
-  it("times out hanging commands and provides original request_id retry guidance", async () => {
-    const fakeClient: any = {
-      isOpen: true,
-      isReady: true,
-      async sendCommand(args: string[], options?: { abortSignal?: AbortSignal }) {
-        return new Promise((resolve, reject) => {
-          if (args[0] === "HANG") {
-            if (options?.abortSignal) {
-              options.abortSignal.addEventListener("abort", () => {
-                const err: any = new Error("The command was aborted");
-                err.name = "AbortError";
-                reject(err);
-              });
-            }
-            return;
-          }
-          resolve("OK_RESULT");
-        });
+describe("createRedisRunnerFromClient factory failure", () => {
+  it("reports the factory error once, stays unavailable, and never auto-retries", async () => {
+    const reported: string[] = [];
+    const runner = createRedisRunnerFromClient(
+      () => {
+        throw new Error("factory boom");
       },
-    };
+      { onClientError: (err: unknown) => reported.push(String(err)) },
+    );
 
-    const runner = createRedisRunnerFromClient(fakeClient, { opTimeoutMs: 30 });
+    // A factory throw is contained: construction does not throw, the runner is
+    // simply unavailable, and calls fail explicitly instead of hanging.
+    expect(runner.ready()).toBe(false);
+    await expect(runner.get("k")).rejects.toMatchObject({ code: "QUEUE_UNAVAILABLE" });
+    await expect(runner.get("k")).rejects.toThrow(/Redis is not available/i);
+    // No auto-retry: exactly one report, from the initial spawn.
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toMatch(/factory boom/);
 
-    let caught: any;
-    try {
-      await (runner as any).get("test-key");
-    } catch (err) {
-      caught = err;
-    }
-
-    // Now test hanging get
-    fakeClient.sendCommand = (args: string[], options?: { abortSignal?: AbortSignal }) => {
-      return new Promise((_, reject) => {
-        if (options?.abortSignal) {
-          options.abortSignal.addEventListener("abort", () => {
-            const err: any = new Error("The command was aborted");
-            err.name = "AbortError";
-            reject(err);
-          });
-        }
-      });
-    };
-
-    await expect(runner.get("hang-key")).rejects.toThrow(StoreError);
-    await expect(runner.get("hang-key")).rejects.toThrow(/retry with the original request_id/);
-
-    // Verify subsequent successful calls work
-    fakeClient.sendCommand = async (args: string[]) => {
-      if (args[0] === "GET") return "subsequent_value";
-      return "OK";
-    };
-    expect(await runner.get("good-key")).toBe("subsequent_value");
+    // dispose is safe and idempotent even on an unavailable runner.
+    await runner.dispose();
+    await runner.dispose();
   });
 });
 

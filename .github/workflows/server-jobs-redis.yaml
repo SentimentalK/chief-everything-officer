@@ -80,6 +80,11 @@ jobs:
           npm run typecheck
           npm run build
 
+      - name: Run operator acceptance script (deadline enforcement)
+        run: |
+          cd services/server
+          node scripts/verify-redis-op-timeout.mjs
+
       - name: Capture pre-restart durable job and stream metadata
         run: |
           cd services/server
@@ -89,10 +94,31 @@ jobs:
             import { RedisJobStore, createRedisRunnerFromClient } from "./dist/jobs/redis-store.js";
             import { JobService } from "./dist/jobs/service.js";
 
-            const c = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
-            await c.connect();
-            const store = new RedisJobStore(createRedisRunnerFromClient(c));
+            function waitForReady(isReady, timeoutMs = 5000, stepMs = 20) {
+              const started = Date.now();
+              return new Promise((resolve, reject) => {
+                const tick = () => {
+                  if (isReady()) return resolve();
+                  if (Date.now() - started > timeoutMs) return reject(new Error("runner not ready"));
+                  setTimeout(tick, stepMs);
+                };
+                tick();
+              });
+            }
+
+            const runner = createRedisRunnerFromClient(
+              () =>
+                createClient({
+                  url: "redis://127.0.0.1:6379",
+                  socket: { reconnectStrategy: false },
+                  disableOfflineQueue: true,
+                }),
+              { opTimeoutMs: 2500 },
+            );
+            const store = new RedisJobStore(runner);
             const service = new JobService({ store }, () => true);
+            try {
+              await waitForReady(() => runner.ready());
 
             const scope = { user_id: "usr_restart", workspace_id: "ws_restart" };
             const reqId = "123e4567-e89b-12d3-a456-426614174099";
@@ -128,7 +154,9 @@ jobs:
             mkdirSync(".tmp", { recursive: true });
             writeFileSync(".tmp/restart-expected.json", JSON.stringify(expected, null, 2));
             console.log("Pre-restart state recorded:", expected);
-            await c.quit();
+            } finally {
+              await runner.dispose();
+            }
           '
 
       - name: Force-stop old Redis and restart on the SAME volume
@@ -157,10 +185,32 @@ jobs:
             import { JobService } from "./dist/jobs/service.js";
 
             const expected = JSON.parse(readFileSync(".tmp/restart-expected.json", "utf8"));
-            const c = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
-            await c.connect();
-            const store = new RedisJobStore(createRedisRunnerFromClient(c));
+
+            function waitForReady(isReady, timeoutMs = 5000, stepMs = 20) {
+              const started = Date.now();
+              return new Promise((resolve, reject) => {
+                const tick = () => {
+                  if (isReady()) return resolve();
+                  if (Date.now() - started > timeoutMs) return reject(new Error("runner not ready"));
+                  setTimeout(tick, stepMs);
+                };
+                tick();
+              });
+            }
+
+            const runner = createRedisRunnerFromClient(
+              () =>
+                createClient({
+                  url: "redis://127.0.0.1:6379",
+                  socket: { reconnectStrategy: false },
+                  disableOfflineQueue: true,
+                }),
+              { opTimeoutMs: 2500 },
+            );
+            const store = new RedisJobStore(runner);
             const service = new JobService({ store }, () => true);
+            try {
+              await waitForReady(() => runner.ready());
 
             const scope = { user_id: expected.user_id, workspace_id: expected.workspace_id };
 
@@ -200,7 +250,9 @@ jobs:
             }
 
             console.log("Post-restart persistence, replay dedupe, and stream invariants verified successfully!");
-            await c.quit();
+            } finally {
+              await runner.dispose();
+            }
           '
 
       - name: Cleanup test containers and temp data

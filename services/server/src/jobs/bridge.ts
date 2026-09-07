@@ -1,4 +1,4 @@
-import { createClient, type RedisClientType } from "redis";
+import { createClient } from "redis";
 import { JobService, type JobAuthScope, type JobServiceDeps } from "./service.js";
 import { RedisJobStore, createRedisRunnerFromClient, StoreError } from "./redis-store.js";
 
@@ -45,42 +45,36 @@ export function openJobBridge(
     return { service: new JobService(deps, () => true), dispose: async () => void 0 };
   }
 
-  const client: RedisClientType = createClient({
-    url: cfg.redisUrl,
-    socket: {
-      connectTimeout: CONNECT_TIMEOUT_MS,
-      // Do not buffer offline commands: a datastore fault must surface as an
-      // error, never silently commit after recovery.
-      reconnectStrategy: (retries: number) => Math.min(retries * 500, 5000),
+  // The runner owns the whole connection lifecycle (initial connect + one fresh
+  // client per timeout reset); the factory must mint a NEW unconnected client
+  // per call. The runner attaches the 'error' listener and catches connect
+  // failures, routing them to onClientError below; readiness is read live so
+  // QUEUE_UNAVAILABLE surfaces until the backend recovers.
+  const runner = createRedisRunnerFromClient(
+    () =>
+      createClient({
+        url: cfg.redisUrl,
+        socket: {
+          connectTimeout: CONNECT_TIMEOUT_MS,
+          // Do not buffer offline commands: a datastore fault must surface as an
+          // error, never silently commit after recovery.
+          reconnectStrategy: (retries: number) => Math.min(retries * 500, 5000),
+        },
+        disableOfflineQueue: true,
+        commandsQueueMaxLength: 2,
+      }),
+    {
+      opTimeoutMs: 2500,
+      onClientError: (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`bridge: redis error: ${msg}\n`);
+      },
     },
-    disableOfflineQueue: true,
-    commandsQueueMaxLength: 2,
-  });
-  // Swallow expected transport noise; readiness is reflected by client.isReady.
-  client.on("error", (err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`bridge: redis error: ${msg}\n`);
-  });
-
-  // Fire background connect; never block server listen.
-  client.connect().catch((err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`bridge: redis connect deferred error: ${msg}\n`);
-  });
-
-  const runner = createRedisRunnerFromClient(client, { opTimeoutMs: 2500 });
+  );
   const store = new RedisJobStore(runner);
   const service = new JobService({ store, resourceExists, nowMs: Date.now }, () => true);
   return {
     service,
-    dispose: async () => {
-      if (client.isOpen) {
-        try {
-          await client.quit();
-        } catch {
-          client.destroy();
-        }
-      }
-    },
+    dispose: () => runner.dispose(),
   };
 }

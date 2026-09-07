@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createClient, type RedisClientType } from "redis";
-import { RedisJobStore, createRedisRunnerFromClient } from "../src/jobs/redis-store.js";
+import { RedisJobStore, createRedisRunnerFromClient, type RedisRunner } from "../src/jobs/redis-store.js";
 import { JobService } from "../src/jobs/service.js";
 import { makeJobId, JOBS_SCHEMA_VERSION, businessDigest } from "../src/jobs/schema.js";
 
@@ -70,8 +70,20 @@ const submitPayload = (req: string, prompt = "p-x") => ({
   timeout_seconds: 120,
 });
 
+async function waitForReady(isReady: () => boolean, timeoutMs: number, stepMs = 20): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    if (isReady()) return;
+    if (Date.now() - started > timeoutMs) throw new Error("runner never became ready");
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+}
+
 describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
+  // Test-owned admin side-channel (direct SCRIPT FLUSH etc.); the runner below
+  // owns its own connections via a factory and never shares them with tests.
   let client: RedisClientType;
+  let runner: RedisRunner & { dispose(): Promise<void> };
   let store: RedisJobStore;
   let serviceA: JobService;
   let serviceB: JobService;
@@ -80,13 +92,30 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     client = createClient({ url: URL, socket: { reconnectStrategy: false } });
     client.on("error", () => void 0);
     await client.connect();
-    store = new RedisJobStore(createRedisRunnerFromClient(client));
-    serviceA = new JobService({ store }, () => true);
-    serviceB = new JobService({ store }, () => true);
-    await store.resetForTest();
+    runner = createRedisRunnerFromClient(
+      () =>
+        createClient({
+          url: URL,
+          socket: { reconnectStrategy: false },
+          disableOfflineQueue: true,
+        }),
+      { opTimeoutMs: 2500 },
+    );
+    try {
+      // Runner connect is background now; nothing is usable before ready.
+      await waitForReady(() => runner.ready(), 5000);
+      store = new RedisJobStore(runner);
+      serviceA = new JobService({ store }, () => true);
+      serviceB = new JobService({ store }, () => true);
+      await store.resetForTest();
+    } catch (err) {
+      await runner.dispose();
+      throw err;
+    }
   });
 
   afterAll(async () => {
+    await runner?.dispose();
     if (client?.isOpen) {
       // Leave the final durable job in place (no flush) for the workflow's
       // AOF restart-persistence assertion; just release our own connection.
@@ -247,14 +276,26 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     await expect(serviceWs2.get(userWorkspace2, { job_id: res1.view!.job_id })).rejects.toThrow(/not found/i);
   });
 
-  it("surfaces QUEUE_UNAVAILABLE on disconnect", async () => {
-    await store.resetForTest();
-    const disconnectedClient = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
-    const disconnectedStore = new RedisJobStore(createRedisRunnerFromClient(disconnectedClient));
+  it("surfaces QUEUE_UNAVAILABLE when the backend is unreachable", async () => {
+    const dead = createRedisRunnerFromClient(
+      () =>
+        createClient({
+          url: "redis://127.0.0.1:1", // refused immediately; nothing listens here
+          socket: { reconnectStrategy: false },
+          disableOfflineQueue: true,
+        }),
+      { opTimeoutMs: 100 },
+    );
+    const disconnectedStore = new RedisJobStore(dead);
     const disconnectedService = new JobService({ store: disconnectedStore }, () => true);
-
-    await expect(
-      disconnectedService.submit(userA, submitPayload("123e4567-e89b-12d3-a456-426614174040")),
-    ).rejects.toThrow(/QUEUE_UNAVAILABLE|not available/i);
+    try {
+      await expect(
+        disconnectedService.submit(userA, submitPayload("123e4567-e89b-12d3-a456-426614174040")),
+      ).rejects.toThrow(/QUEUE_UNAVAILABLE|not available/i);
+      // Never becomes ready: connect refused, reconnect disabled.
+      expect(dead.ready()).toBe(false);
+    } finally {
+      await dead.dispose();
+    }
   });
 });
