@@ -326,7 +326,7 @@ export function createMcpServer(
   server.registerTool("resource_capture", {
     title: "Capture external resource into CEO",
     description:
-      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. New resources are always initially saved under a stable ID directory ('resources/res-...'). Do not browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side. After capture, inspect the returned metadata/receipt; if sufficient context exists, invoke resource_apply with op 'rename' to give the resource a clean, concise, retrieval-friendly semantic display name (default to user language). 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。",
+      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. New resources are always initially saved under a stable ID directory ('resources/res-...'). Do not browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side. After capture, inspect the returned metadata/receipt; if sufficient context exists, invoke resource_apply with op 'rename' to give the resource a clean, concise, retrieval-friendly semantic display name (default to user language). 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。重复 capture 可刷新同一资源；检查命名来源，信息足够时继续 rename。",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       source: z.discriminatedUnion("type", [
@@ -349,7 +349,7 @@ export function createMcpServer(
   server.registerTool("resource_apply", {
     title: "Apply updates to a CEO resource",
     description:
-      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set. 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。",
+      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set. 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。rename 同步展示名与实际目录；相同目标可以成功返回无变化。",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),
@@ -366,7 +366,7 @@ export function createMcpServer(
   server.registerTool("resource_search", {
     title: "Search CEO resources",
     description:
-      "Use resource_search to FIND resources for user retrieval/discovery. Filters by query, topics, stage, platform, kind, and date. Returns lightweight resource summary cards without dumping full bodies. Do not call resource_search merely to check whether a source already exists before resource_capture; capture performs dedupe itself.",
+      "Use resource_search to FIND resources for user retrieval/discovery. Filters by query, topics, stage, platform, kind, and date. Returns lightweight resource summary cards without dumping full bodies. Do not call resource_search merely to check whether a source already exists before resource_capture; capture performs dedupe itself. 用 naming_source=id 查找尚未语义命名的资源，stage 不用于判断命名是否完成。",
     inputSchema: {
       query: z.string().max(512).optional().describe("Text query matching title, note, topics, or reference"),
       topics: z.array(z.string()).optional().describe("Filter resources containing any of these topics"),
@@ -376,6 +376,7 @@ export function createMcpServer(
       captured_from: z.string().optional().describe("ISO-8601 start timestamp"),
       captured_to: z.string().optional().describe("ISO-8601 end timestamp"),
       stage: z.enum(["CAPTURED", "EXTRACTED", "NORMALIZED", "READY_FOR_DISCUSSION", "DISCUSSED"]).optional(),
+      naming_source: z.enum(["id", "explicit"]).optional().describe("Filter by naming source: 'id' selects resources not yet semantically named"),
       sort: z.enum(["newest", "oldest"]).optional().default("newest"),
       limit: z.number().int().min(1).max(100).optional().default(20),
     },

@@ -366,4 +366,141 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
     expect(doc3.meta.display_name).toBe("Deep Learning Breakthrough 2026");
     expect(doc3.meta.title).toBe("Deep Learning Breakthrough 2026");
   });
+
+  it("repeated same-target rename with a fresh base commit succeeds without a new commit", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+
+    const applyRes1 = await service.apply({
+      resource_id: resourceId,
+      base_commit: cap.commit as string,
+      summary: "Initial rename",
+      operations: [{ op: "rename", display_name: "Stable Label" }],
+    });
+    expect(applyRes1.renamed).toBe(true);
+    expect(applyRes1.new_path).toBe("resources/Stable Label");
+    const commit1 = applyRes1.commit as string;
+
+    // Retry the exact same rename with the NEW base commit: empty diff is a success.
+    const applyRes2 = await service.apply({
+      resource_id: resourceId,
+      base_commit: commit1,
+      summary: "Retry rename",
+      operations: [{ op: "rename", display_name: "Stable Label" }],
+    });
+    expect(applyRes2.ok).toBe(true);
+    expect(applyRes2.renamed).toBe(false);
+    expect(applyRes2.changed_files).toEqual([]);
+    expect(applyRes2.commit).toBe(commit1);
+    expect(applyRes2.pushed).toBe(false);
+    expect(applyRes2.old_path).toBe("resources/Stable Label");
+    expect(applyRes2.new_path).toBe("resources/Stable Label");
+    expect((applyRes2.resource as any).naming_source).toBe("explicit");
+    expect((await workspace.workspaceStatus()).local_commit).toBe(commit1);
+  });
+
+  it("rename request_id replay returns the cached result without a new commit", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+    const requestId = "123e4567-e89b-12d3-a456-426614174000";
+
+    const applyRes1 = await service.apply({
+      request_id: requestId,
+      resource_id: resourceId,
+      base_commit: cap.commit as string,
+      summary: "Rename with replay id",
+      operations: [{ op: "rename", display_name: "Replay Label" }],
+    });
+    expect(applyRes1.ok).toBe(true);
+    const commitA = applyRes1.commit as string;
+
+    // Identical request_id re-sent (even with a stale base): replay wins over staleness.
+    const applyRes2 = await service.apply({
+      request_id: requestId,
+      resource_id: resourceId,
+      base_commit: cap.commit as string, // deliberately stale
+      summary: "Rename with replay id",
+      operations: [{ op: "rename", display_name: "Replay Label" }],
+    });
+    expect(applyRes2.ok).toBe(true);
+    expect(applyRes2.commit).toBe(commitA);
+    expect((applyRes2.resource as any).resource_id).toBe(resourceId);
+    expect((await workspace.workspaceStatus()).local_commit).toBe(commitA);
+  });
+
+  it("fresh rename request with stale base_commit raises STALE_REVISION", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+    const commit1 = (await service.apply({
+      resource_id: resourceId,
+      base_commit: cap.commit as string,
+      summary: "Rename once",
+      operations: [{ op: "rename", display_name: "First Label" }],
+    })).commit as string;
+
+    // A NEW request (different request_id) on the outdated capture base still conflicts.
+    await expect(
+      service.apply({
+        resource_id: resourceId,
+        base_commit: cap.commit as string, // stale: origin moved past it
+        summary: "Rename twice",
+        operations: [{ op: "rename", display_name: "Second Label" }],
+      }),
+    ).rejects.toMatchObject({ code: "STALE_REVISION" });
+    expect((await workspace.workspaceStatus()).local_commit).toBe(commit1);
+  });
+
+  it("rename from a real id placeholder to its own id commits metadata with renamed=false", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    // Genuine id placeholder: directory and display_name are the resource_id,
+    // naming_source is "id".
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+    const baseCommit = cap.commit as string;
+
+    // Renaming to the current id string: dir stays, but naming_source id -> explicit
+    // is a real metadata change and must be committed with renamed=false.
+    const applyRes = await service.apply({
+      resource_id: resourceId,
+      base_commit: baseCommit,
+      summary: "Confirm id placeholder name",
+      operations: [{ op: "rename", display_name: resourceId }],
+    });
+    expect(applyRes.ok).toBe(true);
+    expect(applyRes.renamed).toBe(false);
+    expect(applyRes.old_path).toBe(`resources/${resourceId}`);
+    expect(applyRes.new_path).toBe(`resources/${resourceId}`);
+    expect((applyRes.changed_files as string[])).toContain(`resources/${resourceId}/meta.md`);
+    expect(applyRes.commit).not.toBe(baseCommit);
+    expect(applyRes.pushed).toBe(true);
+
+    const metaContent = await readFile(
+      path.join(item.config.repoDir, `resources/${resourceId}/meta.md`),
+      "utf8",
+    );
+    expect(parseMetaMarkdown(metaContent).meta.naming_source).toBe("explicit");
+  });
 });

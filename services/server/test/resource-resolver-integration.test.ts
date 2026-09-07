@@ -600,4 +600,60 @@ describe("Resource Resolver Integration V0", () => {
     // Must NOT be coerced to 'video' based on duration_seconds!
     expect(meta.resource_kind).toBe("webpage");
   });
+
+  it("failed revisit refresh preserves original metadata and user note/topics untouched", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const mockResolver = new MockResolver();
+    mockResolver.customHandler = (url) => ({
+      status: "resolved",
+      metadata: {
+        schema_version: 1,
+        source_type: "youtube",
+        source_url: url,
+        source_id: "vid456",
+        title: "Original Resolver Title",
+      },
+      latency_ms: 10,
+    });
+
+    const service = new ResourceService(workspace, item.config, mockResolver);
+    const cap1 = await service.capture({
+      source: { type: "url", url: "https://www.youtube.com/watch?v=vid456" },
+      note: "Keep this capture note",
+      topics: ["preserve-me"],
+    });
+    const resourceId = (cap1.resource as any).resource_id;
+    const dir1 = (cap1.resource as any).relative_path;
+
+    // Refresh attempt fails (metadata fetch unavailable, note/topics omitted).
+    mockResolver.customHandler = (url) => ({
+      status: "unavailable",
+      code: "timeout",
+    });
+    const cap2 = await service.capture({
+      source: { type: "url", url: "https://www.youtube.com/watch?v=vid456" },
+    });
+
+    expect(cap2.ok).toBe(true);
+    expect((cap2.resource as any).resource_id).toBe(resourceId);
+    expect((cap2.resource as any).relative_path).toBe(dir1);
+    expect((cap2.resource as any).is_revisit).toBe(true);
+
+    // Original metadata plus user fields survive the failed refresh.
+    const loc = await resolveResourceLocation(item.config.repoDir, resourceId);
+    const doc = parseMetaMarkdown(await readFile(path.join(item.config.repoDir, loc!.relative_path, "meta.md"), "utf8"));
+    expect(doc.meta.title).toBe("Original Resolver Title");
+    expect(doc.meta.topics).toEqual(["preserve-me"]);
+    expect(doc.capture_note).toContain("Keep this capture note");
+
+    // No duplicate resource was created.
+    const cap3 = await service.capture({
+      source: { type: "url", url: "https://www.youtube.com/watch?v=vid456" },
+    });
+    expect((cap3.resource as any).resource_id).toBe(resourceId);
+  });
 });

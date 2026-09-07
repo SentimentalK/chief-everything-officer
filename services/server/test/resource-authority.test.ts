@@ -268,14 +268,17 @@ describe("Resource Authority & Namespace Hardening", () => {
     expect(capDesc).toContain("Primary tool for saving, remembering, capturing, or importing an external URL/artifact");
     expect(capDesc).toContain("Do not pre-search for duplicates before capture");
     expect(capDesc).toContain("resource_capture performs dedupe server-side");
+    expect(capDesc).toContain("重复 capture 可刷新同一资源；检查命名来源，信息足够时继续 rename。");
 
     // resource_apply
     const appDesc = tools["resource_apply"].description;
     expect(appDesc).toContain("Do not modify Resource artifacts through generic apply_change_set");
+    expect(appDesc).toContain("rename 同步展示名与实际目录；相同目标可以成功返回无变化。");
 
     // resource_search
     const searchDesc = tools["resource_search"].description;
     expect(searchDesc).toContain("Do not call resource_search merely to check whether a source already exists before resource_capture");
+    expect(searchDesc).toContain("用 naming_source=id 查找尚未语义命名的资源，stage 不用于判断命名是否完成。");
 
     // apply_change_set
     const changeDesc = tools["apply_change_set"].description;

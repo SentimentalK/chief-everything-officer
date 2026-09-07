@@ -2,6 +2,7 @@ import { rm, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CeoWorkspace } from "../src/workspace.js";
+import { runGit } from "../src/git.js";
 import { ResourceRetrievalService } from "../src/resource/retrieval.js";
 import { ResourceService } from "../src/resource/service.js";
 import { fixture } from "./helpers.js";
@@ -141,5 +142,126 @@ describe("Resource Retrieval & Progressive Reading", () => {
     const evidenceView = await retrieval.get({ resource_id: resourceId, view: "evidence" });
     expect(evidenceView.available).toBe(false);
     expect(evidenceView.status).toBe("NOT_AVAILABLE");
+  });
+
+  it("filters unnamed resources via naming_source=id with consistent total and limit", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    const capA = await service.capture({ source: { type: "file_descriptor", filename: "a.pdf" } });
+    const idA = (capA.resource as any).resource_id;
+    const capB = await service.capture({ source: { type: "file_descriptor", filename: "b.pdf" } });
+    const idB = (capB.resource as any).resource_id;
+
+    const capC = await service.capture({ source: { type: "file_descriptor", filename: "c.pdf" } });
+    const idC = (capC.resource as any).resource_id;
+    await service.apply({
+      resource_id: idC,
+      base_commit: capC.commit as string,
+      summary: "Name C",
+      operations: [{ op: "rename", display_name: "Named Doc" }],
+    });
+
+    // All id-unnamed resources surface with naming_source === "id".
+    const unnamed = await retrieval.search({ naming_source: "id" });
+    expect(unnamed.count).toBe(2);
+    expect(unnamed.total).toBe(2);
+    const unnamedIds = (unnamed.results as any[]).map((r) => r.resource_id);
+    expect(unnamedIds.sort()).toEqual([idA, idB].sort());
+    for (const r of unnamed.results as any[]) {
+      expect(r.naming_source).toBe("id");
+    }
+
+    const named = await retrieval.search({ naming_source: "explicit" });
+    expect(named.count).toBe(1);
+    expect((named.results as any[])[0].resource_id).toBe(idC);
+
+    // limit is applied after the filter; total stays the pre-limit count.
+    const limited = await retrieval.search({ naming_source: "id", limit: 1 });
+    expect(limited.count).toBe(1);
+    expect(limited.total).toBe(2);
+
+    // Absent parameter keeps legacy behavior.
+    const all = await retrieval.search();
+    expect(all.count).toBe(3);
+  });
+
+  it("capture -> search naming_source=id -> rename surfaces the same UUID as explicit", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    const cap = await service.capture({
+      source: { type: "file_descriptor", filename: "course.pdf" },
+    });
+    const resource = cap.resource as Record<string, unknown>;
+    const resId = resource.resource_id as string;
+    expect(resource.naming_source).toBe("id");
+    expect(resource.display_name).toBe(resId);
+
+    const found = await retrieval.search({ naming_source: "id" });
+    expect(found.count).toBe(1);
+    expect((found.results as any[])[0].resource_id).toBe(resId);
+    expect((found.results as any[])[0].display_name).toBe(resId);
+
+    await service.apply({
+      resource_id: resId,
+      base_commit: cap.commit as string,
+      summary: "Name the course",
+      operations: [{ op: "rename", display_name: "Named Course" }],
+    });
+
+    expect((await retrieval.search({ naming_source: "id" })).count).toBe(0);
+    const afterRename = await retrieval.search({ query: "Named Course" });
+    expect(afterRename.count).toBe(1);
+    expect((afterRename.results as any[])[0].resource_id).toBe(resId);
+    expect((afterRename.results as any[])[0].naming_source).toBe("explicit");
+    expect((afterRename.results as any[])[0].stage).toBe("CAPTURED");
+  });
+
+  it("naming_source filter takes effect before reading artifacts of filtered-out resources", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    // Named resource A gets a deliberately corrupt summary.md (no frontmatter):
+    // deriveResourceStage would throw VALIDATION_FAILED if A were ever reached.
+    const capA = await service.capture({ source: { type: "file_descriptor", filename: "a.pdf" } });
+    const idA = (capA.resource as any).resource_id;
+    const renA = await service.apply({
+      resource_id: idA,
+      base_commit: capA.commit as string,
+      summary: "Name A",
+      operations: [{ op: "rename", display_name: "Corrupt Summary Doc" }],
+    });
+    await writeFile(
+      path.join(item.config.repoDir, "resources/Corrupt Summary Doc/summary.md"),
+      "this summary has no YAML frontmatter\n",
+      "utf8",
+    );
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "Corrupt A summary"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    const capB = await service.capture({ source: { type: "file_descriptor", filename: "b.pdf" } });
+    const idB = (capB.resource as any).resource_id;
+
+    // Any search that reaches A's artifacts must fail...
+    await expect(retrieval.search({})).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+
+    // ...but the naming_source=id filter excludes A before its summary is read.
+    const unnamed = await retrieval.search({ naming_source: "id" });
+    expect(unnamed.count).toBe(1);
+    expect((unnamed.results as any[])[0].resource_id).toBe(idB);
   });
 });

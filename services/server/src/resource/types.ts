@@ -180,6 +180,7 @@ export interface ResourceSearchInput {
   captured_from?: string;
   captured_to?: string;
   stage?: ResourceStage;
+  naming_source?: NamingSource;
   sort?: "newest" | "oldest";
   limit?: number;
 }

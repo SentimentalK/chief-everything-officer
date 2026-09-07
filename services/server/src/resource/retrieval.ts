@@ -35,6 +35,10 @@ export class ResourceRetrievalService {
       for (const item of all) {
         const { meta, doc, location } = item;
         const { capture_note } = doc;
+
+        // Filter: naming_source (exact match; runs before artifact reads and stage derivation)
+        if (input.naming_source && meta.naming_source !== input.naming_source) continue;
+
         const resDir = path.join(this.config.repoDir, location.relative_path);
 
         // Check artifact existence

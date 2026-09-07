@@ -9,6 +9,7 @@ import { fixture } from "./helpers.js";
 import { parseMetaMarkdown, formatMetaMarkdown } from "../src/resource/meta.js";
 import { enumerateResources, resolveResourceLocation } from "../src/resource/locator.js";
 import { CeoError } from "../src/errors.js";
+import { MAX_DIRECTORY_BYTES } from "../src/resource/naming.js";
 import type { UrlMetadataResolver, ResolveOutcome } from "../src/resource/resolver-client.js";
 
 const cleanupDirs: string[] = [];
@@ -427,5 +428,147 @@ Legacy note
     // Both enumerateResources and resolveResourceLocation must detect this corruption
     await expect(enumerateResources(item.config.repoDir)).rejects.toThrowError(CeoError);
     await expect(resolveResourceLocation(item.config.repoDir, sharedId)).rejects.toThrowError(CeoError);
+  });
+
+  it("case-insensitive collision: 'Design' exists, renaming another resource to 'design' allocates 'design-2'", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap1 = await service.capture({ source: { type: "file_descriptor", filename: "a.pdf" } });
+    const id1 = (cap1.resource as any).resource_id;
+    const ren1 = await service.apply({
+      resource_id: id1,
+      base_commit: cap1.commit as string,
+      summary: "Rename 1",
+      operations: [{ op: "rename", display_name: "Design" }],
+    });
+    expect(ren1.new_path).toBe("resources/Design");
+
+    const cap2 = await service.capture({ source: { type: "file_descriptor", filename: "b.pdf" } });
+    const id2 = (cap2.resource as any).resource_id;
+    const ren2 = await service.apply({
+      resource_id: id2,
+      base_commit: cap2.commit as string,
+      summary: "Rename 2",
+      operations: [{ op: "rename", display_name: "design" }],
+    });
+    // No cross-platform conflict: suffix keeps both dirs distinct, display name kept verbatim.
+    expect(ren2.ok).toBe(true);
+    expect(ren2.renamed).toBe(true);
+    expect(ren2.new_path).toBe("resources/design-2");
+    expect((ren2.resource as any).display_name).toBe("design");
+  });
+
+  it("case-variant rename of own display keeps physical directory and updates display_name", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+    const ren1 = await service.apply({
+      resource_id: resourceId,
+      base_commit: cap.commit as string,
+      summary: "Rename to Design",
+      operations: [{ op: "rename", display_name: "Design" }],
+    });
+    expect(ren1.new_path).toBe("resources/Design");
+    const base = ren1.commit as string;
+
+    // Same resource renamed to a case-only variant: physical dir kept, display updated.
+    const ren2 = await service.apply({
+      resource_id: resourceId,
+      base_commit: base,
+      summary: "Rename to design",
+      operations: [{ op: "rename", display_name: "design" }],
+    });
+    expect(ren2.ok).toBe(true);
+    expect(ren2.renamed).toBe(false);
+    expect(ren2.old_path).toBe("resources/Design");
+    expect(ren2.new_path).toBe("resources/Design");
+    expect((ren2.changed_files as string[])).toContain("resources/Design/meta.md");
+
+    const metaContent = await readFile(path.join(item.config.repoDir, "resources/Design/meta.md"), "utf8");
+    expect(parseMetaMarkdown(metaContent).meta.display_name).toBe("design");
+    expect(parseMetaMarkdown(metaContent).meta.naming_source).toBe("explicit");
+  });
+
+  it("another directory occupying the current dir's key raises RESOURCE_NAME_CONFLICT", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const cap = await service.capture({ source: { type: "file_descriptor", filename: "doc.pdf" } });
+    const resourceId = (cap.resource as any).resource_id;
+    const ren1 = await service.apply({
+      resource_id: resourceId,
+      base_commit: cap.commit as string,
+      summary: "Rename to Design",
+      operations: [{ op: "rename", display_name: "Design" }],
+    });
+    expect(ren1.new_path).toBe("resources/Design");
+
+    // Hand-create a second entry occupying the same case/NFC-insensitive key.
+    const designDir = path.join(item.config.repoDir, "resources/design");
+    await mkdir(designDir, { recursive: true });
+    await writeFile(path.join(designDir, "notes.txt"), "occupied by another object\n", "utf8");
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "Add conflicting design dir"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+    const base = (await workspace.workspaceStatus()).local_commit as string;
+
+    // Renaming to the same key is an explicit ambiguity: no arbitrary pick, no overwrite.
+    await expect(
+      service.apply({
+        resource_id: resourceId,
+        base_commit: base,
+        summary: "Conflict rename",
+        operations: [{ op: "rename", display_name: "Design" }],
+      }),
+    ).rejects.toMatchObject({ code: "RESOURCE_NAME_CONFLICT" });
+    // Transaction aborted: no new commit was created.
+    expect((await workspace.workspaceStatus()).local_commit).toBe(base);
+  });
+
+  it("fullwidth colon and long CJK names survive rename and collision suffix within the byte limit", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const service = new ResourceService(workspace, item.config);
+
+    const displayName = `人工智能：${"深度学习与大规模语言模型的工程实践".repeat(6)}`;
+    const cap1 = await service.capture({ source: { type: "file_descriptor", filename: "a.pdf" } });
+    const id1 = (cap1.resource as any).resource_id;
+    const ren1 = await service.apply({
+      resource_id: id1,
+      base_commit: cap1.commit as string,
+      summary: "Rename 1",
+      operations: [{ op: "rename", display_name: displayName }],
+    });
+    expect(ren1.ok).toBe(true);
+    const dir1 = path.basename(ren1.new_path as string);
+    expect(dir1).toContain("：");
+    expect(Buffer.byteLength(dir1, "utf8")).toBeLessThanOrEqual(MAX_DIRECTORY_BYTES);
+
+    const cap2 = await service.capture({ source: { type: "file_descriptor", filename: "b.pdf" } });
+    const id2 = (cap2.resource as any).resource_id;
+    const ren2 = await service.apply({
+      resource_id: id2,
+      base_commit: cap2.commit as string,
+      summary: "Rename 2",
+      operations: [{ op: "rename", display_name: displayName }],
+    });
+    const dir2 = path.basename(ren2.new_path as string);
+    expect(dir2.endsWith("-2")).toBe(true);
+    expect(Buffer.byteLength(dir2, "utf8")).toBeLessThanOrEqual(MAX_DIRECTORY_BYTES);
+    expect((ren2.resource as any).display_name).toBe(displayName);
   });
 });

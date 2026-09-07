@@ -671,6 +671,12 @@ export class ResourceService {
     }
     validateResourceOperations(input.operations);
 
+    // A pure rename with no state_changes may produce zero file changes when the
+    // directory already sits at the target name (empty diff is a valid success).
+    const allowEmpty =
+      input.operations.every((op) => op.op === "rename") &&
+      (input.state_changes?.length ?? 0) === 0;
+
     if (input.state_changes && input.state_changes.length > 0) {
       assertNoResourceMutations(input.state_changes, "state_changes");
     }
@@ -684,6 +690,7 @@ export class ResourceService {
       baseCommit: input.base_commit,
       commitMessage: `CEO: ${input.summary.trim()}`,
       allowResourceSourceFiles: true,
+      allowEmpty,
       operationResultProducer: (_changedFiles) => {
         return {
           resource: appliedResourceReceipt,
