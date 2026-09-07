@@ -103,9 +103,10 @@ jobs:
             await c.connect();
             const store = new RedisJobStore(createRedisRunnerFromClient(c));
             // durable completed job from the earlier run must still be present
-            const keys = await c.scan("0", { MATCH: "ceo:job:*", COUNT: 100 });
-            process.stdout.write("JOB_KEYS="+JSON.stringify(keys)+"\n");
-            if (!keys || keys.length < 1 || !Array.isArray(keys[1]) || keys[1].length === 0) {
+            const scan = await c.scan("0", { MATCH: "ceo:job:*", COUNT: 100 });
+            const returned = (Array.isArray(scan) ? (scan[1] as string[]) : (scan as { keys: string[] }).keys) ?? [];
+            process.stdout.write("JOB_KEYS="+JSON.stringify(scan)+"\n");
+            if (returned.length === 0) {
               throw new Error("No job record survived restart");
             }
             await c.quit();
