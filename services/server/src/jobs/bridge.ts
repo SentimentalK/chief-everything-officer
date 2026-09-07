@@ -61,7 +61,7 @@ export function openJobBridge(
           reconnectStrategy: (retries: number) => Math.min(retries * 500, 5000),
         },
         disableOfflineQueue: true,
-        commandsQueueMaxLength: 2,
+        commandsQueueMaxLength: 64,
       }),
     {
       opTimeoutMs: 2500,
