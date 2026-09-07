@@ -83,6 +83,7 @@ describe("Resource Operations & Atomic Closures", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# Summary\n\n- Non-compete: 1 year\n- Stock options: 4 year vest\n",
         },
         {
@@ -270,6 +271,7 @@ describe("Resource Operations & Atomic Closures", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# AI Whitepaper Summary\n\nKey finding: atomic workspaces ensure reliability.\n",
         },
       ],

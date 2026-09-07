@@ -183,7 +183,8 @@ const upsertContentOp = z.object({
 const upsertSummaryOp = z.object({
   op: z.literal("upsert_summary"),
   provenance: z.enum(["host_exact", "host_semantic", "trusted_adapter", "worker"]),
-  content: z.string(),
+  basis: z.enum(["metadata", "source_content"]).describe("Summary basis: 'metadata' (只依据标题、简介等元数据) or 'source_content' (确实读取了来源内容，不要求保存原文件). Required."),
+  content: z.string().min(1).describe("Summary text body (non-empty)"),
 });
 const appendInteractionOp = z.object({
   op: z.literal("append_interaction"),
@@ -198,7 +199,7 @@ const patchTopicsOp = z.object({
 });
 const renameOp = z.object({
   op: z.literal("rename"),
-  display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates display_name and renames physical directory."),
+  display_name: z.string().min(1).max(160).describe("New semantic display name for this Resource. Updates display_name and renames physical directory. Use clean human-readable title, default to user language, without artificial file extensions or hyphenated topics slugs."),
 });
 
 const resourceCaptureInitialOperationSchema = z.discriminatedUnion("op", [
@@ -325,7 +326,7 @@ export function createMcpServer(
   server.registerTool("resource_capture", {
     title: "Capture external resource into CEO",
     description:
-      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. New resources are always initially saved under a stable ID directory ('resources/res-...'). Do not browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side. After capture, inspect the returned metadata/receipt; if sufficient context exists, invoke resource_apply with op 'rename' to give the resource a clean, concise, retrieval-friendly semantic display name.",
+      "Primary tool for saving, remembering, capturing, or importing an external URL/artifact into CEO. Use this directly when the user asks to save/remember an external source. New resources are always initially saved under a stable ID directory ('resources/res-...'). Do not browse resources/, inspect old Resource files, read Resource design documents, or manually construct Resource metadata. The server handles normalization, dedupe, deterministic resolver enrichment, Resource identity, validation, and persistence. Do not pre-search for duplicates before capture; resource_capture performs dedupe server-side. After capture, inspect the returned metadata/receipt; if sufficient context exists, invoke resource_apply with op 'rename' to give the resource a clean, concise, retrieval-friendly semantic display name (default to user language). 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       source: z.discriminatedUnion("type", [
@@ -348,7 +349,7 @@ export function createMcpServer(
   server.registerTool("resource_apply", {
     title: "Apply updates to a CEO resource",
     description:
-      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set.",
+      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set. 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),

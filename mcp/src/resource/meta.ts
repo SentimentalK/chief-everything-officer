@@ -7,6 +7,7 @@ import type {
   ResourceStage,
 } from "./types.js";
 import { CeoError } from "../errors.js";
+import { parseSummaryDocument, type ParsedSummary } from "./summary.js";
 
 export interface ParsedMetaDocument {
   meta: ResourceMeta;
@@ -197,7 +198,21 @@ export function formatMetaMarkdown(
 export function deriveResourceStage(
   existingArtifacts: Set<string>,
   interactionsContent?: string | null,
+  summaryContent?: string | null,
+  summaryPath?: string,
 ): ResourceStage {
+  let parsedSummary: ParsedSummary | null = null;
+  if (existingArtifacts.has("summary.md")) {
+    if (summaryContent == null) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        `Failed to read summary file: ${summaryPath || "summary.md"}`,
+        { filePath: summaryPath },
+      );
+    }
+    parsedSummary = parseSummaryDocument(summaryContent, summaryPath);
+  }
+
   if (existingArtifacts.has("interactions.md")) {
     const content = (interactionsContent || "").trim();
     // Check if interactions has actual recorded episode (e.g. beyond just header)
@@ -205,14 +220,18 @@ export function deriveResourceStage(
       return "DISCUSSED";
     }
   }
-  if (existingArtifacts.has("summary.md")) {
+
+  if (parsedSummary && parsedSummary.basis === "source_content") {
     return "READY_FOR_DISCUSSION";
   }
+
   if (existingArtifacts.has("content.md")) {
     return "NORMALIZED";
   }
+
   if (existingArtifacts.has("evidence.md")) {
     return "EXTRACTED";
   }
+
   return "CAPTURED";
 }

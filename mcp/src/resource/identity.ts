@@ -33,6 +33,27 @@ const TRACKING_PARAMS = new Set([
   "mc_eid",
 ]);
 
+export function isWeixinVideoUrl(rawUrl: string | URL): { isVideo: boolean; id: string | null } {
+  let parsed: URL;
+  try {
+    parsed = typeof rawUrl === "string" ? new URL(rawUrl.trim()) : rawUrl;
+  } catch {
+    return { isVideo: false, id: null };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname !== "weixin.qq.com") {
+    return { isVideo: false, id: null };
+  }
+
+  const match = parsed.pathname.match(/^\/sph\/([A-Za-z0-9_-]+)$/);
+  if (match && match[1]) {
+    return { isVideo: true, id: match[1] };
+  }
+
+  return { isVideo: false, id: null };
+}
+
 export function normalizeUrlSource(rawUrl: string): NormalizedUrlResult {
   let parsed: URL;
   try {
@@ -89,6 +110,18 @@ export function normalizeUrlSource(rawUrl: string): NormalizedUrlResult {
         resource_kind: "video",
       };
     }
+  }
+
+  // WeChat Channels video normalization
+  const weixinVideo = isWeixinVideoUrl(parsed);
+  if (weixinVideo.isVideo && weixinVideo.id) {
+    return {
+      source_identity: `weixin:${weixinVideo.id}`,
+      canonical_ref: `https://weixin.qq.com/sph/${weixinVideo.id}`,
+      platform: "weixin",
+      platform_id: weixinVideo.id,
+      resource_kind: "video",
+    };
   }
 
   // Generic Web normalization

@@ -36,6 +36,7 @@ describe("Resource Retrieval & Progressive Reading", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# Terms Summary\n\nNo warranty.\n",
         },
       ],
@@ -100,6 +101,7 @@ describe("Resource Retrieval & Progressive Reading", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# Lease Summary\n\nRent: $2500/mo. Pets allowed.\n",
         },
       ],
@@ -117,6 +119,8 @@ describe("Resource Retrieval & Progressive Reading", () => {
     const summaryView = await retrieval.get({ resource_id: resourceId, view: "summary" });
     expect(summaryView.available).toBe(true);
     expect(summaryView.content).toContain("Rent: $2500/mo");
+    expect(summaryView.provenance).toBe("host_semantic");
+    expect(summaryView.basis).toBe("source_content");
 
     // 3. Section filtering on content
     const sectionView = await retrieval.get({

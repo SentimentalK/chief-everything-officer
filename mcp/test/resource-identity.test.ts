@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   computeFileIdentity,
   generateResourceId,
+  isWeixinVideoUrl,
   normalizeUrlSource,
 } from "../src/resource/identity.js";
 
@@ -56,6 +57,64 @@ describe("Resource Identity & Normalization", () => {
       expect(result.platform).toBe("bilibili");
       expect(result.platform_id).toBe("BV1xx411c7mD");
       expect(result.resource_kind).toBe("video");
+    });
+  });
+
+  describe("WeChat Channels Video URL normalization", () => {
+    it("normalizes standard SPH video URL and classifies as video", () => {
+      const url = "https://weixin.qq.com/sph/AvVRIgX3jV";
+      const result = normalizeUrlSource(url);
+      expect(result.source_identity).toBe("weixin:AvVRIgX3jV");
+      expect(result.canonical_ref).toBe("https://weixin.qq.com/sph/AvVRIgX3jV");
+      expect(result.platform).toBe("weixin");
+      expect(result.platform_id).toBe("AvVRIgX3jV");
+      expect(result.resource_kind).toBe("video");
+    });
+
+    it("strips tracking parameters from SPH video URL", () => {
+      const url = "https://weixin.qq.com/sph/AvVRIgX3jV?from=singlemessage&utm_source=chat";
+      const result = normalizeUrlSource(url);
+      expect(result.source_identity).toBe("weixin:AvVRIgX3jV");
+      expect(result.canonical_ref).toBe("https://weixin.qq.com/sph/AvVRIgX3jV");
+      expect(result.resource_kind).toBe("video");
+    });
+
+    it("leaves WeChat Official Account articles as webpage", () => {
+      const url = "https://mp.weixin.qq.com/s/someArticleId123";
+      const result = normalizeUrlSource(url);
+      expect(result.resource_kind).toBe("webpage");
+      expect(result.platform).toBe("mp.weixin.qq.com");
+    });
+
+    it("does NOT guess unconfirmed video aliases (treats as webpage)", () => {
+      const unconfirmedUrls = [
+        "https://weixin.qq.com/finder-preview/AvVRIgX3jV",
+        "https://weixin.qq.com/sph/?id=AvVRIgX3jV",
+        "https://channels.weixin.qq.com/sph/AvVRIgX3jV",
+      ];
+      for (const u of unconfirmedUrls) {
+        const result = normalizeUrlSource(u);
+        expect(result.resource_kind).toBe("webpage");
+      }
+    });
+
+    it("verifies isWeixinVideoUrl strictly matches host and path", () => {
+      expect(isWeixinVideoUrl("https://weixin.qq.com/sph/AvVRIgX3jV")).toEqual({
+        isVideo: true,
+        id: "AvVRIgX3jV",
+      });
+      expect(isWeixinVideoUrl("https://other.qq.com/sph/AvVRIgX3jV")).toEqual({
+        isVideo: false,
+        id: null,
+      });
+      expect(isWeixinVideoUrl("https://weixin.qq.com/sph/")).toEqual({
+        isVideo: false,
+        id: null,
+      });
+      expect(isWeixinVideoUrl("not a url")).toEqual({
+        isVideo: false,
+        id: null,
+      });
     });
   });
 

@@ -54,6 +54,7 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# Summary of Renamed Document\n\nContent here.",
         },
       ],
@@ -97,6 +98,7 @@ describe("PROJECT-023 Resource Rename Operations & Physical Renaming", () => {
         {
           op: "upsert_summary",
           provenance: "host_semantic",
+          basis: "source_content",
           content: "# Summary created before rename",
         },
         {

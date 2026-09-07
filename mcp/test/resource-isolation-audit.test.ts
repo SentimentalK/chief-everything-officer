@@ -41,6 +41,7 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
           {
             op: "upsert_summary",
             provenance: "host_semantic",
+            basis: "source_content",
             content: "# Exclusive Summary\n\nEXCLUSIVE_RESOURCE_SECRET_KEYWORD\n",
           },
         ],

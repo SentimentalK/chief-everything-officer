@@ -33,14 +33,16 @@ The Resource Plane manages durable, structured understanding of external materia
 
 - **`resource_id`**: Immutable logical identity (`res-<uuid-v4>`) stored in `meta.md`.
 - **Physical Directory & Naming**: New resources are always captured under their stable ID directory (`resources/res-<uuid>/`) with temporary placeholder `display_name = resource_id` and `naming_source = "id"`. AI subsequently inspects metadata/content and performs semantic naming via `resource_apply` with `op: "rename"`, which renames the directory to a clean, retrieval-friendly storage label.
+  - 命名规范：默认沿用用户语言，使用简短自然的语义化标题；不为模拟物理文件额外拼接扩展名（允许专有名词自身包含扩展名，如 `DESIGN.md`、`RFC-7231.pdf`），不机械拼接 topics，收藏动机记入 capture note。
+  - 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。
 
 ```text
 resources/<directory_label>/
-  meta.md         -> CAPTURED
+  meta.md         -> CAPTURED (初始收藏 / 纯命名保持)
   evidence.md     -> EXTRACTED
   content.md      -> NORMALIZED
-  summary.md      -> READY_FOR_DISCUSSION
-  interactions.md -> DISCUSSED
+  summary.md      -> READY_FOR_DISCUSSION (仅当 basis 为 source_content 时)
+  interactions.md -> DISCUSSED (存在实际讨论记录时)
 ```
 
 - **`meta.md`**: Immutable identity (`resource_id: res-<uuid>`), semantic `display_name`, `naming_source` (`explicit` | `id`), `source_aliases`, bounded `last_metadata_attempt`, normalized `source_identity`, source facts, capture note, topics, capture history. Explicit directory renames use `op: "rename"`.
@@ -49,8 +51,10 @@ resources/<directory_label>/
 - **`source_aliases`**: Symmetrical URL/platform aliases ensuring bidirectional deduplication.
 - **`evidence.md`**: Raw/near-raw platform transcripts, ASR, OCR, or exact web text. Provenance must be `host_exact`, `trusted_adapter`, or `worker`. **`host_semantic` is strictly forbidden for evidence**.
 - **`content.md`**: Lossless, normalized readable content structured with stable section IDs (`S001`, `S002`, ...).
-- **`summary.md`**: High-level overview, TOC / section map, section summaries, key claims, caveats, and topic tags. Acceptable with `host_semantic` provenance.
-- **`interactions.md`**: Append-only log of user questions, discussion episodes, conclusions, open questions, and promoted State consequences.
+- **`summary.md`**: High-level overview, TOC / section map, section summaries, key claims, caveats, and topic tags. 必须包含严格的 YAML frontmatter，声明 `provenance` 和 `basis`：
+  - `basis: metadata`：只依据标题、简介等元数据，不提升阶段至 `READY_FOR_DISCUSSION`。
+  - `basis: source_content`：确实读取了来源内容（不要求保存原文件），可达成 `READY_FOR_DISCUSSION`。
+- **`interactions.md`**: Append-only log of user questions, discussion episodes, conclusions, open questions, and promoted State consequences. 存在有效讨论记录时阶段为 `DISCUSSED`（若存在 summary.md 仍优先校验其合法性）。
 
 ---
 

@@ -510,4 +510,94 @@ describe("Resource Resolver Integration V0", () => {
     expect(cap2.resource).toEqual(cap1.resource);
     expect(cap2.metadata_enrichment).toEqual(cap1.metadata_enrichment);
   });
+
+  it("corrects legacy webpage to video on revisit even when resolver fails, without touching metadata_fetched_at", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const mockResolver = new MockResolver();
+    const service = new ResourceService(workspace, item.config, mockResolver);
+
+    // Initial capture with resolver disabled
+    const cap1 = await service.capture({
+      source: { type: "url", url: "https://weixin.qq.com/sph/AvVRIgX3jV" },
+    });
+    const resId = (cap1.resource as any).resource_id;
+
+    // Manually simulate a legacy Resource where resource_kind was mistakenly saved as 'webpage'
+    const loc1 = await resolveResourceLocation(item.config.repoDir, resId);
+    expect(loc1).not.toBeNull();
+    const metaPath = path.join(item.config.repoDir, loc1!.relative_path, "meta.md");
+    const rawMeta = await readFile(metaPath, "utf8");
+    const parsed = parseMetaMarkdown(rawMeta);
+    parsed.meta.resource_kind = "webpage";
+    parsed.meta.metadata_fetched_at = null;
+    const { formatMetaMarkdown } = await import("../src/resource/meta.js");
+    await (await import("node:fs/promises")).writeFile(
+      metaPath,
+      formatMetaMarkdown(parsed.meta, parsed.capture_note, parsed.capture_history),
+      "utf8",
+    );
+    const { runGit } = await import("../src/git.js");
+    await runGit(item.config, item.config.repoDir, ["commit", "-am", "Simulate legacy webpage kind"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    // Now revisit with resolver failing (e.g. unavailable)
+    mockResolver.customHandler = () => ({
+      status: "unavailable",
+      error: "Upstream timeout",
+      latency_ms: 5000,
+    });
+
+    const cap2 = await service.capture({
+      source: { type: "url", url: "https://weixin.qq.com/sph/AvVRIgX3jV" },
+      note: "Revisit attempt during network outage",
+    });
+
+    // Revisit corrected the classification to video!
+    const loc2 = await resolveResourceLocation(item.config.repoDir, resId);
+    expect(loc2!.relative_path).toBe(loc1!.relative_path); // directory unchanged
+    const meta2Raw = await readFile(metaPath, "utf8");
+    const meta2 = parseMetaMarkdown(meta2Raw).meta;
+    expect(meta2.resource_kind).toBe("video");
+    // metadata_fetched_at remains null (local correction is not a successful network fetch)
+    expect(meta2.metadata_fetched_at).toBeNull();
+    expect(meta2.resource_id).toBe(resId);
+  });
+
+  it("does not classify non-video source as video merely because duration_seconds > 0", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const mockResolver = new MockResolver();
+    mockResolver.customHandler = (url) => ({
+      status: "resolved",
+      metadata: {
+        schema_version: 1,
+        source_type: "podcast",
+        source_url: url,
+        source_id: "ep123",
+        title: "Audio Podcast Episode",
+        duration_seconds: 1800, // 30 minutes duration
+      },
+      latency_ms: 10,
+    });
+
+    const service = new ResourceService(workspace, item.config, mockResolver);
+    const cap = await service.capture({
+      source: { type: "url", url: "https://example.com/podcast/ep123" },
+    });
+
+    const resId = (cap.resource as any).resource_id;
+    const loc = await resolveResourceLocation(item.config.repoDir, resId);
+    const metaRaw = await readFile(path.join(item.config.repoDir, loc!.relative_path, "meta.md"), "utf8");
+    const meta = parseMetaMarkdown(metaRaw).meta;
+
+    // Must NOT be coerced to 'video' based on duration_seconds!
+    expect(meta.resource_kind).toBe("webpage");
+  });
 });

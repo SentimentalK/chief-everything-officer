@@ -15,6 +15,7 @@ import type {
   NamingSource,
   ResourceApplyInput,
   ResourceApplyOperation,
+  ResourceCaptureInitialOperation,
   ResourceCaptureInput,
   ResourceId,
   ResourceKind,
@@ -22,6 +23,7 @@ import type {
   ResourceStage,
   SourceType,
 } from "./types.js";
+import { PROVENANCE_VALUES, SUMMARY_BASIS_VALUES } from "./types.js";
 import {
   computeFileIdentity,
   generateResourceId,
@@ -59,7 +61,9 @@ import {
   applyResolverRevisitUpdates,
   buildResolvedMetadataSeed,
   derivePreferredIdentity,
+  reconcileResourceKind,
 } from "./resolver-mapping.js";
+import { formatSummaryDocument } from "./summary.js";
 import type { ContentMetadataV1 } from "./resolver-contract.js";
 
 export interface ResourceExecutionContext {
@@ -108,6 +112,70 @@ export async function applyResourceRename(
   return { renamed: true, old_path: oldRelative, new_path: newRelative };
 }
 
+export function validateResourceOperations(
+  operations: (ResourceApplyOperation | ResourceCaptureInitialOperation)[],
+): void {
+  for (const op of operations) {
+    if (op.op === "upsert_summary") {
+      if (!PROVENANCE_VALUES.includes(op.provenance)) {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `Invalid summary provenance: '${op.provenance}'. Must be one of: ${PROVENANCE_VALUES.join(", ")}`,
+          { provenance: op.provenance },
+        );
+      }
+      if (!SUMMARY_BASIS_VALUES.includes(op.basis)) {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `Invalid or missing summary basis: '${(op as any).basis}'. Must be one of: ${SUMMARY_BASIS_VALUES.join(", ")}`,
+          { basis: (op as any).basis },
+        );
+      }
+      if (typeof op.content !== "string" || op.content.trim().length === 0) {
+        throw new CeoError("VALIDATION_FAILED", "Summary content cannot be empty.");
+      }
+    } else if (op.op === "rename") {
+      const trimmed = cleanDisplayName(op.display_name);
+      if (!trimmed || Array.from(trimmed).length > MAX_DISPLAY_NAME_CHARS) {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `display_name must be between 1 and ${MAX_DISPLAY_NAME_CHARS} characters.`,
+        );
+      }
+    } else if (op.op === "upsert_evidence") {
+      if ((op.provenance as string) === "host_semantic") {
+        throw new CeoError(
+          "INVALID_OPERATION",
+          "upsert_evidence rejects host_semantic provenance. Evidence requires host_exact, trusted_adapter, or worker.",
+        );
+      }
+      if (typeof op.content !== "string" || op.content.trim().length === 0) {
+        throw new CeoError("VALIDATION_FAILED", "Evidence content cannot be empty.");
+      }
+    } else if (op.op === "upsert_content") {
+      if ((op.provenance as string) === "host_semantic") {
+        throw new CeoError(
+          "INVALID_OPERATION",
+          "upsert_content rejects host_semantic provenance.",
+        );
+      }
+      if (typeof op.content !== "string" || op.content.trim().length === 0) {
+        throw new CeoError("VALIDATION_FAILED", "Content cannot be empty.");
+      }
+    } else if (op.op === "append_interaction") {
+      if (!PROVENANCE_VALUES.includes(op.provenance)) {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `Invalid interaction provenance: '${op.provenance}'.`,
+        );
+      }
+      if (typeof op.entry !== "string" || op.entry.trim().length === 0) {
+        throw new CeoError("VALIDATION_FAILED", "Interaction entry cannot be empty.");
+      }
+    }
+  }
+}
+
 export class ResourceService {
   private readonly resolverClient: UrlMetadataResolver;
 
@@ -145,6 +213,7 @@ export class ResourceService {
           );
         }
       }
+      validateResourceOperations(input.initial_operations);
     }
 
     // Determine normalized source properties
@@ -334,6 +403,15 @@ export class ResourceService {
             captureHistory = [...existing.doc.capture_history];
             captureNote = input.note ?? existing.doc.capture_note;
 
+            // Reconcile classification independently from resolver status
+            const kindChanged = reconcileResourceKind(
+              meta,
+              input.source.type === "url" ? input.source.url : undefined,
+            );
+            if (kindChanged) {
+              hasSemanticChange = true;
+            }
+
             // Revisit note
             if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
@@ -410,6 +488,11 @@ export class ResourceService {
             };
             captureHistory = [...existing.doc.capture_history];
             captureNote = input.note ?? existing.doc.capture_note;
+
+            const kindChanged = reconcileResourceKind(meta);
+            if (kindChanged) {
+              hasSemanticChange = true;
+            }
 
             if (input.note && input.note.trim() && input.note.trim() !== existing.doc.capture_note) {
               captureHistory.push(`${new Date().toISOString()} — revisit — ${input.note.trim()}`);
@@ -542,7 +625,12 @@ export class ResourceService {
         if (artifactSet.has("interactions.md")) {
           interactionsText = await readFile(path.join(ctx.getResDir(), "interactions.md"), "utf8").catch(() => null);
         }
-        const stage = deriveResourceStage(artifactSet, interactionsText);
+        let summaryText: string | null = null;
+        const summaryPath = path.join(ctx.getResDir(), "summary.md");
+        if (artifactSet.has("summary.md")) {
+          summaryText = await readFile(summaryPath, "utf8");
+        }
+        const stage = deriveResourceStage(artifactSet, interactionsText, summaryText, summaryPath);
 
         if (enrichmentReceipt.status !== "disabled") {
           enrichmentReceipt = {
@@ -581,6 +669,7 @@ export class ResourceService {
     if (input.operations.length === 0) {
       throw new CeoError("VALIDATION_FAILED", "At least one operation is required.");
     }
+    validateResourceOperations(input.operations);
 
     if (input.state_changes && input.state_changes.length > 0) {
       assertNoResourceMutations(input.state_changes, "state_changes");
@@ -648,7 +737,12 @@ export class ResourceService {
         if (artifactSet.has("interactions.md")) {
           interactionsText = await readFile(path.join(ctx.getResDir(), "interactions.md"), "utf8").catch(() => null);
         }
-        const stage = deriveResourceStage(artifactSet, interactionsText);
+        let summaryText: string | null = null;
+        const summaryPath = path.join(ctx.getResDir(), "summary.md");
+        if (artifactSet.has("summary.md")) {
+          summaryText = await readFile(summaryPath, "utf8");
+        }
+        const stage = deriveResourceStage(artifactSet, interactionsText, summaryText, summaryPath);
 
         appliedResourceReceipt = {
           resource_id: meta.resource_id,
@@ -725,7 +819,8 @@ export class ResourceService {
         }
         await writeFile(path.join(resDir, "content.md"), op.content, "utf8");
       } else if (op.op === "upsert_summary") {
-        await writeFile(path.join(resDir, "summary.md"), op.content, "utf8");
+        const formatted = formatSummaryDocument(op.provenance, op.basis, op.content);
+        await writeFile(path.join(resDir, "summary.md"), formatted, "utf8");
       } else if (op.op === "append_interaction") {
         const interactionPath = path.join(resDir, "interactions.md");
         const interactionExists = await access(interactionPath).then(() => true).catch(() => false);

@@ -14,6 +14,7 @@ import {
   deriveResourceStage,
   parseMetaMarkdown,
 } from "./meta.js";
+import { parseSummaryDocument } from "./summary.js";
 import {
   enumerateResources,
   resolveResourceLocation,
@@ -45,7 +46,13 @@ export class ResourceRetrievalService {
           interactionsText = await readFile(path.join(resDir, "interactions.md"), "utf8").catch(() => null);
         }
 
-        const stage = deriveResourceStage(artifactSet, interactionsText);
+        let summaryText: string | null = null;
+        const summaryPath = path.join(resDir, "summary.md");
+        if (artifactSet.has("summary.md")) {
+          summaryText = await readFile(summaryPath, "utf8");
+        }
+
+        const stage = deriveResourceStage(artifactSet, interactionsText, summaryText, summaryPath);
         const sourceAssetAvailable = dirFiles.includes("source");
 
         // Filter: stage
@@ -160,7 +167,13 @@ export class ResourceRetrievalService {
         interactionsText = await readFile(path.join(resDir, "interactions.md"), "utf8").catch(() => null);
       }
 
-      const derivedStage = deriveResourceStage(artifactSet, interactionsText);
+      let summaryText: string | null = null;
+      const summaryPath = path.join(resDir, "summary.md");
+      if (artifactSet.has("summary.md")) {
+        summaryText = await readFile(summaryPath, "utf8");
+      }
+
+      const derivedStage = deriveResourceStage(artifactSet, interactionsText, summaryText, summaryPath);
       const sourceAssetAvailable = dirFiles.includes("source");
 
       const availableViews: ResourceGetView[] = ["metadata"];
@@ -248,6 +261,15 @@ export class ResourceRetrievalService {
       const paginatedContent = lines.slice(sliceStartIndex, sliceEndIndex).join("\n");
       const truncated = sliceEndIndex < totalLines;
 
+      let parsedSummaryMeta: { provenance?: string; basis?: string } = {};
+      if (requestedView === "summary") {
+        const parsed = parseSummaryDocument(text, path.join(resDir, fileName));
+        parsedSummaryMeta = {
+          provenance: parsed.provenance,
+          basis: parsed.basis,
+        };
+      }
+
       return {
         ...commonHeader,
         view: requestedView,
@@ -258,6 +280,7 @@ export class ResourceRetrievalService {
         total_lines: totalLines,
         truncated,
         ...(truncated ? { next_start_line: sliceEndIndex + 1 } : {}),
+        ...parsedSummaryMeta,
       };
     });
   }

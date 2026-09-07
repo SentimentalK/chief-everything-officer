@@ -4,6 +4,7 @@ import {
   formatMetaMarkdown,
   parseMetaMarkdown,
 } from "../src/resource/meta.js";
+import { formatSummaryDocument } from "../src/resource/summary.js";
 import type { ResourceMeta } from "../src/resource/types.js";
 
 describe("Resource Metadata & Frontmatter Serialization", () => {
@@ -78,27 +79,99 @@ describe("Resource Metadata & Frontmatter Serialization", () => {
       expect(stage).toBe("NORMALIZED");
     });
 
-    it("derives READY_FOR_DISCUSSION when summary.md exists", () => {
+    it("derives READY_FOR_DISCUSSION when summary.md exists with basis: source_content", () => {
+      const summaryContent = formatSummaryDocument(
+        "host_semantic",
+        "source_content",
+        "## Summary\nSubstantive content overview.",
+      );
       const stage = deriveResourceStage(
         new Set(["meta.md", "content.md", "summary.md"]),
+        null,
+        summaryContent,
+        "summary.md",
       );
       expect(stage).toBe("READY_FOR_DISCUSSION");
     });
 
-    it("derives DISCUSSED when interactions.md contains substantive entries", () => {
+    it("does NOT derive READY_FOR_DISCUSSION when summary basis is metadata", () => {
+      const metadataSummary = formatSummaryDocument(
+        "host_semantic",
+        "metadata",
+        "## Summary\nOnly based on video title and tags.",
+      );
+      // With content.md present, falls back to NORMALIZED
+      const stageWithContent = deriveResourceStage(
+        new Set(["meta.md", "content.md", "summary.md"]),
+        null,
+        metadataSummary,
+        "summary.md",
+      );
+      expect(stageWithContent).toBe("NORMALIZED");
+
+      // Without content.md or evidence.md, falls back to CAPTURED
+      const stageCaptured = deriveResourceStage(
+        new Set(["meta.md", "summary.md"]),
+        null,
+        metadataSummary,
+        "summary.md",
+      );
+      expect(stageCaptured).toBe("CAPTURED");
+    });
+
+    it("derives DISCUSSED when interactions.md contains substantive entries and summary is valid", () => {
+      const summaryContent = formatSummaryDocument(
+        "host_semantic",
+        "source_content",
+        "## Summary\nSubstantive content overview.",
+      );
       const stage = deriveResourceStage(
         new Set(["meta.md", "summary.md", "interactions.md"]),
         "# Interactions\n\n## 2026-09-05T14:00:00Z (host_semantic)\nDiscussed non-compete clause.",
+        summaryContent,
+        "summary.md",
       );
       expect(stage).toBe("DISCUSSED");
     });
 
     it("does NOT derive DISCUSSED when interactions.md is empty", () => {
+      const summaryContent = formatSummaryDocument(
+        "host_semantic",
+        "source_content",
+        "## Summary\nSubstantive content overview.",
+      );
       const stage = deriveResourceStage(
         new Set(["meta.md", "summary.md", "interactions.md"]),
         "",
+        summaryContent,
+        "summary.md",
       );
       expect(stage).toBe("READY_FOR_DISCUSSION");
+    });
+
+    it("reports summary validation error even when interactions.md has valid substantive entries", () => {
+      // Invalid summary: missing basis in frontmatter
+      const invalidSummary = "---\nprovenance: host_semantic\n---\n\nMissing basis!";
+      expect(() =>
+        deriveResourceStage(
+          new Set(["meta.md", "summary.md", "interactions.md"]),
+          "# Interactions\n\n## 2026-09-05T14:00:00Z (host_semantic)\nSubstantive interaction entry.",
+          invalidSummary,
+          "/path/to/res-123/summary.md",
+        ),
+      ).toThrowError(/Invalid or missing summary basis/);
+    });
+
+    it("reports summary validation error when summary has blank body", () => {
+      const blankBodySummary = "---\nprovenance: host_semantic\nbasis: source_content\n---\n\n   \n";
+      expect(() =>
+        deriveResourceStage(
+          new Set(["meta.md", "summary.md"]),
+          null,
+          blankBodySummary,
+          "/path/to/res-123/summary.md",
+        ),
+      ).toThrowError(/Summary body content cannot be empty/);
     });
   });
 });

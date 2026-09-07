@@ -28,6 +28,17 @@ export type Provenance =
   | "trusted_adapter"
   | "worker";
 
+export const PROVENANCE_VALUES = [
+  "host_exact",
+  "host_semantic",
+  "trusted_adapter",
+  "worker",
+] as const;
+
+export type SummaryBasis = "metadata" | "source_content";
+
+export const SUMMARY_BASIS_VALUES = ["metadata", "source_content"] as const;
+
 export type NamingSource = "explicit" | "id";
 
 export type MetadataAttemptStatus =
@@ -120,6 +131,7 @@ export type ResourceApplyOperation =
   | {
       op: "upsert_summary";
       provenance: Provenance;
+      basis: SummaryBasis;
       content: string;
     }
   | {

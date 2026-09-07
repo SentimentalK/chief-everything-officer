@@ -1,5 +1,5 @@
 import type { ContentMetadataV1 } from "./resolver-contract.js";
-import type { NormalizedUrlResult } from "./identity.js";
+import { isWeixinVideoUrl, normalizeUrlSource, type NormalizedUrlResult } from "./identity.js";
 import type { ResourceKind, ResourceMeta } from "./types.js";
 
 /**
@@ -103,8 +103,7 @@ export function buildResolvedMetadataSeed(
   const isVideo =
     baseline.resource_kind === "video" ||
     validPlatform === "youtube" ||
-    validPlatform === "bilibili" ||
-    (metadata.duration_seconds != null && metadata.duration_seconds > 0 && validPlatform !== "weixin");
+    validPlatform === "bilibili";
 
   return {
     canonical_ref: validCanonicalRef,
@@ -203,3 +202,40 @@ export function applyResolverRevisitUpdates(
 
   return changed;
 }
+
+/**
+ * Reconciles resource_kind from verified video URL patterns (e.g. legacy webpage -> video).
+ * Checks currentUrl, canonical_ref, and source_ref.
+ * Does NOT merely rely on weixin: prefix.
+ * Only updates meta.resource_kind; does NOT update metadata_fetched_at.
+ * Returns true if resource_kind changed.
+ */
+export function reconcileResourceKind(
+  meta: ResourceMeta,
+  currentUrl?: string | null,
+): boolean {
+  if (meta.resource_kind === "video") return false;
+
+  const candidates = [currentUrl, meta.canonical_ref, meta.source_ref].filter(
+    (c): c is string => typeof c === "string" && c.trim().length > 0,
+  );
+
+  for (const cand of candidates) {
+    if (isWeixinVideoUrl(cand).isVideo) {
+      meta.resource_kind = "video";
+      return true;
+    }
+    try {
+      const norm = normalizeUrlSource(cand);
+      if (norm.resource_kind === "video") {
+        meta.resource_kind = "video";
+        return true;
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  return false;
+}
+
