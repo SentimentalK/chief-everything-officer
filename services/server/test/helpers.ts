@@ -18,8 +18,10 @@ export function git(cwd: string, ...args: string[]): string {
   }).trim();
 }
 
-export async function fixture(): Promise<{ root: string; remote: string; config: Config }> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-test-"));
+export async function fixture(options: { tempRoot?: string } = {}): Promise<{ root: string; remote: string; config: Config }> {
+  const base = options.tempRoot ?? os.tmpdir();
+  await mkdir(base, { recursive: true });
+  const root = await mkdtemp(path.join(base, "ceo-mcp-test-"));
   const remote = path.join(root, "remote.git");
   const seed = path.join(root, "seed");
   const dataRoot = path.join(root, "data");

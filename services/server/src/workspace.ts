@@ -10,7 +10,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import type { Config } from "./config.js";
 import { CeoError } from "./errors.js";
 import { assertExpectedBlob, blobOid, resolveRef, runGit } from "./git.js";
@@ -81,6 +81,44 @@ export function isResourcePath(candidate: string): boolean {
 function isDefaultSearchPath(filePath: string): boolean {
   if (!filePath.startsWith("resources/")) return true;
   return /^resources\/[^/]+\/interactions\.md$/.test(filePath);
+}
+
+/**
+ * Archived tasks live under archive/<4-digit year>/<basename>.md, exactly one
+ * path segment per year. Deeper nesting and non-4-digit year directories are
+ * not valid archive homes and are never considered a fallback target.
+ */
+const ARCHIVE_ENTRY_RE = /^archive\/(\d{4})\/([^/]+\.md)$/;
+
+/** A `tasks/<filename>.md` reference, exactly one segment under tasks/. */
+function isTaskFilePath(filePath: string): boolean {
+  return /^tasks\/[^/]+\.md$/.test(filePath);
+}
+
+/** Basename of a valid archived entry, or null when the entry is not a task archive file. */
+function archiveEntryBasename(entry: string): string | null {
+  const match = ARCHIVE_ENTRY_RE.exec(entry);
+  return match ? match[2]! : null;
+}
+
+/**
+ * Maps a raw filesystem error to a closed-union CeoError without leaking the
+ * host path. ENOENT is intentionally NOT handled here: callers classify it
+ * themselves (missing files drive the archive fallback decision).
+ */
+export function mapReadFsError(error: unknown, displayPath: string): CeoError {
+  const code = (error as NodeJS.ErrnoException).code;
+  switch (code) {
+    case "EACCES":
+    case "EPERM":
+      return new CeoError("ACCESS_DENIED", "Access to the requested file was denied.", { path: displayPath });
+    case "EISDIR":
+    case "ENOTDIR":
+    case "ELOOP":
+      return new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: displayPath });
+    default:
+      return new CeoError("INTERNAL_ERROR", "The CEO workspace operation failed.", { path: displayPath, error_code: code ?? "UNKNOWN" });
+  }
 }
 
 export function assertNoResourceMutations(
@@ -276,26 +314,123 @@ export class CeoWorkspace {
       throw new CeoError("VALIDATION_FAILED", `Read between 1 and ${LIMITS.maxFilesPerRead} files.`);
     }
     return await this.withReadyWorkspace(async (base) => {
+      const matcher = await this.loadIgnoreMatcher();
+      let archiveIndex: Map<string, string[]> | null = null;
+      const getArchiveIndex = async (): Promise<Map<string, string[]>> => {
+        if (archiveIndex) return archiveIndex;
+        const index = new Map<string, string[]>();
+        // listTrackedFiles already excludes .ceoignore'd entries, so restricted
+        // archive candidates never reach the index or any error message. This
+        // scans the tracked file list at most once per batch.
+        for (const entry of await this.listTrackedFiles(base, matcher)) {
+          const basename = archiveEntryBasename(entry);
+          if (!basename) continue;
+          const list = index.get(basename);
+          if (list) list.push(entry);
+          else index.set(basename, [entry]);
+        }
+        archiveIndex = index;
+        return index;
+      };
+
       let total = 0;
       const files = [];
-      const matcher = await this.loadIgnoreMatcher();
-      for (const candidate of paths) {
-        const filePath = validatePath(candidate);
-        if (isPathIgnored(matcher, filePath)) {
-          throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: filePath });
+      for (const requestedPath of paths) {
+        // Tracks the path a raw filesystem error was raised against: the
+        // original requested path until resolution succeeds, the resolved
+        // (possibly archived) path afterwards. Never a host absolute path.
+        let displayPath = requestedPath;
+        try {
+          const resolved = await this.resolveReadTarget(base, matcher, requestedPath, getArchiveIndex);
+          displayPath = resolved.path;
+          if (resolved.size > LIMITS.maxFileWriteBytes) {
+            throw new CeoError("VALIDATION_FAILED", `File size (${Math.round(resolved.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`, { path: resolved.path });
+          }
+          total += resolved.size;
+          if (total > LIMITS.maxReadResponseBytes) {
+            throw new CeoError("VALIDATION_FAILED", `Total response size exceeds response budget of ${Math.round(LIMITS.maxReadResponseBytes / (1024 * 1024))} MiB.`);
+          }
+          const content = await this.readUtf8(path.join(this.config.repoDir, resolved.path), resolved.path);
+          const oid = await blobOid(this.config, this.config.repoDir, base, resolved.path);
+          files.push({ requested_path: requestedPath, path: resolved.path, blob_oid: oid, content });
+        } catch (error) {
+          throw this.withReadErrorContext(error, paths, requestedPath, displayPath);
         }
-        await assertNoSymlink(this.config.repoDir, filePath);
-        const absolute = path.join(this.config.repoDir, filePath);
-        const info = await stat(absolute).catch(() => null);
-        if (!info?.isFile()) throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: filePath });
-        if (info.size > LIMITS.maxFileWriteBytes) throw new CeoError("VALIDATION_FAILED", `File size (${Math.round(info.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`, { path: filePath });
-        total += info.size;
-        if (total > LIMITS.maxReadResponseBytes) throw new CeoError("VALIDATION_FAILED", `Total response size exceeds response budget of ${Math.round(LIMITS.maxReadResponseBytes / (1024 * 1024))} MiB.`);
-        const content = await this.readUtf8(absolute, filePath);
-        const oid = await blobOid(this.config, this.config.repoDir, base, filePath);
-        files.push({ path: filePath, blob_oid: oid, content });
       }
       return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: base, files };
+    });
+  }
+
+  /**
+   * Resolves where a requested file is read from and returns its actual path
+   * and size. When the requested `tasks/<name>.md` does not exist at base and
+   * exactly one tracked `archive/<year>/<name>.md` exists, the archive file is
+   * the read target. All other outcomes raise a closed-union CeoError (raw
+   * filesystem errors propagate up to be mapped by the batch loop).
+   */
+  private async resolveReadTarget(
+    base: string,
+    matcher: CeoIgnoreMatcher,
+    requestedPath: string,
+    getArchiveIndex: () => Promise<Map<string, string[]>>,
+  ): Promise<{ path: string; size: number }> {
+    const filePath = validatePath(requestedPath);
+    if (isPathIgnored(matcher, filePath)) {
+      throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: filePath });
+    }
+    await assertNoSymlink(this.config.repoDir, filePath);
+    let original: Stats | null = null;
+    try {
+      original = await stat(path.join(this.config.repoDir, filePath));
+    } catch (error) {
+      // ENOENT: proceed to the archive fallback decision below. Every other
+      // errno (permission, IO, ...) rethrows as a whole-batch failure and never
+      // triggers the archive fallback.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (original) {
+      if (!original.isFile()) {
+        throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: filePath });
+      }
+      // The original exists: read it, never consult archive.
+      return { path: filePath, size: original.size };
+    }
+    // Missing original. Only a single-level tasks/ reference may consult archive.
+    if (!isTaskFilePath(filePath)) {
+      throw new CeoError("INVALID_PATH", "Requested file was not found. Correct the path and retry the complete batch.", { path: filePath, reason: "NOT_FOUND" });
+    }
+    const basename = filePath.slice("tasks/".length);
+    const candidates = ((await getArchiveIndex()).get(basename) ?? []).slice().sort();
+    if (candidates.length === 0) {
+      throw new CeoError("INVALID_PATH", "Task file was not found at the requested path or in archive. Correct the path and retry the complete batch.", { path: filePath, reason: "NOT_FOUND" });
+    }
+    if (candidates.length > 1) {
+      throw new CeoError("INVALID_PATH", "Task file exists in multiple archive years. Specify the archive path explicitly and retry the complete batch.", { path: filePath, reason: "AMBIGUOUS_ARCHIVE_MATCH", candidates });
+    }
+    const actualPath = candidates[0]!;
+    // Re-validate the chosen archive target before reading. A permission/IO
+    // failure here is a whole-batch failure — never skip to another candidate.
+    await assertNoSymlink(this.config.repoDir, actualPath);
+    const archived = await stat(path.join(this.config.repoDir, actualPath));
+    if (!archived.isFile()) {
+      throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: actualPath });
+    }
+    return { path: actualPath, size: archived.size };
+  }
+
+  /**
+   * Single enrichment point for read_files batch failures. CeoErrors keep their
+   * code/message/details; raw filesystem errors are mapped through
+   * mapReadFsError against the path that actually failed; anything else becomes
+   * a generic INTERNAL_ERROR. The original user-supplied batch (not a validated
+   * prefix) is always echoed as requested_paths alongside the failing entry.
+   */
+  private withReadErrorContext(error: unknown, requestedPaths: string[], failedRequestedPath: string, displayPath: string): CeoError {
+    const mapped = error instanceof CeoError ? error : mapReadFsError(error, displayPath);
+    return new CeoError(mapped.code, mapped.message, {
+      ...mapped.details,
+      requested_paths: [...requestedPaths],
+      failed_requested_path: failedRequestedPath,
     });
   }
 

@@ -282,7 +282,9 @@ export function createMcpServer(
   // 3. read_files
   server.registerTool("read_files", {
     title: "Read CEO files",
-    description: `Use this to read up to ${LIMITS.maxFilesPerRead} related CEO Markdown files in one call and obtain the base commit and blob OIDs needed for safe writes.`,
+    description:
+      `Use this to read up to ${LIMITS.maxFilesPerRead} related CEO Markdown files in one call and obtain the base commit and blob OIDs needed for safe writes. ` +
+      "缺失的 `tasks/<filename>.md` 会尝试匹配唯一的 `archive/<year>/<filename>.md`。返回的 `path` 是实际路径，后续写入使用该路径和对应 blob OID。批量读取失败时没有返回任何正文；修正失败路径后重新读取完整批次。",
     inputSchema: { paths: z.array(z.string()).min(1).max(LIMITS.maxFilesPerRead) },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, tracedHandler(auditStore, "read_files", async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
