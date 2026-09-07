@@ -5,12 +5,77 @@ import { CeoWorkspace } from "../src/workspace.js";
 import { runGit } from "../src/git.js";
 import { ResourceRetrievalService } from "../src/resource/retrieval.js";
 import { ResourceService } from "../src/resource/service.js";
+import { formatMetaMarkdown } from "../src/resource/meta.js";
+import type { ResourceMeta } from "../src/resource/types.js";
 import { fixture } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
 afterEach(async () => {
   await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
+
+// Hand-written fixtures give each resource a controlled first_captured_at,
+// which real captures (runtime toISOString) cannot provide.
+function makeMeta(o: {
+  resource_id: string;
+  first_captured_at: string;
+  display_name?: string;
+  naming_source?: "id" | "explicit";
+}): ResourceMeta {
+  return {
+    schema_version: 1,
+    resource_id: o.resource_id,
+    display_name: o.display_name ?? o.resource_id,
+    naming_source: o.naming_source ?? "id",
+    source_aliases: [],
+    last_metadata_attempt: null,
+    resource_kind: "document",
+    source_type: "url",
+    source_identity: `fixture:${o.resource_id}`,
+    source_ref: null,
+    canonical_ref: null,
+    platform: null,
+    platform_id: null,
+    original_name: null,
+    media_type: null,
+    format: null,
+    asset_ref: null,
+    source_hash: null,
+    title: null,
+    author: null,
+    published_at: null,
+    first_captured_at: o.first_captured_at,
+    language: null,
+    topics: [],
+    metadata_method: null,
+    metadata_fetched_at: null,
+    capture_surface: "mcp",
+  };
+}
+
+async function writeResourceFixture(
+  repoDir: string,
+  resId: string,
+  firstCapturedAt: string,
+  overrides?: { display_name?: string; naming_source?: "id" | "explicit" },
+): Promise<void> {
+  const dir = path.join(repoDir, "resources", resId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    path.join(dir, "meta.md"),
+    formatMetaMarkdown(makeMeta({ resource_id: resId, first_captured_at: firstCapturedAt, ...overrides })),
+    "utf8",
+  );
+}
+
+function resultIds(search: Record<string, unknown>): string[] {
+  return (search.results as Array<{ resource_id: string }>).map((r) => r.resource_id);
+}
+
+// Deterministic lexicographic order a < b < c (ASCII resource_id).
+const RES_A = "res-00000000-0000-4000-8000-00000000000a";
+const RES_B = "res-00000000-0000-4000-8000-00000000000b";
+const RES_C = "res-00000000-0000-4000-8000-00000000000c";
 
 describe("Resource Retrieval & Progressive Reading", () => {
   it("searches resources using lightweight metadata cards and stage filters", async () => {
@@ -263,5 +328,134 @@ describe("Resource Retrieval & Progressive Reading", () => {
     const unnamed = await retrieval.search({ naming_source: "id" });
     expect(unnamed.count).toBe(1);
     expect((unnamed.results as any[])[0].resource_id).toBe(idB);
+  });
+
+  it("filters and sorts on first_captured_at across timezone spellings; bounds are inclusive", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    // All three spellings denote the same instant: 2024-01-01T00:00:00Z.
+    await writeResourceFixture(item.config.repoDir, RES_A, "2024-01-01T00:00:00Z");
+    await writeResourceFixture(item.config.repoDir, RES_B, "2024-01-01T01:00:00+01:00");
+    await writeResourceFixture(item.config.repoDir, RES_C, "2023-12-31T19:00:00-05:00");
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "seed timezone fixtures"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    // Equal instants tie-break by resource_id ascending, for both orders.
+    expect(resultIds(await retrieval.search({}))).toEqual([RES_A, RES_B, RES_C]);
+    expect(resultIds(await retrieval.search({ sort: "oldest" }))).toEqual([RES_A, RES_B, RES_C]);
+
+    // Inclusive bounds at the shared instant.
+    expect((await retrieval.search({ captured_from: "2024-01-01T00:00:00Z" })).count).toBe(3);
+    expect((await retrieval.search({ captured_from: "2024-01-01T00:00:00.001Z" })).count).toBe(0);
+    expect((await retrieval.search({ captured_to: "2024-01-01T00:00:00Z" })).count).toBe(3);
+    expect((await retrieval.search({ captured_to: "2023-12-31T23:59:59.999Z" })).count).toBe(0);
+
+    // The same instant spelled with offsets is an inclusive boundary too.
+    expect((await retrieval.search({ captured_from: "2024-01-01T01:00:00+01:00" })).count).toBe(3);
+    expect((await retrieval.search({ captured_to: "2023-12-31T19:00:00-05:00" })).count).toBe(3);
+  });
+
+  it("treats .1 and .100 as the same instant and resolves ties by resource_id", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    await writeResourceFixture(item.config.repoDir, RES_A, "2024-01-01T00:00:00.1Z"); // 100ms
+    await writeResourceFixture(item.config.repoDir, RES_B, "2024-01-01T00:00:00.100Z"); // 100ms (tie with A)
+    await writeResourceFixture(item.config.repoDir, RES_C, "2024-01-01T00:00:00.2Z"); // 200ms
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "seed fractional fixtures"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    expect(resultIds(await retrieval.search({}))).toEqual([RES_C, RES_A, RES_B]);
+    expect(resultIds(await retrieval.search({ sort: "oldest" }))).toEqual([RES_A, RES_B, RES_C]);
+  });
+
+  it("throws VALIDATION_FAILED naming resource_id and meta.md when first_captured_at is invalid (no skipping)", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    const goodId = "res-00000000-0000-4000-8000-0000000000aa";
+    const badId = "res-00000000-0000-4000-8000-0000000000bb";
+    await writeResourceFixture(item.config.repoDir, goodId, "2024-01-01T00:00:00Z");
+    await writeResourceFixture(item.config.repoDir, badId, "not-a-timestamp");
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "seed bad fixture"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    await expect(retrieval.search({})).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: expect.stringContaining(badId),
+      details: { value: "not-a-timestamp" },
+    });
+  });
+
+  it("rejects malformed captured_from / from>to even on an empty repository", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    // No resources seeded: validation still fires before enumeration.
+    await expect(retrieval.search({ captured_from: "2023-02-29T00:00:00Z" })).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+    await expect(retrieval.search({ captured_from: "2024-13-01T00:00:00Z" })).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+    await expect(
+      retrieval.search({
+        captured_from: "2024-01-02T00:00:00Z",
+        captured_to: "2024-01-01T00:00:00Z",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: expect.stringContaining("captured_from must not be later than captured_to"),
+    });
+  });
+
+  it("combines the naming_source filter (commit-1) with a date range on first_captured_at", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const retrieval = new ResourceRetrievalService(workspace, item.config);
+
+    await writeResourceFixture(item.config.repoDir, RES_A, "2024-01-01T00:00:00Z", { naming_source: "id" });
+    await writeResourceFixture(item.config.repoDir, RES_B, "2024-02-01T00:00:00Z", {
+      naming_source: "explicit",
+      display_name: "Named B",
+    });
+    await writeResourceFixture(item.config.repoDir, RES_C, "2024-03-01T00:00:00Z", { naming_source: "id" });
+    await runGit(item.config, item.config.repoDir, ["add", "."]);
+    await runGit(item.config, item.config.repoDir, ["commit", "-m", "seed naming fixtures"]);
+    await runGit(item.config, item.config.repoDir, ["push", "origin", "main"]);
+
+    // id resources captured between mid-January and mid-March: only C.
+    const combined = await retrieval.search({
+      naming_source: "id",
+      captured_from: "2024-01-15T00:00:00Z",
+      captured_to: "2024-03-15T00:00:00Z",
+    });
+    expect(combined.count).toBe(1);
+    expect(combined.total).toBe(1);
+    expect(resultIds(combined)).toEqual([RES_C]);
+
+    const named = await retrieval.search({ naming_source: "explicit" });
+    expect(named.count).toBe(1);
+    expect((named.results as any[])[0].resource_id).toBe(RES_B);
+
+    expect(resultIds(await retrieval.search({ naming_source: "id", sort: "oldest" }))).toEqual([RES_A, RES_C]);
   });
 });

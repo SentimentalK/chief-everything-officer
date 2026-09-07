@@ -1,6 +1,6 @@
 # CEO 资源策略 (Resource Policy)
 
-Resource 平面负责管理外部材料（URL、文章、视频、PDF、办公文档、数据集）的持久化、结构化理解。它与 State（Personal、Tasks、Journal）共享同一个属于用户的 Git 工作空间，存放在 `resources/` 目录下，但默认与 State 的常规检索相互隔离。
+Resource 平面负责管理外部材料（URL、文章、视频、PDF、办公文档、数据集）的持久化、结构化理解。它与 State（Personal、Tasks、Journal）共享同一个属于用户的 Git 工作空间，存放在 `resources/` 目录下。默认全文检索仅覆盖每个资源的 `interactions.md`；来源 metadata、摘要、正文、evidence 与原始文件不进入默认检索——发现资料用 `resource_search`，读取资料用 `resource_get`，明确指定 `prefixes` 可按需定向搜索。
 
 ---
 

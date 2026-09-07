@@ -15,6 +15,7 @@ import {
   parseMetaMarkdown,
 } from "./meta.js";
 import { parseSummaryDocument } from "./summary.js";
+import { parseResourceTimestamp } from "./timestamps.js";
 import {
   enumerateResources,
   resolveResourceLocation,
@@ -27,10 +28,25 @@ export class ResourceRetrievalService {
   ) {}
 
   async search(input: ResourceSearchInput = {}): Promise<Record<string, unknown>> {
+    // Validate date-range params before entering the workspace (mirrors how
+    // searchText validates its query up front): malformed bounds are rejected
+    // even when the repository has no resources, and no sync happens for a
+    // bad request.
+    const fromMs =
+      input.captured_from !== undefined ? parseResourceTimestamp(input.captured_from, "captured_from") : undefined;
+    const toMs =
+      input.captured_to !== undefined ? parseResourceTimestamp(input.captured_to, "captured_to") : undefined;
+    if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) {
+      throw new CeoError("VALIDATION_FAILED", "captured_from must not be later than captured_to.", {
+        captured_from: input.captured_from,
+        captured_to: input.captured_to,
+      });
+    }
+
     return await this.workspace.withReadyWorkspace(async (base) => {
       const all = await enumerateResources(this.config.repoDir);
 
-      const cards: ResourceCard[] = [];
+      const entries: Array<{ card: ResourceCard; capturedMs: number }> = [];
 
       for (const item of all) {
         const { meta, doc, location } = item;
@@ -38,6 +54,20 @@ export class ResourceRetrievalService {
 
         // Filter: naming_source (exact match; runs before artifact reads and stage derivation)
         if (input.naming_source && meta.naming_source !== input.naming_source) continue;
+
+        // Parse first_captured_at once per candidate (never before the
+        // naming_source filter, so filtered-out resources are not touched).
+        // An invalid value is a hard error naming the resource and its
+        // meta.md — never skipped or guessed.
+        const metaPath = path.posix.join(location.relative_path, "meta.md");
+        const capturedMs = parseResourceTimestamp(
+          meta.first_captured_at,
+          `first_captured_at for resource '${meta.resource_id}' (${metaPath})`,
+        );
+
+        // Filter: date range (inclusive bounds on the parsed instant)
+        if (fromMs !== undefined && capturedMs < fromMs) continue;
+        if (toMs !== undefined && capturedMs > toMs) continue;
 
         const resDir = path.join(this.config.repoDir, location.relative_path);
 
@@ -79,10 +109,6 @@ export class ResourceRetrievalService {
           if (!hasTopic) continue;
         }
 
-        // Filter: date range
-        if (input.captured_from && meta.first_captured_at < input.captured_from) continue;
-        if (input.captured_to && meta.first_captured_at > input.captured_to) continue;
-
         // Filter: query (matches display_name, title, note, ref, name, id, topics)
         if (input.query && input.query.trim()) {
           const q = input.query.trim().toLowerCase();
@@ -99,43 +125,48 @@ export class ResourceRetrievalService {
           }
         }
 
-        cards.push({
-          resource_id: meta.resource_id,
-          display_name: meta.display_name,
-          naming_source: meta.naming_source,
-          relative_path: location.relative_path,
-          title: meta.title,
-          stage,
-          resource_kind: meta.resource_kind,
-          source_type: meta.source_type,
-          source_identity: meta.source_identity,
-          canonical_ref: meta.canonical_ref,
-          platform: meta.platform,
-          topics: meta.topics,
-          first_captured_at: meta.first_captured_at,
-          source_asset_available: sourceAssetAvailable,
-          capture_note,
-          original_name: meta.original_name,
+        entries.push({
+          card: {
+            resource_id: meta.resource_id,
+            display_name: meta.display_name,
+            naming_source: meta.naming_source,
+            relative_path: location.relative_path,
+            title: meta.title,
+            stage,
+            resource_kind: meta.resource_kind,
+            source_type: meta.source_type,
+            source_identity: meta.source_identity,
+            canonical_ref: meta.canonical_ref,
+            platform: meta.platform,
+            topics: meta.topics,
+            first_captured_at: meta.first_captured_at,
+            source_asset_available: sourceAssetAvailable,
+            capture_note,
+            original_name: meta.original_name,
+          },
+          capturedMs,
         });
       }
 
-      // Sort
+      // Sort on the parsed instant; ties resolve by resource_id ascending via a
+      // fixed code-unit comparison (resource_ids are ASCII "res-<uuid>", so < / >
+      // is deterministic). Never localeCompare.
       const sortOrder = input.sort ?? "newest";
-      cards.sort((a, b) => {
-        if (sortOrder === "newest") {
-          return b.first_captured_at.localeCompare(a.first_captured_at);
+      entries.sort((a, b) => {
+        if (a.capturedMs !== b.capturedMs) {
+          return sortOrder === "newest" ? b.capturedMs - a.capturedMs : a.capturedMs - b.capturedMs;
         }
-        return a.first_captured_at.localeCompare(b.first_captured_at);
+        return a.card.resource_id < b.card.resource_id ? -1 : a.card.resource_id > b.card.resource_id ? 1 : 0;
       });
 
       const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
-      const results = cards.slice(0, limit);
+      const results = entries.slice(0, limit).map((entry) => entry.card);
 
       return {
         ok: true,
         base_commit: base,
         count: results.length,
-        total: cards.length,
+        total: entries.length,
         results,
       };
     });

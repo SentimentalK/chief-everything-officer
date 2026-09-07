@@ -127,6 +127,9 @@ function tracedHandler<T>(
   };
 }
 
+const RESOURCE_TIMESTAMP_DESCRIPTION =
+  "ISO-8601 timestamp with REQUIRED timezone (YYYY-MM-DDTHH:mm:ssZ or ±HH:mm; optional 1–3 fractional-second digits). Bounds are inclusive and compare against the resource's first_captured_at.";
+
 const createOperation = z.object({
   op: z.literal("create"),
   path: z.string().describe("Allowed CEO Markdown path that does not yet exist"),
@@ -287,7 +290,8 @@ export function createMcpServer(
   // 4. search_text
   server.registerTool("search_text", {
     title: "Search CEO text",
-    description: "Use this for literal text search inside allowed CEO Markdown files. Regular expressions are not supported. Excludes resources/ by default unless explicitly scoped.",
+    description:
+      "Use this for literal text search inside allowed CEO Markdown files. Regular expressions are not supported. 默认搜索普通 State Markdown 和 Resource interactions；来源 metadata、摘要、正文及 evidence 不在默认范围。查找资料使用 resource_search，读取资料使用 resource_get；明确指定 prefixes 可按需定向搜索。",
     inputSchema: {
       query: z.string().min(1).max(LIMITS.maxSearchQueryBytes),
       prefixes: z.array(z.string()).max(LIMITS.maxFilesPerRead).optional().default([]),
@@ -373,8 +377,8 @@ export function createMcpServer(
       resource_kind: z.enum(["document", "video", "audio", "image", "webpage", "dataset", "code", "message", "other"]).optional(),
       source_type: z.enum(["url", "file", "external_ref"]).optional(),
       platform: z.string().optional(),
-      captured_from: z.string().optional().describe("ISO-8601 start timestamp"),
-      captured_to: z.string().optional().describe("ISO-8601 end timestamp"),
+      captured_from: z.string().optional().describe(RESOURCE_TIMESTAMP_DESCRIPTION),
+      captured_to: z.string().optional().describe(RESOURCE_TIMESTAMP_DESCRIPTION),
       stage: z.enum(["CAPTURED", "EXTRACTED", "NORMALIZED", "READY_FOR_DISCUSSION", "DISCUSSED"]).optional(),
       naming_source: z.enum(["id", "explicit"]).optional().describe("Filter by naming source: 'id' selects resources not yet semantically named"),
       sort: z.enum(["newest", "oldest"]).optional().default("newest"),

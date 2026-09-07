@@ -71,6 +71,18 @@ export function isResourcePath(candidate: string): boolean {
   }
 }
 
+/**
+ * Default search_text scope: every non-resources Markdown file, plus each
+ * Resource directory's interactions.md only. meta/summary/content/evidence.md,
+ * source/**, and any other resources/** file stay out of the default scope.
+ * The regex requires exactly one path segment between resources/ and
+ * interactions.md, so nested resources/a/b/interactions.md stays excluded.
+ */
+function isDefaultSearchPath(filePath: string): boolean {
+  if (!filePath.startsWith("resources/")) return true;
+  return /^resources\/[^/]+\/interactions\.md$/.test(filePath);
+}
+
 export function assertNoResourceMutations(
   operations: ChangeOperation[],
   context: "apply_change_set" | "state_changes",
@@ -302,7 +314,7 @@ export class CeoWorkspace {
       }
       const matches: Array<{ path: string; line: number; snippet: string }> = [];
       for (const filePath of listed) {
-        if (prefixes.length === 0 && filePath.startsWith("resources/")) continue;
+        if (prefixes.length === 0 && !isDefaultSearchPath(filePath)) continue;
         if (!safePrefixes.some((prefix) => filePath.startsWith(prefix))) continue;
         await assertNoSymlink(this.config.repoDir, filePath);
         const content = await this.readUtf8(path.join(this.config.repoDir, filePath), filePath);
