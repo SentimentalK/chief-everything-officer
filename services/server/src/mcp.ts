@@ -23,6 +23,8 @@ import type {
   ResourceGetInput,
   ResourceSearchInput,
 } from "./resource/types.js";
+import { registerJobTools } from "./jobs/tools.js";
+import type { JobService } from "./jobs/service.js";
 
 function result(value: Record<string, unknown>, isError = false) {
   return {
@@ -232,9 +234,10 @@ export function createMcpServer(
     auditStore?: AuditStore;
     resolverClient?: UrlMetadataResolver;
     identity?: WorkspaceIdentity;
+    jobs?: { service: JobService | null };
   } = {},
 ): McpServer {
-  const { auditStore, resolverClient, identity } = options;
+  const { auditStore, resolverClient, identity, jobs } = options;
   const resourceService = new ResourceService(
     workspace,
     workspace.config,
@@ -452,6 +455,15 @@ export function createMcpServer(
       };
     },
   );
+
+  // Worker bridge tools (enabled only when the server layer provides a job service).
+  if (jobs && identity) {
+    registerJobTools(server, {
+      service: jobs.service,
+      scope: { user_id: identity.user_id, workspace_id: identity.workspace_id },
+      auditStore: auditStore ?? null,
+    });
+  }
 
   return server;
 }

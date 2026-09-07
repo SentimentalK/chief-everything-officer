@@ -10,6 +10,8 @@ import { createHostGuard, createOriginGuard, createIdentityAuthMiddleware } from
 import { IdentityService } from "./identity/service.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
+import { openJobBridge } from "./jobs/bridge.js";
+import { resolveResourceLocation } from "./resource/locator.js";
 
 function fatal(prefix: string, error: unknown): never {
   const message = error instanceof Error ? error.message : String(error);
@@ -89,9 +91,23 @@ app.use(
 // enforced at the /mcp boundary by the identity middleware per request.
 const workspaceIdentity = identityService.workspaceIdentityValue;
 
+// Optional worker-bridge job layer (disabled unless configured). Resource
+// existence for new tasks is checked against the single-user repo contents.
+const jobBridge = openJobBridge({
+  bridgeEnabled: config.bridgeEnabled,
+  redisUrl: config.redisUrl,
+}, async (_scope, resourceId) => {
+  const loc = await resolveResourceLocation(workspace.config.repoDir, resourceId);
+  return loc !== null;
+});
+
 // MCP handler (dedicated to /mcp)
 const mcpHandler = createMcpHandler(
-  () => createMcpServer(workspace, productPolicy, { auditStore, identity: workspaceIdentity }),
+  () => createMcpServer(workspace, productPolicy, {
+    auditStore,
+    identity: workspaceIdentity,
+    jobs: { service: jobBridge.service },
+  }),
   { legacy: "reject" },
 );
 const nodeHandler = toNodeHandler(mcpHandler);
@@ -114,6 +130,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     auditStore.close();
     identityService.close();
+    void jobBridge.dispose();
     listener.close(() => process.exit(0));
   });
 }
