@@ -453,4 +453,14 @@ describe("Audit HTTP API & Session Management", () => {
     });
     expect(tracesAfterLogout.status).toBe(401);
   });
+
+  it("does not serve /audit static frontend or SPA fallback", async () => {
+    const { baseUrl } = await setupTestApp();
+
+    const res = await fetch(`${baseUrl}/audit`);
+    expect(res.status).toBe(404);
+
+    const subRes = await fetch(`${baseUrl}/audit/subpath`);
+    expect(subRes.status).toBe(404);
+  });
 });

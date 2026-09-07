@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import express from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
@@ -36,20 +34,9 @@ app.get("/readyz", (_req, res) => {
 });
 
 // Audit routes
-const currentDir = import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname);
-const candidates = [
-  path.resolve(currentDir, "../audit-web/dist"),
-  path.resolve(currentDir, "../audit-web"),
-  path.resolve(currentDir, "audit-web/dist"),
-  path.resolve(currentDir, "audit-web"),
-  "/app/audit-web",
-];
-const auditWebDir = candidates.find((dir) => fs.existsSync(dir) && fs.existsSync(path.join(dir, "index.html")));
-
 app.use(createAuditRouter({
   auditStore,
   apiKey: config.mcpApiKey,
-  auditWebDir,
 }));
 
 // MCP handler (dedicated to /mcp - UNCHANGED)

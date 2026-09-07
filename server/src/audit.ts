@@ -332,9 +332,8 @@ function getSessionCookie(req: Request): string | null {
 export function createAuditRouter(options: {
   auditStore: AuditStore;
   apiKey?: string;
-  auditWebDir?: string;
 }): Router {
-  const { auditStore, apiKey, auditWebDir } = options;
+  const { auditStore, apiKey } = options;
   const router = express.Router();
   router.use(express.json());
 
@@ -463,17 +462,6 @@ export function createAuditRouter(options: {
 
     res.status(200).json({ ok: true, trace });
   });
-
-  if (auditWebDir && fs.existsSync(auditWebDir) && fs.existsSync(path.join(auditWebDir, "index.html"))) {
-    router.use("/audit", express.static(auditWebDir));
-    router.get(/^\/audit(?:\/.*)?$/, (_req, res) => {
-      res.sendFile(path.join(auditWebDir, "index.html"));
-    });
-  } else {
-    router.get(/^\/audit(?:\/.*)?$/, (_req, res) => {
-      res.status(503).send("Audit Console web frontend is building or not available yet.");
-    });
-  }
 
   return router;
 }

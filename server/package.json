@@ -1,5 +1,5 @@
 {
-  "name": "@sentimentalk/ceo-mcp",
+  "name": "@sentimentalk/ceo-server",
   "version": "0.3.5",
   "private": true,
   "type": "module",

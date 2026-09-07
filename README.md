@@ -30,6 +30,13 @@ Long-term AI memory is part of this problem, but not the goal itself. We do not 
   $$\text{Hard Invariants} \longrightarrow \text{Workspace Rules (rules/)} \longrightarrow \text{Runtime Defaults (policy/)} \longrightarrow \text{Model Reasoning}$$
 - **Full Trace Audit & Observability**: Embedded SQLite audit logging capturing exact tool inputs, outputs, estimated token usage, latencies, affected files, and resulting commit hashes with an accompanying Audit Web UI.
 
+## Project Structure
+
+- **`server/`**: The core `@sentimentalk/ceo-server` service providing the MCP server (`/mcp`), product policy endpoints, Git transaction engine, and SQLite audit trace logging (`/api/audit/*`).
+- **`web/`**: The standalone `ceo-web` Audit Console frontend built with React, Vite, and Tailwind CSS, served in production via a non-root unprivileged NGINX container (`/audit/`).
+- **`worker/`**: The Rust-based headless task worker orchestrating agent execution inside isolated workspaces.
+- **`docs/`**: Deployment, architecture, and operational documentation (see [Deployment Architecture](docs/deployment.md)).
+
 ## What Belongs Here
 
 CEO focuses on the relationship between a person and the world, rather than the world itself.

@@ -1,6 +1,6 @@
-# CEO State MCP
+# CEO Server (@sentimentalk/ceo-server)
 
-A narrow, Git-backed MCP server for the user's durable personal state workspace. It exposes four read tools, one runtime policy read tool, and one atomic write transaction (`apply_change_set`); it does not expose a shell, arbitrary non-Markdown filesystem access, raw Git commands, branch switching, history rewrites, rebases, or force pushes.
+A narrow, Git-backed MCP and state server for the user's durable personal state workspace. It exposes MCP tools for safe state interaction, runtime policy queries, and audit trace persistence. The audit web console is maintained separately in `web/`.
 
 ## Tools
 

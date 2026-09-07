@@ -1,0 +1,121 @@
+name: CEO Web — Test & Publish Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-image.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-image.yaml"
+  workflow_dispatch:
+
+jobs:
+  test-build-publish:
+    name: Test, Build & Publish CEO Web
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Typecheck, Test and Build Web
+        run: |
+          cd web
+          npm ci --prefer-offline=false --audit=false --fund=false
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: CI Docker Smoke Build
+        run: |
+          docker build -t ceo-web:ci -f web/Dockerfile web
+
+      - name: CI Web Server Startup and Contract Verification
+        run: |
+          CONTAINER_ID=$(docker run -d -p 8080:8080 ceo-web:ci)
+          trap "docker rm -f $CONTAINER_ID" EXIT
+
+          for i in $(seq 1 10); do
+            if curl -s http://localhost:8080/healthz | grep -q '"ok":true'; then
+              break
+            fi
+            sleep 1
+          done
+
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/healthz)
+          test "$HEALTH_STATUS" = "200" || { echo "Healthz probe failed with $HEALTH_STATUS"; exit 1; }
+
+          LOCATION_HEADER=$(curl -sI http://localhost:8080/audit | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')
+          echo "Location header for /audit: '$LOCATION_HEADER'"
+          test "$LOCATION_HEADER" = "/audit/" || { echo "Unexpected redirect location: $LOCATION_HEADER"; exit 1; }
+
+          PAGE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/audit/)
+          test "$PAGE_STATUS" = "200" || { echo "Page /audit/ failed with $PAGE_STATUS"; exit 1; }
+
+          DEEP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/audit/traces/123)
+          test "$DEEP_STATUS" = "200" || { echo "Deep path /audit/traces/123 failed with $DEEP_STATUS"; exit 1; }
+
+          INDEX_HTML=$(curl -s http://localhost:8080/audit/)
+          JS_ASSET=$(echo "$INDEX_HTML" | grep -o 'src="/audit/assets/[^"]*"' | head -n 1 | cut -d'"' -f2)
+          CSS_ASSET=$(echo "$INDEX_HTML" | grep -o 'href="/audit/assets/[^"]*"' | head -n 1 | cut -d'"' -f2)
+
+          if [ -n "$JS_ASSET" ]; then
+            JS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080$JS_ASSET")
+            test "$JS_STATUS" = "200" || { echo "JS asset $JS_ASSET failed with $JS_STATUS"; exit 1; }
+          fi
+
+          if [ -n "$CSS_ASSET" ]; then
+            CSS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080$CSS_ASSET")
+            test "$CSS_STATUS" = "200" || { echo "CSS asset $CSS_ASSET failed with $CSS_STATUS"; exit 1; }
+          fi
+
+          MISSING_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/audit/assets/non-existent-bundle.js)
+          test "$MISSING_STATUS" = "404" || { echo "Missing asset returned $MISSING_STATUS instead of 404"; exit 1; }
+
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/audit/traces)
+          test "$API_STATUS" = "404" || { echo "API path returned $API_STATUS instead of 404"; exit 1; }
+
+          echo "All Web server startup, routing, and contract checks passed successfully!"
+
+      - name: Set up QEMU
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase image tag
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          echo "IMAGE_TAG=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ceo-web:latest" >> "$GITHUB_ENV"
+
+      - name: Build and push CEO Web image
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_TAG }}

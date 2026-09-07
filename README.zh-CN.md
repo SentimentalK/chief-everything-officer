@@ -30,6 +30,13 @@ AI 的长期记忆是这个问题的一部分，但不是目标本身。我们�
   $$\text{硬安全边界} \longrightarrow \text{Workspace 规则 (rules/)} \longrightarrow \text{内置默认策略 (policy/)} \longrightarrow \text{模型自主推理}$$
 - **全链路 Trace 审计与可观测性**：内嵌 SQLite 审计引擎与 Web 控制台，精准记录每次 tool call 输入、输出、token 估算、耗时及产生之 commit。
 
+## 项目结构
+
+- **`server/`**：核心 `@sentimentalk/ceo-server` 后端服务，提供 MCP 协议端点（`/mcp`）、Runtime 策略读取、Git 原子事务引擎以及 SQLite 审计日志服务（`/api/audit/*`）。
+- **`web/`**：独立的 `ceo-web` 审计 Web 控制台，基于 React、Vite 与 Tailwind CSS 构建，生产环境使用非 root 无特权 NGINX 容器服务（`/audit/`）。
+- **`worker/`**：基于 Rust 的通用无人值守 Agent 任务执行器，负责在独立工作区内编排并执行任务。
+- **`docs/`**：部署、架构与运维说明（详见 [部署架构文档](docs/deployment.md)）。
+
 ## 属于这里的内容
 
 CEO 关注的是人与世界之间的关系，而不是世界本身。
