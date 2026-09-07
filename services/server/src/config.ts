@@ -24,6 +24,8 @@ export interface Config {
   contentResolverUrl?: string;
   contentResolverToken?: string;
   contentResolverTimeoutMs: number;
+  bridgeEnabled: boolean;
+  redisUrl?: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -33,6 +35,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("PORT must be an integer from 1 to 65535");
   }
   const bindHost = env.BIND_HOST ?? "127.0.0.1";
+
+  const bridgeEnabled = parseBool(env.CEO_BRIDGE_ENABLED, false);
+  const redisUrlRaw = env.CEO_REDIS_URL?.trim();
+  if (redisUrlRaw && !/^rediss?:\/\//i.test(redisUrlRaw)) {
+    throw new Error("CEO_REDIS_URL must be a redis:// or rediss:// URL");
+  }
+  const redisUrl = redisUrlRaw || undefined;
 
   const mcpApiKey = env.MCP_API_KEY;
   if (mcpApiKey === undefined) {
@@ -100,5 +109,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(contentResolverUrl ? { contentResolverUrl } : {}),
     ...(contentResolverToken ? { contentResolverToken } : {}),
     contentResolverTimeoutMs,
+    bridgeEnabled,
+    ...(redisUrl ? { redisUrl } : {}),
   };
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  return fallback;
 }
