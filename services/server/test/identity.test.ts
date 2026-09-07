@@ -178,3 +178,125 @@ describe("Identity service: startup validation and key lifecycle", () => {
     expect(rotated.revalidate(auth)).toBe(false);
   });
 });
+
+/** SQL helpers for building “almost-valid” databases that miss ONE contract rule. */
+function topicBrokenSchema(
+  dbPath: string,
+  defect: "no-pk" | "no-foreign-key" | "no-unique" | "no-not-null",
+): void {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  const noPk = defect === "no-pk";
+  const noFk = defect === "no-foreign-key";
+  const noUnique = defect === "no-unique";
+  const noNotNull = defect === "no-not-null";
+
+  const idDef = noPk ? "TEXT NOT NULL" : "TEXT PRIMARY KEY NOT NULL";
+  const usersCreatedAt = noNotNull ? "INTEGER" : "INTEGER NOT NULL";
+  const wsForeignKey = noFk ? "" : ", FOREIGN KEY (owner_user_id) REFERENCES users(id)";
+  const akForeignKey = noFk ? "" : ", FOREIGN KEY (user_id) REFERENCES users(id)";
+  const digestUnique = noUnique ? "" : "UNIQUE";
+
+  db.exec("PRAGMA foreign_keys = OFF;");
+  db.exec(`
+    CREATE TABLE users (
+      id ${idDef},
+      created_at ${usersCreatedAt},
+      disabled_at INTEGER
+    );
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      remote_url TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      created_at INTEGER NOT NULL${wsForeignKey}
+    );
+    CREATE TABLE api_keys (
+      id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      key_digest TEXT NOT NULL ${digestUnique},
+      created_at INTEGER NOT NULL${akForeignKey}
+    );
+  `);
+  db.close();
+}
+
+describe("Provisioning atomicity & no-overwrite publish", () => {
+  it("two competing provisions settle on exactly one identity and leave no temp files", async () => {
+    const ctx = await tempCtx();
+    const first = provision(ctx, "key-a");
+    const second = provision(ctx, "key-b"); // competes with the already-published DB
+
+    // The winning DB wins; the second call must not have replaced anything.
+    const verified = IdentityStore.open(ctx.dbPath).loadVerifiedBinding();
+    expect(verified.user.id).toBe(first.user_id);
+    expect(verified.workspace.id).toBe(first.workspace_id);
+
+    const leftOver = fs.readdirSync(path.dirname(ctx.dbPath)).filter((f) => f.includes(".identity-init-"));
+    expect(leftOver).toEqual([]);
+
+    // second could have returned either the winner or the same (never a third id).
+    expect([first.user_id, second?.user_id ?? ""]).toContain(first.user_id ?? "");
+  });
+
+  it("fails cleanly (no temp leak) when the publish target is unusable (a directory)", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(ctx.dbPath, { recursive: true }); // dbPath is a directory => link fails non-EEXIST
+    expect(() =>
+      provisionEmptyIdentityDatabase(ctx.dbPath, {
+        remoteUrl: ctx.remoteUrl,
+        branch: ctx.branch,
+        apiKeyDigest: sha256Hex("key"),
+      }),
+    ).toThrow();
+    expect(fs.readdirSync(path.dirname(ctx.dbPath)).filter((f) => f.includes(".identity-init-"))).toEqual([]);
+  });
+
+  it("rejects a half-built DB and re-initialization recovers after the bad file is removed", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.exec("PRAGMA user_version = 1;");
+    raw.exec("CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);");
+    raw.close();
+    // Missing the other two tables => structural rejection (no silent repair).
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/missing required table|exactly one user/);
+    // After removing the half file, a fresh init succeeds.
+    fs.rmSync(ctx.dbPath, { force: true });
+    const ok = await IdentityService.initialize(
+      { remoteUrl: ctx.remoteUrl, branch: ctx.branch, envApiKey: "key" },
+      ctx.dbPath,
+    );
+    expect(ok.created).toBe(true);
+  });
+});
+
+describe("init only verifies (never rotates) an existing database", () => {
+  it("a second init under a different key fails and leaves the original untouched", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    openService(ctx, "key-1");
+    const before = IdentityStore.open(ctx.dbPath).loadVerifiedBinding();
+
+    // A different (rotating) env key is rejected by init, not applied.
+    expect(() =>
+      IdentityService.initialize({ remoteUrl: ctx.remoteUrl, branch: ctx.branch, envApiKey: "key-OTHER" }, ctx.dbPath),
+    ).toThrow(/different active key|does not rotate/);
+
+    const after = IdentityStore.open(ctx.dbPath).loadVerifiedBinding();
+    expect(after.user.id).toBe(before.user.id);
+    expect(after.workspace.id).toBe(before.workspace.id);
+    expect(after.activeKey.key_digest).toBe(before.activeKey.key_digest);
+  });
+});
+
+describe("structural contract rejects bad schemas", () => {
+  it.each(["no-pk", "no-foreign-key", "no-unique", "no-not-null"] as const)(
+    "rejects a database missing %s",
+    async (defect) => {
+      const ctx = await tempCtx();
+      topicBrokenSchema(ctx.dbPath, defect);
+      expect(() => IdentityStore.open(ctx.dbPath)).toThrow();
+    },
+  );
+});

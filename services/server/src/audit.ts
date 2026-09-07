@@ -3,8 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
-import type { IdentityService } from "./identity/service.js";
-import { IdentityDbUnavailable } from "./identity/service.js";
+import type { IdentityService, AuthIdentity } from "./identity/service.js";
+import {
+  IdentityDbUnavailable,
+  IdentityDbContextClosed,
+  IdentityStructureError,
+} from "./identity/store.js";
 
 export interface TraceRecordInput {
   timestamp_ms: number;
@@ -326,6 +330,13 @@ function getSessionCookie(req: Request): string | null {
   return token ? decodeURIComponent(token) : null;
 }
 
+function getAuditBearer(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.substring(7);
+  return token ? token : null;
+}
+
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 function setAuditCookie(res: Response, value: string, maxAgeSeconds: number, secure: boolean): void {
@@ -342,12 +353,16 @@ function setAuditCookie(res: Response, value: string, maxAgeSeconds: number, sec
   res.setHeader("Set-Cookie", cookieParts.join("; "));
 }
 
-function isDbUnavailable(error: unknown): boolean {
-  return error instanceof IdentityDbUnavailable;
-}
-
-function identityMatches(identity: SessionIdentity, servedWorkspaceId: string): boolean {
-  return identity.workspace_id === servedWorkspaceId;
+/**
+ * Whether an identity-enforcement error reflects an unavailable/closed store
+ * (503) rather than ordinary auth semantics handled by null/ownership checks.
+ */
+function isIdentityUnavailable(error: unknown): boolean {
+  return (
+    error instanceof IdentityDbUnavailable ||
+    error instanceof IdentityDbContextClosed ||
+    error instanceof IdentityStructureError
+  );
 }
 
 export function createAuditRouter(options: {
@@ -361,8 +376,14 @@ export function createAuditRouter(options: {
 
   const sessions = new Map<string, Session>();
 
-  /** Returns the bound identity if the cookie session is still valid, else null. */
-  function sessionIdentity(sessionId: string | null): SessionIdentity | null {
+  /**
+   * Re-derives the identity for a cookie session from the current DB (not the
+   * cached value). Returns the fresh identity when the bound key is valid and
+   * the owning workspace resolves; returns null and deletes the session only on
+   * a genuine expiry/revocation/disablement. Throws an identity-unavailable
+   * error when the DB cannot be read, in which case the session is preserved.
+   */
+  function sessionIdentityOrNull(sessionId: string | null): AuthIdentity | null {
     if (!sessionId) return null;
     const session = sessions.get(sessionId);
     if (!session) return null;
@@ -370,17 +391,17 @@ export function createAuditRouter(options: {
       sessions.delete(sessionId);
       return null;
     }
-    const identity: SessionIdentity = {
+    const pseudo: AuthIdentity = {
       user_id: session.user_id,
       api_key_id: session.api_key_id,
       workspace_id: session.workspace_id,
     };
-    // Every use re-validates the underlying user + key still being active.
-    if (!identityService.revalidate(identity)) {
+    const resolved = identityService.revalidateAndOwnership(pseudo);
+    if (!resolved) {
       sessions.delete(sessionId);
       return null;
     }
-    return identity;
+    return resolved;
   }
 
   function respondUnauthorized(res: Response): void {
@@ -389,54 +410,68 @@ export function createAuditRouter(options: {
 
   /**
    * Requires a valid bound session cookie OR a valid Bearer credential. Both
-   * are checked against the unified IdentityService. No raw-key bypass.
+   * paths share the same ownership/error mapping but keep their own credential
+   * source. DB faults are surfaced as 503 without deleting cookie sessions.
    */
   function auditAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-    const sessionIdent = sessionIdentity(getSessionCookie(req));
-    if (sessionIdent) {
-      if (!identityMatches(sessionIdent, servedWorkspaceId)) {
-        res.status(403).json({ error: "Forbidden: workspace not owned" });
+    // Cookie-first.
+    const cookieSessionId = getSessionCookie(req);
+    if (cookieSessionId) {
+      try {
+        const ident = sessionIdentityOrNull(cookieSessionId);
+        if (!ident) {
+          respondUnauthorized(res);
+          return;
+        }
+        if (!identityService.holdsWorkspace(ident)) {
+          res.status(403).json({ error: "Forbidden: workspace not owned" });
+          return;
+        }
+        next();
         return;
+      } catch (error) {
+        if (isIdentityUnavailable(error)) {
+          res.status(503).json({ error: "Identity service unavailable" });
+          return;
+        }
+        throw error;
       }
-      next();
-      return;
     }
 
-    const authHeader = req.headers.authorization;
-    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : null;
+    // No cookie: require a Bearer credential.
+    const token = getAuditBearer(req);
     if (!token) {
       respondUnauthorized(res);
       return;
     }
-
     try {
       const identity = identityService.authenticateApiKey(token);
       if (!identity) {
         respondUnauthorized(res);
         return;
       }
-      if (!identityMatches(identity, servedWorkspaceId)) {
+      if (!identityService.holdsWorkspace(identity)) {
         res.status(403).json({ error: "Forbidden: workspace not owned" });
         return;
       }
       next();
     } catch (error) {
-      if (isDbUnavailable(error)) {
+      if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
         return;
       }
-      next(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     }
   }
 
-  router.post("/api/audit/session", (req: Request, res: Response, next: NextFunction) => {
+  router.post("/api/audit/session", (req: Request, res: Response) => {
     const { token } = req.body ?? {};
     if (typeof token !== "string" || token.length === 0) {
       res.status(401).json({ error: "Invalid access token" });
       return;
     }
 
-    let identity: SessionIdentity;
+    let identity: AuthIdentity;
     try {
       const result = identityService.authenticateApiKey(token);
       if (!result) {
@@ -445,15 +480,14 @@ export function createAuditRouter(options: {
       }
       identity = result;
     } catch (error) {
-      if (isDbUnavailable(error)) {
+      if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
         return;
       }
-      next(error instanceof Error ? error : new Error(String(error)));
-      return;
+      throw error;
     }
 
-    if (!identityMatches(identity, servedWorkspaceId)) {
+    if (!identityService.holdsWorkspace(identity)) {
       res.status(403).json({ error: "Forbidden: workspace not owned" });
       return;
     }
@@ -479,9 +513,21 @@ export function createAuditRouter(options: {
     res.status(200).json({ ok: true });
   });
 
+  // Session status: COOKIE ONLY. A missing/invalid cookie is 200 {false}.
+  // A Bearer header does not count as “browser logged in”. DB fault -> 503.
   router.get("/api/audit/session", (req: Request, res: Response) => {
     const sessionId = getSessionCookie(req);
-    res.status(200).json({ authenticated: Boolean(sessionIdentity(sessionId)) });
+    try {
+      const ident = sessionId ? sessionIdentityOrNull(sessionId) : null;
+      const authenticated = ident ? identityService.holdsWorkspace(ident) : false;
+      res.status(200).json({ authenticated });
+    } catch (error) {
+      if (isIdentityUnavailable(error)) {
+        res.status(503).json({ error: "Identity service unavailable" });
+        return;
+      }
+      throw error;
+    }
   });
 
   router.delete("/api/audit/session", (req: Request, res: Response) => {

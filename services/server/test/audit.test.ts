@@ -521,6 +521,48 @@ describe("Audit HTTP API & Session Management", () => {
     expect(tracesAfterLogout.status).toBe(401);
   });
 
+  it("session status is cookie-only and stays 200/false without a cookie (even with Bearer)", async () => {
+    const { baseUrl, apiKey } = await setupTestApp();
+
+    const noCookie = await fetch(`${baseUrl}/api/audit/session`);
+    expect(noCookie.status).toBe(200);
+    expect(await noCookie.json()).toEqual({ authenticated: false });
+
+    // A Bearer credential does not imply a browser login session.
+    const withBearer = await fetch(`${baseUrl}/api/audit/session`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    expect(withBearer.status).toBe(200);
+    expect(await withBearer.json()).toEqual({ authenticated: false });
+  });
+
+  it("returns 503 on identity DB fault for both cookie and Bearer, preserving the session", async () => {
+    const { baseUrl, apiKey, service } = await setupTestApp();
+
+    const login = await fetch(`${baseUrl}/api/audit/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: apiKey }),
+    });
+    expect(login.status).toBe(200);
+    const cookieHeader = login.headers.get("set-cookie");
+    const sessionCookie = cookieHeader!.split(";")[0]!;
+
+    // Simulate the identity DB becoming unavailable mid-flight.
+    service.close();
+
+    const cookieTraces = await fetch(`${baseUrl}/api/audit/traces`, { headers: { Cookie: sessionCookie } });
+    expect(cookieTraces.status).toBe(503);
+
+    const cookieStatus = await fetch(`${baseUrl}/api/audit/session`, { headers: { Cookie: sessionCookie } });
+    expect(cookieStatus.status).toBe(503);
+
+    const bearerTraces = await fetch(`${baseUrl}/api/audit/traces`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    expect(bearerTraces.status).toBe(503);
+  });
+
   it("does not serve /audit static frontend or SPA fallback", async () => {
     const { baseUrl } = await setupTestApp();
 

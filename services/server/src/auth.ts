@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import type { IdentityService, AuthIdentity } from "./identity/service.js";
-import { IdentityDbUnavailable, WorkspaceAccessDeniedError } from "./identity/service.js";
+import { WorkspaceAccessDeniedError } from "./identity/service.js";
+import { IdentityDbUnavailable } from "./identity/store.js";
 
 declare global {
   namespace Express {
