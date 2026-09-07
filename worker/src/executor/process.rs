@@ -26,6 +26,33 @@ impl ManagedProcess for GroupManagedProcess {
         self.child.stderr.take()
     }
 
+    fn send_input_line<'a>(
+        &'a mut self,
+        line: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            let stdin = self.child.stdin.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdin is closed or not piped",
+                )
+            })?;
+            stdin.write_all(line.as_bytes()).await?;
+            if !line.ends_with('\n') {
+                stdin.write_all(b"\n").await?;
+            }
+            stdin.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn close_stdin(&mut self) -> Result<(), std::io::Error> {
+        self.child.stdin.take();
+        Ok(())
+    }
+
     fn kill_group(&mut self) -> Result<(), std::io::Error> {
         if let Some(pgid) = self.pgid {
             #[cfg(target_os = "linux")]

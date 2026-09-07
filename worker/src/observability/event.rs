@@ -40,6 +40,16 @@ impl EventLogger {
         }
     }
 
+    pub fn log_event(
+        &self,
+        stage: &str,
+        event_name: &str,
+        source: crate::observability::logger::LogSource,
+        data: serde_json::Value,
+    ) {
+        self.log(stage, event_name, source.as_tag(), data);
+    }
+
     pub fn log(&self, stage: &str, event_name: &str, source: &str, data: serde_json::Value) {
         if self.truncated.load(Ordering::Relaxed) {
             return;

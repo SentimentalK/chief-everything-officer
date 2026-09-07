@@ -1,4 +1,5 @@
-use crate::verifier::BusinessOutcome;
+use crate::doctor::SessionDoctorReport;
+use crate::verifier::{ArtifactClaim, BusinessOutcome};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -14,29 +15,10 @@ pub struct ExecutorInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmissionInfo {
-    pub status: String,
-    pub exit_code: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptInfo {
-    pub exit_code: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampsInfo {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactRef {
-    pub name: String,
-    pub path: String,
-    pub size_bytes: u64,
-    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,15 +33,6 @@ pub struct LogSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationSummary {
-    pub valid: bool,
-    pub url_matched: bool,
-    pub schema_conforming: bool,
-    pub artifact_fresh: bool,
-    pub transcript_status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptError {
     pub stage: String,
     pub code: String,
@@ -70,18 +43,16 @@ pub struct ReceiptError {
 pub struct TaskReceipt {
     pub job_id: String,
     pub attempt_id: String,
-    pub capability_id: String,
-    pub manifest_revision: u32,
+    pub workspace: String,
+    pub prompt_file: String,
+    pub prompt_sha256: String,
     pub execution_status: String,
-    pub agent_session_state: String,
     pub business_outcome: BusinessOutcome,
     pub executor: ExecutorInfo,
-    pub submission: SubmissionInfo,
-    pub script: ScriptInfo,
+    pub doctor: Option<SessionDoctorReport>,
     pub timestamps: TimestampsInfo,
-    pub artifacts: Vec<ArtifactRef>,
+    pub artifacts: Vec<ArtifactClaim>,
     pub logs: LogSummary,
-    pub verification: Option<VerificationSummary>,
     pub error: Option<ReceiptError>,
 }
 

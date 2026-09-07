@@ -32,10 +32,9 @@ pub struct ExecutorMetadata {
 pub struct ExecutionRequest<'a> {
     pub job_id: &'a str,
     pub attempt_id: &'a str,
-    pub capability_id: &'a str,
+    pub workspace_dir: &'a Path,
     pub attempt_dir: &'a Path,
-    pub input_json_path: &'a Path,
-    pub run_script_path: &'a Path,
+    pub prompt_file: &'a Path,
     pub model: Option<&'a str>,
 }
 
@@ -43,6 +42,11 @@ pub trait ManagedProcess: Send + Sync {
     fn pid(&self) -> Option<u32>;
     fn take_stdout(&mut self) -> Option<ChildStdout>;
     fn take_stderr(&mut self) -> Option<ChildStderr>;
+    fn send_input_line<'a>(
+        &'a mut self,
+        line: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
+    fn close_stdin(&mut self) -> Result<(), std::io::Error>;
     fn kill_group(&mut self) -> Result<(), std::io::Error>;
     fn force_kill_group(&mut self) -> Result<(), std::io::Error>;
     fn wait(

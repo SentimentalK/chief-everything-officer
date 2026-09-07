@@ -54,13 +54,14 @@ impl ExecutorAdapter for TestStubAdapter {
             self.executable.clone()
         };
         let mut cmd = Command::new(&exe);
-        cmd.arg("--input")
-            .arg(request.input_json_path)
-            .arg("--output-dir")
+        cmd.arg("--workspace")
+            .arg(request.workspace_dir)
+            .arg("--attempt-dir")
             .arg(request.attempt_dir)
-            .arg("--run-script")
-            .arg(request.run_script_path)
-            .current_dir(request.attempt_dir)
+            .arg("--prompt-file")
+            .arg(request.prompt_file)
+            .current_dir(request.workspace_dir)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

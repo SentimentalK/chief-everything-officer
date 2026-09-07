@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Test Stub for CEO Worker Plane
-# Simulates Google Agent or worker capability execution
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If invoked with modern generic runner arguments, delegate to test_stub.py
+for arg in "$@"; do
+    if [[ "$arg" == "--workspace" || "$arg" == "--attempt-dir" ]]; then
+        exec python3 "$DIR/test_stub.py" "$@"
+    fi
+done
 
 INPUT_FILE=""
 OUTPUT_DIR=""

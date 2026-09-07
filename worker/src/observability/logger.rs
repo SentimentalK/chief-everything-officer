@@ -201,3 +201,108 @@ impl ProcessLogger {
         }
     }
 }
+
+pub struct StreamEventDispatcher {
+    events_path: PathBuf,
+    stdout_logger: ProcessLogger,
+    event_tx: mpsc::Sender<serde_json::Value>,
+}
+
+impl StreamEventDispatcher {
+    pub fn new(
+        events_path: PathBuf,
+        stdout_logger: ProcessLogger,
+        event_tx: mpsc::Sender<serde_json::Value>,
+    ) -> Self {
+        Self {
+            events_path,
+            stdout_logger,
+            event_tx,
+        }
+    }
+
+    pub async fn run<R: AsyncRead + Unpin>(self, stream: R) {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stream).lines();
+
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                // 1. Write raw line to events.jsonl without modification
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.events_path)
+                {
+                    let _ = writeln!(f, "{}", trimmed);
+                }
+
+                // 2. Dispatch to state machine channel
+                let _ = self.event_tx.send(val.clone()).await;
+
+                // 3. Format for stdout logger
+                if let Some(event_type) = val.get("event").and_then(|v| v.as_str()) {
+                    match event_type {
+                        "init" => {
+                            self.stdout_logger.log_line_with_source(
+                                LogSource::Launcher,
+                                &format!(
+                                    "Session initialized: conversation_id={}",
+                                    val.get("conversation_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown")
+                                ),
+                            );
+                        }
+                        "step_update" => {
+                            if let Some(step) = val.get("step_update") {
+                                if let Some(delta) = step.get("text_delta").and_then(|v| v.as_str())
+                                {
+                                    if !delta.trim().is_empty() {
+                                        self.stdout_logger.log_line_with_source(
+                                            LogSource::Agent,
+                                            delta.trim_end(),
+                                        );
+                                    }
+                                } else if let Some(tool) =
+                                    step.get("tool_name").and_then(|v| v.as_str())
+                                {
+                                    let state =
+                                        step.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                                    self.stdout_logger.log_line_with_source(
+                                        LogSource::Launcher,
+                                        &format!("[tool:{}] {}", tool, state),
+                                    );
+                                }
+                            }
+                        }
+                        "result" => {
+                            self.stdout_logger.log_line_with_source(
+                                LogSource::Launcher,
+                                &format!(
+                                    "Turn completed: status={}",
+                                    val.get("result")
+                                        .and_then(|r| r.get("status"))
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("unknown")
+                                ),
+                            );
+                        }
+                        _ => {
+                            self.stdout_logger.log_line(trimmed);
+                        }
+                    }
+                } else {
+                    self.stdout_logger.log_line(trimmed);
+                }
+            } else {
+                // Non-JSON line from stdout
+                self.stdout_logger.log_line(trimmed);
+            }
+        }
+    }
+}

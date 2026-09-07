@@ -1,11 +1,9 @@
-use ceo_worker::config::{validate_id, WorkerConfig};
-use ceo_worker::doctor::{run_doctor, DoctorStatus};
-use ceo_worker::executor::create_executor;
+use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
 use ceo_worker::observability::status::{JobStage, StatusTracker};
 use ceo_worker::runner::Runner;
 use ceo_worker::verifier::BusinessOutcome;
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -19,29 +17,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run doctor checks on a capability and executor
+    /// Run doctor checks on a workspace
     Doctor {
-        #[arg(short, long, default_value = "content.extract_url")]
-        capability: String,
-    },
-    /// Run a capability task
-    Run {
-        #[arg(short, long, default_value = "content.extract_url")]
-        capability: String,
         #[arg(short, long)]
-        url: String,
+        workspace: PathBuf,
+    },
+    /// Run an agent task on a workspace
+    Run {
+        #[arg(short, long)]
+        workspace: PathBuf,
+        #[arg(short, long)]
+        prompt_file: PathBuf,
         #[arg(short, long)]
         job_id: Option<String>,
+        #[arg(short, long)]
+        timeout: Option<u64>,
         #[arg(long, default_value_t = false)]
         no_stream: bool,
     },
     /// Query the status of a job
     Status {
         #[arg(short, long)]
+        workspace: PathBuf,
+        #[arg(short, long)]
         job_id: String,
     },
     /// Inspect logs for a job
     Logs {
+        #[arg(short, long)]
+        workspace: PathBuf,
         #[arg(short, long)]
         job_id: String,
         #[arg(short, long)]
@@ -63,62 +67,26 @@ async fn main() {
     let config = WorkerConfig::from_env();
 
     match cli.command {
-        Commands::Doctor { capability } => {
-            if let Err(e) = validate_id("capability", &capability) {
-                eprintln!("Invalid capability name: {}", e);
-                std::process::exit(1);
-            }
-            let cap_dir = config.capability_dir(&capability);
-            if !cap_dir.exists() {
-                eprintln!("Error: Capability directory not found at {:?}", cap_dir);
-                std::process::exit(1);
-            }
-
-            let cap_report = match run_doctor(&cap_dir).await {
-                Ok(report) => report,
+        Commands::Doctor { workspace } => {
+            let runner = Runner::new(config, None);
+            match runner.run_standalone_doctor(&workspace).await {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                    if !report.ready {
+                        std::process::exit(1);
+                    }
+                }
                 Err(e) => {
-                    eprintln!("Doctor script check failed: {}", e);
+                    eprintln!("Doctor failed: {}", e);
                     std::process::exit(1);
                 }
-            };
-
-            let executor = create_executor(&config);
-            let exec_result = executor.preflight_check();
-
-            let capability_ready = cap_report.status == DoctorStatus::Ready;
-            let executor_ready = exec_result.is_ok();
-            let overall_ready = capability_ready && executor_ready;
-
-            let report_json = serde_json::json!({
-                "capability_id": capability,
-                "capability_ready": capability_ready,
-                "executor_type": executor.executor_type(),
-                "executor_ready": executor_ready,
-                "ready": overall_ready,
-                "capability_details": cap_report,
-                "executor_details": match &exec_result {
-                    Ok(meta) => serde_json::json!({
-                        "status": "ready",
-                        "version": meta.version,
-                        "binary_path": meta.binary_path.as_ref().map(|p| p.to_string_lossy()),
-                    }),
-                    Err(e) => serde_json::json!({
-                        "status": "not_ready",
-                        "error": e.to_string(),
-                    }),
-                }
-            });
-
-            println!("{}", serde_json::to_string_pretty(&report_json).unwrap());
-
-            if !overall_ready {
-                std::process::exit(1);
             }
         }
         Commands::Run {
-            capability,
-            url,
+            workspace,
+            prompt_file,
             job_id,
+            timeout,
             no_stream,
         } => {
             let (echo_tx, echo_rx) = if !no_stream {
@@ -137,7 +105,9 @@ async fn main() {
             });
 
             let runner = Runner::new(config, echo_tx);
-            let run_result = runner.run_job(&capability, &url, job_id).await;
+            let run_result = runner
+                .run_task(&workspace, &prompt_file, job_id, timeout)
+                .await;
             drop(runner);
 
             if let Some(h) = print_handle {
@@ -160,7 +130,7 @@ async fn main() {
                         for art in &receipt.artifacts {
                             println!(
                                 "  - {} ({} bytes, sha256: {})",
-                                art.name, art.size_bytes, art.sha256
+                                art.path, art.size_bytes, art.sha256
                             );
                         }
                     }
@@ -169,12 +139,11 @@ async fn main() {
                         std::process::exit(1);
                     }
 
-                    // Distinction: Subtitle success vs subtitle unavailable
-                    if receipt.business_outcome == BusinessOutcome::TranscriptUnavailable {
-                        println!("\nNotice: Metadata extracted and preserved, but transcript is unavailable for this media.");
-                        std::process::exit(2);
-                    } else if receipt.business_outcome != BusinessOutcome::TranscriptAvailable {
+                    if receipt.business_outcome == BusinessOutcome::Failed {
                         std::process::exit(1);
+                    } else if receipt.business_outcome == BusinessOutcome::Unverified {
+                        println!("\nNotice: Task completed execution, but artifacts are unverified by business verifier.");
+                        std::process::exit(2);
                     }
                 }
                 Err(e) => {
@@ -183,12 +152,12 @@ async fn main() {
                 }
             }
         }
-        Commands::Status { job_id } => {
+        Commands::Status { workspace, job_id } => {
             if let Err(e) = validate_id("job_id", &job_id) {
                 eprintln!("Invalid job_id: {}", e);
                 std::process::exit(1);
             }
-            let job_dir = match config.safe_job_dir(&job_id) {
+            let job_dir = match safe_job_dir(&workspace, &job_id) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("Invalid job path: {}", e);
@@ -196,10 +165,7 @@ async fn main() {
                 }
             };
             if !job_dir.exists() {
-                eprintln!(
-                    "Job ID '{}' not found in {:?}",
-                    job_id, config.workspace_dir
-                );
+                eprintln!("Job ID '{}' not found in {:?}", job_id, workspace);
                 std::process::exit(1);
             }
             match StatusTracker::load_status(&job_dir) {
@@ -213,6 +179,7 @@ async fn main() {
             }
         }
         Commands::Logs {
+            workspace,
             job_id,
             attempt_id,
             follow,
@@ -224,7 +191,7 @@ async fn main() {
                 eprintln!("Invalid job_id: {}", e);
                 std::process::exit(1);
             }
-            let job_dir = match config.safe_job_dir(&job_id) {
+            let job_dir = match safe_job_dir(&workspace, &job_id) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("Invalid job path: {}", e);
@@ -232,7 +199,7 @@ async fn main() {
                 }
             };
             if !job_dir.exists() {
-                eprintln!("Job ID '{}' not found.", job_id);
+                eprintln!("Job ID '{}' not found in {:?}.", job_id, workspace);
                 std::process::exit(1);
             }
 
@@ -252,7 +219,7 @@ async fn main() {
                 }
             };
 
-            let attempt_dir = match config.safe_attempt_dir(&job_id, &resolved_attempt_id) {
+            let attempt_dir = match safe_attempt_dir(&workspace, &job_id, &resolved_attempt_id) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("Invalid attempt path: {}", e);

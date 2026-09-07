@@ -94,27 +94,35 @@ impl ExecutorAdapter for AgyHeadlessAdapter {
         &self,
         request: &ExecutionRequest,
     ) -> Result<Box<dyn ManagedProcess>, ExecutorError> {
-        let prompt = format!(
-            "Execute capability '{}'.\nInput configuration: {}\nWorking directory: {}\nCapability script: {}\n\nExecute the command:\n{} --input {} --output-dir {}\n\nVerify that output artifacts and completion.json are generated in {}.",
-            request.capability_id,
-            request.input_json_path.display(),
-            request.attempt_dir.display(),
-            request.run_script_path.display(),
-            request.run_script_path.display(),
-            request.input_json_path.display(),
-            request.attempt_dir.display(),
-            request.attempt_dir.display(),
-        );
+        let binary_path = self.resolve_binary().ok_or_else(|| {
+            ExecutorError::NeedsUserAction {
+                message: format!(
+                    "Google Antigravity CLI ('{}') is not installed or not found in PATH.",
+                    self.executable.display()
+                ),
+                action_required: "Install agy CLI via: curl -fsSL https://antigravity.google/cli/install.sh | bash, and run 'agy' in an interactive terminal to complete authentication.".to_string(),
+            }
+        })?;
 
-        let mut cmd = Command::new(&self.executable);
-        cmd.arg("-p")
-            .arg(&prompt)
+        let mut cmd = Command::new(&binary_path);
+        cmd.arg("--input-format")
+            .arg("stream-json")
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--dangerously-skip-permissions")
-            .current_dir(request.attempt_dir)
+            .arg("--mode")
+            .arg("accept-edits")
+            .arg("--sandbox")
+            .current_dir(request.workspace_dir)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Confine logs and temp files to workspace
+        let ceo_tmp = request.workspace_dir.join(".ceo").join("tmp");
+        std::fs::create_dir_all(&ceo_tmp)?;
+        cmd.env("TMPDIR", &ceo_tmp);
+        cmd.arg("--log-file")
+            .arg(request.attempt_dir.join("agy.log"));
 
         if let Some(model) = request.model {
             cmd.arg("--model").arg(model);
