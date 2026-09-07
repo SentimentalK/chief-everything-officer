@@ -122,7 +122,7 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     const req = "123e4567-e89b-12d3-a456-426614174003";
     const first = await serviceA.submit(userA, submitPayload(req));
     expect(first.ok).toBe(true);
-    await expect(serviceA.submit(userA, submitPayload(req, "DIFFERENT"))).rejects.toThrow(/conflict|=different/i);
+    await expect(serviceA.submit(userA, submitPayload(req, "DIFFERENT"))).rejects.toThrow(/different content/i);
   });
 
   it("lost-response retry returns the original job replayed without a second stream entry", async () => {
