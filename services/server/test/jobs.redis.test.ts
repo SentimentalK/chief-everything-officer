@@ -139,7 +139,7 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
 
   it("real-Lua diagnosis of prior incomplete states and no duplicate XADD", async () => {
     // For each staged partial shape plant it over the REAL keys, then drive the
-    // REAL production Lua (store.submit) and assert incomplete diagnosis + no
+    // REAL production Lua (store.submit directly) and assert incomplete diagnosis + no
     // additional stream entry. plantPartialForTest exists only for tests.
     const stages = ["placeholder", "prepare", "stream"] as const;
     for (const stage of stages) {
@@ -147,15 +147,19 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
       const req = `123e4567-e89b-12d3-a456-4266141740${10 + stage.length}`;
       const { prepared } = makePrepared(userA, req, stage);
       await store.plantPartialForTest(userA, req, prepared, stage);
+
+      // 1. Direct call to production RedisJobStore.submit() must return INCOMPLETE decision from Lua
+      const decision = await store.submit(userA, req, prepared as any);
+      expect(decision).toBe("INCOMPLETE");
+
+      // 2. Service-level submit on incomplete state must reject with QUEUE_UNAVAILABLE
       await expect(serviceA.submit(userA, submitPayload(req, prepared.prompt))).rejects.toThrow(/incomplete|not available/i);
-      // For placeholder/prepare there must be no committed queued job and no NEW
+
+      // 3. For placeholder/prepare there must be no committed queued job and no NEW
       // stream append beyond the planted one in the 'stream' case.
-      const plantedStreamAppend = stage === "stream" ? 0 : 0;
-      void plantedStreamAppend;
-      // The real Lua path returns INCOMPLETE and must not XADD a NEW entry.
       const len = await store.streamLength();
       if (stage === "stream") {
-        // plant stage writes one stream entry; a submit must not add another.
+        // plant stage writes one stream entry; neither Lua nor service adds another.
         expect(len).toBe(1);
       } else {
         expect(len).toBe(0);
@@ -174,11 +178,83 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     expect(forged.ok).toBe(false);
   });
 
-  it("EVALSHA+NOSCRIPT reload after SCRIPT FLUSH still submits", async () => {
+  it("EVALSHA+NOSCRIPT reload after SCRIPT FLUSH on cached SHA reloads and retries", async () => {
     await store.resetForTest();
+    // 1. Initial submit to populate cached SHA
+    const req1 = "123e4567-e89b-12d3-a456-426614174007";
+    const res1 = await serviceA.submit(userA, submitPayload(req1));
+    expect(res1.ok).toBe(true);
+    const cachedSha = store.getCachedShaForTest();
+    expect(cachedSha).toBeTruthy();
+    expect(await store["redis"].scriptExists(cachedSha!)).toBe(true);
+
+    // 2. Real SCRIPT FLUSH in Redis: script cache is wiped
     await client.sendCommand(["SCRIPT", "FLUSH"]);
-    const req = "123e4567-e89b-12d3-a456-426614174007";
-    const res = await serviceA.submit(userA, submitPayload(req));
-    expect(res.ok).toBe(true);
+    expect(await store["redis"].scriptExists(cachedSha!)).toBe(false);
+
+    // 3. Next submit uses the cached SHA, receives NOSCRIPT, triggers reload and retry
+    const req2 = "123e4567-e89b-12d3-a456-426614174008";
+    const res2 = await serviceA.submit(userA, submitPayload(req2));
+    expect(res2.ok).toBe(true);
+    expect(await store["redis"].scriptExists(store.getCachedShaForTest()!)).toBe(true);
+  });
+
+  it("7-day claim deadline is preserved and not renewed on lost-response retry", async () => {
+    await store.resetForTest();
+    let currentNow = 1700000000000;
+    const timeService = new JobService({ store, nowMs: () => currentNow }, () => true);
+
+    const req = "123e4567-e89b-12d3-a456-426614174020";
+    const res1 = await timeService.submit(userA, submitPayload(req));
+    expect(res1.ok).toBe(true);
+    const originalExpiresAt = res1.view!.expires_at;
+
+    // Advance simulated time by 2 days
+    currentNow += 2 * 24 * 60 * 60 * 1000;
+
+    // Retry identical request
+    const res2 = await timeService.submit(userA, submitPayload(req));
+    expect(res2.ok).toBe(true);
+    expect(res2.view!.replayed).toBe(true);
+    expect(res2.view!.expires_at).toBe(originalExpiresAt);
+
+    // Query via get: expires_at must still be the original deadline
+    const got = await timeService.get(userA, { job_id: res1.view!.job_id });
+    expect(got.ok).toBe(true);
+    expect(got.view!.expires_at).toBe(originalExpiresAt);
+  });
+
+  it("multi-workspace isolation: same user across different workspaces does not collide or cross-read", async () => {
+    await store.resetForTest();
+    const userWorkspace1 = { user_id: "usr_alice", workspace_id: "ws_alpha" };
+    const userWorkspace2 = { user_id: "usr_alice", workspace_id: "ws_beta" };
+
+    const serviceWs1 = new JobService({ store }, () => true);
+    const serviceWs2 = new JobService({ store }, () => true);
+
+    const req = "123e4567-e89b-12d3-a456-426614174030";
+
+    // Same user, same request_id, but different workspace: each gets its own independent job
+    const res1 = await serviceWs1.submit(userWorkspace1, submitPayload(req, "job alpha"));
+    const res2 = await serviceWs2.submit(userWorkspace2, submitPayload(req, "job beta"));
+
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+    expect(res1.view!.job_id).not.toBe(res2.view!.job_id);
+
+    // ws_alpha cannot read ws_beta job, and vice versa
+    await expect(serviceWs1.get(userWorkspace1, { job_id: res2.view!.job_id })).rejects.toThrow(/not found/i);
+    await expect(serviceWs2.get(userWorkspace2, { job_id: res1.view!.job_id })).rejects.toThrow(/not found/i);
+  });
+
+  it("surfaces QUEUE_UNAVAILABLE on disconnect", async () => {
+    await store.resetForTest();
+    const disconnectedClient = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
+    const disconnectedStore = new RedisJobStore(createRedisRunnerFromClient(disconnectedClient));
+    const disconnectedService = new JobService({ store: disconnectedStore }, () => true);
+
+    await expect(
+      disconnectedService.submit(userA, submitPayload("123e4567-e89b-12d3-a456-426614174040")),
+    ).rejects.toThrow(/QUEUE_UNAVAILABLE|not available/i);
   });
 });

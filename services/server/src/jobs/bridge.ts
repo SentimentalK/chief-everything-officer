@@ -68,7 +68,7 @@ export function openJobBridge(
     process.stderr.write(`bridge: redis connect deferred error: ${msg}\n`);
   });
 
-  const runner = createRedisRunnerFromClient(client);
+  const runner = createRedisRunnerFromClient(client, { opTimeoutMs: 2500 });
   const store = new RedisJobStore(runner);
   const service = new JobService({ store, resourceExists, nowMs: Date.now }, () => true);
   return {

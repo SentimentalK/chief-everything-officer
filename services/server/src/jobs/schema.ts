@@ -107,94 +107,48 @@ export function utcIsoFromMs(ms: number): string {
 
 export type ParseOutcome<T> = { ok: true; value: T } | { ok: false; issue: string; reason: string };
 
-export function unknownFieldCheck(raw: unknown, allowedKeys: string[]) {
-  if (raw !== null && typeof raw === "object") {
-    const extra = Object.keys(raw as Record<string, unknown>).filter((k) => !allowedKeys.includes(k));
-    if (extra.length > 0) return extra;
-  }
-  return [];
-}
+import * as z from "zod/v4";
+
+export const workerSubmitSchema = z.object({
+  request_id: z.string().regex(REQUEST_ID_RE, "request_id must be a UUID").describe("Client UUID; retries of the same logical task must reuse it."),
+  workspace_ref: z.string().regex(WORKSPACE_REF_RE, "workspace_ref must be 1-64 [A-Za-z0-9_-]").describe("Preconfigured local directory alias (1-64 [A-Za-z0-9_-])."),
+  prompt: z.string().min(1, "prompt must be non-empty").refine((s) => !isWhitespaceOnly(s), "prompt must not be whitespace-only").refine((s) => utf8ByteLength(s) <= MAX_PROMPT_BYTES, "prompt exceeds 64 KiB (UTF-8)").describe("Task instructions (non-empty, UTF-8 <= 64 KiB)."),
+  acceptance: z.string().min(1, "acceptance must be non-empty").refine((s) => !isWhitespaceOnly(s), "acceptance must not be whitespace-only").refine((s) => utf8ByteLength(s) <= MAX_ACCEPTANCE_BYTES, "acceptance exceeds 8 KiB (UTF-8)").describe("Completion criterion (non-empty, UTF-8 <= 8 KiB)."),
+  resource_id: z.string().regex(RESOURCE_ID_RE, "resource_id must be a res-<uuid>").optional().describe("Optional res-<uuid> that must already exist in your workspace."),
+  timeout_seconds: z.number().int("timeout_seconds must be an integer").min(MIN_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).max(MAX_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).optional().describe("Execution timeout; 1800 default, 60-7200."),
+}).strict();
+
+export const workerGetSchema = z.object({
+  job_id: z.string().regex(JOB_ID_RE, "job_id must be a job-<uuid>").describe("Canonical job identifier (job-<uuid>)."),
+}).strict();
 
 export function parseSubmit(raw: unknown): ParseOutcome<NormalizedSubmit> {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    return { ok: false, issue: "input must be an object", reason: "INVALID_INPUT" };
+  const parsed = workerSubmitSchema.safeParse(raw);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const issue = first ? first.message : "validation failed";
+    return { ok: false, issue, reason: "INVALID_INPUT" };
   }
-  const allowed = ["request_id", "workspace_ref", "prompt", "acceptance", "resource_id", "timeout_seconds"];
-  const extra = unknownFieldCheck(raw, allowed);
-  if (extra.length > 0) {
-    return { ok: false, issue: `unexpected field(s): ${extra.join(", ")}`, reason: "INVALID_INPUT" };
-  }
-  const r = raw as Record<string, unknown>;
-
-  const request_id = r.request_id;
-  if (typeof request_id !== "string" || !REQUEST_ID_RE.test(request_id)) {
-    return { ok: false, issue: "request_id must be a UUID", reason: "INVALID_INPUT" };
-  }
-
-  const workspace_ref = r.workspace_ref;
-  if (typeof workspace_ref !== "string" || !WORKSPACE_REF_RE.test(workspace_ref)) {
-    return { ok: false, issue: "workspace_ref must be 1-64 [A-Za-z0-9_-]", reason: "INVALID_INPUT" };
-  }
-
-  const prompt = r.prompt;
-  if (typeof prompt !== "string" || isWhitespaceOnly(prompt)) {
-    return { ok: false, issue: "prompt must be a non-empty, non-whitespace string", reason: "INVALID_INPUT" };
-  }
-  if (utf8ByteLength(prompt) > MAX_PROMPT_BYTES) {
-    return { ok: false, issue: "prompt exceeds 64 KiB (UTF-8)", reason: "INVALID_INPUT" };
-  }
-
-  const acceptance = r.acceptance;
-  if (typeof acceptance !== "string" || isWhitespaceOnly(acceptance)) {
-    return { ok: false, issue: "acceptance must be a non-empty, non-whitespace string", reason: "INVALID_INPUT" };
-  }
-  if (utf8ByteLength(acceptance) > MAX_ACCEPTANCE_BYTES) {
-    return { ok: false, issue: "acceptance exceeds 8 KiB (UTF-8)", reason: "INVALID_INPUT" };
-  }
-
-  let resource_id: string | null = null;
-  if (r.resource_id !== undefined) {
-    if (typeof r.resource_id !== "string" || !RESOURCE_ID_RE.test(r.resource_id)) {
-      return { ok: false, issue: "resource_id must be a res-<uuid>", reason: "INVALID_INPUT" };
-    }
-    resource_id = r.resource_id;
-  }
-
-  let timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
-  if (r.timeout_seconds !== undefined) {
-    if (typeof r.timeout_seconds !== "number" || !Number.isInteger(r.timeout_seconds)) {
-      return { ok: false, issue: "timeout_seconds must be an integer", reason: "INVALID_INPUT" };
-    }
-    if (r.timeout_seconds < MIN_TIMEOUT_SECONDS || r.timeout_seconds > MAX_TIMEOUT_SECONDS) {
-      return { ok: false, issue: `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`, reason: "INVALID_INPUT" };
-    }
-    timeout_seconds = r.timeout_seconds;
-  }
-
+  const val = parsed.data;
   return {
     ok: true,
     value: {
-      request_id,
-      workspace_ref,
-      prompt,
-      acceptance,
-      resource_id,
-      execution_timeout_seconds: timeout_seconds,
+      request_id: val.request_id,
+      workspace_ref: val.workspace_ref,
+      prompt: val.prompt,
+      acceptance: val.acceptance,
+      resource_id: val.resource_id ?? null,
+      execution_timeout_seconds: val.timeout_seconds ?? DEFAULT_TIMEOUT_SECONDS,
     },
   };
 }
 
 export function parseJobGet(raw: unknown): ParseOutcome<JobRequest> {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    return { ok: false, issue: "input must be an object", reason: "INVALID_INPUT" };
+  const parsed = workerGetSchema.safeParse(raw);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const issue = first ? first.message : "validation failed";
+    return { ok: false, issue, reason: "INVALID_INPUT" };
   }
-  const extra = unknownFieldCheck(raw, ["job_id"]);
-  if (extra.length > 0) {
-    return { ok: false, issue: `unexpected field(s): ${extra.join(", ")}`, reason: "INVALID_INPUT" };
-  }
-  const job_id = (raw as Record<string, unknown>).job_id;
-  if (typeof job_id !== "string" || !JOB_ID_RE.test(job_id)) {
-    return { ok: false, issue: "job_id must be a job-<uuid>", reason: "INVALID_INPUT" };
-  }
-  return { ok: true, value: { job_id } };
+  return { ok: true, value: { job_id: parsed.data.job_id } };
 }

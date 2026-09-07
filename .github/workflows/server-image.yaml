@@ -14,8 +14,13 @@ on:
   workflow_dispatch:
 
 jobs:
+  redis-integration:
+    name: Redis Integration Gate
+    uses: ./.github/workflows/server-jobs-redis.yaml
+
   test-build-publish:
     name: Test, Build & Publish CEO Server
+    needs: [redis-integration]
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,6 +1,7 @@
 name: CEO Server — Jobs (Redis) Integration
 
 on:
+  workflow_call:
   pull_request:
     branches: [main]
     paths:
@@ -32,11 +33,13 @@ jobs:
         with:
           node-version: 22
 
+      - name: Prepare isolated data directory
+        run: mkdir -p .tmp/redis-data
+
       - name: Start isolated Redis (persistent config)
         run: |
-          mkdir -p .redis-data
           docker run -d --name ceo-redis-ci -p 6379:6379 \
-            -v "${PWD}/.redis-data:/data" \
+            -v "${PWD}/.tmp/redis-data:/data" \
             redis:7-alpine \
             redis-server \
               --appendonly yes \
@@ -62,27 +65,78 @@ jobs:
       - name: Jobs Redis integration (must NOT skip)
         run: |
           cd services/server
-          npx vitest run test/jobs.redis.test.ts > /tmp/jobs-redis.log 2>&1 || { cat /tmp/jobs-redis.log; exit 1; }
-          cat /tmp/jobs-redis.log
-          if grep -qi "skipped" /tmp/jobs-redis.log; then
+          mkdir -p .tmp
+          npx vitest run test/jobs.redis.test.ts > .tmp/jobs-redis.log 2>&1 || { cat .tmp/jobs-redis.log; exit 1; }
+          cat .tmp/jobs-redis.log
+          if grep -qi "skipped" .tmp/jobs-redis.log; then
             echo "::error::Redis jobs tests were skipped - failing gate."
             exit 1
           fi
-          grep -qE "[0-9]+ passed" /tmp/jobs-redis.log || { echo "::error::No passed summary found"; exit 1; }
+          grep -qE "[0-9]+ passed" .tmp/jobs-redis.log || { echo "::error::No passed summary found"; exit 1; }
 
-      - name: Typecheck + build (needed for restart helper)
+      - name: Typecheck + build
         run: |
           cd services/server
           npm run typecheck
           npm run build
 
+      - name: Capture pre-restart durable job and stream metadata
+        run: |
+          cd services/server
+          node --input-type=module -e '
+            import { writeFileSync, mkdirSync } from "node:fs";
+            import { createClient } from "redis";
+            import { RedisJobStore, createRedisRunnerFromClient } from "./dist/jobs/redis-store.js";
+            import { JobService } from "./dist/jobs/service.js";
+
+            const c = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
+            await c.connect();
+            const store = new RedisJobStore(createRedisRunnerFromClient(c));
+            const service = new JobService({ store }, () => true);
+
+            const scope = { user_id: "usr_restart", workspace_id: "ws_restart" };
+            const reqId = "123e4567-e89b-12d3-a456-426614174099";
+            const res = await service.submit(scope, {
+              request_id: reqId,
+              workspace_ref: "tools",
+              prompt: "restart test persistence job",
+              acceptance: "survives force-kill and replay",
+              timeout_seconds: 300,
+            });
+            if (!res.ok) throw new Error("Failed pre-restart submit: " + JSON.stringify(res));
+
+            const job = await store.getJob(res.view.job_id);
+            if (!job) throw new Error("Job not found immediately after submit");
+            const placeholder = await store.getPlaceholder(scope, reqId);
+            if (!placeholder) throw new Error("Placeholder not found immediately after submit");
+            const streamLen = await store.streamLength();
+
+            const expected = {
+              job_id: job.job_id,
+              request_id: job.request_id,
+              request_digest: job.request_digest,
+              user_id: job.user_id,
+              workspace_id: job.workspace_id,
+              prompt: job.prompt,
+              acceptance: job.acceptance,
+              status: job.status,
+              created_at_ms: job.created_at_ms,
+              claim_deadline_ms: job.claim_deadline_ms,
+              stream_entry_id: job.stream_entry_id,
+              stream_length_before: streamLen,
+            };
+            mkdirSync(".tmp", { recursive: true });
+            writeFileSync(".tmp/restart-expected.json", JSON.stringify(expected, null, 2));
+            console.log("Pre-restart state recorded:", expected);
+            await c.quit();
+          '
 
       - name: Force-stop old Redis and restart on the SAME volume
         run: |
           docker kill --signal KILL ceo-redis-ci || true
           docker rm -f ceo-redis-ci || true
           docker run -d --name ceo-redis-ci-restarted -p 6379:6379 \
-            -v "${PWD}/.redis-data:/data" \
+            -v "${PWD}/.tmp/redis-data:/data" \
             redis:7-alpine \
             redis-server \
               --appendonly yes --appendfsync always \
@@ -93,25 +147,64 @@ jobs:
           done
           docker exec ceo-redis-ci-restarted redis-cli ping
 
-      - name: Verify job + dedupe survived the forced restart (AOF)
+      - name: Verify job, dedupe, and stream survived the forced restart (AOF)
         run: |
           cd services/server
           node --input-type=module -e '
+            import { readFileSync } from "node:fs";
             import { createClient } from "redis";
             import { RedisJobStore, createRedisRunnerFromClient } from "./dist/jobs/redis-store.js";
-            const c = createClient({ url: "redis://127.0.0.1:6379", socket:{reconnectStrategy:false} });
+            import { JobService } from "./dist/jobs/service.js";
+
+            const expected = JSON.parse(readFileSync(".tmp/restart-expected.json", "utf8"));
+            const c = createClient({ url: "redis://127.0.0.1:6379", socket: { reconnectStrategy: false } });
             await c.connect();
             const store = new RedisJobStore(createRedisRunnerFromClient(c));
-            // durable completed job from the earlier run must still be present
-            const scan = await c.scan("0", { MATCH: "ceo:job:*", COUNT: 100 });
-            const returned = Array.isArray(scan) ? (scan[1] || []) : ((scan && scan.keys) || []);
-            process.stdout.write("JOB_KEYS="+JSON.stringify(scan)+"\n");
-            if (returned.length === 0) {
-              throw new Error("No job record survived restart");
+            const service = new JobService({ store }, () => true);
+
+            const scope = { user_id: expected.user_id, workspace_id: expected.workspace_id };
+
+            // 1. Exact match on persisted job record
+            const job = await store.getJob(expected.job_id);
+            if (!job) throw new Error("Job missing after restart");
+            if (job.job_id !== expected.job_id) throw new Error("job_id mismatch");
+            if (job.request_id !== expected.request_id) throw new Error("request_id mismatch");
+            if (job.request_digest !== expected.request_digest) throw new Error("request_digest mismatch");
+            if (job.created_at_ms !== expected.created_at_ms) throw new Error("created_at_ms mismatch");
+            if (job.claim_deadline_ms !== expected.claim_deadline_ms) throw new Error("claim_deadline_ms mismatch");
+            if (job.stream_entry_id !== expected.stream_entry_id) throw new Error("stream_entry_id mismatch");
+            if (job.status !== "queued") throw new Error("status mismatch: " + job.status);
+
+            // 2. Exact match on dedupe placeholder
+            const ph = await store.getPlaceholder(scope, expected.request_id);
+            if (!ph) throw new Error("Dedupe placeholder missing after restart");
+            if (ph.job_id !== expected.job_id) throw new Error("placeholder job_id mismatch");
+            if (ph.request_digest !== expected.request_digest) throw new Error("placeholder request_digest mismatch");
+
+            // 3. Re-submit via JobService: must return replayed: true and same job_id
+            const replayRes = await service.submit(scope, {
+              request_id: expected.request_id,
+              workspace_ref: "tools",
+              prompt: expected.prompt,
+              acceptance: expected.acceptance,
+              timeout_seconds: 300,
+            });
+            if (!replayRes.ok) throw new Error("Replay submission failed: " + JSON.stringify(replayRes));
+            if (!replayRes.view.replayed) throw new Error("Expected replayed: true on post-restart submit");
+            if (replayRes.view.job_id !== expected.job_id) throw new Error("Replay returned different job_id");
+
+            // 4. Confirm stream length is unchanged (no duplicate XADD on replay)
+            const streamLenAfter = await store.streamLength();
+            if (streamLenAfter !== expected.stream_length_before) {
+              throw new Error(`Stream length changed from ${expected.stream_length_before} to ${streamLenAfter}`);
             }
+
+            console.log("Post-restart persistence, replay dedupe, and stream invariants verified successfully!");
             await c.quit();
           '
 
-      - name: Cleanup test container
+      - name: Cleanup test containers and temp data
         if: always()
-        run: docker rm -f ceo-redis-ci-restarted || true
+        run: |
+          docker rm -f ceo-redis-ci ceo-redis-ci-restarted 2>/dev/null || true
+          rm -rf .tmp/redis-data services/server/.tmp/restart-expected.json services/server/.tmp/jobs-redis.log 2>/dev/null || true

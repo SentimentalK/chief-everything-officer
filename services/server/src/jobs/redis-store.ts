@@ -114,7 +114,18 @@ redis.call('SET', P .. job_id, cjson.encode(prepared))
 return 'NEW'
 `;
 
+export function isNoScriptError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const as = error as { code?: string; message?: string; cause?: { code?: string; message?: string } };
+  if (as.code === "NOSCRIPT" || as.cause?.code === "NOSCRIPT") return true;
+  const msg = as.message ?? as.cause?.message;
+  if (typeof msg === "string" && /^NOSCRIPT\b/i.test(msg.trim())) return true;
+  return false;
+}
+
 export class RedisJobStore {
+  private cachedSha: string | null = null;
+
   constructor(private readonly redis: RedisRunner) {}
 
   isReady(): boolean {
@@ -140,16 +151,21 @@ export class RedisJobStore {
       prepared.workspace_id,
       String(JOBS_SCHEMA_VERSION),
     ];
-    let sha = await this.createScriptVia(redisLike);
+    if (!this.cachedSha) {
+      this.cachedSha = await this.createScriptVia(redisLike);
+    }
     try {
-      const res = await redisLike.evalsha(sha, 2, [req, KEY_STREAM], args);
+      const res = await redisLike.evalsha(this.cachedSha, 2, [req, KEY_STREAM], args);
       return normalizeDecision(res);
     } catch (error) {
-      const cause = shapeOfError(error);
-      if (cause.code === "NOSCRIPT") {
-        sha = await this.createScriptVia(redisLike);
-        const res = await redisLike.evalsha(sha, 2, [req, KEY_STREAM], args);
-        return normalizeDecision(res);
+      if (isNoScriptError(error)) {
+        this.cachedSha = await this.createScriptVia(redisLike);
+        try {
+          const res = await redisLike.evalsha(this.cachedSha, 2, [req, KEY_STREAM], args);
+          return normalizeDecision(res);
+        } catch (retryError) {
+          throw new StoreError("QUEUE_UNAVAILABLE", "Redis EVALSHA retry failed after NOSCRIPT reload.", { cause: String(retryError) });
+        }
       }
       throw new StoreError("QUEUE_UNAVAILABLE", "Redis EVALSHA failed.", { cause: String(error) });
     }
@@ -160,6 +176,14 @@ export class RedisJobStore {
     this.keyCheck();
     const req = requestKey(scope.user_id, scope.workspace_id, requestId);
     return this.evalshaCreate(this.redis, req, prepared);
+  }
+
+  getCachedShaForTest(): string | null {
+    return this.cachedSha;
+  }
+
+  setCachedShaForTest(sha: string | null): void {
+    this.cachedSha = sha;
   }
 
   async getJob(jobId: string): Promise<PersistedJobRecord | null> {
@@ -264,48 +288,94 @@ function normalizeDecision(res: unknown): CommitDecision {
   throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected queue decision: ${s}`);
 }
 
-/** Builds a real node-redis v5 adapter (offline queue disabled). */
-export function createRedisRunnerFromClient(client: RedisClientType): RedisRunner {
+export interface RedisRunnerOptions {
+  opTimeoutMs?: number;
+}
+
+export const DEFAULT_REDIS_OP_TIMEOUT_MS = 2500;
+
+/** Builds a real node-redis v5 adapter (offline queue disabled) with bounded per-command timeout. */
+export function createRedisRunnerFromClient(
+  client: RedisClientType,
+  runnerOptions: RedisRunnerOptions = {},
+): RedisRunner {
+  const opTimeoutMs = runnerOptions.opTimeoutMs ?? DEFAULT_REDIS_OP_TIMEOUT_MS;
   const ready = (): boolean => (typeof client.isReady === "boolean" ? client.isReady : client.isOpen);
+
+  async function execute<T>(fn: (cmdOpts: { abortSignal: AbortSignal }) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, opTimeoutMs);
+    try {
+      return await fn({ abortSignal: controller.signal });
+    } catch (error: any) {
+      if (controller.signal.aborted || error?.name === "AbortError") {
+        throw new StoreError(
+          "QUEUE_UNAVAILABLE",
+          "Redis command timed out. Please retry with the original request_id.",
+          { timeoutMs: opTimeoutMs, cause: String(error) },
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   return {
     ready,
     async get(key) {
-      const v = await client.get(key);
-      return v === null ? null : String(v);
+      return execute(async (cmdOpts) => {
+        const v = await client.sendCommand(["GET", key], cmdOpts);
+        return v === null ? null : String(v);
+      });
     },
     async set(key, value) {
-      await client.set(key, value);
+      await execute(async (cmdOpts) => {
+        await client.sendCommand(["SET", key, value], cmdOpts);
+      });
     },
     async xaddStream(payload) {
       const parts: string[] = [];
       for (const [k, v] of Object.entries(payload)) parts.push(k, String(v));
       if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for XADD.");
-      const out = await client.sendCommand(["XADD", KEY_STREAM, "*", ...parts]);
-      return String(out);
+      return execute(async (cmdOpts) => {
+        const out = await client.sendCommand(["XADD", KEY_STREAM, "*", ...parts], cmdOpts);
+        return String(out);
+      });
     },
     async xlen() {
       if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for XLEN.");
-      const out = await client.sendCommand(["XLEN", KEY_STREAM]);
-      return typeof out === "number" ? out : Number(out);
+      return execute(async (cmdOpts) => {
+        const out = await client.sendCommand(["XLEN", KEY_STREAM], cmdOpts);
+        return typeof out === "number" ? out : Number(out);
+      });
     },
     async scriptLoad(script) {
       if (!ready()) throw new StoreError("QUEUE_UNAVAILABLE", "Redis not ready for SCRIPT LOAD.");
-      if (typeof client.scriptLoad === "function") return String(await client.scriptLoad(script));
-      const out = await client.sendCommand(["SCRIPT", "LOAD", script]);
-      return String(out);
+      return execute(async (cmdOpts) => {
+        const out = await client.sendCommand(["SCRIPT", "LOAD", script], cmdOpts);
+        return String(out);
+      });
     },
     async evalsha(sha, keyCount, keys, args) {
-      // node-redis may surface NOSCRIPT with code 'NOSCRIPT' in cause.
-      const out = await client.sendCommand(["EVALSHA", sha, String(keyCount), ...keys, ...args]);
-      return String(out);
+      return execute(async (cmdOpts) => {
+        const out = await client.sendCommand(["EVALSHA", sha, String(keyCount), ...keys, ...args], cmdOpts);
+        return String(out);
+      });
     },
     async scriptExists(sha) {
-      const res = await client.sendCommand(["SCRIPT", "EXISTS", sha]);
-      const arr = Array.isArray(res) ? res.map(String) : [String(res)];
-      return arr.includes("1");
+      return execute(async (cmdOpts) => {
+        const res = await client.sendCommand(["SCRIPT", "EXISTS", sha], cmdOpts);
+        const arr = Array.isArray(res) ? res.map(String) : [String(res)];
+        return arr.includes("1");
+      });
     },
     async flush() {
-      await client.sendCommand(["FLUSHALL"]);
+      await execute(async (cmdOpts) => {
+        await client.sendCommand(["FLUSHALL"], cmdOpts);
+      });
     },
   };
 }
