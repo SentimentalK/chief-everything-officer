@@ -115,6 +115,39 @@ impl ExecutorAdapter for AgyHeadlessAdapter {
         })
     }
 
+    fn get_launch_config(
+        &self,
+        request: &ExecutionRequest,
+    ) -> crate::executor::adapter_trait::LaunchConfiguration {
+        let bin = self.resolve_binary();
+        let version = bin.as_ref().and_then(|bp| {
+            std::process::Command::new(bp)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        });
+        crate::executor::adapter_trait::LaunchConfiguration {
+            executable_path: bin,
+            version,
+            model: request
+                .model
+                .unwrap_or("gemini-3.8-flash-medium")
+                .to_string(),
+            effort: None,
+            persona: None,
+            mode: "accept-edits".to_string(),
+            skip_permissions: true,
+            sandbox: true,
+            input_output_format: "stream-json".to_string(),
+            project_id: "default-cli-project".to_string(),
+            tmpdir_root_rule: "<workspace>/.ceo/tmp".to_string(),
+            log_dir_rule: "<workspace>/.ceo/jobs/<job-id>/attempts/<attempt-id>/agy.log"
+                .to_string(),
+        }
+    }
+
     fn spawn_execution(
         &self,
         request: &ExecutionRequest,

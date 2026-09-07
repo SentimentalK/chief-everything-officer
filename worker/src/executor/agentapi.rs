@@ -31,6 +31,26 @@ impl ExecutorAdapter for AgentapiAdapter {
         ))
     }
 
+    fn get_launch_config(
+        &self,
+        request: &ExecutionRequest,
+    ) -> crate::executor::adapter_trait::LaunchConfiguration {
+        crate::executor::adapter_trait::LaunchConfiguration {
+            executable_path: None,
+            version: Some(self.default_version().to_string()),
+            model: request.model.unwrap_or("agentapi-model").to_string(),
+            effort: None,
+            persona: None,
+            mode: "agentapi-mode".to_string(),
+            skip_permissions: false,
+            sandbox: false,
+            input_output_format: "agentapi".to_string(),
+            project_id: "agentapi-project".to_string(),
+            tmpdir_root_rule: "<workspace>/.ceo/tmp".to_string(),
+            log_dir_rule: "<attempt_dir>/agentapi.log".to_string(),
+        }
+    }
+
     fn spawn_execution(
         &self,
         _request: &ExecutionRequest,

@@ -3,6 +3,12 @@ set -eo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# If invoked with --version, return stub version immediately
+if [[ "$1" == "--version" ]]; then
+    echo "test-stub 0.1.0"
+    exit 0
+fi
+
 # If invoked with modern generic runner arguments, delegate to test_stub.py
 for arg in "$@"; do
     if [[ "$arg" == "--workspace" || "$arg" == "--attempt-dir" ]]; then

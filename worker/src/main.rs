@@ -21,6 +21,8 @@ enum Commands {
     Doctor {
         #[arg(short, long)]
         workspace: PathBuf,
+        #[arg(short, long, default_value_t = false)]
+        force: bool,
     },
     /// Run an agent task on a workspace
     Run {
@@ -34,6 +36,8 @@ enum Commands {
         timeout: Option<u64>,
         #[arg(long, default_value_t = false)]
         no_stream: bool,
+        #[arg(long, default_value_t = false)]
+        force_doctor: bool,
     },
     /// Query the status of a job
     Status {
@@ -67,9 +71,12 @@ async fn main() {
     let config = WorkerConfig::from_env();
 
     match cli.command {
-        Commands::Doctor { workspace } => {
+        Commands::Doctor { workspace, force } => {
             let runner = Runner::new(config, None);
-            match runner.run_standalone_doctor(&workspace).await {
+            match runner
+                .run_standalone_doctor_with_options(&workspace, force)
+                .await
+            {
                 Ok(report) => {
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
                     if !report.ready {
@@ -88,6 +95,7 @@ async fn main() {
             job_id,
             timeout,
             no_stream,
+            force_doctor,
         } => {
             let (echo_tx, echo_rx) = if !no_stream {
                 let (tx, rx) = mpsc::channel(1024);
@@ -106,7 +114,7 @@ async fn main() {
 
             let runner = Runner::new(config, echo_tx);
             let run_result = runner
-                .run_task(&workspace, &prompt_file, job_id, timeout)
+                .run_task_with_options(&workspace, &prompt_file, job_id, timeout, force_doctor)
                 .await;
             drop(runner);
 

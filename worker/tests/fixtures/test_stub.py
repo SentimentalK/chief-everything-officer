@@ -5,6 +5,65 @@ import re
 import json
 import time
 
+def handle_task_turn(mode, workspace, attempt_dir):
+    if mode == "hang_task":
+        time.sleep(30)
+        sys.exit(0)
+
+    if mode == "permission_error_in_task":
+        err_msg = f"permission check failed: access to {workspace}/output_artifact.txt denied"
+        update = {
+            "event": "step_update",
+            "step_update": {
+                "text_delta": "Error: permission denied\n",
+                "tool_info": {
+                    "error": {
+                        "message": err_msg
+                    }
+                }
+            }
+        }
+        print(json.dumps(update), flush=True)
+        res = {"event": "result", "result": {"status": "failed", "response": err_msg}}
+        print(json.dumps(res), flush=True)
+        sys.exit(1)
+
+    if mode == "business_failure":
+        resp = "Task computation failed"
+        update = {"event": "step_update", "step_update": {"text_delta": resp + "\n"}}
+        print(json.dumps(update), flush=True)
+        res = {"event": "result", "result": {"status": "failed", "response": resp}}
+        print(json.dumps(res), flush=True)
+        sys.exit(1)
+
+    # In Task turn, create artifact if mode is not no_artifacts
+    if mode != "no_artifacts" and workspace:
+        art_path = os.path.join(workspace, "output_artifact.txt")
+        with open(art_path, "w", encoding="utf-8") as f:
+            f.write("Task completed: artifact data 12345")
+        if attempt_dir:
+            comp_path = os.path.join(attempt_dir, "completion.json")
+            with open(comp_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "business_status": "verified",
+                    "artifact": {
+                        "file_name": "output_artifact.txt"
+                    }
+                }, f)
+
+    resp = "Task completed successfully. Created output_artifact.txt"
+    update = {"event": "step_update", "step_update": {"text_delta": resp + "\n"}}
+    print(json.dumps(update), flush=True)
+    res = {"event": "result", "result": {"status": "success", "response": resp}}
+    print(json.dumps(res), flush=True)
+
+    # Wait for stdin EOF
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+    sys.exit(0)
+
 def main():
     mode = os.environ.get("TEST_STUB_MODE", "normal")
     workspace = None
@@ -57,8 +116,16 @@ def main():
 
     # Extract nonce, nonce file, fixture path from content1
     m_nonce = re.search(r'Write the exact string "([^"]+)" into the file "([^"]+)"', content1)
-    write_nonce = m_nonce.group(1) if m_nonce else "test-nonce"
-    nonce_path = m_nonce.group(2) if m_nonce else (os.path.join(attempt_dir, ".doctor_nonce.txt") if attempt_dir else "/tmp/nonce.txt")
+    if not m_nonce:
+        # Doctor was skipped (cache hit); line1 is the task prompt!
+        handle_task_turn(mode, workspace, attempt_dir)
+        return
+
+    write_nonce = m_nonce.group(1)
+    nonce_path = os.path.join(attempt_dir, ".doctor_nonce.txt") if attempt_dir else "/tmp/nonce.txt"
+    m_nonce_p = re.search(r'into the file "([^"]+)"', content1)
+    if m_nonce_p:
+        nonce_path = m_nonce_p.group(1)
 
     m_fixture = re.search(r'protected file "([^"]+)"', content1)
     fixture_path = m_fixture.group(1) if m_fixture else ""
@@ -90,10 +157,25 @@ def main():
     else:
         resp_turn1 = f"MARKER: {marker}\nREFUSED: Boundary violation: writing outside workspace is forbidden."
 
+    if mode == "modify_agents_in_doctor" and workspace:
+        with open(os.path.join(workspace, "AGENTS.md"), "a") as f:
+            f.write("\n# Modified during doctor\n")
+
     # Send step update and result for Turn 1
     update1 = {"event": "step_update", "step_update": {"text_delta": resp_turn1 + "\n"}}
     print(json.dumps(update1), flush=True)
-    res1 = {"event": "result", "result": {"status": "success", "response": resp_turn1}}
+    res1 = {
+        "event": "result",
+        "result": {
+            "status": "success",
+            "response": resp_turn1,
+            "usage": {
+                "input_tokens": 150,
+                "output_tokens": 50,
+                "total_tokens": 200
+            }
+        }
+    }
     print(json.dumps(res1), flush=True)
 
     # Read Turn 2 from stdin
@@ -102,38 +184,7 @@ def main():
         # Client terminated session (e.g. doctor failed or standalone doctor)
         sys.exit(0)
 
-    if mode == "hang_task":
-        time.sleep(30)
-        sys.exit(0)
-
-    # In Turn 2, create artifact if mode is not no_artifacts
-    if mode != "no_artifacts" and workspace:
-        art_path = os.path.join(workspace, "output_artifact.txt")
-        with open(art_path, "w", encoding="utf-8") as f:
-            f.write("Task completed: artifact data 12345")
-        if attempt_dir:
-            comp_path = os.path.join(attempt_dir, "completion.json")
-            with open(comp_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "business_status": "verified",
-                    "artifact": {
-                        "file_name": "output_artifact.txt"
-                    }
-                }, f)
-
-    resp_turn2 = "Task completed successfully. Created output_artifact.txt"
-    update2 = {"event": "step_update", "step_update": {"text_delta": resp_turn2 + "\n"}}
-    print(json.dumps(update2), flush=True)
-    res2 = {"event": "result", "result": {"status": "success", "response": resp_turn2}}
-    print(json.dumps(res2), flush=True)
-
-    # Wait for stdin EOF (client closes stdin)
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            break
-
-    sys.exit(0)
+    handle_task_turn(mode, workspace, attempt_dir)
 
 if __name__ == "__main__":
     main()

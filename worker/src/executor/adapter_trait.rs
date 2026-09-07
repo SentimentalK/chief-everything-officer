@@ -56,10 +56,27 @@ pub trait ManagedProcess: Send + Sync {
     >;
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LaunchConfiguration {
+    pub executable_path: Option<PathBuf>,
+    pub version: Option<String>,
+    pub model: String,
+    pub effort: Option<String>,
+    pub persona: Option<String>,
+    pub mode: String,
+    pub skip_permissions: bool,
+    pub sandbox: bool,
+    pub input_output_format: String,
+    pub project_id: String,
+    pub tmpdir_root_rule: String,
+    pub log_dir_rule: String,
+}
+
 pub trait ExecutorAdapter: Send + Sync {
     fn executor_type(&self) -> &'static str;
     fn default_version(&self) -> &'static str;
     fn preflight_check(&self) -> Result<ExecutorMetadata, ExecutorError>;
+    fn get_launch_config(&self, request: &ExecutionRequest) -> LaunchConfiguration;
     fn spawn_execution(
         &self,
         request: &ExecutionRequest,

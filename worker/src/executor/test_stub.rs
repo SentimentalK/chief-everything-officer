@@ -42,6 +42,34 @@ impl ExecutorAdapter for TestStubAdapter {
         })
     }
 
+    fn get_launch_config(
+        &self,
+        request: &ExecutionRequest,
+    ) -> crate::executor::adapter_trait::LaunchConfiguration {
+        let exe = if self.executable.is_relative() {
+            std::env::current_dir()
+                .map(|cd| cd.join(&self.executable))
+                .unwrap_or_else(|_| self.executable.clone())
+        } else {
+            self.executable.clone()
+        };
+
+        crate::executor::adapter_trait::LaunchConfiguration {
+            executable_path: Some(exe),
+            version: Some(self.default_version().to_string()),
+            model: request.model.unwrap_or("stub-model").to_string(),
+            effort: None,
+            persona: None,
+            mode: "stub-mode".to_string(),
+            skip_permissions: false,
+            sandbox: false,
+            input_output_format: "stream-json".to_string(),
+            project_id: "test-stub-project".to_string(),
+            tmpdir_root_rule: "<workspace>/.ceo/tmp".to_string(),
+            log_dir_rule: "<attempt_dir>/stub.log".to_string(),
+        }
+    }
+
     fn spawn_execution(
         &self,
         request: &ExecutionRequest,

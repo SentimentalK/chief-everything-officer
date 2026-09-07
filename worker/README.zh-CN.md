@@ -57,15 +57,55 @@ agy --input-format stream-json \
   - 本地沙箱配置中显式允许写入的目录（如 `/tmp` 或配置的用户目录）依然可被访问。
   - 用户在部署本机无人值守 Agent 时需知晓并接受相应的本地执行风险。
 
+## Doctor 缓存机制与环境指纹
+
+为了消除每会话重复运行 Doctor 带来的耗时与模型消耗（每次约 30-40 秒及 10 万 tokens），CEO Worker 实现了**基于确定性环境指纹与零模型本地预检的 Doctor 缓存**：
+
+1. **快速本地预检（零模型开销）**：
+   - 在启动任何 Agent 进程或调用模型 API 之前，Worker 预先执行本地文件系统与配置检查：
+     - 工作区可写性探测（通过写入探测文件验证）。
+     - `<workspace>/AGENTS.md` 必选 `rule_marker` 元数据标记解析。
+     - Agent 可执行文件权限验证（`libc::access(X_OK)`）。
+     - 核心 JSON 配置完整性校验。
+   - 任何检查未通过立即返回 `BLOCKED` 状态，绝不调用模型，实现零开销快速熔断。
+
+2. **14 项确定性环境指纹（$F$）**：
+   - 对以下 14 类环境组件生成标准化 SHA-256 复合指纹：
+     1. CLI 设置文件（`~/.gemini/antigravity-cli/settings.json`）
+     2. 全局规则（`~/.gemini/GEMINI.md`、`~/.gemini/config/AGENTS.md`、`~/.gemini/config/GEMINI.md`）
+     3. 工作区规则（`<workspace>/AGENTS.md`、`<workspace>/GEMINI.md`）
+     4. Guide 说明文件（配置列表及 `<workspace>/AGENT_GUIDE.md`）
+     5. MCP 配置文件（`~/.gemini/config/mcp_config.json`、`<workspace>/.agents/mcp_config.json`）
+     6. 技能定义（递归扫描 `<workspace>/.agents/skills/` 与全局 skills 下的所有 `*.md`）
+     7. 插件与启用状态清单
+     8. Hook 脚本配置与脚本实体
+     9. 保守监视项（`~/.gemini/config/config.json`、项目配置、rules 目录 Markdown）
+     10. 执行器路径、可执行文件 SHA256 与版本号
+     11. 规范化工作区绝对路径
+     12. Worker 逻辑指纹（Worker 二进制 SHA256 + Doctor Prompt 模板 SHA256）
+     13. 系统身份（UID、GID、附加用户组、内核版本）
+     14. 运行时环境变量（XDG 路径、TMP/TEMP、PATH、Proxy 变量，未设置项显式记录为 `UNSET`）
+   - 严格排除动态 Nonce、时间戳与 Attempt ID，避免无效 miss。
+
+3. **24 小时 TTL 与双轮到单轮无缝切换**：
+   - 缓存持久化于 `<workspace>/.ceo/doctor/cache.json`。
+   - 仅当 $F_{before} == F_{cached}$、上次 Doctor 通过、当前本地检查正常且 $0 \le \text{now} - \text{checked\_at} < 86,400\text{秒}$ 时复用结果。
+   - **缓存命中**：完全跳过 Turn 1 Doctor 探针，直接在 Turn 1 提交业务任务，当前 Doctor 耗时记为 0ms，同时在回执中保留历史度量指标。
+   - **缓存未命中/失效**：执行 Turn 1（Doctor 探针） $\to$ 验证前后一致性（$F_{before} == F_{after}$） $\to$ 持久化缓存 $\to$ 继续执行 Turn 2（任务 Prompt）。
+
+4. **选择性缓存失效**：
+   - 普通业务失败（如任务逻辑错误或产物未验证）保留 Doctor 缓存。
+   - 授权工作区路径权限拒绝、沙箱配置异常或协议崩溃则立即失效缓存并强制重检。
+
 ## CLI 常用命令
 
 - **运行 Preflight Doctor 检查**：
   ```bash
-  ceo-worker doctor --workspace /path/to/workspace
+  ceo-worker doctor --workspace /path/to/workspace [--force]
   ```
 - **运行无人值守任务**：
   ```bash
-  ceo-worker run --workspace /path/to/workspace --prompt-file /path/to/prompt.md [--job-id <id>]
+  ceo-worker run --workspace /path/to/workspace --prompt-file /path/to/prompt.md [--job-id <id>] [--force-doctor]
   ```
 - **查看任务状态**：
   ```bash

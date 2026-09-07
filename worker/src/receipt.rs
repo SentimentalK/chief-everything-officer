@@ -1,4 +1,4 @@
-use crate::doctor::SessionDoctorReport;
+use crate::doctor::{ModelUsageInfo, SessionDoctorReport};
 use crate::verifier::{ArtifactClaim, BusinessOutcome};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,19 @@ pub struct ReceiptError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentDoctorMetrics {
+    pub duration_ms: u64,
+    pub model_usage: Option<ModelUsageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedDoctorMetrics {
+    pub checked_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub model_usage: Option<ModelUsageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskReceipt {
     pub job_id: String,
     pub attempt_id: String,
@@ -50,6 +63,10 @@ pub struct TaskReceipt {
     pub business_outcome: BusinessOutcome,
     pub executor: ExecutorInfo,
     pub doctor: Option<SessionDoctorReport>,
+    pub doctor_cache_hit: bool,
+    pub local_check_duration_ms: u64,
+    pub current_doctor_metrics: Option<CurrentDoctorMetrics>,
+    pub cached_doctor_metrics: Option<CachedDoctorMetrics>,
     pub timestamps: TimestampsInfo,
     pub artifacts: Vec<ArtifactClaim>,
     pub logs: LogSummary,

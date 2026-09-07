@@ -138,6 +138,7 @@ pub struct WorkerConfig {
     pub doctor_timeout_secs: u64,
     pub task_timeout_secs: u64,
     pub teardown_wait_secs: u64,
+    pub guide_files: Vec<PathBuf>,
 }
 
 impl Default for WorkerConfig {
@@ -153,6 +154,7 @@ impl Default for WorkerConfig {
             doctor_timeout_secs: 90,
             task_timeout_secs: 300,
             teardown_wait_secs: 5,
+            guide_files: Vec::new(),
         }
     }
 }

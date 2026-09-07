@@ -1,16 +1,23 @@
 use crate::config::{attempt_dir, job_dir, snapshot_prompt, validate_id, WorkerConfig};
-use crate::doctor::{run_preflight_static_checks, DoctorProbeContext, SessionDoctorReport};
+use crate::doctor::{
+    invalidate_cache, load_cache, run_fast_local_precheck, run_preflight_static_checks, save_cache,
+    DoctorCacheRecord, DoctorMetricsRecord, DoctorProbeContext, FingerprintBuilder, ModelUsageInfo,
+    SessionDoctorReport,
+};
 use crate::executor::{create_executor, ExecutionRequest, ExecutorError};
 use crate::observability::{
     EventLogger, JobStage, LogSource, ProcessLogger, StatusTracker, StreamEventDispatcher,
 };
-use crate::receipt::{ExecutorInfo, LogSummary, ReceiptError, TaskReceipt, TimestampsInfo};
+use crate::receipt::{
+    CachedDoctorMetrics, CurrentDoctorMetrics, ExecutorInfo, LogSummary, ReceiptError, TaskReceipt,
+    TimestampsInfo,
+};
 use crate::verifier::{ArtifactClaim, BusinessOutcome, GenericVerifier, WorkspaceSnapshot};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -43,6 +50,10 @@ struct FinalizeParams<'a> {
     stderr_logger: &'a ProcessLogger,
     log_paths: HashMap<String, String>,
     doctor_report: Option<SessionDoctorReport>,
+    doctor_cache_hit: bool,
+    local_check_duration_ms: u64,
+    current_doctor_metrics: Option<CurrentDoctorMetrics>,
+    cached_doctor_metrics: Option<CachedDoctorMetrics>,
 }
 
 enum AttemptOutcome {
@@ -195,6 +206,10 @@ impl Runner {
             business_outcome,
             executor,
             doctor: params.doctor_report,
+            doctor_cache_hit: params.doctor_cache_hit,
+            local_check_duration_ms: params.local_check_duration_ms,
+            current_doctor_metrics: params.current_doctor_metrics,
+            cached_doctor_metrics: params.cached_doctor_metrics,
             timestamps: TimestampsInfo {
                 started_at: params.started_at,
                 finished_at,
@@ -218,18 +233,22 @@ impl Runner {
         let artifact_paths = receipt.artifacts.iter().map(|a| a.path.clone()).collect();
         let _ = params.status_tracker.update_stage(
             job_stage,
-            receipt_error.map(|e| e.message),
+            receipt_error.map(|re| format!("{}: {}", re.code, re.message)),
             params.log_paths,
             artifact_paths,
         );
 
         params.event_logger.log_event(
-            "completion",
+            "task",
             "receipt_finalized",
             LogSource::System,
             serde_json::json!({
+                "job_id": receipt.job_id,
+                "attempt_id": receipt.attempt_id,
                 "status": receipt.execution_status,
-                "outcome": receipt.business_outcome,
+                "business_outcome": receipt.business_outcome,
+                "doctor_cache_hit": receipt.doctor_cache_hit,
+                "artifacts_count": receipt.artifacts.len(),
             }),
         );
 
@@ -240,45 +259,43 @@ impl Runner {
         &self,
         workspace: &Path,
         prompt_file: &Path,
-        custom_job_id: Option<String>,
+        job_id_opt: Option<String>,
         timeout_secs: Option<u64>,
     ) -> Result<TaskReceipt, RunnerError> {
-        let started_at = Utc::now();
+        self.run_task_with_options(workspace, prompt_file, job_id_opt, timeout_secs, false)
+            .await
+    }
 
-        // 1. Validate paths and IDs
+    pub async fn run_task_with_options(
+        &self,
+        workspace: &Path,
+        prompt_file: &Path,
+        job_id_opt: Option<String>,
+        timeout_secs: Option<u64>,
+        force_doctor: bool,
+    ) -> Result<TaskReceipt, RunnerError> {
         let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
-        if !canonical_workspace.is_dir() {
-            return Err(RunnerError::ConfigError(
-                crate::config::ConfigError::InvalidPath(format!(
-                    "Workspace is not a directory: {}",
-                    canonical_workspace.display()
-                )),
-            ));
-        }
 
-        let job_id = custom_job_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        validate_id("job_id", &job_id)?;
-        let attempt_id = Uuid::new_v4().to_string();
-        validate_id("attempt_id", &attempt_id)?;
-
-        let current_job_dir = job_dir(&canonical_workspace, &job_id);
-        let current_attempt_dir = attempt_dir(&canonical_workspace, &job_id, &attempt_id);
-
-        // Atomic create job directory to prevent concurrent duplicate jobs
-        if let Some(parent) = current_job_dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::create_dir(&current_job_dir) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(RunnerError::JobAlreadyExists(job_id));
+        // 1. Determine job_id & attempt_id
+        let job_id = match job_id_opt {
+            Some(id) => {
+                validate_id("job_id", &id)?;
+                id
             }
-            Err(e) => return Err(RunnerError::IoError(e)),
+            None => Uuid::new_v4().to_string(),
+        };
+
+        let target_job_dir = job_dir(&canonical_workspace, &job_id);
+        if target_job_dir.exists() {
+            return Err(RunnerError::JobAlreadyExists(job_id));
         }
 
+        let attempt_id = Uuid::new_v4().to_string();
+        let current_attempt_dir = attempt_dir(&canonical_workspace, &job_id, &attempt_id);
         fs::create_dir_all(&current_attempt_dir)?;
 
-        let status_tracker = StatusTracker::new(&current_job_dir, &job_id, &attempt_id);
+        let started_at = Utc::now();
+        let status_tracker = StatusTracker::new(&target_job_dir, &job_id, &attempt_id);
         let event_logger = EventLogger::new(&current_attempt_dir, &job_id, &attempt_id);
         let stdout_logger = ProcessLogger::new(
             &current_attempt_dir,
@@ -289,7 +306,7 @@ impl Runner {
         let stderr_logger = ProcessLogger::new(
             &current_attempt_dir,
             "stderr.log",
-            LogSource::Launcher,
+            LogSource::System,
             self.echo_tx.clone(),
         );
 
@@ -316,6 +333,18 @@ impl Runner {
                 .to_string(),
         );
 
+        let _ = status_tracker.update_stage(JobStage::Doctor, None, log_paths.clone(), Vec::new());
+        event_logger.log_event(
+            "task",
+            "attempt_created",
+            LogSource::System,
+            serde_json::json!({
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "workspace": canonical_workspace.to_string_lossy(),
+            }),
+        );
+
         let finalize_params = FinalizeParams {
             job_id: &job_id,
             attempt_id: &attempt_id,
@@ -330,10 +359,14 @@ impl Runner {
             stderr_logger: &stderr_logger,
             log_paths: log_paths.clone(),
             doctor_report: None,
+            doctor_cache_hit: false,
+            local_check_duration_ms: 0,
+            current_doctor_metrics: None,
+            cached_doctor_metrics: None,
         };
 
-        // 2. Snapshot prompt
-        let prompt_snapshot_path = current_attempt_dir.join("prompt_snapshot.md");
+        // 2. Snapshot task prompt
+        let prompt_snapshot_path = current_attempt_dir.join("prompt.snapshot.md");
         let (prompt_content, prompt_sha256) =
             match snapshot_prompt(prompt_file, &prompt_snapshot_path) {
                 Ok(res) => res,
@@ -357,63 +390,8 @@ impl Runner {
         let mut finalize_params = finalize_params;
         finalize_params.prompt_sha256 = &prompt_sha256;
 
-        // 3. Baseline snapshot of workspace
-        let baseline = WorkspaceSnapshot::capture(&canonical_workspace);
-
-        // 4. Static preflight check on workspace AGENTS.md
-        let preflight = match run_preflight_static_checks(&canonical_workspace) {
-            Ok(p) => p,
-            Err(err_msg) => {
-                event_logger.log_event(
-                    "preflight",
-                    "static_check_failed",
-                    LogSource::System,
-                    serde_json::json!({ "error": err_msg }),
-                );
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "preflight".to_string(),
-                        code: "DOCTOR_PREFLIGHT_FAILED".to_string(),
-                        message: err_msg,
-                        executor: ExecutorInfo {
-                            executor_type: self.config.executor_type.to_string(),
-                            version: "unknown".to_string(),
-                            conversation_id: None,
-                        },
-                    },
-                );
-            }
-        };
-
-        // 5. Setup Doctor probe context
-        let doctor_ctx = match DoctorProbeContext::new(
-            &canonical_workspace,
-            &current_attempt_dir,
-            &attempt_id,
-            preflight,
-        ) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "doctor_setup".to_string(),
-                        code: "DOCTOR_SETUP_FAILED".to_string(),
-                        message: format!("Failed to create doctor fixture: {}", e),
-                        executor: ExecutorInfo {
-                            executor_type: self.config.executor_type.to_string(),
-                            version: "unknown".to_string(),
-                            conversation_id: None,
-                        },
-                    },
-                );
-            }
-        };
-
-        // 6. Executor adapter preflight
+        // 3. Adapter preflight check
         let adapter = create_executor(&self.config);
-
         let executor_meta = match adapter.preflight_check() {
             Ok(meta) => meta,
             Err(ExecutorError::NeedsUserAction {
@@ -464,7 +442,81 @@ impl Runner {
             conversation_id: None,
         };
 
-        // 7. Spawn child process
+        // 4. Strict Local Pre-Check (Zero-Model)
+        let local_check_start = Instant::now();
+        let local_check_res = run_fast_local_precheck(
+            &canonical_workspace,
+            &self.config,
+            executor_meta.binary_path.as_deref(),
+        );
+        let local_check_duration_ms = local_check_start.elapsed().as_millis() as u64;
+        finalize_params.local_check_duration_ms = local_check_duration_ms;
+
+        if let Err(e) = local_check_res {
+            event_logger.log_event(
+                "preflight",
+                "local_precheck_failed",
+                LogSource::System,
+                serde_json::json!({ "error": e.to_string(), "code": e.error_code() }),
+            );
+            return self.finalize_attempt(
+                finalize_params,
+                AttemptOutcome::Blocked {
+                    stage: "local_precheck".to_string(),
+                    code: e.error_code().to_string(),
+                    message: e.to_string(),
+                    executor: executor_info,
+                },
+            );
+        }
+
+        // 5. Baseline snapshot of workspace
+        let baseline = WorkspaceSnapshot::capture(&canonical_workspace);
+
+        // 6. Static preflight check on workspace AGENTS.md
+        let preflight = match run_preflight_static_checks(&canonical_workspace) {
+            Ok(p) => p,
+            Err(err_msg) => {
+                event_logger.log_event(
+                    "preflight",
+                    "static_check_failed",
+                    LogSource::System,
+                    serde_json::json!({ "error": err_msg }),
+                );
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "preflight".to_string(),
+                        code: "DOCTOR_PREFLIGHT_FAILED".to_string(),
+                        message: err_msg,
+                        executor: executor_info,
+                    },
+                );
+            }
+        };
+
+        // 7. Setup Doctor probe context
+        let doctor_ctx = match DoctorProbeContext::new(
+            &canonical_workspace,
+            &current_attempt_dir,
+            &attempt_id,
+            preflight,
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor_setup".to_string(),
+                        code: "DOCTOR_SETUP_FAILED".to_string(),
+                        message: format!("Failed to create doctor fixture: {}", e),
+                        executor: executor_info,
+                    },
+                );
+            }
+        };
+
+        // 8. Build F_before Environment Fingerprint
         let exec_request = ExecutionRequest {
             job_id: &job_id,
             attempt_id: &attempt_id,
@@ -473,7 +525,29 @@ impl Runner {
             prompt_file,
             model: self.config.agent_model.as_deref(),
         };
+        let launch_config = adapter.get_launch_config(&exec_request);
+        let doctor_prompt = doctor_ctx.build_probe_prompt();
+        let f_before = FingerprintBuilder::build(
+            &canonical_workspace,
+            &self.config,
+            &launch_config,
+            DoctorProbeContext::PROMPT_TEMPLATE,
+        );
 
+        // 9. Evaluate Doctor Cache
+        let mut cached_doctor_record = None;
+        let mut doctor_cache_hit = false;
+
+        if !force_doctor && f_before.cache_eligible {
+            if let Some(cache) = load_cache(&canonical_workspace) {
+                if cache.is_valid(&f_before.fingerprint_hash, Utc::now()) {
+                    doctor_cache_hit = true;
+                    cached_doctor_record = Some(cache);
+                }
+            }
+        }
+
+        // 10. Spawn child process
         let mut child = match adapter.spawn_execution(&exec_request) {
             Ok(proc) => proc,
             Err(e) => {
@@ -489,7 +563,7 @@ impl Runner {
             }
         };
 
-        // 8. Setup Single-Reader Event Dispatcher on stdout and background drain on stderr
+        // Setup Single-Reader Event Dispatcher on stdout and background drain on stderr
         let (event_tx, mut event_rx) = mpsc::channel::<serde_json::Value>(100);
         let events_path = current_attempt_dir.join("events.jsonl");
         let dispatcher = StreamEventDispatcher::new(events_path, stdout_logger.clone(), event_tx);
@@ -504,138 +578,237 @@ impl Runner {
             });
         }
 
-        // 9. Execute Turn 1: Doctor Probe
-        let _ = status_tracker.update_stage(JobStage::Doctor, None, log_paths.clone(), Vec::new());
-        event_logger.log_event(
-            "doctor",
-            "turn_start",
-            LogSource::System,
-            serde_json::json!({ "stage": "doctor" }),
-        );
+        // 11. Handle Doctor Phase
+        if doctor_cache_hit {
+            let cached_rec = cached_doctor_record.unwrap();
+            finalize_params.doctor_cache_hit = true;
+            finalize_params.doctor_report = Some(cached_rec.doctor_report.clone());
+            finalize_params.current_doctor_metrics = Some(CurrentDoctorMetrics {
+                duration_ms: 0,
+                model_usage: None,
+            });
+            finalize_params.cached_doctor_metrics = Some(CachedDoctorMetrics {
+                checked_at: cached_rec.checked_at,
+                duration_ms: cached_rec.metrics.duration_ms,
+                model_usage: cached_rec.metrics.model_usage.clone(),
+            });
 
-        let doctor_prompt = doctor_ctx.build_probe_prompt();
-        let doctor_msg = serde_json::json!({
-            "event": "user",
-            "message": { "content": doctor_prompt }
-        });
-        if let Err(e) = child.send_input_line(&doctor_msg.to_string()).await {
-            let _ = child.kill_group();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Blocked {
-                    stage: "doctor".to_string(),
-                    code: "STDIN_WRITE_FAILED".to_string(),
-                    message: format!("Failed to send doctor message to child stdin: {}", e),
-                    executor: executor_info,
-                },
+            event_logger.log_event(
+                "doctor",
+                "cache_hit",
+                LogSource::System,
+                serde_json::json!({
+                    "fingerprint": f_before.fingerprint_hash,
+                    "checked_at": cached_rec.checked_at,
+                    "cached_duration_ms": cached_rec.metrics.duration_ms,
+                }),
             );
-        }
+        } else {
+            // Execute Turn 1: Full Doctor Probe
+            finalize_params.doctor_cache_hit = false;
+            let _ =
+                status_tracker.update_stage(JobStage::Doctor, None, log_paths.clone(), Vec::new());
+            event_logger.log_event(
+                "doctor",
+                "turn_start",
+                LogSource::System,
+                serde_json::json!({ "stage": "doctor", "fingerprint": f_before.fingerprint_hash }),
+            );
 
-        // Listen for Turn 1 completion
-        let doctor_timeout = Duration::from_secs(self.config.doctor_timeout_secs);
-        let doctor_deadline = tokio::time::Instant::now() + doctor_timeout;
+            let doctor_start = Instant::now();
+            let doctor_msg = serde_json::json!({
+                "event": "user",
+                "message": { "content": doctor_prompt }
+            });
+            if let Err(e) = child.send_input_line(&doctor_msg.to_string()).await {
+                let _ = child.kill_group();
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "STDIN_WRITE_FAILED".to_string(),
+                        message: format!("Failed to send doctor message to child stdin: {}", e),
+                        executor: executor_info,
+                    },
+                );
+            }
 
-        let mut doctor_agent_response = String::new();
-        let mut doctor_result_status = String::new();
-        let mut doctor_turn_finished = false;
+            let doctor_timeout = Duration::from_secs(self.config.doctor_timeout_secs);
+            let doctor_deadline = tokio::time::Instant::now() + doctor_timeout;
 
-        loop {
-            tokio::select! {
-                maybe_event = event_rx.recv() => {
-                    match maybe_event {
-                        Some(val) => {
-                            if let Some(cid) = val.get("conversation_id").and_then(|c| c.as_str()) {
-                                if executor_info.conversation_id.is_none() {
-                                    executor_info.conversation_id = Some(cid.to_string());
-                                }
-                            }
-                            if let Some(ev_type) = val.get("event").and_then(|e| e.as_str()) {
-                                if ev_type == "step_update" {
-                                    if let Some(delta) = val.get("step_update")
-                                        .and_then(|s| s.get("text_delta"))
-                                        .and_then(|t| t.as_str()) {
-                                        doctor_agent_response.push_str(delta);
+            let mut doctor_agent_response = String::new();
+            let mut doctor_result_status = String::new();
+            let mut doctor_turn_finished = false;
+            let mut doctor_model_usage = None;
+
+            loop {
+                tokio::select! {
+                    maybe_event = event_rx.recv() => {
+                        match maybe_event {
+                            Some(val) => {
+                                if let Some(cid) = val.get("conversation_id").and_then(|c| c.as_str()) {
+                                    if executor_info.conversation_id.is_none() {
+                                        executor_info.conversation_id = Some(cid.to_string());
                                     }
-                                } else if ev_type == "result" {
-                                    if let Some(res) = val.get("result") {
-                                        doctor_result_status = res.get("status")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("UNKNOWN")
-                                            .to_string();
-                                        if let Some(resp) = res.get("response").and_then(|r| r.as_str()) {
-                                            if !resp.is_empty() {
-                                                doctor_agent_response = resp.to_string();
-                                            }
+                                }
+                                if let Some(ev_type) = val.get("event").and_then(|e| e.as_str()) {
+                                    if ev_type == "step_update" {
+                                        if let Some(delta) = val.get("step_update")
+                                            .and_then(|s| s.get("text_delta"))
+                                            .and_then(|t| t.as_str()) {
+                                            doctor_agent_response.push_str(delta);
                                         }
+                                    } else if ev_type == "result" {
+                                        if let Some(res) = val.get("result") {
+                                            doctor_result_status = res.get("status")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("UNKNOWN")
+                                                .to_string();
+                                            if let Some(resp) = res.get("response").and_then(|r| r.as_str()) {
+                                                if !resp.is_empty() {
+                                                    doctor_agent_response = resp.to_string();
+                                                }
+                                            }
+                                            doctor_model_usage = ModelUsageInfo::from_json_value(res.get("usage"));
+                                        }
+                                        doctor_turn_finished = true;
+                                        break;
                                     }
-                                    doctor_turn_finished = true;
-                                    break;
                                 }
                             }
-                        }
-                        None => {
-                            // EOF on event channel before result
-                            break;
+                            None => {
+                                break;
+                            }
                         }
                     }
+                    _ = tokio::time::sleep_until(doctor_deadline) => {
+                        let _ = child.kill_group();
+                        return self.finalize_attempt(
+                            finalize_params,
+                            AttemptOutcome::Blocked {
+                                stage: "doctor".to_string(),
+                                code: "DOCTOR_TIMEOUT".to_string(),
+                                message: format!("Doctor preflight timed out after {}s", self.config.doctor_timeout_secs),
+                                executor: executor_info,
+                            },
+                        );
+                    }
                 }
-                _ = tokio::time::sleep_until(doctor_deadline) => {
-                    let _ = child.kill_group();
-                    return self.finalize_attempt(
-                        finalize_params,
-                        AttemptOutcome::Blocked {
-                            stage: "doctor".to_string(),
-                            code: "DOCTOR_TIMEOUT".to_string(),
-                            message: format!("Doctor preflight timed out after {}s", self.config.doctor_timeout_secs),
-                            executor: executor_info,
-                        },
+            }
+
+            if !doctor_turn_finished {
+                let _ = child.kill_group();
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "DOCTOR_STREAM_TERMINATED".to_string(),
+                        message: "Process or stream terminated prematurely during doctor check"
+                            .to_string(),
+                        executor: executor_info,
+                    },
+                );
+            }
+
+            // Evaluate Doctor Turn
+            let doctor_report =
+                doctor_ctx.evaluate_turn(&doctor_agent_response, &doctor_result_status);
+            let doctor_duration_ms = doctor_start.elapsed().as_millis() as u64;
+            finalize_params.doctor_report = Some(doctor_report.clone());
+            finalize_params.current_doctor_metrics = Some(CurrentDoctorMetrics {
+                duration_ms: doctor_duration_ms,
+                model_usage: doctor_model_usage.clone(),
+            });
+
+            if !doctor_report.ready {
+                let _ = invalidate_cache(&canonical_workspace);
+                let err_msg = doctor_report
+                    .error
+                    .unwrap_or_else(|| "Doctor checks failed".to_string());
+                let _ = child.kill_group();
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "DOCTOR_VERIFICATION_FAILED".to_string(),
+                        message: err_msg,
+                        executor: executor_info,
+                    },
+                );
+            }
+
+            // Before/After Consistency Verification
+            let f_after = FingerprintBuilder::build(
+                &canonical_workspace,
+                &self.config,
+                &launch_config,
+                DoctorProbeContext::PROMPT_TEMPLATE,
+            );
+
+            if f_before.fingerprint_hash != f_after.fingerprint_hash {
+                let _ = child.kill_group();
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "CONFIG_CHANGED_DURING_DOCTOR".to_string(),
+                        message: "Environment configuration changed during Doctor execution"
+                            .to_string(),
+                        executor: executor_info,
+                    },
+                );
+            }
+
+            // Save Cache if eligible
+            if f_after.cache_eligible {
+                let mut subitem_hashes = BTreeMap::new();
+                subitem_hashes.insert(
+                    "cli_settings".to_string(),
+                    f_after
+                        .components
+                        .cli_settings
+                        .content_sha256
+                        .clone()
+                        .unwrap_or_default(),
+                );
+                for r in &f_after.components.workspace_rules {
+                    subitem_hashes
+                        .insert(r.path.clone(), r.content_sha256.clone().unwrap_or_default());
+                }
+
+                let cache_rec = DoctorCacheRecord::new(
+                    f_after.fingerprint_hash.clone(),
+                    Utc::now(),
+                    doctor_report.clone(),
+                    DoctorMetricsRecord {
+                        duration_ms: doctor_duration_ms,
+                        model_usage: doctor_model_usage,
+                    },
+                    subitem_hashes,
+                );
+
+                if let Err(e) = save_cache(&canonical_workspace, &cache_rec) {
+                    eprintln!(
+                        "Notice: Failed to save doctor cache at {}: {}",
+                        canonical_workspace.display(),
+                        e
                     );
                 }
             }
-        }
 
-        if !doctor_turn_finished {
-            let _ = child.kill_group();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Blocked {
-                    stage: "doctor".to_string(),
-                    code: "DOCTOR_STREAM_TERMINATED".to_string(),
-                    message: "Process or stream terminated prematurely during doctor check"
-                        .to_string(),
-                    executor: executor_info,
-                },
+            event_logger.log_event(
+                "doctor",
+                "turn_passed",
+                LogSource::System,
+                serde_json::json!({
+                    "ready": true,
+                    "duration_ms": doctor_duration_ms,
+                    "cache_eligible": f_after.cache_eligible,
+                }),
             );
         }
 
-        // Evaluate Doctor Turn
-        let doctor_report = doctor_ctx.evaluate_turn(&doctor_agent_response, &doctor_result_status);
-        finalize_params.doctor_report = Some(doctor_report.clone());
-
-        if !doctor_report.ready {
-            let err_msg = doctor_report
-                .error
-                .unwrap_or_else(|| "Doctor checks failed".to_string());
-            let _ = child.kill_group();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Blocked {
-                    stage: "doctor".to_string(),
-                    code: "DOCTOR_VERIFICATION_FAILED".to_string(),
-                    message: err_msg,
-                    executor: executor_info,
-                },
-            );
-        }
-
-        event_logger.log_event(
-            "doctor",
-            "turn_passed",
-            LogSource::System,
-            serde_json::json!({ "ready": true }),
-        );
-
-        // 10. Execute Turn 2: Business Prompt
+        // 12. Execute Task Prompt
         let _ =
             status_tracker.update_stage(JobStage::Execution, None, log_paths.clone(), Vec::new());
         event_logger.log_event(
@@ -664,7 +837,7 @@ impl Runner {
             );
         }
 
-        // Listen for Turn 2 completion
+        // Listen for Task completion
         let task_timeout_duration =
             Duration::from_secs(timeout_secs.unwrap_or(self.config.task_timeout_secs));
         let task_deadline = tokio::time::Instant::now() + task_timeout_duration;
@@ -672,18 +845,36 @@ impl Runner {
         let mut task_agent_response = String::new();
         let mut task_result_status = String::new();
         let mut task_turn_finished = false;
+        let mut task_authorized_permission_failure = false;
 
         loop {
             tokio::select! {
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
                         Some(val) => {
+                            if let Some(cid) = val.get("conversation_id").and_then(|c| c.as_str()) {
+                                if executor_info.conversation_id.is_none() {
+                                    executor_info.conversation_id = Some(cid.to_string());
+                                }
+                            }
                             if let Some(ev_type) = val.get("event").and_then(|e| e.as_str()) {
                                 if ev_type == "step_update" {
                                     if let Some(delta) = val.get("step_update")
                                         .and_then(|s| s.get("text_delta"))
                                         .and_then(|t| t.as_str()) {
                                         task_agent_response.push_str(delta);
+                                    }
+                                    // Check for structured tool errors indicating authorized path denial
+                                    if let Some(step) = val.get("step_update") {
+                                        if let Some(tool_info) = step.get("tool_info") {
+                                            if let Some(err) = tool_info.get("error") {
+                                                let err_msg = err.get("message").and_then(|m| m.as_str()).unwrap_or_default();
+                                                if (err_msg.contains("permission check failed") || err_msg.contains("user denied permission"))
+                                                    && (err_msg.contains(&canonical_workspace.to_string_lossy().to_string()) || err_msg.contains("/tmp")) {
+                                                    task_authorized_permission_failure = true;
+                                                }
+                                            }
+                                        }
                                     }
                                 } else if ev_type == "result" {
                                     if let Some(res) = val.get("result") {
@@ -720,7 +911,7 @@ impl Runner {
             }
         }
 
-        // 11. Teardown & Graceful Child Exit
+        // Teardown & Graceful Child Exit
         let _ = child.close_stdin();
         let teardown_deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.teardown_wait_secs);
@@ -735,6 +926,22 @@ impl Runner {
         }
 
         if !task_turn_finished || !task_result_status.eq_ignore_ascii_case("success") {
+            let stderr_tail = stderr_logger.get_tail_snippet(10);
+            let combined_err = format!("{} {}", task_agent_response, stderr_tail);
+
+            if task_authorized_permission_failure
+                || combined_err.contains("sandbox configuration error")
+                || combined_err.contains("jetski: no output produced")
+            {
+                let _ = invalidate_cache(&canonical_workspace);
+                event_logger.log_event(
+                    "doctor",
+                    "cache_invalidated",
+                    LogSource::System,
+                    serde_json::json!({ "reason": "authorized_capability_or_sandbox_failure" }),
+                );
+            }
+
             return self.finalize_attempt(
                 finalize_params,
                 AttemptOutcome::Failed {
@@ -751,7 +958,7 @@ impl Runner {
             );
         }
 
-        // 12. Verification of Artifacts
+        // 13. Verification of Artifacts
         let verification = GenericVerifier::verify_attempt(
             &canonical_workspace,
             &current_attempt_dir,
@@ -773,7 +980,18 @@ impl Runner {
         &self,
         workspace: &Path,
     ) -> Result<SessionDoctorReport, RunnerError> {
+        self.run_standalone_doctor_with_options(workspace, false)
+            .await
+    }
+
+    pub async fn run_standalone_doctor_with_options(
+        &self,
+        workspace: &Path,
+        force: bool,
+    ) -> Result<SessionDoctorReport, RunnerError> {
         let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
+
+        // Preflight static checks
         let preflight = match run_preflight_static_checks(&canonical_workspace) {
             Ok(p) => p,
             Err(e) => {
@@ -791,7 +1009,7 @@ impl Runner {
             }
         };
 
-        // Create standalone doctor report dir
+        // Create standalone doctor attempt dir
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let doctor_dir = canonical_workspace
             .join(".ceo")
@@ -803,7 +1021,6 @@ impl Runner {
             DoctorProbeContext::new(&canonical_workspace, &doctor_dir, &timestamp, preflight)?;
 
         let adapter = create_executor(&self.config);
-
         let exec_request = ExecutionRequest {
             job_id: "doctor",
             attempt_id: &timestamp,
@@ -812,6 +1029,47 @@ impl Runner {
             prompt_file: &canonical_workspace.join("AGENTS.md"),
             model: self.config.agent_model.as_deref(),
         };
+
+        // Check local precheck first
+        let executor_meta = adapter.preflight_check().ok();
+        let local_res = run_fast_local_precheck(
+            &canonical_workspace,
+            &self.config,
+            executor_meta
+                .as_ref()
+                .and_then(|m| m.binary_path.as_deref()),
+        );
+        if let Err(e) = local_res {
+            return Ok(SessionDoctorReport {
+                ready: false,
+                rule_marker: Some(doctor_ctx.expected_marker),
+                agents_md_hash: doctor_ctx.agents_md_hash,
+                checks: vec![crate::doctor::DoctorCheckItem {
+                    name: "local_precheck".to_string(),
+                    passed: false,
+                    message: e.to_string(),
+                }],
+                error: Some(e.to_string()),
+            });
+        }
+
+        // Check cache if !force
+        let launch_config = adapter.get_launch_config(&exec_request);
+        let doctor_prompt = doctor_ctx.build_probe_prompt();
+        let f_before = FingerprintBuilder::build(
+            &canonical_workspace,
+            &self.config,
+            &launch_config,
+            DoctorProbeContext::PROMPT_TEMPLATE,
+        );
+
+        if !force && f_before.cache_eligible {
+            if let Some(cached) = load_cache(&canonical_workspace) {
+                if cached.is_valid(&f_before.fingerprint_hash, Utc::now()) {
+                    return Ok(cached.doctor_report);
+                }
+            }
+        }
 
         let mut child = match adapter.spawn_execution(&exec_request) {
             Ok(proc) => proc,
@@ -839,7 +1097,7 @@ impl Runner {
             tokio::spawn(dispatcher.run(stdout));
         }
 
-        let doctor_prompt = doctor_ctx.build_probe_prompt();
+        let doctor_start = Instant::now();
         let doctor_msg = serde_json::json!({
             "event": "user",
             "message": { "content": doctor_prompt }
@@ -850,6 +1108,7 @@ impl Runner {
             tokio::time::Instant::now() + Duration::from_secs(self.config.doctor_timeout_secs);
         let mut doctor_response = String::new();
         let mut result_status = String::new();
+        let mut model_usage = None;
 
         loop {
             tokio::select! {
@@ -871,6 +1130,7 @@ impl Runner {
                                                 doctor_response = resp.to_string();
                                             }
                                         }
+                                        model_usage = ModelUsageInfo::from_json_value(res.get("usage"));
                                     }
                                     break;
                                 }
@@ -888,13 +1148,46 @@ impl Runner {
         }
 
         let _ = child.close_stdin();
-        let _ = child.kill_group();
-
         let report = doctor_ctx.evaluate_turn(&doctor_response, &result_status);
+        let doctor_duration_ms = doctor_start.elapsed().as_millis() as u64;
 
-        // Persist report to doctor_dir/doctor_report.json
-        let report_json = serde_json::to_string_pretty(&report).unwrap_or_default();
-        let _ = fs::write(doctor_dir.join("doctor_report.json"), report_json);
+        if report.ready {
+            let f_after = FingerprintBuilder::build(
+                &canonical_workspace,
+                &self.config,
+                &launch_config,
+                DoctorProbeContext::PROMPT_TEMPLATE,
+            );
+
+            if f_before.fingerprint_hash == f_after.fingerprint_hash && f_after.cache_eligible {
+                let mut subitem_hashes = BTreeMap::new();
+                subitem_hashes.insert(
+                    "cli_settings".to_string(),
+                    f_after
+                        .components
+                        .cli_settings
+                        .content_sha256
+                        .clone()
+                        .unwrap_or_default(),
+                );
+                for r in &f_after.components.workspace_rules {
+                    subitem_hashes
+                        .insert(r.path.clone(), r.content_sha256.clone().unwrap_or_default());
+                }
+
+                let cache_rec = DoctorCacheRecord::new(
+                    f_after.fingerprint_hash.clone(),
+                    Utc::now(),
+                    report.clone(),
+                    DoctorMetricsRecord {
+                        duration_ms: doctor_duration_ms,
+                        model_usage,
+                    },
+                    subitem_hashes,
+                );
+                let _ = save_cache(&canonical_workspace, &cache_rec);
+            }
+        }
 
         Ok(report)
     }

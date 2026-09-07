@@ -57,15 +57,55 @@ agy --input-format stream-json \
   - Directories permitted by the sandbox configuration (e.g., `/tmp` or configured user directories) remain accessible to the agent.
   - Users accept remaining local execution risks when deploying unattended agent runs.
 
+## Doctor Caching & Environment Fingerprinting
+
+To eliminate redundant doctor latency and model consumption (~30-40s and ~100k tokens per run), CEO Worker implements intelligent **Doctor Caching with Zero-Model Local Pre-Checks**:
+
+1. **Fast Local Pre-Check (Zero Model Overhead)**:
+   - Before launching any agent process or invoking model APIs, worker performs local filesystem and configuration checks:
+     - Workspace writability (via write probe).
+     - Presence of mandatory `rule_marker` in `<workspace>/AGENTS.md`.
+     - Executable permissions on the agent binary (`libc::access(X_OK)`).
+     - Integrity of critical JSON configuration files.
+   - Any failure returns `BLOCKED` immediately without spawning processes or consuming tokens.
+
+2. **14-Component Deterministic Fingerprint ($F$)**:
+   - Comprehensive canonical hash computed across:
+     1. CLI settings (`~/.gemini/antigravity-cli/settings.json`)
+     2. Global rules (`~/.gemini/GEMINI.md`, `~/.gemini/config/AGENTS.md`, `~/.gemini/config/GEMINI.md`)
+     3. Workspace rules (`<workspace>/AGENTS.md`, `<workspace>/GEMINI.md`)
+     4. Guide files (configured `guide_files` and `<workspace>/AGENT_GUIDE.md`)
+     5. MCP configs (`~/.gemini/config/mcp_config.json`, `<workspace>/.agents/mcp_config.json`)
+     6. Recursive Markdown scanning of skills in `<workspace>/.agents/skills/` and `~/.gemini/antigravity-cli/skills/`
+     7. Plugins and enabled plugin manifests
+     8. Configured hook scripts
+     9. Conservative watch files (`~/.gemini/config/config.json`, project configs, rules)
+     10. Agent executable path, SHA256, and version
+     11. Canonical workspace path
+     12. Worker logic (Worker binary SHA256 + Doctor prompt template SHA256)
+     13. System identity (UID, GID, supplementary groups, kernel version)
+     14. Runtime environment (XDG paths, TMP/TEMP, PATH, proxy configuration with explicit `UNSET` tracking)
+   - Dynamic nonces, timestamps, and attempt IDs are strictly excluded from fingerprint generation.
+
+3. **24-Hour TTL & Dual-Turn to Single-Turn Optimization**:
+   - Cached in `<workspace>/.ceo/doctor/cache.json`.
+   - Reused only when $F_{before} == F_{cached}$, last doctor passed, current local check passes, and $0 \le \text{now} - \text{checked\_at} < 86,400\text{s}$.
+   - **Cache Hit**: Skips Turn 1 doctor probe completely and executes task prompt in Turn 1, reporting 0ms current doctor duration and preserving cached historical metrics.
+   - **Cache Miss / Expiry**: Executes Turn 1 (Doctor Probe) $\to$ verifies consistency ($F_{before} == F_{after}$) $\to$ persists cache $\to$ executes Turn 2 (Task Prompt).
+
+4. **Selective Invalidation**:
+   - Business failures (e.g. task errors or unverified outputs) preserve the doctor cache.
+   - Permission errors on authorized workspace paths, sandbox faults, or protocol crashes invalidate the cache immediately.
+
 ## CLI Commands
 
 - **Preflight Doctor Check**:
   ```bash
-  ceo-worker doctor --workspace /path/to/workspace
+  ceo-worker doctor --workspace /path/to/workspace [--force]
   ```
 - **Run Unattended Task**:
   ```bash
-  ceo-worker run --workspace /path/to/workspace --prompt-file /path/to/prompt.md [--job-id <id>]
+  ceo-worker run --workspace /path/to/workspace --prompt-file /path/to/prompt.md [--job-id <id>] [--force-doctor]
   ```
 - **Inspect Job Status**:
   ```bash

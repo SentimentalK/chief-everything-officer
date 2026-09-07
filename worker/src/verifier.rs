@@ -195,6 +195,7 @@ impl GenericVerifier {
                             && fname != "receipt.json"
                             && fname != "status.json"
                             && fname != "agy.log"
+                            && fname != "prompt.snapshot.md"
                             && fname != "prompt_snapshot.md"
                             && fname != ".doctor_nonce.txt"
                         {

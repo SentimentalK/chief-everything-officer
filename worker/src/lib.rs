@@ -8,14 +8,16 @@ pub mod verifier;
 
 pub use config::WorkerConfig;
 pub use doctor::{
-    run_preflight_static_checks, DoctorCheckItem, DoctorFixture, DoctorProbeContext, PreflightInfo,
-    SessionDoctorReport,
+    doctor_cache_file, invalidate_cache, load_cache, run_fast_local_precheck,
+    run_preflight_static_checks, save_cache, DoctorCacheRecord, DoctorCheckItem, DoctorFixture,
+    DoctorMetricsRecord, DoctorProbeContext, EnvironmentFingerprint, FingerprintBuilder,
+    ModelUsageInfo, PreflightInfo, SessionDoctorReport, DOCTOR_CACHE_TTL_SECS,
 };
 pub use observability::{
     EventLogger, JobStage, LifecycleEvent, LogSource, ProcessLogger, StatusTracker,
     StreamEventDispatcher,
 };
-pub use receipt::{ReceiptError, TaskReceipt};
+pub use receipt::{CachedDoctorMetrics, CurrentDoctorMetrics, ReceiptError, TaskReceipt};
 pub use runner::{Runner, RunnerError};
 pub use verifier::{
     ArtifactClaim, BusinessOutcome, GenericVerifier, TaskVerificationReport, WorkspaceSnapshot,
