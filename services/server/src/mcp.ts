@@ -7,6 +7,7 @@ import { LIMITS } from "./limits.js";
 import type { ChangeOperation, CeoWorkspace } from "./workspace.js";
 import { type ProductPolicy, getPolicy } from "./product-policy.js";
 import type { AuditStore } from "./audit.js";
+import type { WorkspaceIdentity } from "./identity/store.js";
 import { BUILD_INFO } from "./build-info.js";
 import { ResourceService } from "./resource/service.js";
 import { ResourceRetrievalService } from "./resource/retrieval.js";
@@ -227,9 +228,13 @@ const resourceApplyOperationSchema = z.discriminatedUnion("op", [
 export function createMcpServer(
   workspace: CeoWorkspace,
   productPolicy: ProductPolicy,
-  auditStore?: AuditStore,
-  resolverClient?: UrlMetadataResolver,
+  options: {
+    auditStore?: AuditStore;
+    resolverClient?: UrlMetadataResolver;
+    identity?: WorkspaceIdentity;
+  } = {},
 ): McpServer {
+  const { auditStore, resolverClient, identity } = options;
   const resourceService = new ResourceService(
     workspace,
     workspace.config,
@@ -255,6 +260,7 @@ export function createMcpServer(
     return {
       version: BUILD_INFO.version,
       build: BUILD_INFO.build,
+      ...(identity ?? {}),
       ...status,
     };
   }));

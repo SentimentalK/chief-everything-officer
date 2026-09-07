@@ -7,21 +7,26 @@ import { rm } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { createAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
+import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { BUILD_INFO } from "../src/build-info.js";
-import { fixture } from "./helpers.js";
+import { fixture, createIdentityService } from "./helpers.js";
+import type { IdentityService } from "../src/identity/service.js";
 
 const cleanupDirs: string[] = [];
 const cleanupServers: HttpServer[] = [];
+const cleanupServices: IdentityService[] = [];
 
 afterEach(async () => {
   for (const s of cleanupServers.splice(0)) {
     s.closeAllConnections?.();
     s.closeIdleConnections?.();
     await new Promise<void>((resolve) => s.close(() => resolve()));
+  }
+  for (const svc of cleanupServices.splice(0)) {
+    svc.close();
   }
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -114,15 +119,21 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       allowedOrigins: ["http://localhost"],
     };
 
+    // Seed the identity db + open the runtime identity service under the same
+    // remote/branch/key tuple that this real HTTP server will validate requests against.
+    const identityService = createIdentityService(config, "secret-test-token-123");
+    cleanupServices.push(identityService);
+    const workspaceIdentity = identityService.workspaceIdentityValue;
+
     const app = createMcpExpressApp({ host: config.bindHost });
-    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "reject" });
+    const handler = createMcpHandler(() => createMcpServer(workspace, policy, { identity: workspaceIdentity }), { legacy: "reject" });
     const nodeHandler = toNodeHandler(handler);
 
     app.all(
       "/mcp",
       createHostGuard(config.allowedHosts),
       createOriginGuard(config.allowedOrigins),
-      createAuthMiddleware(config.mcpApiKey),
+      createIdentityAuthMiddleware(identityService),
       (req, res) => {
         void nodeHandler(req, res, req.body);
       },

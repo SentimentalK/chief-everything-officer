@@ -15,11 +15,12 @@ export interface Config {
   gitCommitterEmail: string;
   sshKeyPath?: string;
   knownHostsPath?: string;
-  mcpApiKey?: string;
+  mcpApiKey: string;
   allowedHosts: string[];
   allowedOrigins: string[];
   auditDir: string;
   auditDbPath: string;
+  identityDbPath: string;
   contentResolverUrl?: string;
   contentResolverToken?: string;
   contentResolverTimeoutMs: number;
@@ -32,10 +33,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("PORT must be an integer from 1 to 65535");
   }
   const bindHost = env.BIND_HOST ?? "127.0.0.1";
+
   const mcpApiKey = env.MCP_API_KEY;
-  
-  if (bindHost !== "127.0.0.1" && bindHost !== "::1" && !mcpApiKey) {
-    throw new Error("MCP_API_KEY is required when binding to a non-loopback address");
+  if (mcpApiKey === undefined) {
+    throw new Error("MCP_API_KEY is required");
+  }
+  if (mcpApiKey.length === 0) {
+    throw new Error("MCP_API_KEY must not be empty");
+  }
+  if (mcpApiKey !== mcpApiKey.trim()) {
+    // Reject leading/trailing whitespace rather than silently altering the key.
+    throw new Error("MCP_API_KEY must not contain leading or trailing whitespace");
   }
 
   const remoteUrl = env.CEO_REMOTE?.trim();
@@ -83,11 +91,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     gitCommitterEmail,
     ...(env.CEO_SSH_KEY_PATH ? { sshKeyPath: env.CEO_SSH_KEY_PATH } : {}),
     ...(env.CEO_KNOWN_HOSTS_PATH ? { knownHostsPath: env.CEO_KNOWN_HOSTS_PATH } : {}),
-    ...(mcpApiKey ? { mcpApiKey } : {}),
+    mcpApiKey,
     allowedHosts,
     allowedOrigins,
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: env.CEO_AUDIT_DB_PATH ?? path.join(dataRoot, "audit", "ceo-trace.sqlite"),
+    identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
     ...(contentResolverUrl ? { contentResolverUrl } : {}),
     ...(contentResolverToken ? { contentResolverToken } : {}),
     contentResolverTimeoutMs,

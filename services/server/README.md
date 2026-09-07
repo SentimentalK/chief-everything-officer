@@ -25,7 +25,7 @@ Requires Node.js 22+ and Git.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CEO_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, `state/`, and `audit/` |
+| `CEO_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, `state/`, `audit/`, and `identity/` |
 | `CEO_REMOTE` | **(required)** | Fixed Git origin URL (startup fails if missing) |
 | `CEO_BRANCH` | `main` | Fixed writable branch |
 | `CEO_SSH_KEY_PATH` | unset | Read/write deploy key path |
@@ -35,25 +35,64 @@ Requires Node.js 22+ and Git.
 | `CEO_GIT_COMMITTER_EMAIL` | `ceo-mcp@users.noreply.github.com` | Service identity email |
 | `BIND_HOST` | `127.0.0.1` | HTTP bind host; use `0.0.0.0` for K3s Ingress |
 | `PORT` | `3000` | MCP HTTP port |
-| `MCP_API_KEY` | unset | Static Bearer token; **required** when binding to a non-loopback address |
+| `MCP_API_KEY` | **(required, all binds)** | Static Bearer token; leading/trailing whitespace is rejected |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames accepted by the Host guard |
 | `ALLOWED_ORIGINS` | (empty) | Comma-separated Origins accepted by the Origin guard; absent Origin is always allowed |
 
 ## Authentication
 
-CEO uses a deliberately simple static Bearer credential gate rather than implementing MCP OAuth authorization. The server validates:
+Requests authenticate against the stored identity, not against a raw env value.
 
-```
-Authorization: Bearer <MCP_API_KEY>
-```
+- `Authorization: Bearer <MCP_API_KEY>` is verified by digest against the active
+  stored key; the owning user and workspace must be enabled and bound to the
+  deployment's `CEO_REMOTE`/`CEO_BRANCH`.
+- Success stores the resolved `AuthIdentity` in `res.locals.identity` per
+  request. Identity is never taken from request bodies, query strings,
+  `X-User-ID`, or a global current user.
+- Status: missing / wrong / revoked key, or disabled user → `401`;
+  authenticated but bound to a different workspace → `403`; identity database
+  unavailable on a live request → `503`.
+- `/healthz` and `/readyz` are unauthenticated and structurally outside the
+  protected middleware scope.
 
-- Requests to `/mcp` without a valid Bearer token receive 401 Unauthorized.
-- `/healthz` and `/readyz` are unauthenticated — they are structurally outside the `/mcp` middleware scope.
-- Token comparison uses `crypto.timingSafeEqual`. Tokens are never logged.
+`GET /api/identity` (Bearer-authenticated) returns who this key connects to:
+`{ user_id, workspace_id, deployment_mode: "single_user" }`.
 
-Additionally, the server enforces:
-- **Host validation**: `req.hostname` must be in `ALLOWED_HOSTS`, otherwise 421 Misdirected Request.
-- **Origin validation**: per MCP Streamable HTTP spec, if an `Origin` header is present and not in `ALLOWED_ORIGINS`, the server returns 403 Forbidden. Absent `Origin` is allowed (server-to-server clients typically do not send it).
+The audit console keeps its login endpoint and session cookie but binds
+sessions to the same identity. Audit queries accept either a valid Bearer key
+or the bound session cookie, both identity-checked.
+
+### Persistent single-user identity
+
+CEO keeps a durable identity in a dedicated SQLite database at
+`<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`)
+holding exactly one `users`, one `workspaces`, and one active `api_keys` row.
+The original `MCP_API_KEY` is injected via Kubernetes/Infisical Secret; only
+its SHA-256 digest is stored.
+
+This database is **created only by** `node dist/identity/cli.js init`; the
+service never creates one silently. On missing/corrupt/structurally-mismatched
+identity the server fails to start and instructs to initialize.
+
+### First-deploy / upgrade runbook
+
+1. Land code + tests and publish the container image.
+2. Stop the old server, keeping the existing `/data` volume and Secrets.
+3. With the new image on the same volume + environment variables, run the
+   one-time initializer:
+   ```bash
+   node dist/identity/cli.js init
+   ```
+   It reads `MCP_API_KEY`/`CEO_REMOTE`/`CEO_BRANCH`/`CEO_DATA_ROOT` and prints
+   only `user_id`/`workspace_id` (never the key/digest).
+4. Start the new server only after a successful `init`.
+5. With the existing key, verify MCP, Audit, and `GET /api/identity`, then
+   restart to confirm `user_id`/`workspace_id` stay unchanged.
+
+Backups must include `identity/`; it is not a throwaway/log cache and must not
+be cleaned up alongside trace logs. `init` is idempotent: re-running returns the
+existing ids, refuses to rebind to a different repository/branch, and will not
+revive a disabled user or a revoked key.
 
 ## Transaction and recovery model
 

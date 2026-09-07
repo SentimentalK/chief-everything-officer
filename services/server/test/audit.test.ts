@@ -12,12 +12,15 @@ import { AuditStore, createAuditRouter } from "../src/audit.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
-import { fixture } from "./helpers.js";
+import { fixture, seedIdentity, createIdentityService } from "./helpers.js";
+import { IdentityService } from "../src/identity/service.js";
+import type { Config } from "../src/config.js";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 
 const cleanupDirs: string[] = [];
 const cleanupServers: HttpServer[] = [];
+const cleanupServices: IdentityService[] = [];
 const cleanupStores: AuditStore[] = [];
 
 afterEach(async () => {
@@ -25,6 +28,9 @@ afterEach(async () => {
     s.closeAllConnections?.();
     s.closeIdleConnections?.();
     await new Promise<void>((resolve) => s.close(() => resolve()));
+  }
+  for (const svc of cleanupServices.splice(0)) {
+    svc.close();
   }
   for (const store of cleanupStores.splice(0)) {
     store.close();
@@ -133,7 +139,7 @@ describe("AuditStore & Boundary Tracing", () => {
     const auditStore = new AuditStore(path.join(auditTmpDir, "ceo-trace.sqlite"));
     cleanupStores.push(auditStore);
 
-    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, auditStore), { legacy: "reject" });
+    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, { auditStore }), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => mcpHandler.fetch(new Request(url, init)),
     });
@@ -300,7 +306,7 @@ describe("AuditStore & Boundary Tracing", () => {
     cleanupStores.push(auditStore);
 
     const testApiKey = "secret-mcp-api-key-test-999";
-    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, auditStore), { legacy: "reject" });
+    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, { auditStore }), { legacy: "reject" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => {
         const headers = new Headers(init?.headers);
@@ -335,8 +341,33 @@ describe("Audit HTTP API & Session Management", () => {
     const auditStore = new AuditStore(dbPath);
     cleanupStores.push(auditStore);
 
+    const config = {
+      dataRoot: tmpDir,
+      repoDir: path.join(tmpDir, "repo"),
+      txnDir: path.join(tmpDir, "txns"),
+      stateDir: path.join(tmpDir, "state"),
+      branch: "main",
+      remoteUrl: "dummy-remote",
+      port: 0,
+      bindHost: "127.0.0.1",
+      gitAuthorName: "x",
+      gitAuthorEmail: "x@example.com",
+      gitCommitterName: "x",
+      gitCommitterEmail: "x@example.com",
+      mcpApiKey: apiKey,
+      allowedHosts: ["localhost", "127.0.0.1"],
+      allowedOrigins: [],
+      auditDir: tmpDir,
+      auditDbPath: dbPath,
+      identityDbPath: path.join(tmpDir, "identity", "identity.sqlite"),
+    } as Config;
+
+    const service = createIdentityService(config, apiKey);
+    cleanupServices.push(service);
+
     const app = express();
-    app.use(createAuditRouter({ auditStore, apiKey }));
+    app.use(express.json());
+    app.use(createAuditRouter({ auditStore, identityService: service }));
 
     const server = await new Promise<HttpServer>((resolve) => {
       const s = app.listen(0, "127.0.0.1", () => resolve(s));
@@ -345,7 +376,7 @@ describe("Audit HTTP API & Session Management", () => {
     const port = (server.address() as AddressInfo).port;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    return { baseUrl, auditStore, apiKey };
+    return { baseUrl, auditStore, apiKey, config, service };
   }
 
   it("enforces authentication on /api/audit/traces", async () => {
@@ -353,6 +384,42 @@ describe("Audit HTTP API & Session Management", () => {
 
     const res = await fetch(`${baseUrl}/api/audit/traces`);
     expect(res.status).toBe(401);
+  });
+
+  it("invalidates a session when the bound API key is revoked", async () => {
+    const { baseUrl, apiKey, config, service } = await setupTestApp();
+
+    // Login to get a session cookie bound to this key.
+    const login = await fetch(`${baseUrl}/api/audit/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: apiKey }),
+    });
+    expect(login.status).toBe(200);
+    const cookieHeader = login.headers.get("set-cookie");
+    const sessionCookie = cookieHeader!.split(";")[0]!;
+
+    // Revoke the key by rotating it (opens a second service on the same DB).
+    const rotator = IdentityService.open(
+      { remoteUrl: config.remoteUrl, branch: config.branch, envApiKey: "replacement-key" },
+      config.identityDbPath,
+    );
+    cleanupServices.push(rotator);
+
+    // The previously valid session now points at a revoked key -> rejected.
+    const traces = await fetch(`${baseUrl}/api/audit/traces`, { headers: { Cookie: sessionCookie } });
+    expect(traces.status).toBe(401);
+
+    // And the original key itself is no longer accepted.
+    const auth = await fetch(`${baseUrl}/api/audit/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: apiKey }),
+    });
+    expect(auth.status).toBe(401);
+
+    // The session router still serves the deployment (its own identity is open).
+    expect(service.workspaceIdentityValue.user_id).toMatch(/^usr_/);
   });
 
   it("handles login, session status, authenticated query, detail, and logout lifecycle", async () => {

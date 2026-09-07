@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
@@ -6,14 +6,43 @@ import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
-import { createAuthMiddleware, createHostGuard, createOriginGuard } from "./auth.js";
+import { createHostGuard, createOriginGuard, createIdentityAuthMiddleware } from "./auth.js";
+import { IdentityService } from "./identity/service.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 
+function fatal(prefix: string, error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${prefix}: ${message}\n`);
+  process.exit(1);
+}
+
+// ---- Configuration ----
 const config = loadConfig();
+
+// ---- Identity layer (authoritative, required, fail-fast) ----
+// Identity DB must already exist (created by `dist/identity/cli.js init`).
+// The service runs the full check + optional key-rotation sequence; any
+// mismatch, missing/corrupt DB, or disabled/binding error aborts startup.
+let identityService: IdentityService;
+try {
+  identityService = IdentityService.open(
+    {
+      remoteUrl: config.remoteUrl,
+      branch: config.branch,
+      envApiKey: config.mcpApiKey,
+    },
+    config.identityDbPath,
+  );
+} catch (error) {
+  fatal("identity", error);
+}
+
+// ---- Git workspace ----
 const workspace = new CeoWorkspace(config);
-await workspace.initialize();
 const productPolicy = await loadProductPolicy();
+await workspace.initialize();
+
 const auditStore = new AuditStore(config.auditDbPath);
 
 const app = createMcpExpressApp({ host: config.bindHost });
@@ -33,24 +62,46 @@ app.get("/readyz", (_req, res) => {
   });
 });
 
-// Audit routes
-app.use(createAuditRouter({
-  auditStore,
-  apiKey: config.mcpApiKey,
-}));
+// Read-only identity endpoint: which user/workspace this key connects to.
+app.get(
+  "/api/identity",
+  createHostGuard(config.allowedHosts),
+  createOriginGuard(config.allowedOrigins),
+  createIdentityAuthMiddleware(identityService),
+  (_req: Request, res: Response) => {
+    res.status(200).json({
+      user_id: identityService.workspaceIdentityValue.user_id,
+      workspace_id: identityService.workspaceIdentityValue.workspace_id,
+      deployment_mode: "single_user",
+    });
+  },
+);
 
-// MCP handler (dedicated to /mcp - UNCHANGED)
-const mcpHandler = createMcpHandler(() => createMcpServer(workspace, productPolicy, auditStore), {
-  legacy: "reject",
-});
+// Audit routes (login, session + query endpoints) reuse the same identity layer.
+app.use(
+  createAuditRouter({
+    auditStore,
+    identityService,
+  }),
+);
+
+// Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
+// enforced at the /mcp boundary by the identity middleware per request.
+const workspaceIdentity = identityService.workspaceIdentityValue;
+
+// MCP handler (dedicated to /mcp)
+const mcpHandler = createMcpHandler(
+  () => createMcpServer(workspace, productPolicy, { auditStore, identity: workspaceIdentity }),
+  { legacy: "reject" },
+);
 const nodeHandler = toNodeHandler(mcpHandler);
 
 app.all(
   "/mcp",
   createHostGuard(config.allowedHosts),
   createOriginGuard(config.allowedOrigins),
-  createAuthMiddleware(config.mcpApiKey),
-  (req, res) => {
+  createIdentityAuthMiddleware(identityService),
+  (req: Request, res: Response) => {
     void nodeHandler(req, res, req.body);
   },
 );
@@ -62,6 +113,7 @@ const listener = app.listen(config.port, config.bindHost, () => {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     auditStore.close();
+    identityService.close();
     listener.close(() => process.exit(0));
   });
 }

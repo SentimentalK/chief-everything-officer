@@ -63,10 +63,12 @@ async function createHierarchyFixture(): Promise<{ workspace: CeoWorkspace; root
     gitAuthorEmail: "test@example.com",
     gitCommitterName: "Test Committer",
     gitCommitterEmail: "committer@example.com",
+    mcpApiKey: "test-key",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: path.join(dataRoot, "audit", "trace.sqlite"),
+    identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
   };
 
   const workspace = new CeoWorkspace(config);

@@ -80,9 +80,10 @@ async function createFictionalWorkspaceFixture(): Promise<{ config: Config; root
     gitAuthorEmail: "test@example.com",
     gitCommitterName: "Test Committer",
     gitCommitterEmail: "committer@example.com",
-    mcpApiKey: undefined,
+    mcpApiKey: "test-key",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: ["http://localhost"],
+    identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
   };
 
   return { config, root };

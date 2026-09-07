@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
+import type { IdentityService } from "./identity/service.js";
+import { IdentityDbUnavailable } from "./identity/service.js";
 
 export interface TraceRecordInput {
   timestamp_ms: number;
@@ -308,18 +310,13 @@ export class AuditStore {
 }
 
 interface Session {
+  user_id: string;
+  api_key_id: string;
+  workspace_id: string;
   expiresAt: number;
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  if (bufA.length !== bufB.length) {
-    crypto.timingSafeEqual(bufA, bufA);
-    return false;
-  }
-  return crypto.timingSafeEqual(bufA, bufB);
-}
+type SessionIdentity = Omit<Session, "expiresAt">;
 
 function getSessionCookie(req: Request): string | null {
   const cookie = req.headers.cookie;
@@ -329,66 +326,146 @@ function getSessionCookie(req: Request): string | null {
   return token ? decodeURIComponent(token) : null;
 }
 
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function setAuditCookie(res: Response, value: string, maxAgeSeconds: number, secure: boolean): void {
+  const cookieParts = [
+    `ceo_audit_session=${encodeURIComponent(value)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (secure) {
+    cookieParts.push("Secure");
+  }
+  res.setHeader("Set-Cookie", cookieParts.join("; "));
+}
+
+function isDbUnavailable(error: unknown): boolean {
+  return error instanceof IdentityDbUnavailable;
+}
+
+function identityMatches(identity: SessionIdentity, servedWorkspaceId: string): boolean {
+  return identity.workspace_id === servedWorkspaceId;
+}
+
 export function createAuditRouter(options: {
   auditStore: AuditStore;
-  apiKey?: string;
+  identityService: IdentityService;
 }): Router {
-  const { auditStore, apiKey } = options;
+  const { auditStore, identityService } = options;
+  const servedWorkspaceId = identityService.workspaceIdentityValue.workspace_id;
   const router = express.Router();
   router.use(express.json());
 
   const sessions = new Map<string, Session>();
 
-  function isSessionValid(sessionId: string | null): boolean {
-    if (!sessionId) return false;
+  /** Returns the bound identity if the cookie session is still valid, else null. */
+  function sessionIdentity(sessionId: string | null): SessionIdentity | null {
+    if (!sessionId) return null;
     const session = sessions.get(sessionId);
-    if (!session) return false;
+    if (!session) return null;
     if (Date.now() > session.expiresAt) {
       sessions.delete(sessionId);
-      return false;
+      return null;
     }
-    return true;
+    const identity: SessionIdentity = {
+      user_id: session.user_id,
+      api_key_id: session.api_key_id,
+      workspace_id: session.workspace_id,
+    };
+    // Every use re-validates the underlying user + key still being active.
+    if (!identityService.revalidate(identity)) {
+      sessions.delete(sessionId);
+      return null;
+    }
+    return identity;
   }
 
-  function auditAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-    if (!apiKey) {
-      res.status(401).json({ error: "Audit authentication is not configured on server" });
-      return;
-    }
+  function respondUnauthorized(res: Response): void {
+    res.status(401).json({ error: "Unauthorized" });
+  }
 
-    const sessionId = getSessionCookie(req);
-    if (isSessionValid(sessionId)) {
+  /**
+   * Requires a valid bound session cookie OR a valid Bearer credential. Both
+   * are checked against the unified IdentityService. No raw-key bypass.
+   */
+  function auditAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+    const sessionIdent = sessionIdentity(getSessionCookie(req));
+    if (sessionIdent) {
+      if (!identityMatches(sessionIdent, servedWorkspaceId)) {
+        res.status(403).json({ error: "Forbidden: workspace not owned" });
+        return;
+      }
       next();
       return;
     }
 
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      const token = authHeader.substring(7);
-      if (constantTimeEqual(token, apiKey)) {
-        next();
-        return;
-      }
-    }
-
-    res.status(401).json({ error: "Unauthorized" });
-  }
-
-  router.post("/api/audit/session", (req: Request, res: Response) => {
-    if (!apiKey) {
-      res.status(401).json({ error: "Audit authentication is not configured on server" });
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : null;
+    if (!token) {
+      respondUnauthorized(res);
       return;
     }
 
+    try {
+      const identity = identityService.authenticateApiKey(token);
+      if (!identity) {
+        respondUnauthorized(res);
+        return;
+      }
+      if (!identityMatches(identity, servedWorkspaceId)) {
+        res.status(403).json({ error: "Forbidden: workspace not owned" });
+        return;
+      }
+      next();
+    } catch (error) {
+      if (isDbUnavailable(error)) {
+        res.status(503).json({ error: "Identity service unavailable" });
+        return;
+      }
+      next(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  router.post("/api/audit/session", (req: Request, res: Response, next: NextFunction) => {
     const { token } = req.body ?? {};
-    if (typeof token !== "string" || !constantTimeEqual(token, apiKey)) {
+    if (typeof token !== "string" || token.length === 0) {
       res.status(401).json({ error: "Invalid access token" });
       return;
     }
 
+    let identity: SessionIdentity;
+    try {
+      const result = identityService.authenticateApiKey(token);
+      if (!result) {
+        res.status(401).json({ error: "Invalid access token" });
+        return;
+      }
+      identity = result;
+    } catch (error) {
+      if (isDbUnavailable(error)) {
+        res.status(503).json({ error: "Identity service unavailable" });
+        return;
+      }
+      next(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+
+    if (!identityMatches(identity, servedWorkspaceId)) {
+      res.status(403).json({ error: "Forbidden: workspace not owned" });
+      return;
+    }
+
     const sessionId = crypto.randomBytes(32).toString("hex");
-    const expiresAt = Date.now() + 12 * 60 * 60 * 1000;
-    sessions.set(sessionId, { expiresAt });
+    const expiresAt = Date.now() + SESSION_TTL_MS;
+    sessions.set(sessionId, {
+      user_id: identity.user_id,
+      api_key_id: identity.api_key_id,
+      workspace_id: identity.workspace_id,
+      expiresAt,
+    });
 
     if (sessions.size > 1000) {
       const now = Date.now();
@@ -398,24 +475,13 @@ export function createAuditRouter(options: {
     }
 
     const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-    const cookieParts = [
-      `ceo_audit_session=${encodeURIComponent(sessionId)}`,
-      "Path=/",
-      "HttpOnly",
-      "SameSite=Strict",
-      `Max-Age=${12 * 60 * 60}`,
-    ];
-    if (isSecure) {
-      cookieParts.push("Secure");
-    }
-
-    res.setHeader("Set-Cookie", cookieParts.join("; "));
+    setAuditCookie(res, sessionId, SESSION_TTL_MS / 1000, isSecure);
     res.status(200).json({ ok: true });
   });
 
   router.get("/api/audit/session", (req: Request, res: Response) => {
     const sessionId = getSessionCookie(req);
-    res.status(200).json({ authenticated: isSessionValid(sessionId) });
+    res.status(200).json({ authenticated: Boolean(sessionIdentity(sessionId)) });
   });
 
   router.delete("/api/audit/session", (req: Request, res: Response) => {
@@ -424,17 +490,7 @@ export function createAuditRouter(options: {
       sessions.delete(sessionId);
     }
     const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-    const cookieParts = [
-      "ceo_audit_session=",
-      "Path=/",
-      "HttpOnly",
-      "SameSite=Strict",
-      "Max-Age=0",
-    ];
-    if (isSecure) {
-      cookieParts.push("Secure");
-    }
-    res.setHeader("Set-Cookie", cookieParts.join("; "));
+    setAuditCookie(res, "", 0, isSecure);
     res.status(200).json({ ok: true });
   });
 

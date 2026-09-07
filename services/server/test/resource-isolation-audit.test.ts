@@ -264,7 +264,7 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     const auditStore = new AuditStore(item.config.auditDbPath);
     closeables.push(auditStore);
 
-    const server = createMcpServer(workspace, policy, auditStore);
+    const server = createMcpServer(workspace, policy, { auditStore });
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     closeables.push(client, server);

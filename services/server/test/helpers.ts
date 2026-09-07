@@ -1,8 +1,15 @@
+import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
-import path from "node:path";
 import type { Config } from "../src/config.js";
+import { provisionEmptyIdentityDatabase, sha256Hex } from "../src/identity/store.js";
+import { IdentityService } from "../src/identity/service.js";
+
+export interface SeededIdentity {
+  user_id: string;
+  workspace_id: string;
+}
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
@@ -53,11 +60,35 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
     gitAuthorEmail: "ceo-test@example.com",
     gitCommitterName: "CEO State MCP Committer",
     gitCommitterEmail: "ceo-committer@example.com",
-    mcpApiKey: undefined,
+    mcpApiKey: "test-mcp-api-key",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: path.join(dataRoot, "audit", "ceo-trace.sqlite"),
+    identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
   };
   return { root, remote, config };
 }
+
+/**
+ * Provisions a brand-new identity database for a config (first-time setup).
+ * If an API key is given it overrides config.mcpApiKey for the digest.
+ * Records the seeded (stable, single-user) ids.
+ */
+export function seedIdentity(config: Config, apiKey = config.mcpApiKey): SeededIdentity {
+  return provisionEmptyIdentityDatabase(config.identityDbPath, {
+    remoteUrl: config.remoteUrl,
+    branch: config.branch,
+    apiKeyDigest: sha256Hex(apiKey),
+  });
+}
+
+/** Seeds an identity DB and opens a runtime IdentityService for it. */
+export function createIdentityService(config: Config, apiKey = config.mcpApiKey): IdentityService {
+  seedIdentity(config, apiKey);
+  return IdentityService.open(
+    { remoteUrl: config.remoteUrl, branch: config.branch, envApiKey: apiKey },
+    config.identityDbPath,
+  );
+}
+
