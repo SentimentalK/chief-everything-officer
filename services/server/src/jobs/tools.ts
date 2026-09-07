@@ -109,7 +109,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
       } catch (error) {
         const info = errInfo(error);
         logTrace(ctx, "worker_submit", "error", Date.now() - started, { request_id: reqId, error_code: info.code });
-        return result({ ok: false, code: info.code, message: info.message }, true);
+        return result({ ok: false, code: info.code, message: info.message, ...(info.reason ? { reason: info.reason } : {}) }, true);
       }
     }) as unknown as any,
   );
@@ -139,18 +139,23 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
       } catch (error) {
         const info = errInfo(error);
         logTrace(ctx, "worker_get", "error", Date.now() - started, { error_code: info.code });
-        return result({ ok: false, code: info.code, message: info.message }, true);
+        return result({ ok: false, code: info.code, message: info.message, ...(info.reason ? { reason: info.reason } : {}) }, true);
       }
     }) as unknown as any,
   );
 }
 
-function errInfo(error: unknown): { code: string; message: string } {
+function errInfo(error: unknown): { code: string; message: string; reason?: string } {
   if (error && typeof error === "object") {
-    const e = error as { code?: unknown; message?: unknown };
+    const e = error as { code?: unknown; message?: unknown; details?: unknown };
     const code = typeof e.code === "string" && e.code ? e.code : "QUEUE_UNAVAILABLE";
     const message = typeof e.message === "string" ? e.message : String(error);
-    return { code, message };
+    let reason: string | undefined;
+    if (e.details && typeof e.details === "object") {
+      const r = (e.details as { reason?: unknown }).reason;
+      if (typeof r === "string" && r) reason = r;
+    }
+    return { code, message, reason };
   }
   return { code: "QUEUE_UNAVAILABLE", message: String(error) };
 }

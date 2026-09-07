@@ -130,7 +130,7 @@ export class JobService {
       case "replay":
         return { ok: true, view: toView(existing.rec, true, (this.deps.nowMs ?? Date.now)()) };
       case "incomplete":
-        throw new JobError("INCOMPLETE_SUBMISSION", "Queue received an incomplete prior submission.", {
+        throw new JobError("QUEUE_UNAVAILABLE", "Queue received an incomplete prior submission.", {
           job_id: existing.jobId,
           reason: "INCOMPLETE_SUBMISSION",
         });
@@ -185,7 +185,7 @@ export class JobService {
       throw new JobError("IDEMPOTENCY_CONFLICT", "Request ID reused with different content.");
     }
     if (decision === "INCOMPLETE") {
-      throw new JobError("INCOMPLETE_SUBMISSION", "Queue received an incomplete prior submission.", {
+      throw new JobError("QUEUE_UNAVAILABLE", "Queue received an incomplete prior submission.", {
         job_id: jobId,
         reason: "INCOMPLETE_SUBMISSION",
       });
@@ -225,13 +225,13 @@ export class JobService {
     }
     // Own identity but the record is still preparing -> incomplete submission.
     if (rec.status !== "queued") {
-      throw new JobError("INCOMPLETE_SUBMISSION", "This job record is incomplete and not yet queued.", {
+      throw new JobError("QUEUE_UNAVAILABLE", "This job record is incomplete and not yet queued.", {
         job_id: request.job_id,
         reason: "INCOMPLETE_SUBMISSION",
       });
     }
     if (!rec.stream_entry_id) {
-      throw new JobError("INCOMPLETE_SUBMISSION", "This job record is incomplete and not yet queued.", {
+      throw new JobError("QUEUE_UNAVAILABLE", "This job record is incomplete and not yet queued.", {
         job_id: request.job_id,
         reason: "INCOMPLETE_SUBMISSION",
       });
@@ -251,6 +251,15 @@ export class JobService {
     const ph = await this.deps.store.getPlaceholder(scope, input.request_id);
     if (!ph) return { kind: "none" };
     const rec = await this.deps.store.getJob(ph.job_id);
+    if (rec && (rec.user_id !== scope.user_id || rec.workspace_id !== scope.workspace_id)) {
+      // The request placeholder under this scope references a job that is NOT
+      // owned by this identity - corrupt/mismatched association. Never replay
+      // or leak another identity's record.
+      throw new JobError("QUEUE_UNAVAILABLE", "Queue bound job to an unexpected identity.", {
+        job_id: ph.job_id,
+        reason: "INCOMPLETE_SUBMISSION",
+      });
+    }
     const digest = businessDigest({
       workspace_ref: input.workspace_ref,
       prompt: input.prompt,

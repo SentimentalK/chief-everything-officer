@@ -34,6 +34,8 @@ export function openJobBridge(
       ready: () => false,
       get: async () => null,
       set: async () => void 0,
+      xlen: async () => 0,
+      flush: async () => void 0,
       xaddStream: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
       scriptLoad: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
       evalsha: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },

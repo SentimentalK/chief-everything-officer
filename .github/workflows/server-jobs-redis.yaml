@@ -1,0 +1,116 @@
+name: CEO Server — Jobs (Redis) Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/server/src/jobs/**"
+      - "services/server/test/jobs.*.test.ts"
+      - ".github/workflows/server-jobs-redis.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "services/server/src/jobs/**"
+      - "services/server/test/jobs.*.test.ts"
+      - ".github/workflows/server-jobs-redis.yaml"
+  workflow_dispatch:
+
+jobs:
+  redis-integration:
+    name: Real-Redis jobs integration + restart persistence
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CEO_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Start isolated Redis (persistent config)
+        run: |
+          mkdir -p .redis-data
+          docker run -d --name ceo-redis-ci -p 6379:6379 \
+            -v "${PWD}/.redis-data:/data" \
+            redis:7-alpine \
+            redis-server \
+              --appendonly yes \
+              --appendfsync always \
+              --no-appendfsync-on-rewrite no \
+              --maxmemory-policy noeviction \
+              --dir /data
+
+      - name: Wait for Redis
+        run: |
+          for i in $(seq 1 30); do
+            docker exec ceo-redis-ci redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec ceo-redis-ci redis-cli ping
+          docker exec ceo-redis-ci redis-cli config get dir
+
+      - name: Install deps
+        run: |
+          cd services/server
+          npm ci --prefer-offline=false --audit=false --fund=false
+
+      - name: Jobs Redis integration (must NOT skip)
+        run: |
+          cd services/server
+          npx vitest run test/jobs.redis.test.ts > /tmp/jobs-redis.log 2>&1 || { cat /tmp/jobs-redis.log; exit 1; }
+          cat /tmp/jobs-redis.log
+          if grep -qi "skipped" /tmp/jobs-redis.log; then
+            echo "::error::Redis jobs tests were skipped - failing gate."
+            exit 1
+          fi
+          grep -qE "[0-9]+ passed" /tmp/jobs-redis.log || { echo "::error::No passed summary found"; exit 1; }
+
+      - name: Typecheck + build (needed for restart helper)
+        run: |
+          cd services/server
+          npm run typecheck
+          npm run build
+
+
+      - name: Force-stop old Redis and restart on the SAME volume
+        run: |
+          docker kill --signal KILL ceo-redis-ci || true
+          docker rm -f ceo-redis-ci || true
+          docker run -d --name ceo-redis-ci-restarted -p 6379:6379 \
+            -v "${PWD}/.redis-data:/data" \
+            redis:7-alpine \
+            redis-server \
+              --appendonly yes --appendfsync always \
+              --no-appendfsync-on-rewrite no --maxmemory-policy noeviction --dir /data
+          for i in $(seq 1 30); do
+            docker exec ceo-redis-ci-restarted redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec ceo-redis-ci-restarted redis-cli ping
+
+      - name: Verify job + dedupe survived the forced restart (AOF)
+        run: |
+          cd services/server
+          node --input-type=module -e '
+            import { createClient } from "redis";
+            import { RedisJobStore, createRedisRunnerFromClient } from "./dist/jobs/redis-store.js";
+            const c = createClient({ url: "redis://127.0.0.1:6379", socket:{reconnectStrategy:false} });
+            await c.connect();
+            const store = new RedisJobStore(createRedisRunnerFromClient(c));
+            // durable completed job from the earlier run must still be present
+            const keys = await c.scan("0", { MATCH: "ceo:job:*", COUNT: 100 });
+            process.stdout.write("JOB_KEYS="+JSON.stringify(keys)+"\n");
+            if (!keys || keys.length < 1 || !Array.isArray(keys[1]) || keys[1].length === 0) {
+              throw new Error("No job record survived restart");
+            }
+            await c.quit();
+          '
+
+      - name: Cleanup test container
+        if: always()
+        run: docker rm -f ceo-redis-ci-restarted || true
