@@ -15,6 +15,31 @@ impl AgyHeadlessAdapter {
         Self { executable }
     }
 
+    pub fn build_command_args(&self, request: &ExecutionRequest) -> Vec<String> {
+        let mut args = vec![
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--mode".to_string(),
+            "accept-edits".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--sandbox".to_string(),
+            "--log-file".to_string(),
+            request
+                .attempt_dir
+                .join("agy.log")
+                .to_string_lossy()
+                .to_string(),
+        ];
+
+        let model = request.model.unwrap_or("gemini-3.8-flash-medium");
+        args.push("--model".to_string());
+        args.push(model.to_string());
+
+        args
+    }
+
     fn resolve_binary(&self) -> Option<PathBuf> {
         if self.executable.is_absolute() && self.executable.exists() {
             return Some(self.executable.clone());
@@ -105,14 +130,10 @@ impl ExecutorAdapter for AgyHeadlessAdapter {
         })?;
 
         let mut cmd = Command::new(&binary_path);
-        cmd.arg("--input-format")
-            .arg("stream-json")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--mode")
-            .arg("accept-edits")
-            .arg("--sandbox")
-            .current_dir(request.workspace_dir)
+        for arg in self.build_command_args(request) {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(request.workspace_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -121,12 +142,6 @@ impl ExecutorAdapter for AgyHeadlessAdapter {
         let ceo_tmp = request.workspace_dir.join(".ceo").join("tmp");
         std::fs::create_dir_all(&ceo_tmp)?;
         cmd.env("TMPDIR", &ceo_tmp);
-        cmd.arg("--log-file")
-            .arg(request.attempt_dir.join("agy.log"));
-
-        if let Some(model) = request.model {
-            cmd.arg("--model").arg(model);
-        }
 
         #[cfg(target_os = "linux")]
         unsafe {

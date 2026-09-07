@@ -255,7 +255,7 @@ Complete these actions and output your final summary including MARKER: <marker>.
             name: "execution_environment_isolation".to_string(),
             passed: env_ok,
             message: if env_ok {
-                "Execution environment isolation verified".to_string()
+                "Execution environment sandbox active (bubblewrap mounts and workspace boundaries verified; residual risk: unisolated user-level paths may exist depending on local sandbox configuration)".to_string()
             } else {
                 "Execution environment failed isolation check".to_string()
             },

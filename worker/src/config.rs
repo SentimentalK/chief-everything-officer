@@ -149,8 +149,8 @@ impl Default for WorkerConfig {
             workspace_dir: default_workspace,
             executor_type: ExecutorType::AgyHeadless,
             agent_executable: default_agent,
-            agent_model: None,
-            doctor_timeout_secs: 30,
+            agent_model: Some("gemini-3.8-flash-medium".to_string()),
+            doctor_timeout_secs: 90,
             task_timeout_secs: 300,
             teardown_wait_secs: 5,
         }

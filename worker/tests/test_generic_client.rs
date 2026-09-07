@@ -252,3 +252,43 @@ async fn test_7_multi_turn_e2e() {
     assert!(events_content.contains("\"stage\":\"task\""));
     assert!(events_content.contains("\"event\":\"receipt_finalized\""));
 }
+
+#[test]
+fn test_8_agy_headless_unattended_command_line_flags() {
+    let adapter = ceo_worker::executor::AgyHeadlessAdapter::new(PathBuf::from("agy"));
+    let ws = PathBuf::from("/tmp/test_ws");
+    let attempt_dir = PathBuf::from("/tmp/test_ws/.ceo/attempts/att-1");
+    let prompt_file = PathBuf::from("/tmp/test_ws/prompt.md");
+
+    // Case 1: Default execution request with no model override
+    let req_default = ceo_worker::executor::ExecutionRequest {
+        job_id: "job-1",
+        attempt_id: "att-1",
+        workspace_dir: &ws,
+        attempt_dir: &attempt_dir,
+        prompt_file: &prompt_file,
+        model: None,
+    };
+    let args_default = adapter.build_command_args(&req_default);
+    assert!(args_default.contains(&"--input-format".to_string()));
+    assert!(args_default.contains(&"--output-format".to_string()));
+    assert!(args_default.contains(&"stream-json".to_string()));
+    assert!(args_default.contains(&"--mode".to_string()));
+    assert!(args_default.contains(&"accept-edits".to_string()));
+    assert!(args_default.contains(&"--dangerously-skip-permissions".to_string()));
+    assert!(args_default.contains(&"--sandbox".to_string()));
+    assert!(args_default.contains(&"--model".to_string()));
+    assert!(args_default.contains(&"gemini-3.8-flash-medium".to_string()));
+
+    // Case 2: Explicit model override
+    let req_override = ceo_worker::executor::ExecutionRequest {
+        job_id: "job-1",
+        attempt_id: "att-1",
+        workspace_dir: &ws,
+        attempt_dir: &attempt_dir,
+        prompt_file: &prompt_file,
+        model: Some("gemini-1.5-pro"),
+    };
+    let args_override = adapter.build_command_args(&req_override);
+    assert!(args_override.contains(&"gemini-1.5-pro".to_string()));
+}
