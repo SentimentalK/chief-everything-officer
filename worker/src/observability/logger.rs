@@ -273,10 +273,9 @@ impl StreamEventDispatcher {
                                 {
                                     let state =
                                         step.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                                    self.stdout_logger.log_line_with_source(
-                                        LogSource::Launcher,
-                                        &format!("[tool:{}] {}", tool, state),
-                                    );
+                                    let formatted = format_tool_event(step, tool, state);
+                                    self.stdout_logger
+                                        .log_line_with_source(LogSource::Launcher, &formatted);
                                 }
                             }
                         }
@@ -303,6 +302,135 @@ impl StreamEventDispatcher {
                 // Non-JSON line from stdout
                 self.stdout_logger.log_line(trimmed);
             }
+        }
+    }
+}
+
+pub fn format_tool_event(step: &serde_json::Value, tool: &str, state: &str) -> String {
+    let duration_str = step
+        .get("duration_seconds")
+        .and_then(|v| v.as_f64())
+        .map(|d| format!(" ({:.2}s)", d))
+        .unwrap_or_default();
+
+    match state {
+        "ACTIVE" => {
+            let param_summary = extract_tool_param_summary(step, tool);
+            if !param_summary.is_empty() {
+                format!("[tool:{}] ACTIVE {}", tool, param_summary)
+            } else {
+                format!("[tool:{}] ACTIVE", tool)
+            }
+        }
+        "DONE" => {
+            format!("[tool:{}] DONE{}", tool, duration_str)
+        }
+        "ERROR" => {
+            let error_msg = step
+                .get("tool_info")
+                .and_then(|ti| ti.get("error"))
+                .and_then(|e| e.get("message").or_else(|| e.get("error")))
+                .and_then(|m| m.as_str())
+                .or_else(|| step.get("error").and_then(|e| e.as_str()))
+                .unwrap_or("");
+
+            if !error_msg.is_empty() {
+                let clean_err: String = error_msg
+                    .lines()
+                    .next()
+                    .unwrap_or(error_msg)
+                    .chars()
+                    .take(120)
+                    .collect();
+                format!("[tool:{}] ERROR: {}{}", tool, clean_err, duration_str)
+            } else {
+                format!("[tool:{}] ERROR{}", tool, duration_str)
+            }
+        }
+        other => {
+            if !other.is_empty() {
+                format!("[tool:{}] {}{}", tool, other, duration_str)
+            } else {
+                format!("[tool:{}]", tool)
+            }
+        }
+    }
+}
+
+pub fn extract_tool_param_summary(step: &serde_json::Value, tool: &str) -> String {
+    let params = step
+        .get("tool_info")
+        .and_then(|ti| ti.get("parameters"))
+        .or_else(|| step.get("tool_args"));
+
+    let Some(params) = params else {
+        return String::new();
+    };
+
+    match tool {
+        "run_command" => {
+            if let Some(cmd) = params.get("CommandLine").and_then(|v| v.as_str()) {
+                let flattened = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+                let truncated: String = if flattened.chars().count() > 100 {
+                    format!("{}...", flattened.chars().take(97).collect::<String>())
+                } else {
+                    flattened
+                };
+                format!("$ {}", truncated)
+            } else {
+                String::new()
+            }
+        }
+        "write_to_file" => params
+            .get("TargetFile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "view_file" => params
+            .get("AbsolutePath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "list_dir" => params
+            .get("DirectoryPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "grep_search" => {
+            let query = params.get("Query").and_then(|v| v.as_str()).unwrap_or("");
+            let path = params
+                .get("SearchPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !query.is_empty() && !path.is_empty() {
+                format!("\"{}\" in {}", query, path)
+            } else if !query.is_empty() {
+                format!("\"{}\"", query)
+            } else {
+                path.to_string()
+            }
+        }
+        "find_by_name" => {
+            let pattern = params.get("Pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let dir = params
+                .get("SearchDirectory")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !pattern.is_empty() && !dir.is_empty() {
+                format!("\"{}\" in {}", pattern, dir)
+            } else if !pattern.is_empty() {
+                format!("\"{}\"", pattern)
+            } else {
+                dir.to_string()
+            }
+        }
+        _ => {
+            for key in &["path", "file", "url", "Url", "target", "query"] {
+                if let Some(val) = params.get(*key).and_then(|v| v.as_str()) {
+                    return val.to_string();
+                }
+            }
+            String::new()
         }
     }
 }

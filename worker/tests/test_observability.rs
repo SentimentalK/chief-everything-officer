@@ -62,3 +62,67 @@ fn test_status_tracker_crash_detection() {
         .unwrap()
         .contains("terminated unexpectedly"));
 }
+
+#[test]
+fn test_tool_event_formatting() {
+    use ceo_worker::observability::logger::format_tool_event;
+    use serde_json::json;
+
+    // 1. run_command ACTIVE
+    let step_active_cmd = json!({
+        "tool_name": "run_command",
+        "state": "ACTIVE",
+        "tool_info": {
+            "parameters": {
+                "CommandLine": "which pdfunite   pdfinfo\npython3"
+            }
+        }
+    });
+    let line1 = format_tool_event(&step_active_cmd, "run_command", "ACTIVE");
+    assert_eq!(
+        line1,
+        "[tool:run_command] ACTIVE $ which pdfunite pdfinfo python3"
+    );
+
+    // 2. write_to_file ACTIVE
+    let step_active_file = json!({
+        "tool_name": "write_to_file",
+        "state": "ACTIVE",
+        "tool_info": {
+            "parameters": {
+                "TargetFile": "/tmp/my_ws/merge_pdfs.py"
+            }
+        }
+    });
+    let line2 = format_tool_event(&step_active_file, "write_to_file", "ACTIVE");
+    assert_eq!(
+        line2,
+        "[tool:write_to_file] ACTIVE /tmp/my_ws/merge_pdfs.py"
+    );
+
+    // 3. DONE with duration
+    let step_done = json!({
+        "tool_name": "run_command",
+        "state": "DONE",
+        "duration_seconds": 0.0714
+    });
+    let line3 = format_tool_event(&step_done, "run_command", "DONE");
+    assert_eq!(line3, "[tool:run_command] DONE (0.07s)");
+
+    // 4. ERROR with error message and duration
+    let step_error = json!({
+        "tool_name": "run_command",
+        "state": "ERROR",
+        "duration_seconds": 0.0581,
+        "tool_info": {
+            "error": {
+                "message": "sandbox configuration error: readwrite /tmp/*: globs not supported"
+            }
+        }
+    });
+    let line4 = format_tool_event(&step_error, "run_command", "ERROR");
+    assert_eq!(
+        line4,
+        "[tool:run_command] ERROR: sandbox configuration error: readwrite /tmp/*: globs not supported (0.06s)"
+    );
+}
