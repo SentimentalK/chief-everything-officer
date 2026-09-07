@@ -24,4 +24,4 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["url_resolver"]
+packages = ["src/url_resolver"]
