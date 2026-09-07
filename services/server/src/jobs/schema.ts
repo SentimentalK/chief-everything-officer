@@ -10,6 +10,12 @@ export const WORKSPACE_REF_MAX = 64;
 export const CLAIM_TTL_DAYS = 7;
 export const CLAIM_TTL_MS = CLAIM_TTL_DAYS * 24 * 60 * 60 * 1000;
 
+// Server-decided execution lease parameters. Clients cannot override them; the
+// Lua lease script receives them as fixed ARGV values, never from HTTP input.
+export const LEASE_DURATION_MS = 90_000;
+export const START_WINDOW_MS = 300_000;
+export const HEARTBEAT_INTERVAL_MS = 20_000;
+
 export const KEY_STREAM = "ceo:jobs";
 export const JOB_PREFIX = "ceo:job:";
 
@@ -24,6 +30,10 @@ export const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 export const WORKSPACE_REF_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export const JOB_ID_RE = /^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const RESOURCE_ID_RE = /^res-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const WORKER_ID_RE =
+  /^wrk-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const ATTEMPT_ID_RE = REQUEST_ID_RE;
+export const LEASE_TOKEN_RE = /^[0-9a-f]{64}$/;
 
 export function isWhitespaceOnly(s: string): boolean {
   return s.trim().length === 0;
@@ -48,6 +58,33 @@ export interface JobRequest {
 
 export type JobRecordStatus = "queued";
 
+/**
+ * Derived execution/claim state surfaced to consumers. `interrupted` means the
+ * server can no longer confirm the current attempt holds execution eligibility;
+ * it does NOT confirm a remote process stopped nor that the task succeeded.
+ */
+export type JobState = "queued" | "expired" | "claimed" | "running" | "interrupted";
+
+/**
+ * Server-side execution lease for a single task attempt. Persisted inside the
+ * Job record (not a separate key). `lease_token_sha256` is the ONLY token form
+ * stored in Redis; the raw token never reaches Redis, logs, or public output.
+ */
+export interface JobExecution {
+  worker_id: string;
+  attempt_id: string;
+  lease_token_sha256: string;
+
+  phase: "claimed" | "running";
+
+  claimed_at_ms: number;
+  start_deadline_ms: number;
+  lease_expires_at_ms: number;
+
+  started_at_ms: number | null;
+  execution_deadline_ms: number | null;
+}
+
 export interface PersistedJobRecord {
   schema_version: number;
   job_id: string;
@@ -68,7 +105,35 @@ export interface PersistedJobRecord {
   stream_entry_id: string | null;
   created_at_ms: number;
   claim_deadline_ms: number;
+  /** Present once an attempt has been claimed. Missing/null = not yet claimed. */
+  execution?: JobExecution;
 }
+
+/** Reason codes for state derivation and corruption diagnosis. */
+export type JobLeaseReason =
+  | "CORRUPT_RECORD"
+  | "INCOMPLETE_SUBMISSION"
+  | "START_DEADLINE_EXCEEDED"
+  | "EXECUTION_DEADLINE_EXCEEDED"
+  | "LEASE_EXPIRED";
+
+/** Structured result returned by the shared lease Lua (one op = one result). */
+export type LeaseScriptResult =
+  | {
+      ok: true;
+      record: PersistedJobRecord;
+      server_time_ms: number;
+      state: JobState;
+      reason: string | null;
+      replayed: boolean;
+    }
+  | {
+      ok: false;
+      code: string;
+      reason: string | null;
+    };
+
+export type LeaseOperation = "inspect" | "claim" | "start" | "heartbeat";
 
 export interface RequestPlaceholder {
   job_id: string;
@@ -122,6 +187,24 @@ export const workerGetSchema = z.object({
   job_id: z.string().regex(JOB_ID_RE, "job_id must be a job-<uuid>").describe("Canonical job identifier (job-<uuid>)."),
 }).strict();
 
+/**
+ * Claim payload. Identity ownership is taken ONLY from the authenticated scope
+ * (middleware), never from the body. The lease_token is client-generated so a
+ * lost claim response can be safely retried with the original token.
+ */
+export const workerClaimSchema = z.object({
+  worker_id: z.string().regex(WORKER_ID_RE, "worker_id must be a wrk-<uuid>"),
+  attempt_id: z.string().regex(ATTEMPT_ID_RE, "attempt_id must be a UUID"),
+  workspace_ref: z.string().regex(WORKSPACE_REF_RE, "workspace_ref must be 1-64 [A-Za-z0-9_-]"),
+  lease_token: z.string().regex(LEASE_TOKEN_RE, "lease_token must be 64 lowercase hex chars"),
+}).strict();
+
+export const workerLeaseOperationSchema = z.object({
+  worker_id: z.string().regex(WORKER_ID_RE, "worker_id must be a wrk-<uuid>"),
+  attempt_id: z.string().regex(ATTEMPT_ID_RE, "attempt_id must be a UUID"),
+  lease_token: z.string().regex(LEASE_TOKEN_RE, "lease_token must be 64 lowercase hex chars"),
+}).strict();
+
 export function parseSubmit(raw: unknown): ParseOutcome<NormalizedSubmit> {
   const parsed = workerSubmitSchema.safeParse(raw);
   if (!parsed.success) {
@@ -151,4 +234,53 @@ export function parseJobGet(raw: unknown): ParseOutcome<JobRequest> {
     return { ok: false, issue, reason: "INVALID_INPUT" };
   }
   return { ok: true, value: { job_id: parsed.data.job_id } };
+}
+
+export interface NormalizedClaim {
+  worker_id: string;
+  attempt_id: string;
+  workspace_ref: string;
+  lease_token: string;
+}
+
+export interface NormalizedLeaseOperation {
+  worker_id: string;
+  attempt_id: string;
+  lease_token: string;
+}
+
+function issueOf(parsed: { success: false; error: z.ZodError<unknown> }): string {
+  const first = parsed.error.issues[0];
+  return first ? first.message : "validation failed";
+}
+
+export function parseClaim(raw: unknown): ParseOutcome<NormalizedClaim> {
+  const parsed = workerClaimSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { ok: false, issue: issueOf(parsed), reason: "INVALID_INPUT" };
+  }
+  return {
+    ok: true,
+    value: {
+      worker_id: parsed.data.worker_id,
+      attempt_id: parsed.data.attempt_id,
+      workspace_ref: parsed.data.workspace_ref,
+      lease_token: parsed.data.lease_token,
+    },
+  };
+}
+
+export function parseLeaseOperation(raw: unknown): ParseOutcome<NormalizedLeaseOperation> {
+  const parsed = workerLeaseOperationSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { ok: false, issue: issueOf(parsed), reason: "INVALID_INPUT" };
+  }
+  return {
+    ok: true,
+    value: {
+      worker_id: parsed.data.worker_id,
+      attempt_id: parsed.data.attempt_id,
+      lease_token: parsed.data.lease_token,
+    },
+  };
 }

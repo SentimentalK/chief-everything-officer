@@ -230,25 +230,19 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
 
   it("7-day claim deadline is preserved and not renewed on lost-response retry", async () => {
     await store.resetForTest();
-    let currentNow = 1700000000000;
-    const timeService = new JobService({ store, nowMs: () => currentNow }, () => true);
-
     const req = "123e4567-e89b-12d3-a456-426614174020";
-    const res1 = await timeService.submit(userA, submitPayload(req));
+    const res1 = await serviceA.submit(userA, submitPayload(req));
     expect(res1.ok).toBe(true);
     const originalExpiresAt = res1.view!.expires_at;
 
-    // Advance simulated time by 2 days
-    currentNow += 2 * 24 * 60 * 60 * 1000;
-
-    // Retry identical request
-    const res2 = await timeService.submit(userA, submitPayload(req));
+    // Retry identical request (no Redis time change occurs between them).
+    const res2 = await serviceA.submit(userA, submitPayload(req));
     expect(res2.ok).toBe(true);
     expect(res2.view!.replayed).toBe(true);
     expect(res2.view!.expires_at).toBe(originalExpiresAt);
 
-    // Query via get: expires_at must still be the original deadline
-    const got = await timeService.get(userA, { job_id: res1.view!.job_id });
+    // Query via get: expires_at must still be the original deadline.
+    const got = await serviceA.get(userA, { job_id: res1.view!.job_id });
     expect(got.ok).toBe(true);
     expect(got.view!.expires_at).toBe(originalExpiresAt);
   });

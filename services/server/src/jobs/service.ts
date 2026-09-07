@@ -1,14 +1,20 @@
+import { createHash } from "node:crypto";
 import {
   businessDigest,
   makeJobId,
   utcIsoFromMs,
   parseSubmit,
   parseJobGet,
+  parseClaim,
+  parseLeaseOperation,
   CLAIM_TTL_MS,
   JOBS_SCHEMA_VERSION,
   type NormalizedSubmit,
   type JobRequest,
   type PersistedJobRecord,
+  type JobExecution,
+  type JobState,
+  type LeaseScriptResult,
 } from "./schema.js";
 import { RedisJobStore } from "./redis-store.js";
 
@@ -25,7 +31,13 @@ export type JobErrorCode =
   | "IDEMPOTENCY_CONFLICT"
   | "JOB_NOT_FOUND"
   | "RESOURCE_NOT_FOUND"
-  | "INCOMPLETE_SUBMISSION";
+  | "INCOMPLETE_SUBMISSION"
+  | "JOB_EXPIRED"
+  | "JOB_ALREADY_CLAIMED"
+  | "JOB_NOT_CLAIMED"
+  | "LEASE_MISMATCH"
+  | "LEASE_EXPIRED"
+  | "WORKSPACE_MISMATCH";
 
 export class JobError extends Error {
   constructor(
@@ -38,7 +50,17 @@ export class JobError extends Error {
   }
 }
 
-export type JobState = "queued" | "expired";
+/** Get output execution sub-object (worker_get). No phase; reason on interrupt. */
+export interface ExecutionGetView {
+  worker_id: string;
+  attempt_id: string;
+  claimed_at: string;
+  start_deadline: string;
+  started_at: string | null;
+  lease_expires_at: string;
+  execution_deadline: string | null;
+  reason: string | null;
+}
 
 export interface JobView {
   ok: true;
@@ -49,6 +71,7 @@ export interface JobView {
   workspace_ref: string;
   resource_id: string | null;
   replayed: boolean;
+  execution: ExecutionGetView | null;
 }
 
 export interface SubmitResult {
@@ -59,33 +82,124 @@ export interface SubmitResult {
   details?: Record<string, unknown>;
 }
 
+/** Lease HTTP execution sub-object (claim/start/heartbeat). Includes phase. */
+export interface ExecutionLeaseView {
+  worker_id: string;
+  attempt_id: string;
+  phase: "claimed" | "running";
+  claimed_at: string;
+  start_deadline: string;
+  started_at: string | null;
+  lease_expires_at: string;
+  execution_deadline: string | null;
+}
+
+export interface ClaimJobInfo {
+  job_id: string;
+  workspace_ref: string;
+  resource_id: string | null;
+  prompt: string;
+  acceptance: string;
+  timeout_seconds: number;
+}
+
+export type LeaseResult =
+  | { ok: true; replayed: boolean; server_time: string; execution: ExecutionLeaseView; job?: ClaimJobInfo }
+  | { ok: false; code?: JobErrorCode; message?: string; reason?: string | null };
+
 export interface JobServiceDeps {
   store: RedisJobStore;
   /** Existence check for a resource_id within the calling workspace (only for NEW tasks). */
   resourceExists?: (scope: JobAuthScope, resourceId: string) => Promise<boolean>;
-  nowMs?: () => number;
 }
 
-function effectiveState(rec: PersistedJobRecord, now: number): JobState {
-  // Deadline is a CLAIM deadline, not a delete TTL. Records/dedupe are retained.
-  if (rec.status !== "queued" || !rec.stream_entry_id) {
-    // Incomplete submissions are never surfaced as jobs; handled by caller.
-    throw new JobError("JOB_NOT_FOUND", "Unknown job.");
-  }
-  return now >= rec.claim_deadline_ms ? "expired" : "queued";
+function iso(ms: number): string {
+  return utcIsoFromMs(ms);
 }
 
-function toView(rec: PersistedJobRecord, replayed: boolean, now: number): JobView {
+function executionGetView(rec: PersistedJobRecord, reason: string | null): ExecutionGetView | null {
+  const ex = rec.execution;
+  if (!ex) return null;
+  return {
+    worker_id: ex.worker_id,
+    attempt_id: ex.attempt_id,
+    claimed_at: iso(ex.claimed_at_ms),
+    start_deadline: iso(ex.start_deadline_ms),
+    started_at: ex.started_at_ms == null ? null : iso(ex.started_at_ms),
+    lease_expires_at: iso(ex.lease_expires_at_ms),
+    execution_deadline: ex.execution_deadline_ms == null ? null : iso(ex.execution_deadline_ms),
+    reason,
+  };
+}
+
+function executionLeaseView(ex: JobExecution): ExecutionLeaseView {
+  return {
+    worker_id: ex.worker_id,
+    attempt_id: ex.attempt_id,
+    phase: ex.phase,
+    claimed_at: iso(ex.claimed_at_ms),
+    start_deadline: iso(ex.start_deadline_ms),
+    started_at: ex.started_at_ms == null ? null : iso(ex.started_at_ms),
+    lease_expires_at: iso(ex.lease_expires_at_ms),
+    execution_deadline: ex.execution_deadline_ms == null ? null : iso(ex.execution_deadline_ms),
+  };
+}
+
+function viewFromLease(res: Extract<LeaseScriptResult, { ok: true }>, replayed: boolean): JobView {
+  const rec = res.record;
   return {
     ok: true,
     job_id: rec.job_id,
-    state: effectiveState(rec, now),
-    created_at: utcIsoFromMs(rec.created_at_ms),
-    expires_at: utcIsoFromMs(rec.claim_deadline_ms),
+    state: res.state,
+    created_at: iso(rec.created_at_ms),
+    expires_at: iso(rec.claim_deadline_ms),
     workspace_ref: rec.workspace_ref,
     resource_id: rec.resource_id,
     replayed,
+    execution: executionGetView(rec, res.state === "interrupted" ? res.reason : null),
   };
+}
+
+/** Map a Lua lease error into a JobError with an explicit, stable message. */
+function leaseToError(res: Extract<LeaseScriptResult, { ok: false }>): JobError {
+  const code = res.code as JobErrorCode;
+  const reason = res.reason;
+  switch (code) {
+    case "JOB_NOT_FOUND":
+      return new JobError("JOB_NOT_FOUND", "Job not found.");
+    case "JOB_EXPIRED":
+      return new JobError("JOB_EXPIRED", "Job is past its seven-day claim window.");
+    case "JOB_ALREADY_CLAIMED":
+      return new JobError("JOB_ALREADY_CLAIMED", "Job already claimed by another attempt.");
+    case "IDEMPOTENCY_CONFLICT":
+      return new JobError("IDEMPOTENCY_CONFLICT", "Attempt reused with different credentials.");
+    case "JOB_NOT_CLAIMED":
+      return new JobError("JOB_NOT_CLAIMED", "Job is not claimed.");
+    case "LEASE_MISMATCH":
+      return new JobError("LEASE_MISMATCH", "Execution credentials do not match.");
+    case "LEASE_EXPIRED":
+      return new JobError("LEASE_EXPIRED", "Execution lease has expired.");
+    case "WORKSPACE_MISMATCH":
+      return new JobError("WORKSPACE_MISMATCH", "Workspace does not match the job.");
+    case "QUEUE_UNAVAILABLE":
+      return new JobError("QUEUE_UNAVAILABLE", incompleteQueueMessage(reason), {
+        ...(reason ? { reason } : {}),
+      });
+    default:
+      return new JobError("QUEUE_UNAVAILABLE", incompleteQueueMessage(reason), {
+        ...(reason ? { reason } : {}),
+      });
+  }
+}
+
+function incompleteQueueMessage(reason: string | null): string {
+  if (reason === "INCOMPLETE_SUBMISSION") {
+    return "This job record is incomplete and not yet queued.";
+  }
+  if (reason === "CORRUPT_RECORD") {
+    return "Queue record is corrupt.";
+  }
+  return "Queue backend is not available.";
 }
 
 export class JobService {
@@ -110,6 +224,18 @@ export class JobService {
     }
   }
 
+  /** Single source of truth for building a JobView: always via the lease inspect. */
+  private async inspectView(scope: JobAuthScope, jobId: string, replayed: boolean): Promise<JobView> {
+    let res: LeaseScriptResult;
+    try {
+      res = await this.deps.store.inspect(scope, jobId);
+    } catch (error) {
+      throw wrapStore(error);
+    }
+    if (!res.ok) throw leaseToError(res);
+    return viewFromLease(res, replayed);
+  }
+
   async submit(scope: JobAuthScope, raw: unknown): Promise<SubmitResult> {
     this.assertSelf(scope);
     const parsed = parseSubmit(raw);
@@ -128,7 +254,7 @@ export class JobService {
       case "conflict":
         throw new JobError("IDEMPOTENCY_CONFLICT", "Request ID reused with different content.");
       case "replay":
-        return { ok: true, view: toView(existing.rec, true, (this.deps.nowMs ?? Date.now)()) };
+        return { ok: true, view: await this.inspectView(scope, existing.jobId, true) };
       case "incomplete":
         throw new JobError("QUEUE_UNAVAILABLE", "Queue received an incomplete prior submission.", {
           job_id: existing.jobId,
@@ -144,7 +270,7 @@ export class JobService {
       if (!okRes) throw new JobError("RESOURCE_NOT_FOUND", "Referenced resource not found in this workspace.");
     }
 
-    const now = (this.deps.nowMs ?? Date.now)();
+    const now = Date.now();
     const digest = businessDigest({
       workspace_ref: input.workspace_ref,
       prompt: input.prompt,
@@ -193,21 +319,22 @@ export class JobService {
 
     // NEW: we created our own job. REPLAY: a concurrent winner created theirs
     // between our placeholder-read and our atomic submit, so resolve by request.
-    let recOrNull: PersistedJobRecord | null = null;
+    let resolvedJobId: string;
     if (decision === "NEW") {
-      recOrNull = await this.deps.store.getJob(jobId);
+      resolvedJobId = jobId;
     } else {
       const phAfter = await this.deps.store.getPlaceholder(scope, input.request_id);
-      recOrNull = phAfter ? await this.deps.store.getJob(phAfter.job_id) : null;
-    }
-    if (!recOrNull) {
-      throw new JobError("QUEUE_UNAVAILABLE", "Queue backend could not confirm the written job.");
-    }
-    if (recOrNull.user_id !== scope.user_id || recOrNull.workspace_id !== scope.workspace_id) {
-      throw new JobError("QUEUE_UNAVAILABLE", "Queue bound job to an unexpected identity.");
+      resolvedJobId = phAfter ? phAfter.job_id : jobId;
     }
     const replayed = decision === "REPLAY";
-    return { ok: true, view: toView(recOrNull, replayed, (this.deps.nowMs ?? Date.now)()) };
+    try {
+      return { ok: true, view: await this.inspectView(scope, resolvedJobId, replayed) };
+    } catch (error) {
+      if (error instanceof JobError && error.code === "JOB_NOT_FOUND") {
+        throw new JobError("QUEUE_UNAVAILABLE", "Queue bound job to an unexpected identity.");
+      }
+      throw error;
+    }
   }
 
   async get(scope: JobAuthScope, raw: unknown): Promise<SubmitResult> {
@@ -217,26 +344,10 @@ export class JobService {
       return err(parsed.reason, parsed.issue);
     }
     const request: JobRequest = parsed.value;
-    // Missing, unknown, or not owned -> uniform JOB_NOT_FOUND.
-    const rec = await this.deps.store.getJob(request.job_id);
-    if (!rec) throw new JobError("JOB_NOT_FOUND", "Job not found.");
-    if (rec.user_id !== scope.user_id || rec.workspace_id !== scope.workspace_id) {
-      throw new JobError("JOB_NOT_FOUND", "Job not found.");
-    }
-    // Own identity but the record is still preparing -> incomplete submission.
-    if (rec.status !== "queued") {
-      throw new JobError("QUEUE_UNAVAILABLE", "This job record is incomplete and not yet queued.", {
-        job_id: request.job_id,
-        reason: "INCOMPLETE_SUBMISSION",
-      });
-    }
-    if (!rec.stream_entry_id) {
-      throw new JobError("QUEUE_UNAVAILABLE", "This job record is incomplete and not yet queued.", {
-        job_id: request.job_id,
-        reason: "INCOMPLETE_SUBMISSION",
-      });
-    }
-    return { ok: true, view: toView(rec, false, (this.deps.nowMs ?? Date.now)()) };
+    this.assertAvailable();
+    // Missing, unknown, or not owned -> uniform JOB_NOT_FOUND (from Lua inspect).
+    const view = await this.inspectView(scope, request.job_id, false);
+    return { ok: true, view };
   }
 
   private async readExistingFull(
@@ -244,13 +355,22 @@ export class JobService {
     input: NormalizedSubmit,
   ): Promise<
     | { kind: "conflict" }
-    | { kind: "replay"; rec: PersistedJobRecord }
+    | { kind: "replay"; jobId: string }
     | { kind: "incomplete"; jobId: string | undefined }
     | { kind: "none" }
   > {
     const ph = await this.deps.store.getPlaceholder(scope, input.request_id);
     if (!ph) return { kind: "none" };
-    const rec = await this.deps.store.getJob(ph.job_id);
+    let rec: PersistedJobRecord | null;
+    try {
+      rec = await this.deps.store.getJob(ph.job_id);
+    } catch (error) {
+      if (error instanceof JobError) throw error;
+      throw new JobError("QUEUE_UNAVAILABLE", "Queue bound job to an unexpected identity.", {
+        job_id: ph.job_id,
+        reason: "INCOMPLETE_SUBMISSION",
+      });
+    }
     if (rec && (rec.user_id !== scope.user_id || rec.workspace_id !== scope.workspace_id)) {
       // The request placeholder under this scope references a job that is NOT
       // owned by this identity - corrupt/mismatched association. Never replay
@@ -271,10 +391,123 @@ export class JobService {
     if (!rec || rec.status !== "queued" || !rec.stream_entry_id) {
       return { kind: "incomplete", jobId: ph.job_id };
     }
-    return { kind: "replay", rec };
+    return { kind: "replay", jobId: rec.job_id };
+  }
+
+  /** sha256 hex of the raw lease token (the only form stored/compared). */
+  private static hashLeaseToken(leaseToken: string): string {
+    return createHash("sha256").update(leaseToken, "utf8").digest("hex");
+  }
+
+  async claim(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
+    this.assertSelf(scope);
+    const parsed = parseClaim(raw);
+    if (!parsed.ok) {
+      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
+    }
+    const input = parsed.value;
+    this.assertAvailable();
+    let res: LeaseScriptResult;
+    try {
+      res = await this.deps.store.claimLease(scope, jobId, {
+        worker_id: input.worker_id,
+        attempt_id: input.attempt_id,
+        workspace_ref: input.workspace_ref,
+        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
+      });
+    } catch (error) {
+      throw wrapStore(error);
+    }
+    if (!res.ok) throw leaseToError(res);
+    const ex = res.record.execution;
+    if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Claim did not attach an execution record.");
+    const rec = res.record;
+    return {
+      ok: true,
+      replayed: res.replayed,
+      server_time: iso(res.server_time_ms),
+      execution: executionLeaseView(ex),
+      job: {
+        job_id: rec.job_id,
+        workspace_ref: rec.workspace_ref,
+        resource_id: rec.resource_id,
+        prompt: rec.prompt,
+        acceptance: rec.acceptance,
+        timeout_seconds: rec.execution_timeout_seconds,
+      },
+    };
+  }
+
+  async start(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
+    this.assertSelf(scope);
+    const parsed = parseLeaseOperation(raw);
+    if (!parsed.ok) {
+      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
+    }
+    const input = parsed.value;
+    this.assertAvailable();
+    let res: LeaseScriptResult;
+    try {
+      res = await this.deps.store.startLease(scope, jobId, {
+        worker_id: input.worker_id,
+        attempt_id: input.attempt_id,
+        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
+      });
+    } catch (error) {
+      throw wrapStore(error);
+    }
+    if (!res.ok) throw leaseToError(res);
+    const ex = res.record.execution;
+    if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Start did not produce an execution record.");
+    return {
+      ok: true,
+      replayed: res.replayed,
+      server_time: iso(res.server_time_ms),
+      execution: executionLeaseView(ex),
+    };
+  }
+
+  async heartbeat(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
+    this.assertSelf(scope);
+    const parsed = parseLeaseOperation(raw);
+    if (!parsed.ok) {
+      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
+    }
+    const input = parsed.value;
+    this.assertAvailable();
+    let res: LeaseScriptResult;
+    try {
+      res = await this.deps.store.heartbeatLease(scope, jobId, {
+        worker_id: input.worker_id,
+        attempt_id: input.attempt_id,
+        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
+      });
+    } catch (error) {
+      throw wrapStore(error);
+    }
+    if (!res.ok) throw leaseToError(res);
+    const ex = res.record.execution;
+    if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Heartbeat did not produce an execution record.");
+    return {
+      ok: true,
+      replayed: false,
+      server_time: iso(res.server_time_ms),
+      execution: executionLeaseView(ex),
+    };
   }
 }
 
 function err(code: string, message: string): SubmitResult {
   return { ok: false, code: code as JobErrorCode, message };
+}
+
+function leaseErr(code: JobErrorCode, message: string): LeaseResult {
+  return { ok: false, code, message };
+}
+
+function wrapStore(error: unknown): JobError {
+  if (error instanceof JobError) return error;
+  return new JobError("QUEUE_UNAVAILABLE", "Queue backend is not available.", {
+    error: error instanceof Error ? error.message : String(error),
+  });
 }

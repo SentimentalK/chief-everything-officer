@@ -97,7 +97,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Submit a worker task (queue only)",
       description:
-        "Enqueue a task for the configured worker bridge. This ONLY queues and returns a persistent job id/state 'queued'; the task is not started and 'queued' is not 'done'. After a success you may end the conversation. worker_get reflects queue state, not this machine being online - do not poll intensely. Retry with the same request_id when the submit outcome is unknown.",
+        "Enqueue a task for the configured worker bridge. A first submission returns state 'queued'; it only enqueues - submission itself does not start the task, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (e.g. claimed/running/interrupted) rather than queuing again. worker_get reflects queue and execution-eligibility state; do not poll intensely. Retry with the same request_id when the submit outcome is unknown.",
       inputSchema: workerSubmitSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -128,7 +128,8 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     "worker_get",
     {
       title: "Get worker job status",
-      description: "Return queue/claim state, created/expiry time, and execution target for a job. The full prompt is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
+      description:
+        "Show queue and execution-eligibility state for a job: derived state (queued/expired/claimed/running/interrupted), created time, the seven-day claim expiry (expires_at, NOT an execution deadline), and the current execution lease when claimed. 'interrupted' only means the server can no longer confirm the current attempt holds execution eligibility - it does NOT confirm a remote process stopped or that the task succeeded/cancelled. The full prompt/acceptance is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
       inputSchema: workerGetSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -145,7 +146,16 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
         logTrace(ctx, "worker_get", res.ok ? "success" : "error", Date.now() - started, { job_id: res.ok ? res.view!.job_id : jobId, error_code: res.ok ? null : res.code ?? null });
         if (!res.ok) return result({ ok: false, code: res.code, message: res.message }, true);
         const v = res.view!;
-        return result({ ok: true, job_id: v.job_id, state: v.state, created_at: v.created_at, expires_at: v.expires_at, workspace_ref: v.workspace_ref, resource_id: v.resource_id });
+        return result({
+          ok: true,
+          job_id: v.job_id,
+          state: v.state,
+          created_at: v.created_at,
+          expires_at: v.expires_at,
+          workspace_ref: v.workspace_ref,
+          resource_id: v.resource_id,
+          execution: v.execution,
+        });
       } catch (error) {
         const info = errInfo(error);
         logTrace(ctx, "worker_get", "error", Date.now() - started, { job_id: jobId, error_code: info.code });

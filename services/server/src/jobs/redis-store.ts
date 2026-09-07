@@ -3,9 +3,14 @@ import {
   requestKey,
   jobKey,
   JOBS_SCHEMA_VERSION,
+  LEASE_DURATION_MS,
+  START_WINDOW_MS,
   type RequestPlaceholder,
   type PersistedJobRecord,
+  type LeaseScriptResult,
+  type JobState,
 } from "./schema.js";
+import { LEASE_SCRIPT } from "./lease-script.js";
 import {
   ClientClosedError,
   ClientOfflineError,
@@ -133,6 +138,7 @@ export function isNoScriptError(error: unknown): boolean {
 
 export class RedisJobStore {
   private cachedSha: string | null = null;
+  private leaseSha: string | null = null;
 
   constructor(private readonly redis: RedisRunner) {}
 
@@ -192,6 +198,106 @@ export class RedisJobStore {
 
   setCachedShaForTest(sha: string | null): void {
     this.cachedSha = sha;
+  }
+
+  getLeaseShaForTest(): string | null {
+    return this.leaseSha;
+  }
+
+  setLeaseShaForTest(sha: string | null): void {
+    this.leaseSha = sha;
+  }
+
+  private async loadLeaseScript(redisLike: RedisRunner): Promise<string> {
+    return redisLike.scriptLoad(LEASE_SCRIPT);
+  }
+
+  private async evalshaLease(redisLike: RedisRunner, keys: string[], args: string[]): Promise<LeaseScriptResult> {
+    if (!this.leaseSha) {
+      this.leaseSha = await this.loadLeaseScript(redisLike);
+    }
+    const doRun = async (sha: string): Promise<LeaseScriptResult> => {
+      const res = await redisLike.evalsha(sha, keys.length, keys, args);
+      return parseLeaseResult(res);
+    };
+    try {
+      return await doRun(this.leaseSha);
+    } catch (error) {
+      if (isNoScriptError(error)) {
+        this.leaseSha = await this.loadLeaseScript(redisLike);
+        try {
+          return await doRun(this.leaseSha);
+        } catch (retryError) {
+          throw new StoreError("QUEUE_UNAVAILABLE", "Redis lease EVALSHA retry failed after NOSCRIPT reload.", { cause: String(retryError) });
+        }
+      }
+      throw new StoreError("QUEUE_UNAVAILABLE", "Redis lease EVALSHA failed.", { cause: String(error) });
+    }
+  }
+
+  /** Shared single-key lease executor. Empty optional fields are passed as "". */
+  private async runLease(
+    scope: AuthScope,
+    operation: string,
+    jobId: string,
+    argsIn: { workerId?: string; attemptId?: string; workspaceRef?: string; tokenSha?: string },
+  ): Promise<LeaseScriptResult> {
+    this.keyCheck();
+    const args = [
+      operation,
+      jobId,
+      scope.user_id,
+      scope.workspace_id,
+      argsIn.workerId ?? "",
+      argsIn.attemptId ?? "",
+      argsIn.workspaceRef ?? "",
+      argsIn.tokenSha ?? "",
+      String(LEASE_DURATION_MS),
+      String(START_WINDOW_MS),
+    ];
+    return this.evalshaLease(this.redis, [jobKey(jobId)], args);
+  }
+
+  /** Read + derive state for a single owned job. No write is performed. */
+  async inspect(scope: AuthScope, jobId: string): Promise<LeaseScriptResult> {
+    return this.runLease(scope, "inspect", jobId, {});
+  }
+
+  async claimLease(
+    scope: AuthScope,
+    jobId: string,
+    input: { worker_id: string; attempt_id: string; workspace_ref: string; lease_token_sha256: string },
+  ): Promise<LeaseScriptResult> {
+    return this.runLease(scope, "claim", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      workspaceRef: input.workspace_ref,
+      tokenSha: input.lease_token_sha256,
+    });
+  }
+
+  async startLease(
+    scope: AuthScope,
+    jobId: string,
+    input: { worker_id: string; attempt_id: string; lease_token_sha256: string },
+  ): Promise<LeaseScriptResult> {
+    return this.runLease(scope, "start", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      tokenSha: input.lease_token_sha256,
+    });
+  }
+
+  async heartbeatLease(
+    scope: AuthScope,
+    jobId: string,
+    input: { worker_id: string; attempt_id: string; lease_token_sha256: string },
+  ): Promise<LeaseScriptResult> {
+    return this.runLease(scope, "heartbeat", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      tokenSha: input.lease_token_sha256,
+    });
   }
 
   async getJob(jobId: string): Promise<PersistedJobRecord | null> {
@@ -294,6 +400,46 @@ function normalizeDecision(res: unknown): CommitDecision {
   if (s === "NEW" || s === "REPLAY" || s === "CONFLICT" || s === "INCOMPLETE") return s;
   // WRONGTYPE / CORRUPT_* become an errored EVAL whose reply is an error object.
   throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected queue decision: ${s}`);
+}
+
+function parseLeaseResult(res: unknown): LeaseScriptResult {
+  const s = typeof res === "string" ? res : String(res);
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(s) as Record<string, unknown>;
+  } catch (error) {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected lease script reply: ${s}`, {
+      cause: String(error),
+    });
+  }
+  if (!obj || typeof obj !== "object") {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected lease script reply: ${s}`);
+  }
+  const ok = obj.ok === true;
+  if (!ok) {
+    const code = typeof obj.code === "string" ? obj.code : "QUEUE_UNAVAILABLE";
+    const reason = obj.reason == null ? null : String(obj.reason);
+    return { ok: false, code, reason };
+  }
+  const record = obj.record as unknown;
+  const serverTimeMs = obj.server_time_ms;
+  if (
+    !record ||
+    typeof record !== "object" ||
+    typeof serverTimeMs !== "number" ||
+    typeof obj.state !== "string"
+  ) {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected lease success reply: ${s}`);
+  }
+  const reason = obj.reason == null ? null : String(obj.reason);
+  return {
+    ok: true,
+    record: record as PersistedJobRecord,
+    server_time_ms: serverTimeMs,
+    state: obj.state as JobState,
+    reason,
+    replayed: obj.replayed === true,
+  };
 }
 
 export interface RedisRunnerOptions {

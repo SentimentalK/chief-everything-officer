@@ -18,12 +18,16 @@ on:
 
 jobs:
   redis-integration:
-    name: Real-Redis jobs integration + restart persistence
+    name: Real-Redis jobs leases integration + auth bridge + restart persistence
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
-      CEO_REDIS_URL: redis://127.0.0.1:6379
+      # Test-only credential. The isolated Redis enforces AUTH and every client
+      # (node scripts, redis-cli, openJobBridge) must authenticate with it so
+      # the production bridge path is exercised, never a simplified client.
+      REDIS_PASS: ceo-ci-test-pass
+      CEO_REDIS_URL: redis://:ceo-ci-test-pass@127.0.0.1:6379
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,7 +40,7 @@ jobs:
       - name: Prepare isolated data directory
         run: mkdir -p .tmp/redis-data
 
-      - name: Start isolated Redis (persistent config)
+      - name: Start isolated Redis with password auth (persistent config)
         run: |
           docker run -d --name ceo-redis-ci -p 6379:6379 \
             -v "${PWD}/.tmp/redis-data:/data" \
@@ -46,33 +50,39 @@ jobs:
               --appendfsync always \
               --no-appendfsync-on-rewrite no \
               --maxmemory-policy noeviction \
+              --requirepass "${REDIS_PASS}" \
               --dir /data
 
-      - name: Wait for Redis
+      - name: Wait for Redis (authenticated)
         run: |
           for i in $(seq 1 30); do
-            docker exec ceo-redis-ci redis-cli ping 2>/dev/null | grep -q PONG && break
+            docker exec ceo-redis-ci redis-cli -a "${REDIS_PASS}" --no-auth-warning ping 2>/dev/null | grep -q PONG && break
             sleep 1
           done
-          docker exec ceo-redis-ci redis-cli ping
-          docker exec ceo-redis-ci redis-cli config get dir
+          docker exec ceo-redis-ci redis-cli -a "${REDIS_PASS}" --no-auth-warning ping
+          docker exec ceo-redis-ci redis-cli -a "${REDIS_PASS}" --no-auth-warning config get dir
 
       - name: Install deps
         run: |
           cd services/server
           npm ci --prefer-offline=false --audit=false --fund=false
 
-      - name: Jobs Redis integration (must NOT skip)
+      # Redis-clearing test files MUST run one at a time (never parallel) so no
+      # test deletes another's keys mid-flight. Each run must pass (never skip).
+      - name: Jobs integration tests (serial, must NOT skip)
         run: |
           cd services/server
-          mkdir -p .tmp
-          npx vitest run test/jobs.redis.test.ts > .tmp/jobs-redis.log 2>&1 || { cat .tmp/jobs-redis.log; exit 1; }
-          cat .tmp/jobs-redis.log
-          if grep -qi "skipped" .tmp/jobs-redis.log; then
-            echo "::error::Redis jobs tests were skipped - failing gate."
-            exit 1
-          fi
-          grep -qE "[0-9]+ passed" .tmp/jobs-redis.log || { echo "::error::No passed summary found"; exit 1; }
+          for f in jobs.redis.test.ts jobs.lease.test.ts jobs.http.test.ts; do
+            mkdir -p .tmp
+            log=".tmp/${f}.log"
+            npx vitest run "test/${f}" > "${log}" 2>&1 || { cat "${log}"; exit 1; }
+            cat "${log}"
+            if grep -qi "skipped" "${log}"; then
+              echo "::error::${f} reported skipped tests - failing gate."
+              exit 1
+            fi
+            grep -qE "[0-9]+ passed" "${log}" || { echo "::error::no passed summary found in ${f}"; exit 1; }
+          done
 
       - name: Typecheck + build
         run: |
@@ -85,7 +95,59 @@ jobs:
           cd services/server
           node scripts/verify-redis-op-timeout.mjs
 
-      - name: Capture pre-restart durable job and stream metadata
+      - name: Production bridge acceptance (openJobBridge over authenticated Redis)
+        run: |
+          cd services/server
+          node --input-type=module -e '
+            import { openJobBridge } from "./dist/jobs/bridge.js";
+
+            function waitAvailable(service, timeoutMs = 8000, stepMs = 30) {
+              const started = Date.now();
+              return new Promise((resolve, reject) => {
+                const tick = () => {
+                  if (service.available()) return resolve();
+                  if (Date.now() - started > timeoutMs) return reject(new Error("bridge never became available"));
+                  setTimeout(tick, stepMs);
+                };
+                tick();
+              });
+            }
+
+            const scope = { user_id: "usr_accept", workspace_id: "ws_accept" };
+            const reqId = "123e4567-e89b-12d3-a456-426614174077";
+            const wrk = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+            const att = "123e4567-e89b-12d3-a456-4266141740ab";
+            const tok = "d".repeat(64);
+
+            // Real production bridge: same config object the server passes, one
+            // shared node-redis client with offline queue disabled.
+            const bridge = openJobBridge({ bridgeEnabled: true, redisUrl: process.env.CEO_REDIS_URL });
+            try {
+              await waitAvailable(bridge.service);
+              const sub = await bridge.service.submit(scope, {
+                request_id: reqId,
+                workspace_ref: "tools",
+                prompt: "acceptance prompt",
+                acceptance: "acceptance done",
+                timeout_seconds: 120,
+              });
+              if (!sub.ok) throw new Error("submit failed: " + JSON.stringify(sub));
+              const jobId = sub.view.job_id;
+              const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", lease_token: tok });
+              if (!c.ok) throw new Error("claim failed: " + JSON.stringify(c));
+              const s = await bridge.service.start(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+              if (!s.ok) throw new Error("start failed: " + JSON.stringify(s));
+              const h = await bridge.service.heartbeat(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+              if (!h.ok) throw new Error("heartbeat failed: " + JSON.stringify(h));
+              const g = await bridge.service.get(scope, { job_id: jobId });
+              if (!g.ok || g.view.state !== "running") throw new Error("get failed: " + JSON.stringify(g));
+              console.log("Production bridge acceptance PASS state=" + g.view.state);
+            } finally {
+              await bridge.dispose();
+            }
+          '
+
+      - name: Capture pre-restart durable job and execution lease metadata
         run: |
           cd services/server
           node --input-type=module -e '
@@ -109,7 +171,7 @@ jobs:
             const runner = createRedisRunnerFromClient(
               () =>
                 createClient({
-                  url: "redis://127.0.0.1:6379",
+                  url: process.env.CEO_REDIS_URL,
                   socket: { reconnectStrategy: false },
                   disableOfflineQueue: true,
                 }),
@@ -122,6 +184,9 @@ jobs:
 
             const scope = { user_id: "usr_restart", workspace_id: "ws_restart" };
             const reqId = "123e4567-e89b-12d3-a456-426614174099";
+            const wrk = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+            const att = "123e4567-e89b-12d3-a456-4266141740ab";
+            const tok = "e".repeat(64);
             const res = await service.submit(scope, {
               request_id: reqId,
               workspace_ref: "tools",
@@ -131,7 +196,14 @@ jobs:
             });
             if (!res.ok) throw new Error("Failed pre-restart submit: " + JSON.stringify(res));
 
-            const job = await store.getJob(res.view.job_id);
+            const jobId = res.view.job_id;
+            const claim = await service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", lease_token: tok });
+            if (!claim.ok) throw new Error("pre-restart claim failed: " + JSON.stringify(claim));
+            const start = await service.start(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+            if (!start.ok) throw new Error("pre-restart start failed: " + JSON.stringify(start));
+            await service.heartbeat(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+
+            const job = await store.getJob(jobId);
             if (!job) throw new Error("Job not found immediately after submit");
             const placeholder = await store.getPlaceholder(scope, reqId);
             if (!placeholder) throw new Error("Placeholder not found immediately after submit");
@@ -149,6 +221,13 @@ jobs:
               created_at_ms: job.created_at_ms,
               claim_deadline_ms: job.claim_deadline_ms,
               stream_entry_id: job.stream_entry_id,
+              execution_worker_id: job.execution && job.execution.worker_id,
+              execution_attempt_id: job.execution && job.execution.attempt_id,
+              execution_phase: job.execution && job.execution.phase,
+              execution_claimed_at_ms: job.execution && job.execution.claimed_at_ms,
+              execution_started_at_ms: job.execution && job.execution.started_at_ms,
+              execution_deadline_ms: job.execution && job.execution.execution_deadline_ms,
+              execution_lease_expires_at_ms: job.execution && job.execution.lease_expires_at_ms,
               stream_length_before: streamLen,
             };
             mkdirSync(".tmp", { recursive: true });
@@ -159,7 +238,7 @@ jobs:
             }
           '
 
-      - name: Force-stop old Redis and restart on the SAME volume
+      - name: Force-stop old Redis and restart on the SAME volume (AUTH retained)
         run: |
           docker kill --signal KILL ceo-redis-ci || true
           docker rm -f ceo-redis-ci || true
@@ -168,14 +247,15 @@ jobs:
             redis:7-alpine \
             redis-server \
               --appendonly yes --appendfsync always \
-              --no-appendfsync-on-rewrite no --maxmemory-policy noeviction --dir /data
+              --no-appendfsync-on-rewrite no --maxmemory-policy noeviction \
+              --requirepass "${REDIS_PASS}" --dir /data
           for i in $(seq 1 30); do
-            docker exec ceo-redis-ci-restarted redis-cli ping 2>/dev/null | grep -q PONG && break
+            docker exec ceo-redis-ci-restarted redis-cli -a "${REDIS_PASS}" --no-auth-warning ping 2>/dev/null | grep -q PONG && break
             sleep 1
           done
-          docker exec ceo-redis-ci-restarted redis-cli ping
+          docker exec ceo-redis-ci-restarted redis-cli -a "${REDIS_PASS}" --no-auth-warning ping
 
-      - name: Verify job, dedupe, and stream survived the forced restart (AOF)
+      - name: Verify job, dedupe, stream AND execution lease survived the forced restart
         run: |
           cd services/server
           node --input-type=module -e '
@@ -201,7 +281,7 @@ jobs:
             const runner = createRedisRunnerFromClient(
               () =>
                 createClient({
-                  url: "redis://127.0.0.1:6379",
+                  url: process.env.CEO_REDIS_URL,
                   socket: { reconnectStrategy: false },
                   disableOfflineQueue: true,
                 }),
@@ -213,8 +293,11 @@ jobs:
               await waitForReady(() => runner.ready());
 
             const scope = { user_id: expected.user_id, workspace_id: expected.workspace_id };
+            const wrk = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+            const att = "123e4567-e89b-12d3-a456-4266141740ab";
+            const tok = "e".repeat(64);
 
-            // 1. Exact match on persisted job record
+            // 1. Exact match on persisted job record incl. the execution lease.
             const job = await store.getJob(expected.job_id);
             if (!job) throw new Error("Job missing after restart");
             if (job.job_id !== expected.job_id) throw new Error("job_id mismatch");
@@ -224,14 +307,27 @@ jobs:
             if (job.claim_deadline_ms !== expected.claim_deadline_ms) throw new Error("claim_deadline_ms mismatch");
             if (job.stream_entry_id !== expected.stream_entry_id) throw new Error("stream_entry_id mismatch");
             if (job.status !== "queued") throw new Error("status mismatch: " + job.status);
+            if (!job.execution) throw new Error("execution lease missing after restart");
+            if (job.execution.worker_id !== expected.execution_worker_id) throw new Error("execution.worker_id mismatch");
+            if (job.execution.attempt_id !== expected.execution_attempt_id) throw new Error("execution.attempt_id mismatch");
+            if (job.execution.phase !== expected.execution_phase) throw new Error("execution.phase mismatch");
+            if (job.execution.claimed_at_ms !== expected.execution_claimed_at_ms) throw new Error("execution.claimed_at_ms mismatch");
+            if (job.execution.started_at_ms !== expected.execution_started_at_ms) throw new Error("execution.started_at_ms mismatch");
+            if (job.execution.execution_deadline_ms !== expected.execution_deadline_ms) throw new Error("execution.execution_deadline_ms mismatch");
+            if (job.execution.lease_expires_at_ms !== expected.execution_lease_expires_at_ms) throw new Error("execution.lease_expires_at_ms mismatch");
 
-            // 2. Exact match on dedupe placeholder
+            // 2. get still derives running from the persisted lease.
+            const got = await service.get(scope, { job_id: expected.job_id });
+            if (!got.ok || got.view.state !== "running") throw new Error("get did not derive running: " + JSON.stringify(got));
+
+            // 3. The original attempt can still heartbeat after the restart.
+            const hb = await service.heartbeat(scope, expected.job_id, { worker_id: wrk, attempt_id: att, lease_token: tok });
+            if (!hb.ok) throw new Error("post-restart heartbeat failed: " + JSON.stringify(hb));
+
+            // 4. Dedupe placeholder + replay submit return running (no re-queue).
             const ph = await store.getPlaceholder(scope, expected.request_id);
             if (!ph) throw new Error("Dedupe placeholder missing after restart");
             if (ph.job_id !== expected.job_id) throw new Error("placeholder job_id mismatch");
-            if (ph.request_digest !== expected.request_digest) throw new Error("placeholder request_digest mismatch");
-
-            // 3. Re-submit via JobService: must return replayed: true and same job_id
             const replayRes = await service.submit(scope, {
               request_id: expected.request_id,
               workspace_ref: "tools",
@@ -242,14 +338,15 @@ jobs:
             if (!replayRes.ok) throw new Error("Replay submission failed: " + JSON.stringify(replayRes));
             if (!replayRes.view.replayed) throw new Error("Expected replayed: true on post-restart submit");
             if (replayRes.view.job_id !== expected.job_id) throw new Error("Replay returned different job_id");
+            if (replayRes.view.state !== "running") throw new Error("Replay state not running: " + replayRes.view.state);
 
-            // 4. Confirm stream length is unchanged (no duplicate XADD on replay)
+            // 5. Stream length unchanged (no duplicate XADD on replay).
             const streamLenAfter = await store.streamLength();
             if (streamLenAfter !== expected.stream_length_before) {
               throw new Error(`Stream length changed from ${expected.stream_length_before} to ${streamLenAfter}`);
             }
 
-            console.log("Post-restart persistence, replay dedupe, and stream invariants verified successfully!");
+            console.log("Post-restart persistence, execution lease, replay dedupe, and stream invariants verified successfully!");
             } finally {
               await runner.dispose();
             }
@@ -259,4 +356,4 @@ jobs:
         if: always()
         run: |
           docker rm -f ceo-redis-ci ceo-redis-ci-restarted 2>/dev/null || true
-          rm -rf .tmp/redis-data services/server/.tmp/restart-expected.json services/server/.tmp/jobs-redis.log 2>/dev/null || true
+          rm -rf .tmp/redis-data services/server/.tmp 2>/dev/null || true

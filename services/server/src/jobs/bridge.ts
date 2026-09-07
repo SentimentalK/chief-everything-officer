@@ -72,7 +72,7 @@ export function openJobBridge(
     },
   );
   const store = new RedisJobStore(runner);
-  const service = new JobService({ store, resourceExists, nowMs: Date.now }, () => true);
+  const service = new JobService({ store, resourceExists }, () => true);
   return {
     service,
     dispose: () => runner.dispose(),
