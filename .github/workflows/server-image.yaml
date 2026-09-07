@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "server/**"
+      - "services/server/**"
       - ".github/workflows/server-image.yaml"
   pull_request:
     branches: [main]
     paths:
-      - "server/**"
+      - "services/server/**"
       - ".github/workflows/server-image.yaml"
   workflow_dispatch:
 
@@ -32,7 +32,7 @@ jobs:
 
       - name: Typecheck, Test and Build Server
         run: |
-          cd server
+          cd services/server
           npm ci --prefer-offline=false --audit=false --fund=false
           npm run typecheck
           npm test
@@ -40,7 +40,7 @@ jobs:
 
       - name: CI Docker Smoke Build
         run: |
-          docker build -t ceo-server:ci --build-arg BUILD_SHA=${{ github.sha }} -f server/Dockerfile server
+          docker build -t ceo-server:ci --build-arg BUILD_SHA=${{ github.sha }} -f services/server/Dockerfile services/server
 
       - name: CI Policy Assets Verification
         run: |
@@ -78,8 +78,8 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
         with:
-          context: ./server
-          file: ./server/Dockerfile
+          context: ./services/server
+          file: ./services/server/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |

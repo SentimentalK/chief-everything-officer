@@ -32,7 +32,8 @@ Long-term AI memory is part of this problem, but not the goal itself. We do not 
 
 ## Project Structure
 
-- **`server/`**: The core `@sentimentalk/ceo-server` service providing the MCP server (`/mcp`), product policy endpoints, Git transaction engine, and SQLite audit trace logging (`/api/audit/*`).
+- **`services/server/`**: The core `@sentimentalk/ceo-server` service providing the MCP server (`/mcp`), product policy endpoints, Git transaction engine, and SQLite audit trace logging (`/api/audit/*`).
+- **`services/url-resolver/`**: The standalone Python HTTP metadata resolution service (`/v1/resolve`, `/healthz`, `/readyz`) powered by Scrapling and `curl_cffi`.
 - **`web/`**: The standalone `ceo-web` Audit Console frontend built with React, Vite, and Tailwind CSS, served in production via a non-root unprivileged NGINX container (`/audit/`).
 - **`worker/`**: The Rust-based headless task worker orchestrating agent execution inside isolated workspaces.
 - **`docs/`**: Documentation and guides (see [简体中文文档](docs/README.zh-CN.md)).

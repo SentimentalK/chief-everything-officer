@@ -1,0 +1,202 @@
+name: CEO Resolver — Test & Publish Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/url-resolver/**"
+      - ".github/workflows/resolver-image.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/url-resolver/**"
+      - ".github/workflows/resolver-image.yaml"
+  workflow_dispatch:
+
+jobs:
+  test-build-publish:
+    name: Test, Build & Publish CEO Resolver
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "services/url-resolver/pyproject.toml"
+
+      - name: Install dependencies & url-resolver
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./services/url-resolver
+
+      - name: Run URL Resolver Test Suite Gate
+        run: |
+          python -m unittest discover -s services/url-resolver/tests -p "test_*.py" -v
+
+      - name: CI Docker Smoke Build
+        run: |
+          docker build -t ceo-resolver:ci -f services/url-resolver/Dockerfile services/url-resolver
+
+      - name: CI Deterministic Container Verification & Zero-Browser Gate
+        run: |
+          echo "=== 1. Testing fail-closed /readyz without token ==="
+          docker run --rm -d --name smoke-resolver-unauth -p 8001:8000 ceo-resolver:ci
+          sleep 3
+
+          echo "Verifying /healthz without token..."
+          curl -f -s http://localhost:8001/healthz | grep -q '"status":"ok"'
+
+          echo "Verifying /readyz returns 503 without token..."
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8001/readyz)
+          if [ "$STATUS_CODE" -ne 503 ]; then
+            echo "Expected 503 from /readyz when unconfigured, got $STATUS_CODE"
+            docker logs smoke-resolver-unauth
+            exit 1
+          fi
+          docker stop smoke-resolver-unauth
+
+          echo "=== 2. Testing fully configured service ==="
+          docker run --rm -d --name smoke-resolver -p 8000:8000 -e TOOLS_INTERNAL_TOKEN=ci-smoke-token ceo-resolver:ci
+          sleep 4
+
+          echo "Verifying /healthz..."
+          curl -f -s http://localhost:8000/healthz | grep -q '"status":"ok"'
+
+          echo "Verifying /readyz returns 200..."
+          curl -f -s http://localhost:8000/readyz | grep -q '"status":"ready"'
+
+          echo "Verifying 401 when Authorization header is missing..."
+          AUTH_MISSING=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/v1/resolve \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://example.com"}')
+          [ "$AUTH_MISSING" -eq 401 ] || { echo "Expected 401 for missing auth, got $AUTH_MISSING"; exit 1; }
+
+          echo "Verifying 401 when Bearer token is invalid..."
+          AUTH_INVALID=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/v1/resolve \
+            -H "Authorization: Bearer wrong-token" \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://example.com"}')
+          [ "$AUTH_INVALID" -eq 401 ] || { echo "Expected 401 for invalid auth, got $AUTH_INVALID"; exit 1; }
+
+          echo "Verifying 422 when request body violates schema (empty object)..."
+          SCHEMA_VIOLATION=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/v1/resolve \
+            -H "Authorization: Bearer ci-smoke-token" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          [ "$SCHEMA_VIOLATION" -eq 422 ] || { echo "Expected 422 for schema violation, got $SCHEMA_VIOLATION"; exit 1; }
+
+          echo "Verifying 400 when URL is malformed..."
+          MALFORMED_URL=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/v1/resolve \
+            -H "Authorization: Bearer ci-smoke-token" \
+            -H "Content-Type: application/json" \
+            -d '{"schema_version": 1, "url": "ftp://broken.scheme/test"}')
+          [ "$MALFORMED_URL" -eq 400 ] || { echo "Expected 400 for malformed URL, got $MALFORMED_URL"; exit 1; }
+
+          echo "=== 3. Verifying zero browser binaries and caches ==="
+          docker exec -u 0 smoke-resolver sh -c '
+            test ! -d /root/.cache/ms-playwright &&
+            test ! -d /home/appuser/.cache/ms-playwright &&
+            test ! -d /root/.cache/patchright &&
+            test ! -d /home/appuser/.cache/patchright
+          '
+
+          docker exec smoke-resolver sh -c '
+            ! command -v chromium &&
+            ! command -v chromium-browser &&
+            ! command -v google-chrome &&
+            ! command -v chrome
+          '
+
+          echo "=== 4. Verifying /healthz and /readyz 200 access logs are suppressed ==="
+          docker logs smoke-resolver > /tmp/smoke-resolver.log
+          if grep -q '"GET /healthz HTTP/1.1" 200' /tmp/smoke-resolver.log; then
+            echo "Error: /healthz 200 OK was logged in container stdout!"
+            cat /tmp/smoke-resolver.log
+            exit 1
+          fi
+          if grep -q '"GET /readyz HTTP/1.1" 200' /tmp/smoke-resolver.log; then
+            echo "Error: /readyz 200 OK was logged in container stdout!"
+            cat /tmp/smoke-resolver.log
+            exit 1
+          fi
+
+          echo "Deterministic container verification passed!"
+
+      - name: CI Live Network Probes (Informational Contract Validation)
+        run: |
+          probe_url() {
+            local name="$1"
+            local target_url="$2"
+            echo "--- Probing $name ($target_url) ---"
+            local resp
+            resp=$(curl -s -X POST http://localhost:8000/v1/resolve \
+              -H "Authorization: Bearer ci-smoke-token" \
+              -H "Content-Type: application/json" \
+              -d "{\"schema_version\": 1, \"url\": \"$target_url\"}")
+
+            echo "Response: $resp"
+            if echo "$resp" | grep -q '"status":"resolved"'; then
+              local title
+              title=$(echo "$resp" | grep -o '"title":"[^"]*"' | head -n1 || echo "")
+              echo "Result [$name]: resolved ($title)"
+            elif echo "$resp" | grep -q '"status":"unavailable"'; then
+              local code
+              code=$(echo "$resp" | grep -o '"code":"[^"]*"' | head -n1 || echo "")
+              echo "Result [$name]: unavailable ($code)"
+            else
+              echo "Warning [$name]: unexpected response format or connection issue"
+            fi
+          }
+
+          probe_url "YouTube" "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+          probe_url "Weixin" "https://weixin.qq.com/sph/AF17JEGHVd"
+          probe_url "Bilibili" "https://www.bilibili.com/video/BV1xx411c7mD"
+
+          echo "Verifying structured business resolution logs exist in container stdout..."
+          docker logs smoke-resolver > /tmp/smoke-resolver-live.log
+          if ! grep -q '"event": "resolve_complete"' /tmp/smoke-resolver-live.log; then
+            echo "Error: Missing structured resolve_complete log in container stdout!"
+            cat /tmp/smoke-resolver-live.log
+            exit 1
+          fi
+
+          docker stop smoke-resolver
+
+      - name: Set up QEMU
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase image tag
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          echo "IMAGE_TAG=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ceo-resolver:latest" >> "$GITHUB_ENV"
+
+      - name: Build and push multi-arch image
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./services/url-resolver
+          file: ./services/url-resolver/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_TAG }}
