@@ -18,7 +18,7 @@ WORKDIR /app
 
 # Copy package files and install dependencies
 # Note: we explicitly do NOT run 'scrapling install' or 'playwright install', ensuring ZERO browser binaries
-COPY pyproject.toml README.md capabilities.yaml ./
+COPY pyproject.toml ./
 COPY src/ ./src/
 
 RUN pip install --no-cache-dir --upgrade pip && \

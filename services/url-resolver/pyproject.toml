@@ -5,8 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "url-resolver"
 version = "0.2.0"
-description = "Lightweight URL metadata resolution capability for Tools monorepo"
-readme = "README.md"
+description = "Lightweight URL metadata resolution service for CEO"
 requires-python = ">=3.12"
 dependencies = [
     "scrapling[fetchers]==0.4.15",
