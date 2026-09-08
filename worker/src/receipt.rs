@@ -1,4 +1,5 @@
 use crate::doctor::{ModelUsageInfo, SessionDoctorReport};
+use crate::runner::control::BridgeReceiptContext;
 use crate::verifier::{ArtifactClaim, BusinessOutcome};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,10 @@ pub struct TaskReceipt {
     pub artifacts: Vec<ArtifactClaim>,
     pub logs: LogSummary,
     pub error: Option<ReceiptError>,
+    /// Present only for bridge-managed attempts. Omitted (None) for local runs
+    /// and for old receipts without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_context: Option<BridgeReceiptContext>,
 }
 
 impl TaskReceipt {

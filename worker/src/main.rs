@@ -429,6 +429,7 @@ async fn follow_file(job_dir: &Path, path: &Path, source: &str, is_raw: bool) {
                             | JobStage::Failed
                             | JobStage::Blocked
                             | JobStage::Cancelled
+                            | JobStage::Interrupted
                             | JobStage::UnknownInterrupted
                     ) {
                         // Drain any newly written lines

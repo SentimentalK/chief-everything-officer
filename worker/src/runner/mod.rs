@@ -5,12 +5,15 @@ pub use control::{
     StopReason,
 };
 
+use crate::bridge::state::ProcessIdentity;
 use crate::config::{attempt_dir, job_dir, snapshot_prompt, validate_id, WorkerConfig};
 use crate::doctor::{
     invalidate_cache, load_cache, run_fast_local_precheck, run_preflight_static_checks, save_cache,
     DoctorCacheRecord, DoctorMetricsRecord, DoctorProbeContext, FingerprintBuilder, ModelUsageInfo,
     SessionDoctorReport,
 };
+use crate::executor::adapter_trait::ManagedProcess;
+use crate::executor::process::pgid_has_live_members;
 use crate::executor::{create_executor, ExecutionRequest, ExecutorError};
 use crate::observability::{
     EventLogger, JobStage, LogSource, ProcessLogger, StatusTracker, StreamEventDispatcher,
@@ -27,12 +30,15 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum RunnerError {
     #[error("Job ID '{0}' already exists. Refusing to overwrite or re-execute.")]
     JobAlreadyExists(String),
+    #[error("Attempt {0} already has a final receipt; refusing to re-execute.")]
+    AttemptAlreadyFinalized(String),
     #[error("Configuration error: {0}")]
     ConfigError(#[from] crate::config::ConfigError),
     #[error("I/O error: {0}")]
@@ -41,6 +47,67 @@ pub enum RunnerError {
     DoctorFailed(String),
     #[error("Failed to persist task receipt to disk: {0}")]
     ReceiptPersistFailed(std::io::Error),
+}
+
+/// Reads the kernel boot id (stable across a single boot) from /proc.
+fn read_boot_id() -> Option<String> {
+    let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Assembles a process identity from a live child (PID/PGID + starttime + boot).
+/// A missing boot id makes the identity unusable for recovery (None).
+fn make_process_identity(pid: Option<u32>, pgid: Option<i32>) -> Option<ProcessIdentity> {
+    let boot_id = read_boot_id()?;
+    Some(ProcessIdentity {
+        pid: pid?,
+        pgid,
+        start_time: pid.and_then(crate::observability::status::get_process_start_time),
+        boot_id,
+    })
+}
+
+/// Two-phase, bounded termination of the managed process group plus its log
+/// drains. Sequence: close stdin → SIGTERM the whole PGID → bounded grace
+/// (drains continue) → SIGKILL any remainder → bounded reap of the leader →
+/// join the drain tasks. Returns true only when no live group member remains.
+/// All early-exit branches and the completion path route through this so no
+/// background process or drain task is ever abandoned.
+async fn teardown_managed(
+    child: &mut Box<dyn ManagedProcess>,
+    drains: &mut Vec<JoinHandle<()>>,
+) -> bool {
+    use tokio::time::timeout;
+    let _ = child.close_stdin();
+    // Phase 1: graceful SIGTERM to the group; keep draining stdout/stderr while
+    // we wait up to 3 s for the group to empty (bail early once it does).
+    let _ = child.kill_group();
+    for _ in 0..60 {
+        let empty = match child.pgid() {
+            Some(pg) => !pgid_has_live_members(pg).unwrap_or(true),
+            None => true,
+        };
+        if empty {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Phase 2: SIGKILL anything that ignored SIGTERM and reap the leader.
+    let _ = child.force_kill_group();
+    let _ = timeout(std::time::Duration::from_secs(2), child.wait()).await;
+    // Join the drain tasks (bounded) so receipt snippets reflect full logs.
+    for handle in drains.drain(..) {
+        let _ = timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+    match child.pgid() {
+        Some(pg) => pgid_has_live_members(pg).map(|has| !has).unwrap_or(false),
+        None => false,
+    }
 }
 
 struct FinalizeParams<'a> {
@@ -61,6 +128,8 @@ struct FinalizeParams<'a> {
     local_check_duration_ms: u64,
     current_doctor_metrics: Option<CurrentDoctorMetrics>,
     cached_doctor_metrics: Option<CachedDoctorMetrics>,
+    dispatch_happened: bool,
+    bridge_context: Option<BridgeReceiptContext>,
 }
 
 enum AttemptOutcome {
@@ -85,6 +154,11 @@ enum AttemptOutcome {
     },
     Timeout {
         duration_secs: u64,
+        executor: ExecutorInfo,
+    },
+    Stopped {
+        stop_reason: StopReason,
+        dispatched: bool,
         executor: ExecutorInfo,
     },
 }
@@ -134,6 +208,11 @@ impl Runner {
             stderr_snippet,
             dropped_lines_count,
             log_truncated,
+        };
+
+        let stop_snapshot: Option<StopReason> = match &outcome {
+            AttemptOutcome::Stopped { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
         };
 
         let (exec_status, business_outcome, executor, artifacts, receipt_error, job_stage) =
@@ -201,6 +280,40 @@ impl Runner {
                     }),
                     JobStage::Failed,
                 ),
+                AttemptOutcome::Stopped {
+                    stop_reason,
+                    dispatched,
+                    executor,
+                } => {
+                    let unverified = if dispatched {
+                        BusinessOutcome::Unverified
+                    } else {
+                        BusinessOutcome::NotStarted
+                    };
+                    let (status, business, stage) = match stop_reason {
+                        StopReason::UserRequested => {
+                            ("CANCELLED".to_string(), unverified, JobStage::Cancelled)
+                        }
+                        StopReason::TaskTimedOut if dispatched => (
+                            "TIMED_OUT".to_string(),
+                            BusinessOutcome::Unverified,
+                            JobStage::Failed,
+                        ),
+                        _ => ("INTERRUPTED".to_string(), unverified, JobStage::Interrupted),
+                    };
+                    (
+                        status,
+                        business,
+                        executor,
+                        Vec::new(),
+                        Some(ReceiptError {
+                            stage: "execution".to_string(),
+                            code: stop_reason.code().to_string(),
+                            message: "execution stopped under lease/control".to_string(),
+                        }),
+                        stage,
+                    )
+                }
             };
 
         let receipt = TaskReceipt {
@@ -225,6 +338,12 @@ impl Runner {
             artifacts,
             logs,
             error: receipt_error.clone(),
+            bridge_context: params.bridge_context.as_ref().map(|t| {
+                let mut bc = t.clone();
+                bc.task_dispatch_intent = params.dispatch_happened;
+                bc.stop_reason = stop_snapshot.map(|s| s.as_safe_error());
+                bc
+            }),
         };
 
         let receipt_path = params.attempt_dir.join("receipt.json");
@@ -283,7 +402,7 @@ impl Runner {
     ) -> Result<TaskReceipt, RunnerError> {
         let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
 
-        // 1. Determine job_id & attempt_id
+        // 1. Determine job_id & attempt_id (local mode generates its own).
         let job_id = match job_id_opt {
             Some(id) => {
                 validate_id("job_id", &id)?;
@@ -298,8 +417,41 @@ impl Runner {
         }
 
         let attempt_id = Uuid::new_v4().to_string();
+        let timeout = timeout_secs.unwrap_or(self.config.task_timeout_secs);
+        self.run_attempt(
+            &canonical_workspace,
+            prompt_file,
+            job_id,
+            attempt_id,
+            timeout,
+            force_doctor,
+            ExecGate::Local,
+            None,
+        )
+        .await
+    }
+
+    /// Runs an attempt already assigned its job/attempt identity, optionally
+    /// under a bridge [`ExecGate`]. Local mode (`ExecGate::Local`, no bridge
+    /// context) reproduces the historical `run_task_with_options` behavior; the
+    /// bridge mode enforces the process-identity and start-permit gates.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_attempt(
+        &self,
+        workspace: &Path,
+        prompt_file: &Path,
+        job_id: String,
+        attempt_id: String,
+        timeout_secs: u64,
+        force_doctor: bool,
+        mut gate: ExecGate,
+        bridge_ctx: Option<BridgeReceiptContext>,
+    ) -> Result<TaskReceipt, RunnerError> {
+        let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
+
         let current_attempt_dir = attempt_dir(&canonical_workspace, &job_id, &attempt_id);
         fs::create_dir_all(&current_attempt_dir)?;
+        let target_job_dir = job_dir(&canonical_workspace, &job_id);
 
         let started_at = Utc::now();
         let status_tracker = StatusTracker::new(&target_job_dir, &job_id, &attempt_id);
@@ -370,6 +522,8 @@ impl Runner {
             local_check_duration_ms: 0,
             current_doctor_metrics: None,
             cached_doctor_metrics: None,
+            dispatch_happened: false,
+            bridge_context: bridge_ctx,
         };
 
         // 2. Snapshot task prompt
@@ -575,14 +729,49 @@ impl Runner {
         let events_path = current_attempt_dir.join("events.jsonl");
         let dispatcher = StreamEventDispatcher::new(events_path, stdout_logger.clone(), event_tx);
 
+        let mut drain_handles: Vec<JoinHandle<()>> = Vec::new();
         if let Some(stdout) = child.take_stdout() {
-            tokio::spawn(dispatcher.run(stdout));
+            drain_handles.push(tokio::spawn(dispatcher.run(stdout)));
         }
         if let Some(stderr) = child.take_stderr() {
             let stderr_drain = stderr_logger.clone();
-            tokio::spawn(async move {
+            drain_handles.push(tokio::spawn(async move {
                 stderr_drain.drain_stream(stderr).await;
-            });
+            }));
+        }
+
+        // In Bridge mode, report the spawned process group and wait for the
+        // controller to persist its identity before the Doctor prompt may go
+        // out. If the controller stops us here (or is gone), tear down and
+        // finalize before returning.
+        if let Some(identity) = make_process_identity(child.pid(), child.pgid()) {
+            if let Err(stop) = gate
+                .signal_and_ack(RunnerSignal::ProcessSpawned(identity))
+                .await
+            {
+                let executor = executor_info.clone();
+                teardown_managed(&mut child, &mut drain_handles).await;
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Stopped {
+                        stop_reason: stop,
+                        dispatched: false,
+                        executor,
+                    },
+                );
+            }
+        }
+        if let Some(stop) = gate.current_stop() {
+            let executor = executor_info.clone();
+            teardown_managed(&mut child, &mut drain_handles).await;
+            return self.finalize_attempt(
+                finalize_params,
+                AttemptOutcome::Stopped {
+                    stop_reason: stop,
+                    dispatched: false,
+                    executor,
+                },
+            );
         }
 
         // 11. Handle Doctor Phase
@@ -628,7 +817,7 @@ impl Runner {
                 "message": { "content": doctor_prompt }
             });
             if let Err(e) = child.send_input_line(&doctor_msg.to_string()).await {
-                let _ = child.kill_group();
+                let _ = child.force_kill_group();
                 return self.finalize_attempt(
                     finalize_params,
                     AttemptOutcome::Blocked {
@@ -647,6 +836,10 @@ impl Runner {
             let mut doctor_result_status = String::new();
             let mut doctor_turn_finished = false;
             let mut doctor_model_usage = None;
+            let mut doctor_stopped: Option<StopReason> = None;
+            let mut doctor_lease_tick =
+                tokio::time::interval(std::time::Duration::from_millis(100));
+            doctor_lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
@@ -689,7 +882,7 @@ impl Runner {
                         }
                     }
                     _ = tokio::time::sleep_until(doctor_deadline) => {
-                        let _ = child.kill_group();
+                        let _ = child.force_kill_group();
                         return self.finalize_attempt(
                             finalize_params,
                             AttemptOutcome::Blocked {
@@ -700,11 +893,30 @@ impl Runner {
                             },
                         );
                     }
+                    _ = doctor_lease_tick.tick(), if gate.is_bridge() => {
+                        if let Some(stop) = gate.current_stop() {
+                            doctor_stopped = Some(stop);
+                            break;
+                        }
+                    }
                 }
             }
 
+            if let Some(stop) = doctor_stopped {
+                teardown_managed(&mut child, &mut drain_handles).await;
+                let executor = executor_info.clone();
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Stopped {
+                        stop_reason: stop,
+                        dispatched: false,
+                        executor,
+                    },
+                );
+            }
+
             if !doctor_turn_finished {
-                let _ = child.kill_group();
+                let _ = child.force_kill_group();
                 return self.finalize_attempt(
                     finalize_params,
                     AttemptOutcome::Blocked {
@@ -732,7 +944,7 @@ impl Runner {
                 let err_msg = doctor_report
                     .error
                     .unwrap_or_else(|| "Doctor checks failed".to_string());
-                let _ = child.kill_group();
+                let _ = child.force_kill_group();
                 return self.finalize_attempt(
                     finalize_params,
                     AttemptOutcome::Blocked {
@@ -753,7 +965,7 @@ impl Runner {
             );
 
             if f_before.fingerprint_hash != f_after.fingerprint_hash {
-                let _ = child.kill_group();
+                let _ = child.force_kill_group();
                 return self.finalize_attempt(
                     finalize_params,
                     AttemptOutcome::Blocked {
@@ -825,12 +1037,76 @@ impl Runner {
             serde_json::json!({ "stage": "task" }),
         );
 
+        // Bridge gate: report PreparedForTask, await the start permit, then
+        // re-check stop/deadline before the business prompt may be written.
+        // A loss of the controller here is a stop, never an implicit approval.
+        if gate.is_bridge() {
+            if let Err(stop) = gate.signal_and_ack(RunnerSignal::PreparedForTask).await {
+                let executor = executor_info.clone();
+                teardown_managed(&mut child, &mut drain_handles).await;
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Stopped {
+                        stop_reason: stop,
+                        dispatched: false,
+                        executor,
+                    },
+                );
+            }
+            match gate.await_permit().await {
+                Ok(Some(deadline)) => {
+                    if gate.past_execution_stop(deadline) {
+                        let executor = executor_info.clone();
+                        teardown_managed(&mut child, &mut drain_handles).await;
+                        return self.finalize_attempt(
+                            finalize_params,
+                            AttemptOutcome::Stopped {
+                                stop_reason: StopReason::LeaseExpired {
+                                    reason: Some("EXECUTION_DEADLINE_EXCEEDED".to_string()),
+                                },
+                                dispatched: false,
+                                executor,
+                            },
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(stop) => {
+                    let executor = executor_info.clone();
+                    teardown_managed(&mut child, &mut drain_handles).await;
+                    return self.finalize_attempt(
+                        finalize_params,
+                        AttemptOutcome::Stopped {
+                            stop_reason: stop,
+                            dispatched: false,
+                            executor,
+                        },
+                    );
+                }
+            }
+            if let Some(stop) = gate.current_stop() {
+                let executor = executor_info.clone();
+                teardown_managed(&mut child, &mut drain_handles).await;
+                return self.finalize_attempt(
+                    finalize_params,
+                    AttemptOutcome::Stopped {
+                        stop_reason: stop,
+                        dispatched: false,
+                        executor,
+                    },
+                );
+            }
+        }
+
         let task_msg = serde_json::json!({
             "event": "user",
             "message": { "content": prompt_content }
         });
+        // The business prompt may (now) be sent. Mark dispatch so a later stop
+        // maps to UNVERIFIED, never NOT_STARTED, and never resends.
+        finalize_params.dispatch_happened = true;
         if let Err(e) = child.send_input_line(&task_msg.to_string()).await {
-            let _ = child.kill_group();
+            let _ = child.force_kill_group();
             return self.finalize_attempt(
                 finalize_params,
                 AttemptOutcome::Failed {
@@ -845,14 +1121,16 @@ impl Runner {
         }
 
         // Listen for Task completion
-        let task_timeout_duration =
-            Duration::from_secs(timeout_secs.unwrap_or(self.config.task_timeout_secs));
+        let task_timeout_duration = Duration::from_secs(timeout_secs);
         let task_deadline = tokio::time::Instant::now() + task_timeout_duration;
 
         let mut task_agent_response = String::new();
         let mut task_result_status = String::new();
         let mut task_turn_finished = false;
         let mut task_authorized_permission_failure = false;
+        let mut task_stopped: Option<StopReason> = None;
+        let mut lease_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -906,30 +1184,37 @@ impl Runner {
                     }
                 }
                 _ = tokio::time::sleep_until(task_deadline) => {
-                    let _ = child.kill_group();
+                    let _ = child.force_kill_group();
                     return self.finalize_attempt(
                         finalize_params,
                         AttemptOutcome::Timeout {
-                            duration_secs: timeout_secs.unwrap_or(self.config.task_timeout_secs),
+                            duration_secs: timeout_secs,
                             executor: executor_info,
                         },
                     );
                 }
+                _ = lease_tick.tick(), if gate.is_bridge() => {
+                    if let Some(stop) = gate.current_stop() {
+                        task_stopped = Some(stop);
+                        break;
+                    }
+                }
             }
         }
 
-        // Teardown & Graceful Child Exit
-        let _ = child.close_stdin();
-        let teardown_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.config.teardown_wait_secs);
+        // Teardown & Graceful Child Exit (bounded two-phase; joins drains).
+        teardown_managed(&mut child, &mut drain_handles).await;
 
-        tokio::select! {
-            _ = child.wait() => {}
-            _ = tokio::time::sleep_until(teardown_deadline) => {
-                let _ = child.kill_group();
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let _ = child.force_kill_group();
-            }
+        if let Some(stop) = task_stopped {
+            let executor = executor_info.clone();
+            return self.finalize_attempt(
+                finalize_params,
+                AttemptOutcome::Stopped {
+                    stop_reason: stop,
+                    dispatched: true,
+                    executor,
+                },
+            );
         }
 
         if !task_turn_finished || !task_result_status.eq_ignore_ascii_case("success") {
@@ -981,6 +1266,43 @@ impl Runner {
                 business_outcome: verification.outcome,
             },
         )
+    }
+
+    /// Runs a fresh attempt under bridge control, reusing the same pipeline as
+    /// local mode (no second Doctor/verification path). The caller (bridge
+    /// controller) must already hold the execution lock, must use a fresh
+    /// attempt id, and must hand over the runner-side [`RunnerControls`].
+    /// Refuses to re-run an attempt that already has a final receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_managed(
+        &self,
+        workspace: &Path,
+        job_id: &str,
+        attempt_id: &str,
+        prompt_file: &Path,
+        timeout_secs: u64,
+        force_doctor: bool,
+        controls: RunnerControls,
+        context: BridgeReceiptContext,
+    ) -> Result<TaskReceipt, RunnerError> {
+        let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
+        validate_id("job_id", job_id)?;
+        validate_id("attempt_id", attempt_id)?;
+        let ad = attempt_dir(&canonical_workspace, job_id, attempt_id);
+        if ad.join("receipt.json").exists() {
+            return Err(RunnerError::AttemptAlreadyFinalized(attempt_id.to_string()));
+        }
+        self.run_attempt(
+            &canonical_workspace,
+            prompt_file,
+            job_id.to_string(),
+            attempt_id.to_string(),
+            timeout_secs,
+            force_doctor,
+            ExecGate::Bridge(controls),
+            Some(context),
+        )
+        .await
     }
 
     pub async fn run_standalone_doctor(
@@ -1148,7 +1470,7 @@ impl Runner {
                 }
                 _ = child.wait() => break,
                 _ = tokio::time::sleep_until(doctor_deadline) => {
-                    let _ = child.kill_group();
+                    let _ = child.force_kill_group();
                     break;
                 }
             }

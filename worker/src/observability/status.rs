@@ -18,6 +18,7 @@ pub enum JobStage {
     Failed,
     Blocked,
     Cancelled,
+    Interrupted,
     UnknownInterrupted,
 }
 
@@ -33,6 +34,7 @@ impl std::fmt::Display for JobStage {
             JobStage::Failed => write!(f, "Failed"),
             JobStage::Blocked => write!(f, "Blocked"),
             JobStage::Cancelled => write!(f, "Cancelled"),
+            JobStage::Interrupted => write!(f, "Interrupted"),
             JobStage::UnknownInterrupted => write!(f, "UnknownInterrupted"),
         }
     }
@@ -142,6 +144,7 @@ impl StatusTracker {
                 | JobStage::Failed
                 | JobStage::Blocked
                 | JobStage::Cancelled
+                | JobStage::Interrupted
                 | JobStage::UnknownInterrupted
         ) {
             let is_alive = check_process_alive(report.runner_pid, report.runner_start_time);
