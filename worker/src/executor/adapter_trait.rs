@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use thiserror::Error;
@@ -40,20 +41,23 @@ pub struct ExecutionRequest<'a> {
 
 pub trait ManagedProcess: Send + Sync {
     fn pid(&self) -> Option<u32>;
+    /// Process-group id of the spawned group (equal to the leader PID because
+    /// each adapter calls `setpgid(0,0)` in a pre-exec hook). None if unknown.
+    /// PID equality is never assumed from `pid()` alone; the actual setpgid
+    /// result is what the adapter records.
+    fn pgid(&self) -> Option<i32>;
     fn take_stdout(&mut self) -> Option<ChildStdout>;
     fn take_stderr(&mut self) -> Option<ChildStderr>;
     fn send_input_line<'a>(
         &'a mut self,
         line: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
     fn close_stdin(&mut self) -> Result<(), std::io::Error>;
     fn kill_group(&mut self) -> Result<(), std::io::Error>;
     fn force_kill_group(&mut self) -> Result<(), std::io::Error>;
     fn wait(
         &mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExitStatus, std::io::Error>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ExitStatus, std::io::Error>> + Send + '_>>;
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

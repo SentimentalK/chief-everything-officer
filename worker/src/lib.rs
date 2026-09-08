@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod config;
 pub mod doctor;
 pub mod executor;
+pub mod local_state;
 pub mod observability;
 pub mod receipt;
 pub mod runner;

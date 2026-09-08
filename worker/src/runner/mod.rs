@@ -1,3 +1,10 @@
+pub mod control;
+
+pub use control::{
+    control_channel, BridgeReceiptContext, ExecGate, ExecutionPermit, RunnerControls, RunnerSignal,
+    StopReason,
+};
+
 use crate::config::{attempt_dir, job_dir, snapshot_prompt, validate_id, WorkerConfig};
 use crate::doctor::{
     invalidate_cache, load_cache, run_fast_local_precheck, run_preflight_static_checks, save_cache,
