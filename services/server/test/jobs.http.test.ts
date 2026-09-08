@@ -5,7 +5,8 @@ import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createJobLeaseRouter } from "../src/jobs/router.js";
-import { JobError, type JobService, type LeaseResult } from "../src/jobs/service.js";
+import { JobService, JobError, type LeaseResult } from "../src/jobs/service.js";
+import { RedisJobStore, createRedisRunnerFromClient } from "../src/jobs/redis-store.js";
 import { fixture, createIdentityService } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
@@ -161,27 +162,73 @@ describe("worker lease HTTP input and routing", () => {
     expect(called).toBe(false);
   });
 
-  it("propagates schema INVALID_INPUT for an unknown/missing field without echoing the raw body", async () => {
-    const body = { ...claimBody(), user_id: "usr_evil" }; // forged identity -> strict schema reject
-    const { baseUrl } = await buildServer(
-      stubService({
-        claim: async () => {
-          throw new JobError("INVALID_INPUT", "validation failed");
-        },
-      }),
-    );
-    const lines = await captureStderr(async () => {
-      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify(body),
+});
+
+/** A real JobService whose Redis is never reachable (parse rejects first). */
+function deadStoreService(): JobService {
+  const runner = createRedisRunnerFromClient(
+    () => {
+      throw new Error("never connect");
+    },
+    { opTimeoutMs: 50 },
+  );
+  return new JobService({ store: new RedisJobStore(runner) }, () => true);
+}
+
+describe("worker lease HTTP strict input validation (real schema, not a throw-all mock)", () => {
+  // These drive the real workerClaimSchema / workerLeaseOperationSchema through
+  // an actual JobService. Because schema rejection happens before any backend
+  // access, an invalid body must yield INVALID_INPUT (400) even though the
+  // store is never reachable - never a QUEUE_UNAVAILABLE (503).
+  const cases: Array<{ name: string; body: Record<string, unknown> }> = [
+    { name: "forged user_id (unknown field)", body: { ...claimBody(), user_id: "usr_evil" } },
+    { name: "forged workspace_id (unknown field)", body: { ...claimBody(), workspace_id: "ws_evil" } },
+    { name: "missing attempt_id", body: { worker_id: WRK, workspace_ref: "tools", lease_token: TOKEN } },
+    { name: "malformed worker_id", body: { ...claimBody(), worker_id: "wrk-NOTHEX" } },
+    { name: "malformed lease_token", body: { ...claimBody(), lease_token: "not-hex" } },
+    { name: "malformed workspace_ref", body: { ...claimBody(), workspace_ref: "tools/../evil" } },
+  ];
+  for (const c of cases) {
+    it(`rejects claim with ${c.name} as INVALID_INPUT via the real schema`, async () => {
+      const { baseUrl } = await buildServer(deadStoreService());
+      const lines = await captureStderr(async () => {
+        const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify(c.body),
+        });
+        expect(res.status).toBe(400);
+        expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
       });
-      expect(res.status).toBe(400);
-      expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
+      const joined = lines.join("");
+      expect(joined).not.toContain("usr_evil");
+      expect(joined).not.toContain(TOKEN);
     });
-    const joined = lines.join("");
-    expect(joined).not.toContain("usr_evil");
-    expect(joined).not.toContain(TOKEN);
+  }
+
+  it("rejects unknown fields on start/heartbeat too (real schema)", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const body = { worker_id: WRK, attempt_id: ATT, lease_token: TOKEN, lease_duration_ms: 1234 };
+    const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/start`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
+  });
+
+  it("a schema-valid claim on an unreachable backend is QUEUE_UNAVAILABLE, not a validation error", async () => {
+    // Proves the real service validated the body successfully and only then hit
+    // the (never-ready) backend - distinguishing validation from availability.
+    const { baseUrl } = await buildServer(deadStoreService());
+    const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(claimBody()),
+    });
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { code: string }).code).toBe("QUEUE_UNAVAILABLE");
   });
 });
 

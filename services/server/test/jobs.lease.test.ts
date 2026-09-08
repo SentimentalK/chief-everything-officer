@@ -1,8 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
+import express from "express";
+import type { Server as HttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { createClient, type RedisClientType } from "redis";
 import { RedisJobStore, createRedisRunnerFromClient, type RedisRunner } from "../src/jobs/redis-store.js";
 import { JobService } from "../src/jobs/service.js";
+import { createJobLeaseRouter } from "../src/jobs/router.js";
 import { makeJobId, jobKey, JOBS_SCHEMA_VERSION, type PersistedJobRecord, type JobExecution } from "../src/jobs/schema.js";
 
 // Real-Redis execution-lease integration. CI-gated exactly like
@@ -51,6 +55,30 @@ function baseRecord(
     created_at_ms: now,
     claim_deadline_ms: now + 7 * 24 * 60 * 60 * 1000,
     ...patch,
+  };
+}
+
+/**
+ * A running execution whose execution deadline is already in the past but whose
+ * internal time ordering is still valid (claimed_at <= started_at <= lease <=
+ * execution_deadline). Used to exercise the EXECUTION_DEADLINE_EXCEEDED path
+ * without crafting a structurally corrupt record.
+ */
+function runningExpiredExecution(): JobExecution {
+  const now = Date.now();
+  const claimedAt = now - 200_000;
+  const startedAt = now - 180_000;
+  const execDeadline = startedAt + 120_000; // == now - 60_000, in the past
+  return {
+    worker_id: WRK,
+    attempt_id: ATT1,
+    lease_token_sha256: sha(TOKEN),
+    phase: "running",
+    claimed_at_ms: claimedAt,
+    start_deadline_ms: claimedAt + 300_000,
+    lease_expires_at_ms: execDeadline,
+    started_at_ms: startedAt,
+    execution_deadline_ms: execDeadline,
   };
 }
 
@@ -255,6 +283,71 @@ describe.skipIf(!URL)("worker execution leases (real Redis, CI-gated)", () => {
     expect((await getJob(corrupt.job_id)).execution?.phase).toBe("bogus");
   });
 
+  it("an explicit execution:null is a corrupt record, never an unclaimed job", async () => {
+    const job = baseRecord(scopeA);
+    await putJob({ ...job, execution: null as unknown as JobExecution });
+    await expect(
+      serviceA.claim(scopeA, job.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", lease_token: TOKEN }),
+    ).rejects.toMatchObject({ code: "QUEUE_UNAVAILABLE", details: { reason: "CORRUPT_RECORD" } });
+    // It must not be claimed over: record stays un-claimed (execution null).
+    const after = await getJob(job.job_id);
+    expect("execution" in after && after.execution === null).toBe(true);
+  });
+
+  it("rejects claimed executions that omit the explicit-null started fields, leaving the record unchanged", async () => {
+    const now = Date.now();
+    // Omit started_at_ms / execution_deadline_ms entirely instead of storing null.
+    const job = baseRecord(scopeA);
+    job.execution = {
+      worker_id: WRK,
+      attempt_id: ATT1,
+      lease_token_sha256: sha(TOKEN),
+      phase: "claimed",
+      claimed_at_ms: now,
+      start_deadline_ms: now + 300_000,
+      lease_expires_at_ms: now + 90_000,
+    } as unknown as JobExecution;
+    await putJob(job);
+    await expect(
+      serviceA.claim(scopeA, job.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", lease_token: TOKEN }),
+    ).rejects.toMatchObject({ code: "QUEUE_UNAVAILABLE", details: { reason: "CORRUPT_RECORD" } });
+    const after = await getJob(job.job_id);
+    expect(after.execution).toEqual(job.execution);
+  });
+
+  it("rejects running executions whose lease predates their start (invalid ordering)", async () => {
+    const now = Date.now();
+    const job = baseRecord(scopeA);
+    job.execution = {
+      worker_id: WRK,
+      attempt_id: ATT1,
+      lease_token_sha256: sha(TOKEN),
+      phase: "running",
+      claimed_at_ms: now,
+      start_deadline_ms: now + 300_000,
+      lease_expires_at_ms: now + 5_000, // < started_at -> invalid
+      started_at_ms: now + 10_000,
+      execution_deadline_ms: now + 120_000,
+    };
+    await putJob(job);
+    await expect(
+      serviceA.get(scopeA, { job_id: job.job_id }),
+    ).rejects.toMatchObject({ code: "QUEUE_UNAVAILABLE", details: { reason: "CORRUPT_RECORD" } });
+    expect((await getJob(job.job_id)).execution).toEqual(job.execution);
+  });
+
+  it("expired-running rejects with LEASE_EXPIRED while preserving the EXECUTION_DEADLINE_EXCEEDED reason", async () => {
+    const job = baseRecord(scopeA);
+    job.execution = runningExpiredExecution();
+    await putJob(job);
+    await expect(
+      serviceA.start(scopeA, job.job_id, { worker_id: WRK, attempt_id: ATT1, lease_token: TOKEN }),
+    ).rejects.toMatchObject({ code: "LEASE_EXPIRED", details: { reason: "EXECUTION_DEADLINE_EXCEEDED" } });
+    await expect(
+      serviceA.heartbeat(scopeA, job.job_id, { worker_id: WRK, attempt_id: ATT1, lease_token: TOKEN }),
+    ).rejects.toMatchObject({ code: "LEASE_EXPIRED", details: { reason: "EXECUTION_DEADLINE_EXCEEDED" } });
+  });
+
   it("identity isolation: another identity cannot claim or even see a job (JOB_NOT_FOUND)", async () => {
     const job = baseRecord(scopeA);
     await putJob(job);
@@ -393,25 +486,23 @@ describe.skipIf(!URL)("worker execution leases (real Redis, CI-gated)", () => {
 
     const running = baseRecord(scopeA, { claim_deadline_ms: now - 1000 });
     running.execution = {
-      ...claimedExecution(),
+      worker_id: WRK,
+      attempt_id: ATT1,
+      lease_token_sha256: sha(TOKEN),
       phase: "running",
-      started_at_ms: now,
-      execution_deadline_ms: now + 60_000,
+      claimed_at_ms: now - 1000,
+      start_deadline_ms: now - 1000 + 300_000,
       lease_expires_at_ms: now + 60_000,
-    } as JobExecution;
+      started_at_ms: now - 1000,
+      execution_deadline_ms: now + 60_000,
+    };
     await putJob(running);
     const rv = await serviceA.get(scopeA, { job_id: running.job_id });
     expect(rv.ok && rv.view!.state).toBe("running");
     expect(rv.ok && rv.view!.execution?.started_at).not.toBeNull();
 
     const inter = baseRecord(scopeA);
-    inter.execution = {
-      ...claimedExecution(),
-      phase: "running",
-      started_at_ms: now,
-      execution_deadline_ms: now - 1,
-      lease_expires_at_ms: now - 1,
-    } as JobExecution;
+    inter.execution = runningExpiredExecution();
     await putJob(inter);
     const iv = await serviceA.get(scopeA, { job_id: inter.job_id });
     expect(iv.ok && iv.view!.state).toBe("interrupted");
@@ -437,9 +528,8 @@ describe.skipIf(!URL)("worker execution leases (real Redis, CI-gated)", () => {
     const jid2 = s2.view!.job_id;
     await serviceA.claim(scopeA, jid2, { worker_id: WRK, attempt_id: ATT2, workspace_ref: "tools", lease_token: TOKEN2 });
     await serviceA.start(scopeA, jid2, { worker_id: WRK, attempt_id: ATT2, lease_token: TOKEN2 });
-    const svNow = await serverNowMs(jid2);
     const rec2 = await getJob(jid2);
-    rec2.execution = { ...rec2.execution!, execution_deadline_ms: svNow - 1, lease_expires_at_ms: svNow - 1 } as JobExecution;
+    rec2.execution = { ...runningExpiredExecution(), attempt_id: ATT2, lease_token_sha256: sha(TOKEN2) };
     await putJob(rec2);
     const rp2 = await serviceA.submit(scopeA, { request_id: reqInter, workspace_ref: "tools", prompt: "replay interrupted", acceptance: "a", timeout_seconds: 120 });
     expect(rp2.ok).toBe(true);
@@ -458,6 +548,37 @@ describe.skipIf(!URL)("worker execution leases (real Redis, CI-gated)", () => {
     expect(await store.streamLength()).toBe(before);
     expect(JSON.stringify(gv.view)).not.toContain(TOKEN);
     expect(JSON.stringify(gv.view)).not.toContain(sha(TOKEN));
+  });
+
+  it("HTTP over the real Service preserves the EXECUTION_DEADLINE_EXCEEDED reason for LEASE_EXPIRED", async () => {
+    const job = baseRecord(scopeA);
+    job.execution = runningExpiredExecution();
+    await putJob(job);
+
+    const app = express();
+    app.use(express.json());
+    app.use((_req, res, next) => {
+      res.locals.identity = scopeA;
+      next();
+    });
+    app.use("/api/worker/jobs", createJobLeaseRouter(serviceA));
+    const server = await new Promise<HttpServer>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/api/worker/jobs/${job.job_id}/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ worker_id: WRK, attempt_id: ATT1, lease_token: TOKEN }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { code: string; details?: { reason?: string } };
+      expect(body.code).toBe("LEASE_EXPIRED");
+      expect(body.details?.reason).toBe("EXECUTION_DEADLINE_EXCEEDED");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it("reloads the lease script after SCRIPT FLUSH and still inspects/heartbeats", async () => {

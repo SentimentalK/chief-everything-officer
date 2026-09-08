@@ -164,31 +164,32 @@ function viewFromLease(res: Extract<LeaseScriptResult, { ok: true }>, replayed: 
 function leaseToError(res: Extract<LeaseScriptResult, { ok: false }>): JobError {
   const code = res.code as JobErrorCode;
   const reason = res.reason;
+  // A specific reason (e.g. EXECUTION_DEADLINE_EXCEEDED, START_DEADLINE_EXCEEDED,
+  // LEASE_EXPIRED, CORRUPT_RECORD, INCOMPLETE_SUBMISSION) is preserved on the
+  // error so HTTP consumers can distinguish why an attempt was rejected.
+  const details = reason ? { reason } : {};
+  const msg = (m: string) => new JobError(code, m, details);
   switch (code) {
     case "JOB_NOT_FOUND":
-      return new JobError("JOB_NOT_FOUND", "Job not found.");
+      return msg("Job not found.");
     case "JOB_EXPIRED":
-      return new JobError("JOB_EXPIRED", "Job is past its seven-day claim window.");
+      return msg("Job is past its seven-day claim window.");
     case "JOB_ALREADY_CLAIMED":
-      return new JobError("JOB_ALREADY_CLAIMED", "Job already claimed by another attempt.");
+      return msg("Job already claimed by another attempt.");
     case "IDEMPOTENCY_CONFLICT":
-      return new JobError("IDEMPOTENCY_CONFLICT", "Attempt reused with different credentials.");
+      return msg("Attempt reused with different credentials.");
     case "JOB_NOT_CLAIMED":
-      return new JobError("JOB_NOT_CLAIMED", "Job is not claimed.");
+      return msg("Job is not claimed.");
     case "LEASE_MISMATCH":
-      return new JobError("LEASE_MISMATCH", "Execution credentials do not match.");
+      return msg("Execution credentials do not match.");
     case "LEASE_EXPIRED":
-      return new JobError("LEASE_EXPIRED", "Execution lease has expired.");
+      return msg("Execution lease has expired.");
     case "WORKSPACE_MISMATCH":
-      return new JobError("WORKSPACE_MISMATCH", "Workspace does not match the job.");
+      return msg("Workspace does not match the job.");
     case "QUEUE_UNAVAILABLE":
-      return new JobError("QUEUE_UNAVAILABLE", incompleteQueueMessage(reason), {
-        ...(reason ? { reason } : {}),
-      });
+      return msg(incompleteQueueMessage(reason));
     default:
-      return new JobError("QUEUE_UNAVAILABLE", incompleteQueueMessage(reason), {
-        ...(reason ? { reason } : {}),
-      });
+      return msg(incompleteQueueMessage(reason));
   }
 }
 

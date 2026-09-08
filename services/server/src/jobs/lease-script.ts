@@ -97,10 +97,15 @@ if job.resource_id ~= nil and job.resource_id ~= cjson.null and type(job.resourc
   return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
 end
 
--- Validate an existing execution whenever present.
+-- Validate an existing execution whenever present. Only the ABSENCE of the
+-- field means "not yet claimed". An explicit null, a non-table, a missing
+-- required field, or an illegal time relation is a corrupt record and must
+-- never be treated as an unclaimed job that could be claimed afresh.
 local ex = job.execution
-if ex ~= nil and ex ~= cjson.null then
-  if type(ex) ~= 'table' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
+if ex ~= nil then
+  if ex == cjson.null or type(ex) ~= 'table' then
+    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+  end
   if ex.phase ~= 'claimed' and ex.phase ~= 'running' then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
@@ -121,10 +126,18 @@ if ex ~= nil and ex ~= cjson.null then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
   if ex.phase == 'claimed' then
-    local sa = ex.started_at_ms
-    local ed = ex.execution_deadline_ms
-    local nullOK = (sa == nil or sa == cjson.null) and (ed == nil or ed == cjson.null)
-    if not nullOK then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
+    -- A claimed (not yet started) execution must explicitly store null for the
+    -- not-yet-set fields; omitting them is a corrupt shape, not "still claiming".
+    if ex.started_at_ms ~= cjson.null or ex.execution_deadline_ms ~= cjson.null then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
+    -- Full ordering: claimed_at <= lease_expires_at <= start_deadline.
+    if ex.claimed_at_ms > ex.start_deadline_ms then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
+    if ex.claimed_at_ms > ex.lease_expires_at_ms then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
     if ex.lease_expires_at_ms > ex.start_deadline_ms then
       return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
     end
@@ -135,7 +148,17 @@ if ex ~= nil and ex ~= cjson.null then
     if type(ex.execution_deadline_ms) ~= 'number' or ex.execution_deadline_ms % 1 ~= 0 then
       return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
     end
+    -- Full ordering: claimed_at <= started_at <= lease_expires_at <= execution_deadline.
+    if ex.started_at_ms < ex.claimed_at_ms then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
+    if ex.lease_expires_at_ms < ex.started_at_ms then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
     if ex.lease_expires_at_ms > ex.execution_deadline_ms then
+      return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+    end
+    if ex.execution_deadline_ms < ex.started_at_ms then
       return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
     end
   end
