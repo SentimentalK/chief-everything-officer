@@ -44,6 +44,8 @@ export interface RedisRunner {
   xaddStream(payload: Record<string, string | number>): Promise<string>;
   /** Number of entries in a key (stream length, for assertions). */
   xlen(key: string): Promise<number>;
+  /** XRANGE over a stream from an EXCLUSIVE start with a bounded COUNT. */
+  xrange(key: string, afterExclusive: string, count: number): Promise<Array<[string, string[]]>>;
   /** Load a Lua script; returns its sha1. */
   scriptLoad(script: string): Promise<string>;
   /** EVALSHA for our script; caller owns NOSCRIPT reload. */
@@ -343,6 +345,26 @@ export class RedisJobStore {
   async streamLength(): Promise<number> {
     this.keyCheck();
     return this.redis.xlen(KEY_STREAM);
+  }
+
+  /**
+   * Read a bounded window of committed stream entries after an EXCLUSIVE start
+   * (task-discovery source). Returns only {id, fields}; no consumer group is
+   * used and no consumption state is mutated.
+   */
+  async readStreamEntries(
+    afterExclusive: string,
+    count: number,
+  ): Promise<Array<{ id: string; fields: Record<string, string> }>> {
+    this.keyCheck();
+    const rows = await this.redis.xrange(KEY_STREAM, afterExclusive, count);
+    return rows.map(([id, flat]) => {
+      const fields: Record<string, string> = {};
+      for (let i = 0; i + 1 < flat.length; i += 2) {
+        fields[flat[i]!] = flat[i + 1]!;
+      }
+      return { id, fields };
+    });
   }
 
   /**
@@ -663,6 +685,26 @@ export function createRedisRunnerFromClient(
       return execute("XLEN", async (client) => {
         const out = await client.sendCommand(["XLEN", KEY_STREAM]);
         return typeof out === "number" ? out : Number(out);
+      });
+    },
+    async xrange(key, afterExclusive, count) {
+      return execute("XRANGE", async (client) => {
+        const out = await client.sendCommand([
+          "XRANGE",
+          key,
+          `(${afterExclusive}`,
+          "+",
+          "COUNT",
+          String(count),
+        ]);
+        const rows = Array.isArray(out) ? out : [];
+        return rows.map((row) => {
+          const arr = Array.isArray(row) ? row : [];
+          const id = arr[0] === null ? "" : String(arr[0]);
+          const flat = (Array.isArray(arr[1]) ? arr[1] : []) as unknown[];
+          const fields = flat.map((f) => (f === null ? "" : String(f)));
+          return [id, fields] as [string, string[]];
+        });
       });
     },
     async scriptLoad(script) {

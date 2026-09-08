@@ -72,7 +72,7 @@ jobs:
       - name: Jobs integration tests (serial, must NOT skip)
         run: |
           cd services/server
-          for f in jobs.redis.test.ts jobs.lease.test.ts jobs.http.test.ts; do
+          for f in jobs.redis.test.ts jobs.lease.test.ts jobs.discovery.test.ts jobs.http.test.ts; do
             mkdir -p .tmp
             log=".tmp/${f}.log"
             npx vitest run "test/${f}" > "${log}" 2>&1 || { cat "${log}"; exit 1; }

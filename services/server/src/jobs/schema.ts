@@ -284,3 +284,68 @@ export function parseLeaseOperation(raw: unknown): ParseOutcome<NormalizedLeaseO
     },
   };
 }
+
+// ---- Task discovery (GET /api/worker/jobs/pending) ----
+
+export const DISCOVERY_PAGE_SIZE = 25;
+export const DISCOVERY_BUDGET_MS = 5000;
+export const DISCOVERY_MAX_RECORD_CHECKS = 4;
+
+/**
+ * A Redis Stream ID is two unsigned 64-bit decimals ("<ms>-<seq>"). Parse each
+ * half as a BigInt (never JavaScript Number, which loses precision) and confirm
+ * it fits u64 so the value can be used as an exclusive XRANGE start.
+ */
+export function isValidStreamId(value: string): boolean {
+  const m = /^([0-9]+)-([0-9]+)$/.exec(value);
+  if (!m) return false;
+  const ms = m[1];
+  const seq = m[2];
+  const max = BigInt("18446744073709551615"); // u64 max
+  try {
+    if (BigInt(ms!) > max || BigInt(seq!) > max) return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+export interface NormalizedPendingQuery {
+  workspace_ref: string;
+  after: string;
+}
+
+export interface PendingJob {
+  job_id: string;
+  workspace_ref: string;
+  resource_id: string | null;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface PendingJobsResult {
+  ok: true;
+  jobs: PendingJob[];
+  next_cursor: string;
+  has_more: boolean;
+}
+
+export const workerPendingSchema = z.object({
+  workspace_ref: z.string().regex(WORKSPACE_REF_RE, "workspace_ref must be 1-64 [A-Za-z0-9_-]"),
+  after: z.string().optional().refine((v) => v === undefined || isValidStreamId(v), "after must be a Redis stream ID (two u64 decimal parts)"),
+}).strict();
+
+/** Raw query-object shape (express query). Rejects arrays/nesting via strict. */
+export function parsePendingQuery(raw: unknown): ParseOutcome<NormalizedPendingQuery> {
+  const parsed = workerPendingSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { ok: false, issue: issueOf(parsed), reason: "INVALID_INPUT" };
+  }
+  return {
+    ok: true,
+    value: {
+      workspace_ref: parsed.data.workspace_ref,
+      after: parsed.data.after ?? "0-0",
+    },
+  };
+}

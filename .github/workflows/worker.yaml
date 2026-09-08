@@ -1,0 +1,111 @@
+name: CEO Worker — Bridge Connectivity
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "services/server/src/jobs/**"
+      - "services/server/test/jobs.*.test.ts"
+      - ".github/workflows/worker.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "services/server/src/jobs/**"
+      - "services/server/test/jobs.*.test.ts"
+      - ".github/workflows/worker.yaml"
+  workflow_dispatch:
+
+jobs:
+  rust-gate:
+    name: Rust fmt / test / clippy / build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt --check
+        run: cd worker && cargo fmt --check
+      - name: cargo test --locked
+        run: cd worker && cargo test --locked
+      - name: cargo clippy -D warnings
+        run: cd worker && cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo build --locked
+        run: cd worker && cargo build --locked
+
+  connectivity:
+    name: Cross-language bridge check (real Server + Redis)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      REDIS_PASS: ceo-worker-test-pass
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Start isolated Redis with password auth
+        run: |
+          docker run -d --name ceo-worker-redis -p 6379:6379 \
+            redis:7-alpine redis-server --requirepass "${REDIS_PASS}"
+          for i in $(seq 1 30); do
+            docker exec ceo-worker-redis redis-cli -a "${REDIS_PASS}" --no-auth-warning ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec ceo-worker-redis redis-cli -a "${REDIS_PASS}" --no-auth-warning ping
+
+      - name: Install + build Server dist
+        run: |
+          cd services/server
+          npm ci --prefer-offline=false --audit=false --fund=false
+          npm run build
+
+      - name: Build worker binary
+        run: |
+          cd worker
+          cargo build --locked
+
+      - name: Prepare repository-of-record (bare remote)
+        run: |
+          mkdir -p .tmp/acceptance
+          git init -q --bare -b main ".tmp/acceptance/remote.git"
+          mkdir -p .tmp/acceptance/seed
+          cd .tmp/acceptance/seed
+          git init -q -b main
+          echo "seed" > seed.txt
+          git add -A
+          git -c user.email=t@ci -c user.name=t commit -qm seed
+          git remote add origin "../../acceptance/remote.git"
+          git push -q origin main
+
+      - name: Cross-language connectivity acceptance (must NOT skip)
+        run: |
+          bash worker/scripts/connectivity-acceptance.sh
+        env:
+          CEO_ACCEPTANCE_REDIS: redis://:ceo-worker-test-pass@127.0.0.1:6379
+          CEO_ACCEPTANCE_KEY: ceo-worker-acceptance-key
+          CEO_ACCEPTANCE_REMOTE: ${{ github.workspace }}/.tmp/acceptance/remote.git
+          CEO_ACCEPTANCE_ROOT: ${{ github.workspace }}/.tmp/acceptance/run
+          CEO_ACCEPTANCE_SERVER: ${{ github.workspace }}/services/server
+          CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker
+          CEO_ACCEPTANCE_PORT: "3803"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f ceo-worker-redis 2>/dev/null || true
+          rm -rf .tmp/acceptance 2>/dev/null || true

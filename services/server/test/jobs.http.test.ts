@@ -232,6 +232,69 @@ describe("worker lease HTTP strict input validation (real schema, not a throw-al
   });
 });
 
+describe("worker discovery HTTP (GET /pending)", () => {
+  const JOB2 = "job-123e4567-e89b-12d3-a456-426614174001";
+
+  it("requires authentication (401)", async () => {
+    const { baseUrl } = await buildServer(stubService({}));
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`);
+    expect(res.status).toBe(401);
+  });
+
+  it("validates query parameters through the real schema (never QUEUE_UNAVAILABLE)", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const bad: Array<[string, number]> = [
+      [`?workspace_ref=tools&after=not-a-cursor`, 400],
+      [`?workspace_ref=tools&extra=1`, 400], // unknown param
+      [`?workspace_ref=`, 400], // missing/empty required alias
+      [`?after=0-0`, 400], // missing workspace_ref
+    ];
+    for (const [qs, expected] of bad) {
+      const res = await fetch(`${baseUrl}/api/worker/jobs/pending${qs}`, { headers: authHeaders() });
+      expect(res.status).toBe(expected);
+      expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
+    }
+  });
+
+  it("a schema-valid pending query on an unreachable backend is QUEUE_UNAVAILABLE", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`, { headers: authHeaders() });
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { code: string }).code).toBe("QUEUE_UNAVAILABLE");
+  });
+
+  it("returns a strict discovery envelope and no-store without leaking task content", async () => {
+    const service = {
+      pending: async () => ({
+        ok: true as const,
+        jobs: [
+          {
+            job_id: JOB2,
+            workspace_ref: "tools",
+            resource_id: null,
+            created_at: "2026-09-07T00:00:00.000Z",
+            expires_at: "2026-09-14T00:00:00.000Z",
+          },
+        ],
+        next_cursor: "1788816855488-0",
+        has_more: true,
+      }),
+    } as unknown as JobService;
+    const { baseUrl } = await buildServer(service);
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`, { headers: authHeaders() });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect((body.jobs as Array<Record<string, unknown>>)[0]!.job_id).toBe(JOB2);
+    expect(body.next_cursor).toBe("1788816855488-0");
+    expect(body.has_more).toBe(true);
+    const text = JSON.stringify(body);
+    expect(text).not.toContain("prompt");
+    expect(text).not.toContain("acceptance");
+  });
+});
+
 describe("worker lease HTTP success output whitelist + no-store", () => {
   it("returns claim output that is a strict whitelist (no token/hash/secret extras)", async () => {
       const secretMarker = "TOP_SECRET_MARKER";

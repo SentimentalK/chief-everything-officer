@@ -165,5 +165,47 @@ export function createJobLeaseRouter(service: JobService | null): Router {
   router.post("/:job_id/start", handle("start", (svc, scope, jobId, body) => svc.start(scope, jobId, body)));
   router.post("/:job_id/heartbeat", handle("heartbeat", (svc, scope, jobId, body) => svc.heartbeat(scope, jobId, body)));
 
+  router.get("/pending", async (req: Request, res: Response) => {
+    const started = Date.now();
+    const scope = scopeFrom(res);
+    const uid = scope?.user_id ?? null;
+    const wsid = scope?.workspace_id ?? null;
+    const fail = (code: string, message: string, reason?: string | null): void => {
+      logLine({
+        event: "pending",
+        user_id: uid,
+        workspace_id: wsid,
+        error_code: code,
+        reason: reason ?? null,
+        latency_ms: Date.now() - started,
+      });
+      respondError(res, { code, message, reason: reason ?? null });
+    };
+    if (!scope) {
+      fail("INVALID_INPUT", "Missing identity context.");
+      return;
+    }
+    if (!service) {
+      fail("BRIDGE_DISABLED", "Job submission is disabled on this deployment.");
+      return;
+    }
+    try {
+      const result = await service.pending(scope, req.query);
+      logLine({
+        event: "pending",
+        user_id: uid,
+        workspace_id: wsid,
+        latency_ms: Date.now() - started,
+      });
+      res.status(200).json({ ok: true, jobs: result.jobs, next_cursor: result.next_cursor, has_more: result.has_more });
+    } catch (e) {
+      const error = e as { code?: unknown; message?: unknown; details?: { reason?: unknown } };
+      const code = (typeof error.code === "string" ? error.code : "QUEUE_UNAVAILABLE") as string;
+      const message = typeof error.message === "string" ? error.message : "Queue backend is not available.";
+      const reasonRaw = error.details?.reason;
+      fail(code, message, typeof reasonRaw === "string" ? reasonRaw : null);
+    }
+  });
+
   return router;
 }

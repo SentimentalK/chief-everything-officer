@@ -1,3 +1,5 @@
+use ceo_worker::bridge::client::BridgeClient;
+use ceo_worker::bridge::config::{load_api_key, BridgeConfig};
 use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
 use ceo_worker::observability::status::{JobStage, StatusTracker};
 use ceo_worker::runner::Runner;
@@ -60,8 +62,29 @@ enum Commands {
         stream: String,
         #[arg(short, long, default_value = "all")]
         source: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(short, long, default_value_t = false)]
         events: bool,
+    },
+    /// Read-only connectivity checks against the CEO server bridge
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Verify identity, config, and task discovery for one workspace
+    Check {
+        /// Path to the bridge config JSON file
+        #[arg(long)]
+        config: PathBuf,
+        /// Workspace alias to check (must exist in the config)
+        #[arg(long)]
+        workspace_ref: String,
+        /// Exclusive stream cursor to start discovery from
+        #[arg(long, default_value = "0-0")]
+        after: String,
     },
 }
 
@@ -275,7 +298,76 @@ async fn main() {
                 }
             }
         }
+        Commands::Bridge { cmd } => match cmd {
+            BridgeCmd::Check {
+                config,
+                workspace_ref,
+                after,
+            } => {
+                // bridge check is READ-ONLY: it never claims, starts, or beats
+                // a job, and never creates attempt/cursor/receipt files.
+                match bridge_check(&config, &workspace_ref, &after).await {
+                    Ok(output) => {
+                        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+                    }
+                    Err(e) => {
+                        eprintln!("bridge check failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
     }
+}
+
+/// Runs the read-only `bridge check` connectivity verification.
+async fn bridge_check(
+    config_path: &Path,
+    workspace_ref: &str,
+    after: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let cfg = BridgeConfig::load(config_path)?;
+    let workspace_dir = cfg
+        .resolve_workspace(workspace_ref)
+        .ok_or_else(|| format!("workspace_ref {workspace_ref:?} is not configured"))?;
+    let api_key = load_api_key(&cfg.api_key_file)?;
+    let client = BridgeClient::new(cfg.server_base.clone(), api_key)?;
+
+    // 1. Confirm the live identity equals the configured binding BEFORE discovery.
+    let identity = client
+        .verify_identity(
+            &cfg.expected_identity.user_id,
+            &cfg.expected_identity.workspace_id,
+        )
+        .await?;
+    // 2. Read one page of pending tasks for the resolved alias.
+    let pending = client.pending(workspace_ref, after).await?;
+
+    let jobs: Vec<serde_json::Value> = pending
+        .jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "job_id": j.job_id,
+                "workspace_ref": j.workspace_ref,
+                "resource_id": j.resource_id,
+                "created_at": j.created_at,
+                "expires_at": j.expires_at,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "identity_verified": true,
+        "user_id": identity.user_id,
+        "workspace_id": identity.workspace_id,
+        "workspace_ref": workspace_ref,
+        "workspace": workspace_dir.display().to_string(),
+        "jobs": jobs,
+        "next_cursor": pending.next_cursor,
+        "has_more": pending.has_more,
+    }))
 }
 
 fn filter_line_by_source(line: &str, source: &str) -> bool {

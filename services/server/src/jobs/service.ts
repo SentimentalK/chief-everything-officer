@@ -7,14 +7,20 @@ import {
   parseJobGet,
   parseClaim,
   parseLeaseOperation,
+  parsePendingQuery,
   CLAIM_TTL_MS,
   JOBS_SCHEMA_VERSION,
+  DISCOVERY_PAGE_SIZE,
+  DISCOVERY_BUDGET_MS,
+  JOB_ID_RE,
   type NormalizedSubmit,
   type JobRequest,
   type PersistedJobRecord,
   type JobExecution,
   type JobState,
   type LeaseScriptResult,
+  type PendingJobsResult,
+  type PendingJob,
 } from "./schema.js";
 import { RedisJobStore } from "./redis-store.js";
 
@@ -494,6 +500,104 @@ export class JobService {
       replayed: false,
       server_time: iso(res.server_time_ms),
       execution: executionLeaseView(ex),
+    };
+  }
+
+  /**
+   * Task discovery: read a bounded window of committed stream entries after an
+   * exclusive cursor, then return those belonging to THIS identity/workspace_ref
+   * whose authoritative state (via the shared lease inspect, Redis TIME) is
+   * still "queued". Only read-only queries happen; claim ownership is decided
+   * later by the atomic claim. Records are never mutated or re-queued.
+   */
+  async pending(scope: JobAuthScope, rawQuery: unknown): Promise<PendingJobsResult> {
+    this.assertSelf(scope);
+    const parsed = parsePendingQuery(rawQuery);
+    if (!parsed.ok) {
+      throw new JobError("INVALID_INPUT", parsed.issue);
+    }
+    const query = parsed.value;
+    this.assertAvailable();
+
+    const deadline = Date.now() + DISCOVERY_BUDGET_MS;
+    const jobs: PendingJob[] = [];
+    const diag = (reason: string, entryId: string | null, jobId: string | null): void => {
+      // Only ever reached for entries already identified as owned/corrupt, so no
+      // other-identity job details leak. job_id is emitted only in valid form.
+      const out: Record<string, unknown> = {
+        event: "discovery_skip",
+        reason,
+        entry_id: entryId,
+        job_id: jobId && JOB_ID_RE.test(jobId) ? jobId : null,
+        user_id: scope.user_id,
+        workspace_id: scope.workspace_id,
+      };
+      process.stderr.write(`jobs-discovery ${JSON.stringify(out)}\n`);
+    };
+
+    let entries;
+    try {
+      entries = await this.deps.store.readStreamEntries(query.after, DISCOVERY_PAGE_SIZE);
+    } catch (error) {
+      throw wrapStore(error);
+    }
+
+    for (const entry of entries) {
+      const f = entry.fields;
+      const jobId = f.job_id;
+      const entryUser = f.user_id;
+      const entryWs = f.workspace_id;
+      // Other identity: skip without reading a JobRecord and without logging.
+      if (typeof entryUser === "string" && typeof entryWs === "string") {
+        if (entryUser !== scope.user_id || entryWs !== scope.workspace_id) continue;
+      }
+      // Owned (or unidentifiable) entry must still be structurally valid.
+      if (f.schema_version !== "1" || typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
+        diag("ENTRY_MALFORMED", entry.id, typeof jobId === "string" ? jobId : null);
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new JobError("QUEUE_UNAVAILABLE", "Discovery budget exceeded before the page was processed.");
+      }
+      let res: LeaseScriptResult;
+      try {
+        res = await this.deps.store.inspect(scope, jobId);
+      } catch (error) {
+        // Transport/timeout is an infrastructure fault -> fail the whole page.
+        throw wrapStore(error);
+      }
+      if (!res.ok) {
+        // Per-record data problems: corrupt record, incomplete submission, or a
+        // record that is not owned after all -> skip, never return as a candidate.
+        diag(
+          res.code === "JOB_NOT_FOUND" ? "RECORD_MISSING" : res.reason ?? "RECORD_INVALID",
+          entry.id,
+          jobId,
+        );
+        continue;
+      }
+      const rec = res.record;
+      // The record's committed stream entry must be THIS entry (association).
+      if (rec.stream_entry_id !== entry.id) {
+        diag("ENTRY_RECORD_MISMATCH", entry.id, jobId);
+        continue;
+      }
+      if (res.state !== "queued" || rec.workspace_ref !== query.workspace_ref) continue;
+      jobs.push({
+        job_id: rec.job_id,
+        workspace_ref: rec.workspace_ref,
+        resource_id: rec.resource_id,
+        created_at: iso(rec.created_at_ms),
+        expires_at: iso(rec.claim_deadline_ms),
+      });
+    }
+
+    const last = entries.length > 0 ? entries[entries.length - 1]!.id : query.after;
+    return {
+      ok: true,
+      jobs,
+      next_cursor: last,
+      has_more: entries.length === DISCOVERY_PAGE_SIZE,
     };
   }
 }
