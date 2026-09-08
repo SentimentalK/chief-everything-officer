@@ -2,7 +2,7 @@
 //! Redis is involved here; the cross-language acceptance in CI exercises the
 //! compiled `bridge check` against a real Server + Redis.
 
-use ceo_worker::bridge::client::{BridgeClient, ErrorKind};
+use ceo_worker::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use ceo_worker::bridge::config::load_api_key;
 use ceo_worker::bridge::protocol::{ClaimRequest, LeaseOperationRequest};
 use parking_lot::Mutex;
@@ -826,6 +826,188 @@ async fn read_faults_are_never_outcome_unknown() {
     let s2 = spawn_server(Box::new(|_| json_response("not json"))).await;
     let e = client(&s2.url).pending("tools", "0-0").await.unwrap_err();
     assert!(!e.outcome_unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Confirmed-rejection classification (through real claim/start/heartbeat)
+// ---------------------------------------------------------------------------
+
+/// Dispatches a single write call and returns its error.
+async fn run_write(c: &BridgeClient, which: &str) -> ClientError {
+    match which {
+        "claim" => c.claim(JOB, &claim_request()).await.unwrap_err(),
+        "start" => c.start(JOB, &lease_request()).await.unwrap_err(),
+        "heartbeat" => c.heartbeat(JOB, &lease_request()).await.unwrap_err(),
+        other => panic!("unexpected write path {other}"),
+    }
+}
+
+fn write_needle(which: &str) -> &str {
+    match which {
+        "claim" => "/claim",
+        "start" => "/start",
+        "heartbeat" => "/heartbeat",
+        _ => panic!("unexpected write path"),
+    }
+}
+
+/// Asserts that serving `action` on a write path yields a Server error carrying
+/// exactly the expected HTTP status + safe code, the given outcome_unknown, and
+/// exactly one request (never a silent re-send).
+async fn assert_server_business_error(
+    action: Action,
+    which: &str,
+    status: u16,
+    code: &str,
+    outcome_unknown: bool,
+) {
+    let server = spawn_server(Box::new(move |_| action.clone())).await;
+    let e = run_write(&client(&server.url), which).await;
+    match &e.kind {
+        ErrorKind::Server {
+            status: s, code: c, ..
+        } => {
+            assert_eq!(*s, status, "HTTP status mismatch for {which}");
+            assert_eq!(c, code, "safe code mismatch for {which}");
+        }
+        other => panic!("expected Server error on {which}, got {other:?}"),
+    }
+    assert_eq!(
+        e.outcome_unknown, outcome_unknown,
+        "outcome_unknown wrong for {which}"
+    );
+    assert_eq!(
+        count_hits(&server, write_needle(which)),
+        1,
+        "{which} must not be silently re-sent"
+    );
+}
+
+/// 4.1: every valid status/code pairing with an explicit `ok:false` is a
+/// confirmed rejection through the real client write paths.
+#[tokio::test]
+async fn confirmed_rejection_valid_pairings() {
+    let cases: &[(u16, &str)] = &[
+        (400, "INVALID_INPUT"),
+        (404, "JOB_NOT_FOUND"),
+        (409, "JOB_EXPIRED"),
+        (409, "JOB_ALREADY_CLAIMED"),
+        (409, "IDEMPOTENCY_CONFLICT"),
+        (409, "JOB_NOT_CLAIMED"),
+        (409, "LEASE_MISMATCH"),
+        (409, "LEASE_EXPIRED"),
+        (409, "WORKSPACE_MISMATCH"),
+        (503, "BRIDGE_DISABLED"),
+    ];
+    for &(status, code) in cases {
+        let body = format!(r#"{{"ok":false,"code":"{code}"}}"#);
+        assert_server_business_error(status_json(status, &body), "claim", status, code, false)
+            .await;
+    }
+}
+
+/// Confirmed rejection is also reached through start() and heartbeat(), which
+/// share the same write classification as claim().
+#[tokio::test]
+async fn confirmed_rejection_through_start_and_heartbeat() {
+    assert_server_business_error(
+        status_json(503, r#"{"ok":false,"code":"BRIDGE_DISABLED"}"#),
+        "start",
+        503,
+        "BRIDGE_DISABLED",
+        false,
+    )
+    .await;
+    assert_server_business_error(
+        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH"}"#),
+        "heartbeat",
+        409,
+        "LEASE_MISMATCH",
+        false,
+    )
+    .await;
+}
+
+/// 4.2: a status/code pairing not on the confirmed table is never a confirmed
+/// rejection, even with `ok:false`. The safe code is still kept for diagnostics
+/// but the write outcome stays unknown.
+#[tokio::test]
+async fn mismatched_pairings_leave_write_outcome_unknown() {
+    let cases: &[(u16, &str)] = &[
+        (502, "BRIDGE_DISABLED"),
+        (504, "BRIDGE_DISABLED"),
+        (400, "LEASE_MISMATCH"),
+        (404, "INVALID_INPUT"),
+        (409, "BRIDGE_DISABLED"),
+        (503, "LEASE_MISMATCH"),
+        (503, "QUEUE_UNAVAILABLE"),
+    ];
+    for &(status, code) in cases {
+        let body = format!(r#"{{"ok":false,"code":"{code}"}}"#);
+        assert_server_business_error(status_json(status, &body), "claim", status, code, true).await;
+    }
+}
+
+/// 4.3: an envelope that does not explicitly carry `ok:false` never confirms a
+/// rejection, even on a valid status/code pairing.
+#[tokio::test]
+async fn ambiguous_envelope_leaves_write_outcome_unknown() {
+    // 503 + BRIDGE_DISABLED with every non-explicit `ok` variant.
+    let cases: &[(&str, u16, &str)] = &[
+        (r#"{"code":"BRIDGE_DISABLED"}"#, 503, "BRIDGE_DISABLED"),
+        (
+            r#"{"ok":null,"code":"BRIDGE_DISABLED"}"#,
+            503,
+            "BRIDGE_DISABLED",
+        ),
+        (
+            r#"{"ok":true,"code":"BRIDGE_DISABLED"}"#,
+            503,
+            "BRIDGE_DISABLED",
+        ),
+        // ok as a string is a structural parse failure: code falls back.
+        (
+            r#"{"ok":"false","code":"BRIDGE_DISABLED"}"#,
+            503,
+            "HTTP_503",
+        ),
+        (r#"not json"#, 503, "HTTP_503"),
+    ];
+    for &(body, status, code) in cases {
+        assert_server_business_error(status_json(status, body), "claim", status, code, true).await;
+    }
+
+    // Not a Bridge-only rule: a valid 409 pairing with a missing `ok` is also
+    // not a confirmed rejection.
+    assert_server_business_error(
+        status_json(409, r#"{"code":"LEASE_MISMATCH"}"#),
+        "heartbeat",
+        409,
+        "LEASE_MISMATCH",
+        true,
+    )
+    .await;
+}
+
+/// Read requests never report outcome_unknown, regardless of how a business
+/// error would be classified on the write side.
+#[tokio::test]
+async fn reads_ignore_write_rejection_classification() {
+    // A confirmed rejection envelope on a read path stays outcome_unknown=false.
+    let s1 = spawn_server(Box::new(|_| {
+        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH","message":"m"}"#)
+    }))
+    .await;
+    let e = client(&s1.url).pending("tools", "0-0").await.unwrap_err();
+    assert!(!e.outcome_unknown, "a read is never outcome-unknown");
+
+    // An ambiguous envelope on a read path is likewise never outcome-unknown.
+    let s2 = spawn_server(Box::new(|_| {
+        status_json(503, r#"{"code":"BRIDGE_DISABLED"}"#)
+    }))
+    .await;
+    let e = client(&s2.url).pending("tools", "0-0").await.unwrap_err();
+    assert!(!e.outcome_unknown, "a read is never outcome-unknown");
 }
 
 #[tokio::test]

@@ -460,21 +460,32 @@ async fn decode_response<T: for<'de> serde::Deserialize<'de>>(
 
     // Non-2xx business error. The HTTP status was preserved before any body
     // processing.
-    let (code, reason) = parse_business_envelope(&bytes);
-    Err(classify_server_error(
-        status.as_u16(),
-        code,
-        reason,
-        is_write,
-    ))
+    let parsed = parse_business_envelope(&bytes);
+    Err(classify_server_error(status.as_u16(), parsed, is_write))
+}
+
+/// Parsed business-error envelope with only whitelisted code/reason surviving.
+/// `explicitly_failed` is true only when the envelope explicitly carries
+/// `ok: false` (absent, `null`, `true`, or a non-bool `ok` never count as an
+/// explicit failure). Private to this module; no public protocol surface.
+struct ParsedBusinessError {
+    code: Option<String>,
+    reason: Option<String>,
+    explicitly_failed: bool,
 }
 
 /// Parses the business-error envelope, returning only whitelisted code/reason.
-fn parse_business_envelope(bytes: &[u8]) -> (Option<String>, Option<String>) {
+fn parse_business_envelope(bytes: &[u8]) -> ParsedBusinessError {
     let env: Result<crate::bridge::protocol::ErrorEnvelope, _> = serde_json::from_slice(bytes);
     let env = match env {
         Ok(e) => e,
-        Err(_) => return (None, None),
+        Err(_) => {
+            return ParsedBusinessError {
+                code: None,
+                reason: None,
+                explicitly_failed: false,
+            };
+        }
     };
     let code = env
         .code
@@ -491,37 +502,58 @@ fn parse_business_envelope(bytes: &[u8]) -> (Option<String>, Option<String>) {
         .details
         .and_then(|d| d.reason)
         .filter(|r| KNOWN_REASONS.contains(&r.as_str()));
-    (code, reason)
+    ParsedBusinessError {
+        code,
+        reason,
+        explicitly_failed: env.ok == Some(false),
+    }
 }
 
 /// Builds the Server-kind ClientError and decides write outcome by the table.
-fn classify_server_error(
-    status: u16,
-    code: Option<String>,
-    reason: Option<String>,
-    is_write: bool,
-) -> ClientError {
-    let display_code = code.clone().unwrap_or_else(|| format!("HTTP_{status}"));
-    // A write request is outcome-unknown unless the server gave an explicit
-    // business rejection we can trust. BRIDGE_DISABLED (503) and known 4xx
-    // rejections confirm no state change; everything else (QUEUE_UNAVAILABLE,
-    // other 5xx, unrecognized) leaves the write outcome unknown.
-    let bridge_disabled = code.as_deref() == Some("BRIDGE_DISABLED");
-    let known_4xx_reject =
-        status < 500 && code.is_some() && !bridge_disabled && !is_unavailable(code.as_deref());
-    let outcome_unknown = is_write && !bridge_disabled && !known_4xx_reject;
+fn classify_server_error(status: u16, parsed: ParsedBusinessError, is_write: bool) -> ClientError {
+    let display_code = parsed
+        .code
+        .clone()
+        .unwrap_or_else(|| format!("HTTP_{status}"));
+    let outcome_unknown = is_write
+        && !is_confirmed_rejection(status, parsed.code.as_deref(), parsed.explicitly_failed);
     ClientError {
         kind: ErrorKind::Server {
             status,
             code: display_code,
-            reason,
+            reason: parsed.reason,
         },
         outcome_unknown,
     }
 }
 
-fn is_unavailable(code: Option<&str>) -> bool {
-    matches!(code, Some("QUEUE_UNAVAILABLE") | Some("HTTP_unknown"))
+/// The ONLY status/code pairings that confirm a write request produced no
+/// server state change. The envelope must explicitly carry `ok: false` AND the
+/// HTTP status must match the code; otherwise the write outcome stays unknown.
+/// `QUEUE_UNAVAILABLE` can never confirm a non-change regardless of `ok`.
+fn is_confirmed_rejection(status: u16, code: Option<&str>, explicitly_failed: bool) -> bool {
+    if !explicitly_failed {
+        return false;
+    }
+
+    matches!(
+        (status, code),
+        (400, Some("INVALID_INPUT"))
+            | (404, Some("JOB_NOT_FOUND"))
+            | (
+                409,
+                Some(
+                    "JOB_EXPIRED"
+                        | "JOB_ALREADY_CLAIMED"
+                        | "IDEMPOTENCY_CONFLICT"
+                        | "JOB_NOT_CLAIMED"
+                        | "LEASE_MISMATCH"
+                        | "LEASE_EXPIRED"
+                        | "WORKSPACE_MISMATCH"
+                )
+            )
+            | (503, Some("BRIDGE_DISABLED"))
+    )
 }
 
 // ---------------------------------------------------------------------------

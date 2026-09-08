@@ -112,12 +112,23 @@ await runner.dispose();
 # the Stream length, writing them to a snapshot file for before/after compares.
 cat > "$E/probe.mjs" <<'PROBE'
 import { readFileSync, writeFileSync } from "node:fs";
-import { createClient } from "redis";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
+
 const base = process.env.SRV;
-const info = JSON.parse(readFileSync(process.env.JOB_FILE, "utf8"));
-const storeMod = await import(pathToFileURL(path.join(base, "dist/jobs/redis-store.js")).href);
+const require = createRequire(path.join(base, "package.json"));
+const { createClient } = require("redis");
+
+const info = JSON.parse(
+  readFileSync(process.env.JOB_FILE, "utf8")
+);
+
+const storeMod = await import(
+  pathToFileURL(
+    path.join(base, "dist/jobs/redis-store.js")
+  ).href
+);
 const runner = storeMod.createRedisRunnerFromClient(
   () => createClient({ url: process.env.REDIS, socket: { reconnectStrategy: false }, disableOfflineQueue: true }),
   { opTimeoutMs: 2500 });
