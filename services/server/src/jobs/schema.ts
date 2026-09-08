@@ -289,7 +289,6 @@ export function parseLeaseOperation(raw: unknown): ParseOutcome<NormalizedLeaseO
 
 export const DISCOVERY_PAGE_SIZE = 25;
 export const DISCOVERY_BUDGET_MS = 5000;
-export const DISCOVERY_MAX_RECORD_CHECKS = 4;
 
 /**
  * A Redis Stream ID is two unsigned 64-bit decimals ("<ms>-<seq>"). Parse each

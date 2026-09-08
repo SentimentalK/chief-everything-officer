@@ -209,11 +209,55 @@ function incompleteQueueMessage(reason: string | null): string {
   return "Queue backend is not available.";
 }
 
+/** Constructor options for testability: a monotonic clock and/or a discovery
+ *  budget override. Production keeps the real `performance.now()` clock and the
+ *  DISCOVERY_BUDGET_MS default. These are internal seams only - no env var or
+ *  CLI switch. */
+export interface JobServiceOptions {
+  /** Monotonic milliseconds clock for per-request discovery budgets. */
+  nowMs?: () => number;
+  /** Per-request discovery budget in the same units as `nowMs`. */
+  discoveryBudgetMs?: number;
+}
+
+/**
+ * A per-request discovery deadline expressed in monotonic milliseconds. It is
+ * both the internal checkpoints' source of truth AND the signal the outer
+ * wall-clock deadline uses to stop the page loop (no further Redis reads are
+ * scheduled after cancel). Deadline comparisons use `>=`.
+ */
+class DiscoveryBudget {
+  readonly deadlineMs: number;
+  cancelled = false;
+  constructor(
+    private readonly now: () => number,
+    private readonly budgetMs: number,
+  ) {
+    this.deadlineMs = now() + budgetMs;
+  }
+  /** Throws QUEUE_UNAVAILABLE once the deadline has been reached or cancelled. */
+  ensure(step: string): void {
+    if (this.cancelled || this.now() >= this.deadlineMs) {
+      throw new JobError("QUEUE_UNAVAILABLE", `Discovery budget exceeded (${step}).`);
+    }
+  }
+  cancel(): void {
+    this.cancelled = true;
+  }
+}
+
 export class JobService {
+  private readonly nowMs: () => number;
+  private readonly discoveryBudgetMs: number;
+
   constructor(
     private readonly deps: JobServiceDeps,
     private readonly enabled: () => boolean,
-  ) {}
+    options: JobServiceOptions = {},
+  ) {
+    this.nowMs = options.nowMs ?? (() => performance.now());
+    this.discoveryBudgetMs = options.discoveryBudgetMs ?? DISCOVERY_BUDGET_MS;
+  }
 
   /** True when the bridge is enabled AND the shared Redis is reachable. */
   available(): boolean {
@@ -509,6 +553,13 @@ export class JobService {
    * whose authoritative state (via the shared lease inspect, Redis TIME) is
    * still "queued". Only read-only queries happen; claim ownership is decided
    * later by the atomic claim. Records are never mutated or re-queued.
+   *
+   * The whole page runs against ONE monotonic deadline (default 5000 ms) that
+   * covers the initial XRANGE, every inspect, and result assembly. Internal
+   * checkpoints stop scheduling further work once the deadline is reached, and
+   * an outer wall-clock deadline guarantees the caller never waits longer than
+   * the budget even if a single Redis command overshoots. No background loop
+   * keeps scanning after the deadline.
    */
   async pending(scope: JobAuthScope, rawQuery: unknown): Promise<PendingJobsResult> {
     this.assertSelf(scope);
@@ -519,86 +570,112 @@ export class JobService {
     const query = parsed.value;
     this.assertAvailable();
 
-    const deadline = Date.now() + DISCOVERY_BUDGET_MS;
-    const jobs: PendingJob[] = [];
-    const diag = (reason: string, entryId: string | null, jobId: string | null): void => {
-      // Only ever reached for entries already identified as owned/corrupt, so no
-      // other-identity job details leak. job_id is emitted only in valid form.
-      const out: Record<string, unknown> = {
-        event: "discovery_skip",
-        reason,
-        entry_id: entryId,
-        job_id: jobId && JOB_ID_RE.test(jobId) ? jobId : null,
-        user_id: scope.user_id,
-        workspace_id: scope.workspace_id,
+    const budget = new DiscoveryBudget(this.nowMs, this.discoveryBudgetMs);
+
+    const work = (async (): Promise<PendingJobsResult> => {
+      const jobs: PendingJob[] = [];
+      const diag = (reason: string, entryId: string | null, jobId: string | null): void => {
+        // Only ever reached for entries already identified as owned/corrupt, so no
+        // other-identity job details leak. job_id is emitted only in valid form.
+        const out: Record<string, unknown> = {
+          event: "discovery_skip",
+          reason,
+          entry_id: entryId,
+          job_id: jobId && JOB_ID_RE.test(jobId) ? jobId : null,
+          user_id: scope.user_id,
+          workspace_id: scope.workspace_id,
+        };
+        process.stderr.write(`jobs-discovery ${JSON.stringify(out)}\n`);
       };
-      process.stderr.write(`jobs-discovery ${JSON.stringify(out)}\n`);
-    };
 
-    let entries;
-    try {
-      entries = await this.deps.store.readStreamEntries(query.after, DISCOVERY_PAGE_SIZE);
-    } catch (error) {
-      throw wrapStore(error);
-    }
-
-    for (const entry of entries) {
-      const f = entry.fields;
-      const jobId = f.job_id;
-      const entryUser = f.user_id;
-      const entryWs = f.workspace_id;
-      // Other identity: skip without reading a JobRecord and without logging.
-      if (typeof entryUser === "string" && typeof entryWs === "string") {
-        if (entryUser !== scope.user_id || entryWs !== scope.workspace_id) continue;
-      }
-      // Owned (or unidentifiable) entry must still be structurally valid.
-      if (f.schema_version !== "1" || typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
-        diag("ENTRY_MALFORMED", entry.id, typeof jobId === "string" ? jobId : null);
-        continue;
-      }
-      if (Date.now() > deadline) {
-        throw new JobError("QUEUE_UNAVAILABLE", "Discovery budget exceeded before the page was processed.");
-      }
-      let res: LeaseScriptResult;
+      // (1) Before XRANGE.
+      budget.ensure("start");
+      let entries;
       try {
-        res = await this.deps.store.inspect(scope, jobId);
+        entries = await this.deps.store.readStreamEntries(query.after, DISCOVERY_PAGE_SIZE);
       } catch (error) {
-        // Transport/timeout is an infrastructure fault -> fail the whole page.
         throw wrapStore(error);
       }
-      if (!res.ok) {
-        // Per-record data problems: corrupt record, incomplete submission, or a
-        // record that is not owned after all -> skip, never return as a candidate.
-        diag(
-          res.code === "JOB_NOT_FOUND" ? "RECORD_MISSING" : res.reason ?? "RECORD_INVALID",
-          entry.id,
-          jobId,
-        );
-        continue;
-      }
-      const rec = res.record;
-      // The record's committed stream entry must be THIS entry (association).
-      if (rec.stream_entry_id !== entry.id) {
-        diag("ENTRY_RECORD_MISMATCH", entry.id, jobId);
-        continue;
-      }
-      if (res.state !== "queued" || rec.workspace_ref !== query.workspace_ref) continue;
-      jobs.push({
-        job_id: rec.job_id,
-        workspace_ref: rec.workspace_ref,
-        resource_id: rec.resource_id,
-        created_at: iso(rec.created_at_ms),
-        expires_at: iso(rec.claim_deadline_ms),
-      });
-    }
+      // (2) After XRANGE returned.
+      budget.ensure("after stream read");
 
-    const last = entries.length > 0 ? entries[entries.length - 1]!.id : query.after;
-    return {
-      ok: true,
-      jobs,
-      next_cursor: last,
-      has_more: entries.length === DISCOVERY_PAGE_SIZE,
-    };
+      for (const entry of entries) {
+        const f = entry.fields;
+        const jobId = f.job_id;
+        const entryUser = f.user_id;
+        const entryWs = f.workspace_id;
+        // Other identity: skip without reading a JobRecord and without logging.
+        if (typeof entryUser === "string" && typeof entryWs === "string") {
+          if (entryUser !== scope.user_id || entryWs !== scope.workspace_id) continue;
+        }
+        // Owned (or unidentifiable) entry must still be structurally valid.
+        if (f.schema_version !== "1" || typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
+          diag("ENTRY_MALFORMED", entry.id, typeof jobId === "string" ? jobId : null);
+          continue;
+        }
+        // (3) Before each inspect.
+        budget.ensure(`inspect ${jobId}`);
+        let res: LeaseScriptResult;
+        try {
+          res = await this.deps.store.inspect(scope, jobId);
+        } catch (error) {
+          // Transport/timeout is an infrastructure fault -> fail the whole page.
+          throw wrapStore(error);
+        }
+        // (4) After each inspect returned.
+        budget.ensure(`after inspect ${jobId}`);
+        if (!res.ok) {
+          // Per-record data problems: corrupt record, incomplete submission, or a
+          // record that is not owned after all -> skip, never return as a candidate.
+          diag(
+            res.code === "JOB_NOT_FOUND" ? "RECORD_MISSING" : res.reason ?? "RECORD_INVALID",
+            entry.id,
+            jobId,
+          );
+          continue;
+        }
+        const rec = res.record;
+        // The record's committed stream entry must be THIS entry (association).
+        if (rec.stream_entry_id !== entry.id) {
+          diag("ENTRY_RECORD_MISMATCH", entry.id, jobId);
+          continue;
+        }
+        if (res.state !== "queued" || rec.workspace_ref !== query.workspace_ref) continue;
+        jobs.push({
+          job_id: rec.job_id,
+          workspace_ref: rec.workspace_ref,
+          resource_id: rec.resource_id,
+          created_at: iso(rec.created_at_ms),
+          expires_at: iso(rec.claim_deadline_ms),
+        });
+      }
+
+      // (5) Immediately before returning a success result.
+      budget.ensure("before returning success");
+      const last = entries.length > 0 ? entries[entries.length - 1]!.id : query.after;
+      return {
+        ok: true,
+        jobs,
+        next_cursor: last,
+        has_more: entries.length === DISCOVERY_PAGE_SIZE,
+      };
+    })();
+
+    // Outer wall-clock deadline: even if one in-flight Redis command overshoots
+    // the per-request budget, the caller never waits longer than it. Firing it
+    // also cancels the page loop so no further inspect is scheduled.
+    let timer: NodeJS.Timeout | undefined;
+    const deadlineGuard = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        budget.cancel();
+        reject(new JobError("QUEUE_UNAVAILABLE", "Discovery budget exceeded."));
+      }, this.discoveryBudgetMs);
+    });
+    try {
+      return await Promise.race([work, deadlineGuard]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
 
