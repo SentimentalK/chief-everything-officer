@@ -58,6 +58,11 @@ pub trait ManagedProcess: Send + Sync {
     fn wait(
         &mut self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<ExitStatus, std::io::Error>> + Send + '_>>;
+    /// Non-blocking reap attempt: returns `Ok(Some(status))` if the child has
+    /// already exited, `Ok(None)` if it is still running. Never waits. Lets the
+    /// caller reap a leader while draining/observing its group without holding a
+    /// background wait task.
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, std::io::Error>;
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

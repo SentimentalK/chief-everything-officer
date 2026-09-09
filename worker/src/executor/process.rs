@@ -119,18 +119,29 @@ impl ManagedProcess for GroupManagedProcess {
     {
         Box::pin(self.child.wait())
     }
+
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
 }
 
 /// Scans `/proc` for any live (non-zombie) process whose process-group id
 /// equals `pgid`. Zombies are not counted as running work, but a live leader or
-/// member is. A permission error or incomplete scan returns `Err`, which the
-/// caller must treat as "cannot confirm stopped".
+/// member is.
+///
+/// Error discipline (so the caller never mistakes an *unreadable* group for an
+/// *empty* one): a process that races away mid-scan (ENOENT/ESRCH) is tolerated
+/// as "not a live member we can confirm"; any other failure to read or parse a
+/// process's essential identity (permission error, unreadable stat, malformed
+/// stat) is returned as `Err`, which the caller must treat as "cannot confirm
+/// stopped". An entry whose directory listing raced away is skipped only
+/// because we could never read it; it is not evidence of absence.
 pub fn pgid_has_live_members(pgid: i32) -> Result<bool, std::io::Error> {
     let entries = std::fs::read_dir("/proc")?;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => continue, // a listing entry raced away; not evidence of absence
         };
         let name = entry.file_name();
         let name = match name.to_str() {
@@ -144,25 +155,45 @@ pub fn pgid_has_live_members(pgid: i32) -> Result<bool, std::io::Error> {
         let stat_path = format!("/proc/{pid}/stat");
         let stat = match std::fs::read_to_string(&stat_path) {
             Ok(s) => s,
-            Err(_) => continue, // raced away; not a live member we can confirm
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Process exited between read_dir and read: not a live member
+                // we can confirm, and a legitimate scan-time exit.
+                continue;
+            }
+            // Permission error or other unreadable stat: we cannot confirm this
+            // process is not a live member -> fail closed.
+            Err(e) => return Err(e),
         };
         // Field 4 (1-indexed) is pgrp; the comm field may contain spaces and
         // parens, so split after the last ')' like status.rs does.
         let Some(idx) = stat.rfind(')') else {
-            continue;
+            // Stat we could read but cannot parse essential identity -> fail
+            // closed rather than guessing the group is empty.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("could not parse {stat_path}"),
+            ));
         };
         let rest = &stat[idx + 2..];
         let fields: Vec<&str> = rest.split_whitespace().collect();
         if fields.len() < 3 {
-            continue;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("could not parse identity fields in {stat_path}"),
+            ));
         }
         let state = fields[0];
         if state == "Z" || state == "X" {
-            continue; // zombie / dead
+            continue; // zombie / dead: not running work (leader still needs reaping)
         }
         let pgrp: i32 = match fields[2].parse() {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("could not parse pgrp in {stat_path}"),
+                ));
+            }
         };
         if pgrp == pgid {
             return Ok(true);

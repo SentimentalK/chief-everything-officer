@@ -92,16 +92,12 @@ impl TeardownReport {
     }
 }
 
-/// Escalates to ProcessStopUnconfirmed when teardown could not be confirmed, so
-/// the caller never records a clean stop or continues as if the process were
-/// gone after an unconfirmed termination.
-fn teardown_stop(report: &TeardownReport, intended: StopReason) -> StopReason {
-    if report.fully_stopped() {
-        intended
-    } else {
-        StopReason::ProcessStopUnconfirmed
-    }
-}
+/// Absolute teardown budget for a managed process group. All teardown waits
+/// (grace for a graceful exit, leader reaping, drain joins) share one hard
+/// deadline measured from the instant teardown begins, so separate waits never
+/// stack into an unbounded total.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(3);
+const TEARDOWN_HARD: Duration = Duration::from_secs(5);
 
 /// Joins a drain task within `budget`, aborting it (and awaiting the abort) on
 /// timeout. The JoinHandle is never dropped into a detached background task.
@@ -120,40 +116,65 @@ async fn join_or_abort(handle: JoinHandle<()>, budget: Duration) -> bool {
     }
 }
 
-/// Two-phase, bounded termination of the managed process group plus its log
-/// drains under a single budget: close stdin → SIGTERM the whole PGID → up to
-/// 3 s for the group to empty (leader reaped while it drains) → SIGKILL any
-/// remainder → up to 2 s to reap the leader and confirm the group empty → join
-/// the drain tasks (aborting+awaiting on timeout, never detaching). Every step
-/// that cannot be confirmed is reported so the caller never treats the process
-/// as gone or the attempt as cleanly complete.
+/// Two-phase, bounded termination of a managed process group plus its log
+/// drains under a single shared budget: close stdin → SIGTERM the whole PGID →
+/// up to [`TEARDOWN_GRACE`] for the group to empty (the leader reaped via the
+/// non-blocking [`ManagedProcess::try_wait`] while it drains) → SIGKILL any
+/// remainder → up to [`TEARDOWN_HARD`] to reap the leader, confirm the group
+/// empty, and join the drain tasks (aborting + awaiting on timeout, never
+/// detaching). Every step that cannot be confirmed is reported so the caller
+/// never treats the process as gone or the attempt as cleanly complete. A
+/// kernel-uninterruptible process is simply unconfirmed — never faked as gone.
 async fn teardown_managed(
     child: &mut Box<dyn ManagedProcess>,
     drains: &mut Vec<JoinHandle<()>>,
 ) -> TeardownReport {
     use tokio::time::timeout;
+    let started = tokio::time::Instant::now();
+    let grace_deadline = started + TEARDOWN_GRACE;
+    let hard_deadline = started + TEARDOWN_HARD;
+
     let _ = child.close_stdin();
-    // Phase 1: graceful SIGTERM to the group; wait up to 3 s for it to empty.
-    let _ = child.kill_group();
-    for _ in 0..60 {
-        let empty = match child.pgid() {
+    let _ = child.kill_group(); // graceful SIGTERM to the whole group.
+
+    let mut force_killed = false;
+    let mut leader_reaped = false;
+    loop {
+        // Reap the leader as soon as it exits, without blocking on a wait.
+        if !leader_reaped {
+            // Reap as soon as it exits; a None (still running) or reap error
+            // (not confirmed) simply keeps us observing.
+            if let Ok(Some(_)) = child.try_wait() {
+                leader_reaped = true;
+            }
+        }
+        let group_empty = match child.pgid() {
             Some(pg) => match pgid_has_live_members(pg) {
                 Ok(has) => !has,
                 Err(_) => false, // scan fault -> cannot confirm empty
             },
             None => false, // no recorded pgid -> cannot confirm empty
         };
-        if empty {
+        if leader_reaped && group_empty {
             break;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= hard_deadline {
+            break;
+        }
+        // Escalate to SIGKILL once the grace period has elapsed while members
+        // are still live; do not wait out a polite SIGTERM forever.
+        if !force_killed && now >= grace_deadline {
+            let _ = child.force_kill_group();
+            force_killed = true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Phase 2: SIGKILL anything that ignored SIGTERM, then reap the leader.
-    let _ = child.force_kill_group();
-    let leader_reaped = matches!(
-        timeout(Duration::from_secs(2), child.wait()).await,
-        Ok(Ok(_))
-    );
+    // Reap the leader within the remaining hard budget if it has not exited yet.
+    if !leader_reaped {
+        let remain = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+        leader_reaped = matches!(timeout(remain, child.wait()).await, Ok(Ok(_)));
+    }
     // Confirm the group is truly empty after reaping (scan faults are unknown,
     // never treated as empty).
     let group_confirmed_empty = if leader_reaped {
@@ -164,11 +185,12 @@ async fn teardown_managed(
     } else {
         false
     };
-    // Join the drain tasks (bounded), aborting + awaiting on timeout so no drain
-    // task is ever detached into the background.
+    // Join the drain tasks under the same absolute hard budget, aborting +
+    // awaiting on timeout so no drain is ever detached into the background.
     let mut drains_ended = true;
     for handle in drains.drain(..) {
-        if !join_or_abort(handle, Duration::from_secs(2)).await {
+        let remain = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !join_or_abort(handle, remain).await {
             drains_ended = false;
         }
     }
@@ -176,6 +198,28 @@ async fn teardown_managed(
         group_confirmed_empty,
         leader_reaped,
         drains_ended,
+    }
+}
+
+/// Stop confirmation precedes business-result classification: once a managed
+/// process has been spawned, no outcome is recorded until teardown confirms the
+/// group/leader/drains are stopped. If they cannot be confirmed stopped, the
+/// intended outcome — whatever the business result looked like — is overridden
+/// to `PROCESS_STOP_UNCONFIRMED` so the attempt is kept for recovery.
+/// `dispatched` is the effective dispatch intent (true once the business prompt
+/// may have been sent).
+fn apply_teardown_evidence(
+    outcome: AttemptOutcome,
+    report: &TeardownReport,
+    dispatched: bool,
+) -> AttemptOutcome {
+    if report.fully_stopped() {
+        return outcome;
+    }
+    AttemptOutcome::Stopped {
+        stop_reason: StopReason::ProcessStopUnconfirmed,
+        dispatched,
+        executor: outcome.executor(),
     }
 }
 
@@ -232,6 +276,18 @@ enum AttemptOutcome {
     },
 }
 
+impl AttemptOutcome {
+    fn executor(&self) -> ExecutorInfo {
+        match self {
+            AttemptOutcome::Success { executor, .. }
+            | AttemptOutcome::Blocked { executor, .. }
+            | AttemptOutcome::Failed { executor, .. }
+            | AttemptOutcome::Timeout { executor, .. }
+            | AttemptOutcome::Stopped { executor, .. } => executor.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Runner {
     config: WorkerConfig,
@@ -241,6 +297,26 @@ pub struct Runner {
 impl Runner {
     pub fn new(config: WorkerConfig, echo_tx: Option<mpsc::Sender<String>>) -> Self {
         Self { config, echo_tx }
+    }
+
+    /// The unified finalization entry for any attempt whose [`ManagedProcess`]
+    /// was actually spawned: run the bounded teardown of the process group and
+    /// drains, then finalize. If teardown cannot confirm the group stopped, the
+    /// intended outcome (whatever the business result looked like) is overridden
+    /// to `PROCESS_STOP_UNCONFIRMED` — a clean result or an ordinary FAILED is
+    /// never recorded while an old process may still be running. No exit that
+    /// has a live child may force-kill and return without this stop
+    /// confirmation.
+    async fn finalize_after_teardown(
+        &self,
+        params: FinalizeParams<'_>,
+        outcome: AttemptOutcome,
+        child: &mut Box<dyn ManagedProcess>,
+        drains: &mut Vec<JoinHandle<()>>,
+    ) -> Result<TaskReceipt, RunnerError> {
+        let report = teardown_managed(child, drains).await;
+        let outcome = apply_teardown_evidence(outcome, &report, params.dispatch_happened);
+        self.finalize_attempt(params, outcome)
     }
 
     fn finalize_attempt(
@@ -819,29 +895,33 @@ impl Runner {
                 .signal_and_ack(RunnerSignal::ProcessSpawned(identity))
                 .await
             {
-                let executor = executor_info.clone();
-                teardown_managed(&mut child, &mut drain_handles).await;
-                return self.finalize_attempt(
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Stopped {
+                            stop_reason: stop,
+                            dispatched: false,
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
+            }
+        }
+        if let Some(stop) = gate.current_stop() {
+            return self
+                .finalize_after_teardown(
                     finalize_params,
                     AttemptOutcome::Stopped {
                         stop_reason: stop,
                         dispatched: false,
-                        executor,
+                        executor: executor_info.clone(),
                     },
-                );
-            }
-        }
-        if let Some(stop) = gate.current_stop() {
-            let executor = executor_info.clone();
-            teardown_managed(&mut child, &mut drain_handles).await;
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Stopped {
-                    stop_reason: stop,
-                    dispatched: false,
-                    executor,
-                },
-            );
+                    &mut child,
+                    &mut drain_handles,
+                )
+                .await;
         }
 
         // 11. Handle Doctor Phase
@@ -887,16 +967,19 @@ impl Runner {
                 "message": { "content": doctor_prompt }
             });
             if let Err(e) = child.send_input_line(&doctor_msg.to_string()).await {
-                let _ = child.force_kill_group();
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "doctor".to_string(),
-                        code: "STDIN_WRITE_FAILED".to_string(),
-                        message: format!("Failed to send doctor message to child stdin: {}", e),
-                        executor: executor_info,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Blocked {
+                            stage: "doctor".to_string(),
+                            code: "STDIN_WRITE_FAILED".to_string(),
+                            message: format!("Failed to send doctor message to child stdin: {}", e),
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
 
             let doctor_timeout = Duration::from_secs(self.config.doctor_timeout_secs);
@@ -952,16 +1035,19 @@ impl Runner {
                         }
                     }
                     _ = tokio::time::sleep_until(doctor_deadline) => {
-                        let _ = child.force_kill_group();
-                        return self.finalize_attempt(
-                            finalize_params,
-                            AttemptOutcome::Blocked {
-                                stage: "doctor".to_string(),
-                                code: "DOCTOR_TIMEOUT".to_string(),
-                                message: format!("Doctor preflight timed out after {}s", self.config.doctor_timeout_secs),
-                                executor: executor_info,
-                            },
-                        );
+                        return self
+                            .finalize_after_teardown(
+                                finalize_params,
+                                AttemptOutcome::Blocked {
+                                    stage: "doctor".to_string(),
+                                    code: "DOCTOR_TIMEOUT".to_string(),
+                                    message: format!("Doctor preflight timed out after {}s", self.config.doctor_timeout_secs),
+                                    executor: executor_info.clone(),
+                                },
+                                &mut child,
+                                &mut drain_handles,
+                            )
+                            .await;
                     }
                     _ = doctor_lease_tick.tick(), if gate.is_bridge() => {
                         if let Some(stop) = gate.current_stop() {
@@ -973,30 +1059,35 @@ impl Runner {
             }
 
             if let Some(stop) = doctor_stopped {
-                teardown_managed(&mut child, &mut drain_handles).await;
-                let executor = executor_info.clone();
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Stopped {
-                        stop_reason: stop,
-                        dispatched: false,
-                        executor,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Stopped {
+                            stop_reason: stop,
+                            dispatched: false,
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
 
             if !doctor_turn_finished {
-                let _ = child.force_kill_group();
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "doctor".to_string(),
-                        code: "DOCTOR_STREAM_TERMINATED".to_string(),
-                        message: "Process or stream terminated prematurely during doctor check"
-                            .to_string(),
-                        executor: executor_info,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Blocked {
+                            stage: "doctor".to_string(),
+                            code: "DOCTOR_STREAM_TERMINATED".to_string(),
+                            message: "Process or stream terminated prematurely during doctor check"
+                                .to_string(),
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
 
             // Evaluate Doctor Turn
@@ -1014,16 +1105,19 @@ impl Runner {
                 let err_msg = doctor_report
                     .error
                     .unwrap_or_else(|| "Doctor checks failed".to_string());
-                let _ = child.force_kill_group();
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "doctor".to_string(),
-                        code: "DOCTOR_VERIFICATION_FAILED".to_string(),
-                        message: err_msg,
-                        executor: executor_info,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Blocked {
+                            stage: "doctor".to_string(),
+                            code: "DOCTOR_VERIFICATION_FAILED".to_string(),
+                            message: err_msg,
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
 
             // Before/After Consistency Verification
@@ -1035,17 +1129,20 @@ impl Runner {
             );
 
             if f_before.fingerprint_hash != f_after.fingerprint_hash {
-                let _ = child.force_kill_group();
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Blocked {
-                        stage: "doctor".to_string(),
-                        code: "CONFIG_CHANGED_DURING_DOCTOR".to_string(),
-                        message: "Environment configuration changed during Doctor execution"
-                            .to_string(),
-                        executor: executor_info,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Blocked {
+                            stage: "doctor".to_string(),
+                            code: "CONFIG_CHANGED_DURING_DOCTOR".to_string(),
+                            message: "Environment configuration changed during Doctor execution"
+                                .to_string(),
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
 
             // Save Cache if eligible
@@ -1112,59 +1209,67 @@ impl Runner {
         // A loss of the controller here is a stop, never an implicit approval.
         if gate.is_bridge() {
             if let Err(stop) = gate.signal_and_ack(RunnerSignal::PreparedForTask).await {
-                let executor = executor_info.clone();
-                teardown_managed(&mut child, &mut drain_handles).await;
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Stopped {
-                        stop_reason: stop,
-                        dispatched: false,
-                        executor,
-                    },
-                );
-            }
-            match gate.await_permit().await {
-                Ok(Some(deadline)) => {
-                    if gate.past_execution_stop(deadline) {
-                        let executor = executor_info.clone();
-                        teardown_managed(&mut child, &mut drain_handles).await;
-                        return self.finalize_attempt(
-                            finalize_params,
-                            AttemptOutcome::Stopped {
-                                stop_reason: StopReason::LeaseExpired {
-                                    reason: Some("EXECUTION_DEADLINE_EXCEEDED".to_string()),
-                                },
-                                dispatched: false,
-                                executor,
-                            },
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(stop) => {
-                    let executor = executor_info.clone();
-                    teardown_managed(&mut child, &mut drain_handles).await;
-                    return self.finalize_attempt(
+                return self
+                    .finalize_after_teardown(
                         finalize_params,
                         AttemptOutcome::Stopped {
                             stop_reason: stop,
                             dispatched: false,
-                            executor,
+                            executor: executor_info.clone(),
                         },
-                    );
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
+            }
+            match gate.await_permit().await {
+                Ok(Some(deadline)) => {
+                    if gate.past_execution_stop(deadline) {
+                        return self
+                            .finalize_after_teardown(
+                                finalize_params,
+                                AttemptOutcome::Stopped {
+                                    stop_reason: StopReason::LeaseExpired {
+                                        reason: Some("EXECUTION_DEADLINE_EXCEEDED".to_string()),
+                                    },
+                                    dispatched: false,
+                                    executor: executor_info.clone(),
+                                },
+                                &mut child,
+                                &mut drain_handles,
+                            )
+                            .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(stop) => {
+                    return self
+                        .finalize_after_teardown(
+                            finalize_params,
+                            AttemptOutcome::Stopped {
+                                stop_reason: stop,
+                                dispatched: false,
+                                executor: executor_info.clone(),
+                            },
+                            &mut child,
+                            &mut drain_handles,
+                        )
+                        .await;
                 }
             }
             if let Some(stop) = gate.current_stop() {
-                let executor = executor_info.clone();
-                teardown_managed(&mut child, &mut drain_handles).await;
-                return self.finalize_attempt(
-                    finalize_params,
-                    AttemptOutcome::Stopped {
-                        stop_reason: stop,
-                        dispatched: false,
-                        executor,
-                    },
-                );
+                return self
+                    .finalize_after_teardown(
+                        finalize_params,
+                        AttemptOutcome::Stopped {
+                            stop_reason: stop,
+                            dispatched: false,
+                            executor: executor_info.clone(),
+                        },
+                        &mut child,
+                        &mut drain_handles,
+                    )
+                    .await;
             }
         }
 
@@ -1176,18 +1281,21 @@ impl Runner {
         // maps to UNVERIFIED, never NOT_STARTED, and never resends.
         finalize_params.dispatch_happened = true;
         if let Err(e) = child.send_input_line(&task_msg.to_string()).await {
-            let _ = child.force_kill_group();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Failed {
-                    stage: "task".to_string(),
-                    code: "STDIN_WRITE_FAILED".to_string(),
-                    message: format!("Failed to send task prompt to child stdin: {}", e),
-                    business_outcome: BusinessOutcome::Failed,
-                    executor: executor_info,
-                    artifacts: Vec::new(),
-                },
-            );
+            return self
+                .finalize_after_teardown(
+                    finalize_params,
+                    AttemptOutcome::Failed {
+                        stage: "task".to_string(),
+                        code: "STDIN_WRITE_FAILED".to_string(),
+                        message: format!("Failed to send task prompt to child stdin: {}", e),
+                        business_outcome: BusinessOutcome::Failed,
+                        executor: executor_info.clone(),
+                        artifacts: Vec::new(),
+                    },
+                    &mut child,
+                    &mut drain_handles,
+                )
+                .await;
         }
 
         // Listen for Task completion
@@ -1254,14 +1362,17 @@ impl Runner {
                     }
                 }
                 _ = tokio::time::sleep_until(task_deadline) => {
-                    let _ = child.force_kill_group();
-                    return self.finalize_attempt(
-                        finalize_params,
-                        AttemptOutcome::Timeout {
-                            duration_secs: timeout_secs,
-                            executor: executor_info,
-                        },
-                    );
+                    return self
+                        .finalize_after_teardown(
+                            finalize_params,
+                            AttemptOutcome::Timeout {
+                                duration_secs: timeout_secs,
+                                executor: executor_info.clone(),
+                            },
+                            &mut child,
+                            &mut drain_handles,
+                        )
+                        .await;
                 }
                 _ = lease_tick.tick(), if gate.is_bridge() => {
                     if let Some(stop) = gate.current_stop() {
@@ -1272,22 +1383,23 @@ impl Runner {
             }
         }
 
-        // Teardown & Graceful Child Exit (bounded two-phase; joins drains).
+        // Teardown & graceful child exit (bounded two-phase; joins drains).
         let teardown = teardown_managed(&mut child, &mut drain_handles).await;
 
-        if let Some(stop) = task_stopped {
-            let executor = executor_info.clone();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Stopped {
-                    stop_reason: teardown_stop(&teardown, stop),
-                    dispatched: true,
-                    executor,
-                },
-            );
-        }
-
-        if !task_turn_finished || !task_result_status.eq_ignore_ascii_case("success") {
+        // Classify the business outcome only after stop confirmation. Any exit
+        // below funnels through `apply_teardown_evidence`: when teardown could
+        // not confirm the process group stopped, the business result — a clean
+        // success, an ordinary FAILED, or a stop — is never recorded as-is; it
+        // is overridden to PROCESS_STOP_UNCONFIRMED so the attempt is kept for
+        // recovery. Dispatch has happened here (the business prompt was sent),
+        // so the escalation preserves dispatch intent as true.
+        let base_outcome = if let Some(stop) = task_stopped {
+            AttemptOutcome::Stopped {
+                stop_reason: stop,
+                dispatched: true,
+                executor: executor_info.clone(),
+            }
+        } else if !task_turn_finished || !task_result_status.eq_ignore_ascii_case("success") {
             let stderr_tail = stderr_logger.get_tail_snippet(10);
             let combined_err = format!("{} {}", task_agent_response, stderr_tail);
 
@@ -1304,53 +1416,34 @@ impl Runner {
                 );
             }
 
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Failed {
-                    stage: "task".to_string(),
-                    code: "TASK_EXECUTION_FAILED".to_string(),
-                    message: format!(
-                        "Task turn finished with non-success status: {}",
-                        task_result_status
-                    ),
-                    business_outcome: BusinessOutcome::Failed,
-                    executor: executor_info,
-                    artifacts: Vec::new(),
-                },
+            AttemptOutcome::Failed {
+                stage: "task".to_string(),
+                code: "TASK_EXECUTION_FAILED".to_string(),
+                message: format!(
+                    "Task turn finished with non-success status: {}",
+                    task_result_status
+                ),
+                business_outcome: BusinessOutcome::Failed,
+                executor: executor_info.clone(),
+                artifacts: Vec::new(),
+            }
+        } else {
+            // 13. Verification of Artifacts (clean business success path).
+            let verification = GenericVerifier::verify_attempt(
+                &canonical_workspace,
+                &current_attempt_dir,
+                &baseline,
+                &task_agent_response,
             );
-        }
-
-        // 13. Verification of Artifacts
-        let verification = GenericVerifier::verify_attempt(
-            &canonical_workspace,
-            &current_attempt_dir,
-            &baseline,
-            &task_agent_response,
-        );
-
-        if !teardown.fully_stopped() {
-            // The business turn finished, but the process group / drains could
-            // not be confirmed stopped. Never write a clean completion: the
-            // outcome is unverified under ProcessStopUnconfirmed.
-            let executor = executor_info.clone();
-            return self.finalize_attempt(
-                finalize_params,
-                AttemptOutcome::Stopped {
-                    stop_reason: StopReason::ProcessStopUnconfirmed,
-                    dispatched: true,
-                    executor,
-                },
-            );
-        }
-
-        self.finalize_attempt(
-            finalize_params,
             AttemptOutcome::Success {
-                executor: executor_info,
+                executor: executor_info.clone(),
                 artifacts: verification.verified_artifacts,
                 business_outcome: verification.outcome,
-            },
-        )
+            }
+        };
+
+        let outcome = apply_teardown_evidence(base_outcome, &teardown, true);
+        self.finalize_attempt(finalize_params, outcome)
     }
 
     /// Runs a fresh attempt under bridge control, reusing the same pipeline as
@@ -1507,8 +1600,9 @@ impl Runner {
         let dispatcher =
             StreamEventDispatcher::new(doctor_dir.join("events.jsonl"), stdout_logger, event_tx);
 
+        let mut doctor_drains: Vec<JoinHandle<()>> = Vec::new();
         if let Some(stdout) = child.take_stdout() {
-            tokio::spawn(dispatcher.run(stdout));
+            doctor_drains.push(tokio::spawn(dispatcher.run(stdout)));
         }
 
         let doctor_start = Instant::now();
@@ -1553,15 +1647,33 @@ impl Runner {
                         None => break,
                     }
                 }
-                _ = child.wait() => break,
                 _ = tokio::time::sleep_until(doctor_deadline) => {
-                    let _ = child.force_kill_group();
+                    // Timeout: fall through to the shared bounded teardown,
+                    // which SIGTERMs, escalates and confirms the group stopped.
                     break;
                 }
             }
         }
 
-        let _ = child.close_stdin();
+        // Confirm the spawned doctor process group is fully stopped via the same
+        // bounded teardown every managed-process exit uses (never a bare
+        // force-kill + drop). An unconfirmed stop means the standalone doctor is
+        // not clean: report it as not-ready rather than claiming success.
+        let teardown = teardown_managed(&mut child, &mut doctor_drains).await;
+        if !teardown.fully_stopped() {
+            return Ok(SessionDoctorReport {
+                ready: false,
+                rule_marker: Some(doctor_ctx.expected_marker),
+                agents_md_hash: doctor_ctx.agents_md_hash,
+                checks: vec![crate::doctor::DoctorCheckItem {
+                    name: "stop_confirmation".to_string(),
+                    passed: false,
+                    message: "Doctor process could not be confirmed stopped".to_string(),
+                }],
+                error: Some("Doctor process could not be confirmed stopped".to_string()),
+            });
+        }
+
         let report = doctor_ctx.evaluate_turn(&doctor_response, &result_status);
         let doctor_duration_ms = doctor_start.elapsed().as_millis() as u64;
 
@@ -1637,22 +1749,200 @@ mod tests {
         .fully_stopped());
     }
 
+    fn stub_executor() -> ExecutorInfo {
+        use crate::receipt::ExecutorInfo;
+        ExecutorInfo {
+            executor_type: "test_stub".to_string(),
+            version: "v".to_string(),
+            conversation_id: None,
+        }
+    }
+
     #[test]
-    fn teardown_stop_escalates_when_unconfirmed() {
+    fn apply_teardown_evidence_keeps_outcome_when_fully_stopped() {
         let full = TeardownReport {
             group_confirmed_empty: true,
             leader_reaped: true,
             drains_ended: true,
         };
-        let intended = StopReason::UserRequested;
-        assert_eq!(teardown_stop(&full, intended.clone()), intended);
+        // A confirmed stop keeps the intended outcome (dispatch preserved).
+        let outcome = AttemptOutcome::Success {
+            executor: stub_executor(),
+            artifacts: Vec::new(),
+            business_outcome: crate::verifier::BusinessOutcome::Verified,
+        };
+        match apply_teardown_evidence(outcome, &full, true) {
+            AttemptOutcome::Success { .. } => {}
+            other => {
+                let _ = other;
+                panic!("expected unchanged Success")
+            }
+        }
+        let stopped = AttemptOutcome::Stopped {
+            stop_reason: StopReason::UserRequested,
+            dispatched: false,
+            executor: stub_executor(),
+        };
+        assert!(matches!(
+            apply_teardown_evidence(stopped, &full, false),
+            AttemptOutcome::Stopped { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_teardown_evidence_escalates_unconfirmed_stop_over_business_result() {
         let partial = TeardownReport {
             group_confirmed_empty: false,
-            ..full
+            leader_reaped: false,
+            drains_ended: true,
         };
-        assert_eq!(
-            teardown_stop(&partial, intended),
-            StopReason::ProcessStopUnconfirmed
+        // A business FAILED whose process group could not be confirmed stopped
+        // must NOT surface as an ordinary, continuable FAILED: it becomes
+        // PROCESS_STOP_UNCONFIRMED (kept for recovery), preserving dispatch.
+        let failed = AttemptOutcome::Failed {
+            stage: "task".to_string(),
+            code: "TASK_EXECUTION_FAILED".to_string(),
+            message: "non-success".to_string(),
+            business_outcome: crate::verifier::BusinessOutcome::Failed,
+            executor: stub_executor(),
+            artifacts: Vec::new(),
+        };
+        match apply_teardown_evidence(failed, &partial, true) {
+            AttemptOutcome::Stopped {
+                stop_reason,
+                dispatched,
+                ..
+            } => {
+                assert_eq!(stop_reason, StopReason::ProcessStopUnconfirmed);
+                assert!(dispatched);
+            }
+            other => {
+                let _ = other;
+                panic!("expected escalated unconfirmed stop")
+            }
+        }
+        // A clean success under an unconfirmed stop also escalates (never a
+        // clean completion while an old process may still be running).
+        let success = AttemptOutcome::Success {
+            executor: stub_executor(),
+            artifacts: Vec::new(),
+            business_outcome: crate::verifier::BusinessOutcome::Verified,
+        };
+        match apply_teardown_evidence(success, &partial, true) {
+            AttemptOutcome::Stopped {
+                stop_reason,
+                dispatched,
+                ..
+            } => {
+                assert_eq!(stop_reason, StopReason::ProcessStopUnconfirmed);
+                assert!(dispatched);
+            }
+            other => {
+                let _ = other;
+                panic!("expected escalated unconfirmed stop")
+            }
+        }
+    }
+
+    /// Spawns a real `/bin/sh` child (new process group, stdout piped) running
+    /// `script`. Used to exercise `teardown_managed` against an actual process
+    /// group rather than a hand-constructed report.
+    fn spawn_real_group(
+        script: &str,
+    ) -> (Box<dyn ManagedProcess>, Option<tokio::process::ChildStdout>) {
+        use crate::executor::process::GroupManagedProcess;
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn sh group");
+        let pgid = child.id().map(|p| p as i32);
+        let stdout = child.stdout.take();
+        (Box::new(GroupManagedProcess::new(child, pgid)), stdout)
+    }
+
+    #[tokio::test]
+    async fn teardown_escalates_sigkill_and_reaps_leader_within_budget() {
+        // A group that ignores SIGTERM and keeps writing to stdout: teardown
+        // must escalate to SIGKILL, reap the leader, confirm the group empty and
+        // drain the (now-closed) stdout — all inside one ~5 s hard budget, not
+        // per-step waits that stack.
+        let (mut child, stdout) = spawn_real_group(
+            r#"trap "" TERM; i=0; while true; do echo "tick $i"; i=$((i+1)); sleep 0.02; done"#,
+        );
+        let mut drains: Vec<JoinHandle<()>> = Vec::new();
+        if let Some(stdout) = stdout {
+            drains.push(tokio::spawn(async move {
+                let mut r = tokio::io::BufReader::new(stdout);
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut r, &mut sink).await;
+            }));
+        }
+        let t0 = std::time::Instant::now();
+        let report = teardown_managed(&mut child, &mut drains).await;
+        let elapsed = t0.elapsed();
+        // Unified budget: hard deadline 5 s. Give generous CI margin.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "teardown exceeded unified budget: {elapsed:?}"
+        );
+        assert!(report.leader_reaped, "leader not reaped: {report:?}");
+        assert!(
+            report.group_confirmed_empty,
+            "group not confirmed empty after SIGKILL: {report:?}"
+        );
+        // The stdout drain should have ended once the group was killed (EOF).
+        assert!(report.drains_ended, "stdout drain did not end: {report:?}");
+        // No live member of the group remains after teardown.
+        let pg = child.pgid().expect("pgid recorded");
+        let still_live = crate::executor::process::pgid_has_live_members(pg).unwrap_or(true);
+        assert!(!still_live, "group still has live members after teardown");
+    }
+
+    #[tokio::test]
+    async fn teardown_aborts_never_ending_drain_within_budget() {
+        // A child that exits immediately (so the group empties and the leader is
+        // reaped fast), but with a drain that never observes EOF. teardown must
+        // abort + await that drain inside the remaining hard budget, report
+        // drains_ended == false, and never leave it detached.
+        let (mut child, _stdout) = spawn_real_group("exit 0");
+        // Wait a moment for it to fully exit and be reapable.
+        let mut drains: Vec<JoinHandle<()>> = Vec::new();
+        drains.push(tokio::spawn(async {
+            // Never-ending drain that never sees EOF.
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }));
+        let t0 = std::time::Instant::now();
+        let report = teardown_managed(&mut child, &mut drains).await;
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "drain abort exceeded unified budget: {elapsed:?}"
+        );
+        assert!(report.leader_reaped, "leader not reaped: {report:?}");
+        assert!(
+            report.group_confirmed_empty,
+            "group not confirmed empty: {report:?}"
+        );
+        assert!(
+            !report.drains_ended,
+            "never-ending drain must be reported as not ended"
+        );
+        assert!(
+            drains.is_empty(),
+            "drain handle must have been consumed/aborted"
         );
     }
 }
