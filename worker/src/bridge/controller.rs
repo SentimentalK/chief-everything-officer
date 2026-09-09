@@ -272,30 +272,104 @@ impl Worker {
                 Err(1)
             }
             _ => {
+                // The active attempt reached at least RunnerIntent. Before we
+                // may clear it, the persisted terminal evidence (receipt +
+                // history + actual receipt/envelope bytes) must be verified to
+                // genuinely and safely correspond to this attempt. A merely
+                // "parseable" history is never enough: field-format legality is
+                // not a correct association. We cannot yet confirm the old
+                // process is gone, so any failure to prove a safe completion
+                // returns RecoveryRequired — we never guess it disappeared.
                 let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
-                let receipt_ok = attempt_dir.join("receipt.json").exists();
-                let history = AttemptHistoryRecord::load(&self.workspace, &job_id, &attempt_id);
-                if receipt_ok && matches!(history, Ok(Some(_))) {
-                    state.active = None;
-                    let _ = state.persist(&self.workspace);
-                    emit(
-                        "bridge_ready",
-                        &job_id,
-                        &attempt_id,
-                        &self.workspace_ref,
-                        "finalized",
-                    );
-                    Ok(())
-                } else {
+                let binding = self.binding();
+                let receipt_path = attempt_dir.join("receipt.json");
+                let receipt_bytes = match std::fs::read(&receipt_path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        emit(
+                            "recovery_required",
+                            &job_id,
+                            &attempt_id,
+                            &self.workspace_ref,
+                            "dispatch_intent_without_receipt",
+                        );
+                        return Err(1);
+                    }
+                };
+                let history =
+                    match AttemptHistoryRecord::load(&self.workspace, &job_id, &attempt_id) {
+                        Ok(Some(h)) => h,
+                        Ok(None) | Err(_) => {
+                            emit(
+                                "recovery_required",
+                                &job_id,
+                                &attempt_id,
+                                &self.workspace_ref,
+                                "receipt_without_history",
+                            );
+                            return Err(1);
+                        }
+                    };
+                let receipt: TaskReceipt = match serde_json::from_slice(&receipt_bytes) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        emit(
+                            "recovery_required",
+                            &job_id,
+                            &attempt_id,
+                            &self.workspace_ref,
+                            "receipt_unparseable",
+                        );
+                        return Err(1);
+                    }
+                };
+                let rec_sha = sha256_of_bytes(&receipt_bytes);
+                let envelope_sha =
+                    match sha256_file(&state::prompt_path(&self.workspace, &job_id, &attempt_id)) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            emit(
+                                "recovery_required",
+                                &job_id,
+                                &attempt_id,
+                                &self.workspace_ref,
+                                "envelope_unreadable",
+                            );
+                            return Err(1);
+                        }
+                    };
+                let active_prompt_sha = active.claim.as_ref().map(|c| sha256_of(&c.prompt));
+                let active_acceptance_sha = active.claim.as_ref().map(|c| sha256_of(&c.acceptance));
+                if let Err(reason) = verify_terminal_evidence(
+                    &binding,
+                    &self.worker_id,
+                    &active,
+                    &receipt,
+                    &rec_sha,
+                    &envelope_sha,
+                    &history,
+                    active_prompt_sha.as_deref(),
+                    active_acceptance_sha.as_deref(),
+                ) {
                     emit(
                         "recovery_required",
                         &job_id,
                         &attempt_id,
                         &self.workspace_ref,
-                        "dispatch_intent_without_receipt",
+                        &format!("evidence:{reason}"),
                     );
-                    Err(1)
+                    return Err(1);
                 }
+                state.active = None;
+                state.persist(&self.workspace).map_err(|_| 1)?;
+                emit(
+                    "bridge_ready",
+                    &job_id,
+                    &attempt_id,
+                    &self.workspace_ref,
+                    "finalized",
+                );
+                Ok(())
             }
         }
     }
@@ -557,6 +631,101 @@ fn classify_disposition(receipt: &TaskReceipt) -> AttemptDisposition {
     }
 }
 
+/// Centralized verification that a persisted terminal state — a final receipt
+/// plus its history record, and the *actual* on-disk receipt/envelope bytes —
+/// genuinely and safely corresponds to this active attempt, before any code may
+/// clear `active` after a restart.
+///
+/// Field-format legality is never evidence of a correct association: a 64-char
+/// hex string only proves it *looks like* a sha256; it does not prove it matches
+/// the file. Every association is compared against the real bytes and against
+/// the current binding/worker/attempt and control token. On any mismatch — or a
+/// terminal state that itself requires recovery (unconfirmed stop, local-state
+/// write failure) — the attempt is kept active and never auto-cleared.
+#[allow(clippy::too_many_arguments)]
+fn verify_terminal_evidence(
+    binding: &BridgeBinding,
+    worker_id: &str,
+    active: &ActiveAttempt,
+    receipt: &TaskReceipt,
+    receipt_bytes_sha: &str,
+    envelope_sha: &str,
+    history: &AttemptHistoryRecord,
+    active_prompt_sha: Option<&str>,
+    active_acceptance_sha: Option<&str>,
+) -> Result<(), String> {
+    let bc = receipt
+        .bridge_context
+        .as_ref()
+        .ok_or("receipt has no bridge context")?;
+    // 1. Server origin / user / workspace / workspace_ref.
+    if bc.server_origin != binding.server_origin {
+        return Err("receipt server_origin does not match binding".to_string());
+    }
+    if bc.user_id != binding.user_id {
+        return Err("receipt user_id does not match binding".to_string());
+    }
+    if bc.workspace_id != binding.workspace_id {
+        return Err("receipt workspace_id does not match binding".to_string());
+    }
+    if bc.workspace_ref != binding.workspace_ref {
+        return Err("receipt workspace_ref does not match binding".to_string());
+    }
+    // 2. Worker / job / attempt identity.
+    if bc.worker_id != worker_id {
+        return Err("receipt worker_id does not match this worker".to_string());
+    }
+    if bc.job_id != active.job_id || bc.attempt_id != active.attempt_id {
+        return Err("receipt job/attempt does not match active attempt".to_string());
+    }
+    // 3. Source prompt & acceptance hashes must agree with the history record
+    // and with the active claim's own fields.
+    if bc.source_prompt_sha256 != history.source_prompt_sha256 {
+        return Err("receipt source-prompt hash disagrees with history".to_string());
+    }
+    if bc.acceptance_sha256 != history.acceptance_sha256 {
+        return Err("receipt acceptance hash disagrees with history".to_string());
+    }
+    if let Some(p) = active_prompt_sha {
+        if p != history.source_prompt_sha256 {
+            return Err("active claim prompt hash disagrees with history".to_string());
+        }
+    }
+    if let Some(a) = active_acceptance_sha {
+        if a != history.acceptance_sha256 {
+            return Err("active claim acceptance hash disagrees with history".to_string());
+        }
+    }
+    // 4. The actual envelope bytes still match the recorded hash (never trust a
+    // hash computed over a post-execution, possibly-mutated file).
+    if envelope_sha != history.envelope_sha256 {
+        return Err("envelope hash does not match recorded history".to_string());
+    }
+    // 5. The actual receipt bytes match the recorded hash.
+    if receipt_bytes_sha != history.receipt_sha256 {
+        return Err("receipt hash does not match recorded history".to_string());
+    }
+    // 6. Dispatch intent must be consistent across receipt, history and the
+    // active attempt's persisted dispatch intent.
+    if bc.task_dispatch_intent != history.task_dispatch_intent {
+        return Err("receipt dispatch intent disagrees with history".to_string());
+    }
+    if bc.task_dispatch_intent != active.task_dispatch_intent {
+        return Err("receipt dispatch intent disagrees with active state".to_string());
+    }
+    // 7. The history control credential must correspond to the active attempt's
+    // lease token (so a history for a different attempt/identity cannot clear it).
+    if history.claim_token != active.lease_token {
+        return Err("history control token does not match active attempt".to_string());
+    }
+    // 8. Only a terminal state that is safe to finalize may be cleared; an
+    // unconfirmed stop or a failed local-state write must never be auto-cleared.
+    if classify_disposition(receipt) == AttemptDisposition::KeepActiveRecovery {
+        return Err("terminal state requires recovery".to_string());
+    }
+    Ok(())
+}
+
 impl Worker {
     /// Claim and run one discovery candidate to local completion.
     async fn claim_and_run(
@@ -755,6 +924,25 @@ impl Worker {
             build_envelope(&self.workspace, &payload).as_bytes(),
         )
         .map_err(|_| 1)?;
+        // Hash the envelope *now* — the exact bytes just made available to the
+        // executor. This is the authoritative "sent content" hash recorded in
+        // history. We never re-hash the envelope after execution and call that
+        // the sent content: the file may have been changed mid-run, and the
+        // runner snapshots the prompt at start, so the post-run file is not
+        // necessarily what was sent.
+        let envelope_sha = match sha256_file(&prompt_path) {
+            Ok(s) => s,
+            Err(_) => {
+                emit(
+                    "bridge_stopped",
+                    &job_id,
+                    &attempt_id,
+                    &self.workspace_ref,
+                    "envelope_unreadable",
+                );
+                return Err(1);
+            }
+        };
 
         let receipt = self
             .run_managed_attempt(
@@ -800,21 +988,6 @@ impl Worker {
                     &attempt_id,
                     &self.workspace_ref,
                     "receipt_unreadable",
-                );
-                return Err(1);
-            }
-        };
-        // Actual envelope bytes hash: the prompt that was really written and made
-        // available to the executor (distinct from the raw claimed prompt).
-        let envelope_sha = match sha256_file(&prompt_path) {
-            Ok(s) => s,
-            Err(_) => {
-                emit(
-                    "bridge_stopped",
-                    &job_id,
-                    &attempt_id,
-                    &self.workspace_ref,
-                    "envelope_unreadable",
                 );
                 return Err(1);
             }
@@ -980,6 +1153,7 @@ impl Worker {
             permit_tx,
             stop_tx,
             clock: _ctl_clock,
+            dispatch_intent,
         } = ctl;
         let mut permit_tx: Option<oneshot::Sender<crate::runner::control::ExecutionPermit>> =
             Some(permit_tx);
@@ -1248,6 +1422,33 @@ impl Worker {
                                 lease = Some(new);
                                 start_done = true;
                                 start_fail = 0;
+                                // Permit gate: re-read the external stop, the
+                                // boot clock and the current lease stop line
+                                // *now* (not the value sampled before the select)
+                                // before committing dispatch. A stop or lease
+                                // line reached here must not dispatch.
+                                if let Some(reason) = stop_rx.borrow().clone() {
+                                    stopping = Some(reason);
+                                    continue;
+                                }
+                                let now_boot = match boot_now(self.clock.as_ref()) {
+                                    Ok(t) => t,
+                                    Err(stop) => {
+                                        stopping = Some(stop);
+                                        continue;
+                                    }
+                                };
+                                if let Some(l) = &lease {
+                                    if let Some(reason) = stop_reason_at_deadline(l, now_boot) {
+                                        stopping = Some(reason);
+                                        continue;
+                                    }
+                                }
+                                // Commit the one-way shared dispatch-intent marker
+                                // before persisting: if the write outcome is
+                                // unknown, the receipt must never claim the
+                                // business prompt was clearly not started.
+                                dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
                                 // Persist DispatchIntent *before* granting the
                                 // permit: once the permit is out the business
                                 // prompt may be sent, so record the intent first.
@@ -1306,6 +1507,7 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::bridge::lease::{claim_backoff, stop_at_from_remaining};
+    use crate::bridge::state::new_history_record;
 
     #[test]
     fn remaining_to_is_none_when_past_deadline() {
@@ -1780,5 +1982,223 @@ mod tests {
             )),
             AttemptDisposition::KeepActiveRecovery
         );
+    }
+
+    // --- C3: centralized terminal-evidence verification ----------------------
+
+    struct Evidence {
+        binding: BridgeBinding,
+        worker_id: String,
+        active: ActiveAttempt,
+        receipt: TaskReceipt,
+        rec_sha: String,
+        envelope_sha: String,
+        history: AttemptHistoryRecord,
+        prompt_sha: String,
+        accept_sha: String,
+    }
+
+    fn binding_for(ws: &str) -> BridgeBinding {
+        BridgeBinding {
+            server_origin: "https://ceo.example".to_string(),
+            user_id: "usr_alice".to_string(),
+            workspace_id: "ws_alpha".to_string(),
+            workspace_ref: "tools".to_string(),
+            canonical_workspace: ws.into(),
+        }
+    }
+
+    /// Builds a fully self-consistent terminal state (receipt bytes + history +
+    /// real hashes + matching active attempt), ready to be mutated per test.
+    fn make_evidence() -> Evidence {
+        use crate::runner::BridgeReceiptContext;
+        let binding = binding_for("/ws");
+        let worker_id = "wrk-123e4567-e89b-12d3-a456-426614174000".to_string();
+        let token = "ab".repeat(32);
+        let prompt = "task goal";
+        let accept = "acceptance";
+        let envelope = "ENVELOPE-SENT-BYTES";
+        let prompt_sha = sha256_of(prompt);
+        let accept_sha = sha256_of(accept);
+        let envelope_sha = sha256_of(envelope);
+
+        let active = ActiveAttempt {
+            job_id: "job-a".to_string(),
+            attempt_id: "attempt-a".to_string(),
+            lease_token: token.clone(),
+            phase: LocalPhase::Running,
+            claim: None,
+            runner_boot_id: None,
+            process: None,
+            task_dispatch_intent: true,
+            stop_error: None,
+        };
+
+        let mut receipt = skeleton_receipt("COMPLETED", None);
+        receipt.job_id = "job-a".to_string();
+        receipt.attempt_id = "attempt-a".to_string();
+        receipt.bridge_context = Some(BridgeReceiptContext {
+            server_origin: binding.server_origin.clone(),
+            user_id: binding.user_id.clone(),
+            workspace_id: binding.workspace_id.clone(),
+            workspace_ref: binding.workspace_ref.clone(),
+            worker_id: worker_id.clone(),
+            job_id: "job-a".to_string(),
+            attempt_id: "attempt-a".to_string(),
+            source_prompt_sha256: prompt_sha.clone(),
+            acceptance_sha256: accept_sha.clone(),
+            task_dispatch_intent: true,
+            stop_reason: None,
+        });
+        let rec_bytes = serde_json::to_vec(&receipt).unwrap();
+        let rec_sha = sha256_of_bytes(&rec_bytes);
+        let history = new_history_record(
+            &binding,
+            &worker_id,
+            "job-a",
+            "attempt-a",
+            &prompt_sha,
+            &accept_sha,
+            &envelope_sha,
+            &rec_sha,
+            true,
+            &token,
+        );
+        Evidence {
+            binding,
+            worker_id,
+            active,
+            receipt,
+            rec_sha,
+            envelope_sha,
+            history,
+            prompt_sha,
+            accept_sha,
+        }
+    }
+
+    fn verify_ev(ev: &Evidence) -> Result<(), String> {
+        verify_terminal_evidence(
+            &ev.binding,
+            &ev.worker_id,
+            &ev.active,
+            &ev.receipt,
+            &ev.rec_sha,
+            &ev.envelope_sha,
+            &ev.history,
+            Some(&ev.prompt_sha),
+            Some(&ev.accept_sha),
+        )
+    }
+
+    /// Recomputes the history receipt hash after the receipt bytes were changed.
+    fn resync_receipt_hash(ev: &mut Evidence) {
+        let bytes = serde_json::to_vec(&ev.receipt).unwrap();
+        let rec_sha = sha256_of_bytes(&bytes);
+        ev.history = new_history_record(
+            &ev.binding,
+            &ev.worker_id,
+            &ev.active.job_id,
+            &ev.active.attempt_id,
+            &ev.history.source_prompt_sha256,
+            &ev.history.acceptance_sha256,
+            &ev.history.envelope_sha256,
+            &rec_sha,
+            ev.receipt
+                .bridge_context
+                .as_ref()
+                .map(|b| b.task_dispatch_intent)
+                .unwrap_or(false),
+            &ev.active.lease_token,
+        );
+        ev.rec_sha = rec_sha;
+    }
+
+    #[test]
+    fn terminal_evidence_accepts_fully_consistent_state() {
+        let ev = make_evidence();
+        assert!(verify_ev(&ev).is_ok());
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_wrong_worker() {
+        let mut ev = make_evidence();
+        ev.receipt.bridge_context.as_mut().unwrap().worker_id = "wrk-other".to_string();
+        assert!(verify_ev(&ev).unwrap_err().contains("worker_id"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_wrong_attempt_and_binding() {
+        let mut ev = make_evidence();
+        ev.receipt.bridge_context.as_mut().unwrap().attempt_id = "attempt-other".to_string();
+        assert!(verify_ev(&ev).unwrap_err().contains("attempt"));
+        // workspace_ref mismatch.
+        let mut ev2 = make_evidence();
+        ev2.receipt.bridge_context.as_mut().unwrap().workspace_ref = "different".to_string();
+        assert!(verify_ev(&ev2).unwrap_err().contains("workspace_ref"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_format_valid_but_mismatched_receipt_hash() {
+        // The receipt is re-serialized with a changed (format-valid) field, but
+        // the history still records the OLD hash. A 64-hex string in history is
+        // not evidence the file matches.
+        let mut ev = make_evidence();
+        // The on-disk receipt file was changed (format-valid field mutation),
+        // so its real byte hash now differs from what history recorded.
+        ev.receipt.executor.version = "mutated".to_string();
+        ev.rec_sha = sha256_of_bytes(&serde_json::to_vec(&ev.receipt).unwrap());
+        assert!(
+            verify_ev(&ev).unwrap_err().contains("receipt hash"),
+            "receipt hash mismatch must be rejected"
+        );
+        // Resyncing so the recorded hash matches the new bytes lets it pass.
+        resync_receipt_hash(&mut ev);
+        assert!(verify_ev(&ev).is_ok());
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_tampered_envelope() {
+        let mut ev = make_evidence();
+        ev.envelope_sha = sha256_of("DIFFERENT-envelope");
+        assert!(verify_ev(&ev).unwrap_err().contains("envelope"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_dispatch_intent_mismatch() {
+        let mut ev = make_evidence();
+        ev.receipt
+            .bridge_context
+            .as_mut()
+            .unwrap()
+            .task_dispatch_intent = false;
+        assert!(verify_ev(&ev).unwrap_err().contains("dispatch"));
+        // active persisted intent mismatch is also caught.
+        let mut ev2 = make_evidence();
+        ev2.active.task_dispatch_intent = false;
+        assert!(verify_ev(&ev2).unwrap_err().contains("dispatch"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_control_token_mismatch() {
+        let mut ev = make_evidence();
+        ev.history.claim_token = "cd".repeat(32);
+        assert!(verify_ev(&ev).unwrap_err().contains("control token"));
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_unconfirmed_stop_terminal_state() {
+        // A syntactically-valid receipt whose terminal state itself requires
+        // recovery (an unconfirmed process stop) is never cleared, even when all
+        // hashes are consistent.
+        let mut ev = make_evidence();
+        ev.receipt.execution_status = "INTERRUPTED".to_string();
+        ev.receipt.error = Some(crate::receipt::ReceiptError {
+            stage: "x".to_string(),
+            code: "PROCESS_STOP_UNCONFIRMED".to_string(),
+            message: String::new(),
+        });
+        resync_receipt_hash(&mut ev);
+        assert!(verify_ev(&ev).unwrap_err().contains("requires recovery"));
     }
 }

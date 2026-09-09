@@ -20,6 +20,7 @@
 
 use crate::bridge::lease::{BootTime, Clock};
 use crate::bridge::state::{ProcessIdentity, SafeStopError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -133,6 +134,12 @@ pub struct RunnerControls {
     /// Stop channel (controller sets `Some(reason)` to request a stop).
     pub stop: watch::Receiver<Option<StopReason>>,
     pub clock: Arc<dyn Clock>,
+    /// One-way shared dispatch-intent marker (shared with the controller). The
+    /// controller sets it to `true` once it has committed `DispatchIntent`
+    /// (business execution is authorized and may have begun). It never resets
+    /// to `false`. The Runner reads it to decide NotStarted vs Unverified even
+    /// when it never observed the actual business send.
+    pub dispatch_intent: Arc<AtomicBool>,
 }
 
 /// The controller side of the control pair.
@@ -141,6 +148,8 @@ pub struct ControllerHandles {
     pub permit_tx: oneshot::Sender<ExecutionPermit>,
     pub stop_tx: watch::Sender<Option<StopReason>>,
     pub clock: Arc<dyn Clock>,
+    /// One-way shared dispatch-intent marker; see [`RunnerControls`].
+    pub dispatch_intent: Arc<AtomicBool>,
 }
 
 /// Builds the paired Runner/controller channels sharing one boot clock. The
@@ -150,18 +159,21 @@ pub fn control_channel(clock: Arc<dyn Clock>) -> (RunnerControls, ControllerHand
     let (signals_tx, signals_rx) = mpsc::channel::<(RunnerSignal, oneshot::Sender<()>)>(16);
     let (permit_tx, permit_rx) = oneshot::channel::<ExecutionPermit>();
     let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
+    let dispatch_intent = Arc::new(AtomicBool::new(false));
     (
         RunnerControls {
             signals: signals_tx,
             permit_rx: Some(permit_rx),
             stop: stop_rx,
             clock: clock.clone(),
+            dispatch_intent: dispatch_intent.clone(),
         },
         ControllerHandles {
             signals_rx,
             permit_tx,
             stop_tx,
             clock,
+            dispatch_intent,
         },
     )
 }
@@ -185,6 +197,17 @@ impl ExecGate {
         match self {
             ExecGate::Local => None,
             ExecGate::Bridge(c) => c.stop.borrow().clone(),
+        }
+    }
+
+    /// Whether the controller has committed dispatch intent (business execution
+    /// is authorized and may have begun). One-way: once `true` it never reverts.
+    /// The Runner uses this (together with an observed send) to classify a stop
+    /// as `Unverified` rather than `NotStarted` after the dispatch boundary.
+    pub fn dispatch_intent(&self) -> bool {
+        match self {
+            ExecGate::Local => false,
+            ExecGate::Bridge(c) => c.dispatch_intent.load(Ordering::SeqCst),
         }
     }
 

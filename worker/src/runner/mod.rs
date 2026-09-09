@@ -1224,6 +1224,11 @@ impl Runner {
             }
             match gate.await_permit().await {
                 Ok(Some(deadline)) => {
+                    // Permit granted: the controller committed DispatchIntent
+                    // (shared marker set + persisted) before sending the permit.
+                    // From here a stop is Unverified, never NotStarted, even if
+                    // the business send itself was never observed.
+                    finalize_params.dispatch_happened = true;
                     if gate.past_execution_stop(deadline) {
                         return self
                             .finalize_after_teardown(
@@ -1232,7 +1237,7 @@ impl Runner {
                                     stop_reason: StopReason::LeaseExpired {
                                         reason: Some("EXECUTION_DEADLINE_EXCEEDED".to_string()),
                                     },
-                                    dispatched: false,
+                                    dispatched: true,
                                     executor: executor_info.clone(),
                                 },
                                 &mut child,
@@ -1243,12 +1248,19 @@ impl Runner {
                 }
                 Ok(None) => {}
                 Err(stop) => {
+                    // Permit never arrived (a stop preceded it). The controller
+                    // may still have committed dispatch intent right before it
+                    // stopped: honor the one-way shared marker rather than
+                    // assuming NotStarted. This effective intent drives both the
+                    // business classification and the recorded task_dispatch_intent.
+                    let dispatched = gate.dispatch_intent() || finalize_params.dispatch_happened;
+                    finalize_params.dispatch_happened = dispatched;
                     return self
                         .finalize_after_teardown(
                             finalize_params,
                             AttemptOutcome::Stopped {
                                 stop_reason: stop,
-                                dispatched: false,
+                                dispatched,
                                 executor: executor_info.clone(),
                             },
                             &mut child,
@@ -1258,12 +1270,14 @@ impl Runner {
                 }
             }
             if let Some(stop) = gate.current_stop() {
+                // Reachable only after the permit was granted (dispatch intent
+                // committed), so a stop here is Unverified, never NotStarted.
                 return self
                     .finalize_after_teardown(
                         finalize_params,
                         AttemptOutcome::Stopped {
                             stop_reason: stop,
-                            dispatched: false,
+                            dispatched: true,
                             executor: executor_info.clone(),
                         },
                         &mut child,
@@ -1943,6 +1957,137 @@ mod tests {
         assert!(
             drains.is_empty(),
             "drain handle must have been consumed/aborted"
+        );
+    }
+
+    /// Sets up a managed workspace (AGENTS.md rule marker + stub mode) plus a
+    /// prompt, and returns (workspace, prompt_file, stub bin).
+    fn managed_workspace(
+        root: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        use std::fs;
+        let ws = root.join("workspace");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            ws.join("AGENTS.md"),
+            "# Guidelines\n\n<!-- ceo:metadata rule_marker: \"MKT-RUN\" -->\n\nrespect.\n",
+        )
+        .unwrap();
+        fs::write(ws.join(".stub_mode"), "normal").unwrap();
+        let prompt = root.join("prompt.md");
+        fs::write(&prompt, "bridge managed task\n").unwrap();
+        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("test_stub.sh");
+        (ws, prompt, bin)
+    }
+
+    /// A user stop requested *after* the controller grants the execution permit
+    /// (i.e. after DispatchIntent is committed) must record dispatch intent as
+    /// true and classify the stop as Unverified (CANCELLED), never NotStarted —
+    /// the runner is never demoted to NotStarted once the permit was granted.
+    #[allow(clippy::field_reassign_with_default)]
+    #[tokio::test]
+    async fn bridge_gated_stop_after_permit_preserves_dispatch_intent() {
+        use crate::bridge::lease::{Clock, ManualClock};
+        use crate::config::{ExecutorType, WorkerConfig};
+        use crate::runner::control::{control_channel, RunnerSignal};
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let (ws, prompt, bin) = managed_workspace(temp.path());
+
+        let mut config = WorkerConfig::default();
+        config.workspace_dir = ws.clone();
+        config.executor_type = ExecutorType::TestStub;
+        config.agent_executable = bin;
+
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
+        let job_id = "job-bridge-stop";
+        let attempt_id = "attempt-bridge-stop-1";
+        let hex64 = "a".repeat(64);
+
+        let context = BridgeReceiptContext {
+            server_origin: "https://ceo.example".to_string(),
+            user_id: "usr_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            workspace_ref: "tools".to_string(),
+            worker_id: "wrk-test".to_string(),
+            job_id: job_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            source_prompt_sha256: hex64.clone(),
+            acceptance_sha256: hex64,
+            task_dispatch_intent: false,
+            stop_reason: None,
+        };
+
+        let (runner_controls, ctl) = control_channel(clock.clone());
+        let crate::runner::control::ControllerHandles {
+            mut signals_rx,
+            permit_tx,
+            stop_tx,
+            clock: _c,
+            dispatch_intent,
+        } = ctl;
+
+        let runner = Runner::new(config.clone(), None);
+        let run = tokio::spawn(async move {
+            runner
+                .run_managed(
+                    &ws,
+                    job_id,
+                    attempt_id,
+                    &prompt,
+                    60,
+                    false,
+                    runner_controls,
+                    context,
+                )
+                .await
+        });
+
+        // Play the controller: ack ProcessSpawned and PreparedForTask.
+        let mut got = 0usize;
+        while got < 2 {
+            let (signal, ack) = signals_rx.recv().await.expect("runner must send signals");
+            match signal {
+                RunnerSignal::ProcessSpawned(_) => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+                RunnerSignal::PreparedForTask => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+            }
+        }
+        // Commit dispatch intent (shared marker) and grant the permit, then
+        // request a user stop right after.
+        dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
+        permit_tx
+            .send(crate::runner::control::ExecutionPermit {
+                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
+            })
+            .unwrap();
+        let _ = stop_tx.send(Some(StopReason::UserRequested));
+
+        let receipt = match run.await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => panic!("runner returned an error: {e}"),
+            Err(e) => panic!("runner task join failed: {e}"),
+        };
+        assert_eq!(receipt.execution_status, "CANCELLED");
+        let bc = receipt.bridge_context.expect("bridge context present");
+        assert!(
+            bc.task_dispatch_intent,
+            "dispatch intent must remain true once the permit was granted"
+        );
+        assert_eq!(
+            receipt.business_outcome,
+            crate::verifier::BusinessOutcome::Unverified
         );
     }
 }
