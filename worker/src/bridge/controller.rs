@@ -24,10 +24,12 @@
 use crate::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use crate::bridge::config::{BridgeConfig, ExpectedIdentity};
 use crate::bridge::lease::{
-    claim_backoff, stop_at_from_remaining, BootTime, Clock, HEARTBEAT_INTERVAL, TAIL_POLL,
-    WATCHDOG_PERIOD,
+    claim_backoff, heartbeat_backoff, stop_at_from_remaining, BootTime, Clock, HEARTBEAT_INTERVAL,
+    STOP_MARGIN, TAIL_POLL, WATCHDOG_PERIOD,
 };
-use crate::bridge::protocol::{ClaimRequest, Execution, LeaseOperationRequest};
+use crate::bridge::protocol::{
+    ClaimRequest, Execution, HeartbeatOk, LeaseOperationRequest, StartOk,
+};
 use crate::bridge::state::{
     self, ActiveAttempt, AttemptHistoryRecord, BridgeBinding, BridgeState, ClaimPayload, LocalPhase,
 };
@@ -36,6 +38,7 @@ use crate::receipt::TaskReceipt;
 use crate::runner::control::control_channel;
 use crate::runner::{BridgeReceiptContext, Runner, RunnerError, RunnerSignal, StopReason};
 use chrono::{DateTime, FixedOffset};
+use futures_util::future::BoxFuture;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,21 +94,65 @@ fn remaining_to(deadline: &str, server_time: &str) -> Option<Duration> {
     }
 }
 
+/// An in-memory, conservatively-confirmed lease established from a validated
+/// Server claim/start/heartbeat response. All deadlines are expressed as local
+/// boot-time instants anchored at the moment the request was *sent* (so round
+/// trip is conservatively subtracted) — never derived from the local wall
+/// clock. `phase` is the last Server-confirmed execution phase.
 #[derive(Clone, Copy)]
-enum StopOrigin {
-    Lease,
-    Execution,
+struct ConfirmedLease {
+    /// Conservative local instant past which the confirmed lease may have
+    /// expired (lease_expires_at mapped onto boot time, minus nothing here).
+    lease_valid_until_boot: BootTime,
+    /// Server-determined phase deadline mapped to boot time. In `claimed` it is
+    /// the start deadline; in `running` the execution deadline. Heartbeats may
+    /// extend the lease but never this deadline.
+    phase_deadline_boot: BootTime,
+    /// `min(lease_valid_until_boot, phase_deadline_boot) - STOP_MARGIN`; the
+    /// line at which the controller must stop issuing new work.
+    stop_at_boot: BootTime,
+    phase: crate::bridge::protocol::Phase,
 }
 
-#[derive(Clone, Copy)]
-struct LeaseLine {
-    stop_at: BootTime,
-    origin: StopOrigin,
+impl ConfirmedLease {
+    /// Builds a conservative lease from a validated response. `sent_boot` is
+    /// the boot clock sampled before the request went out. Returns `None` when
+    /// the numbers are unusable or the stop line is already in the past (the
+    /// lease is immediately expired).
+    fn from_execution(
+        exec: &Execution,
+        server_time: &str,
+        sent_boot: BootTime,
+    ) -> Option<ConfirmedLease> {
+        let running = exec.phase == "running";
+        let lease_rem = remaining_to(&exec.lease_expires_at, server_time)?;
+        // start_deadline / execution_deadline are always present for the
+        // matching phase (the client validated this before we got here).
+        let deadline_str = if running {
+            exec.execution_deadline.as_deref()?
+        } else {
+            &exec.start_deadline
+        };
+        let phase_rem = remaining_to(deadline_str, server_time)?;
+        let lease_valid_until_boot = sent_boot.checked_add(lease_rem)?;
+        let phase_deadline_boot = sent_boot.checked_add(phase_rem)?;
+        let stop_at = stop_at_from_remaining(sent_boot, lease_rem.min(phase_rem))?;
+        Some(ConfirmedLease {
+            lease_valid_until_boot,
+            phase_deadline_boot,
+            stop_at_boot: stop_at,
+            phase: if running {
+                crate::bridge::protocol::Phase::Running
+            } else {
+                crate::bridge::protocol::Phase::Claimed
+            },
+        })
+    }
 }
 
 /// The controller for one canonical workspace / alias.
 pub struct Worker {
-    client: BridgeClient,
+    client: Arc<BridgeClient>,
     clock: Arc<dyn Clock>,
     runner: Runner,
     origin: String,
@@ -128,7 +175,7 @@ impl Worker {
         worker_id: String,
     ) -> Worker {
         Worker {
-            client,
+            client: Arc::new(client),
             clock,
             runner,
             origin: cfg.server_base.as_str().trim_end_matches('/').to_string(),
@@ -147,30 +194,6 @@ impl Worker {
             workspace_ref: self.workspace_ref.clone(),
             canonical_workspace: self.workspace.clone(),
         }
-    }
-
-    fn lease_line_from(
-        &self,
-        exec: &Execution,
-        server_time: &str,
-        sent: BootTime,
-    ) -> Option<LeaseLine> {
-        let running = exec.phase == "running";
-        let phase_deadline = if running {
-            exec.execution_deadline.as_deref()?
-        } else {
-            &exec.start_deadline
-        };
-        let lease_rem = remaining_to(&exec.lease_expires_at, server_time)?;
-        let phase_rem = remaining_to(phase_deadline, server_time)?;
-        let origin = if running && phase_rem <= lease_rem {
-            StopOrigin::Execution
-        } else {
-            StopOrigin::Lease
-        };
-        let eff = lease_rem.min(phase_rem);
-        let stop_at = stop_at_from_remaining(sent, eff).unwrap_or(sent);
-        Some(LeaseLine { stop_at, origin })
     }
 
     /// Runs until stopped. `stop_rx` becomes Some on SIGINT/SIGTERM. Returns
@@ -236,7 +259,7 @@ impl Worker {
                     &self.workspace_ref,
                     "resume_claim",
                 );
-                self.finish_claimed(state, active, stop_rx).await
+                self.finish_claimed(state, active, None, stop_rx).await
             }
             LocalPhase::RecoveryRequired => {
                 emit(
@@ -368,12 +391,92 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(sha256_of(&String::from_utf8_lossy(&bytes)))
 }
 
-/// Result of a lease-write HTTP send, produced by an independent arm future.
-enum HbResult {
-    Ok(LeaseLine),
-    Stopped(StopReason),
-    /// Response invalid / unconfirmed.
-    Unconfirmed,
+/// The two kinds of server lease-write this loop performs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Heartbeat,
+    Start,
+}
+
+/// A lease-write HTTP request held *across* select! rounds so a watchdog/stop
+/// tick can never cancel an already-issued request. The future owns clones of
+/// the shared client and request strings, so it is `'static`.
+enum PendingOp {
+    Heartbeat {
+        sent_boot: BootTime,
+        future: BoxFuture<'static, Result<HeartbeatOk, ClientError>>,
+    },
+    Start {
+        sent_boot: BootTime,
+        future: BoxFuture<'static, Result<StartOk, ClientError>>,
+    },
+}
+
+/// Outcome observed when a retained lease-write future completes, or when a
+/// previously scheduled dispatch time is reached.
+enum LeaseEvt {
+    HeartbeatDone {
+        sent: BootTime,
+        res: Result<HeartbeatOk, ClientError>,
+    },
+    StartDone {
+        sent: BootTime,
+        res: Result<StartOk, ClientError>,
+    },
+    /// It is time to dispatch the requested op (nothing is currently in flight).
+    Due(OpKind),
+}
+
+/// What a failed lease-write should lead to next.
+#[derive(Debug)]
+enum FaultAction {
+    /// Retry with the same identity/attempt/token (caller picks the delay).
+    Retry,
+    /// Terminal: stop and keep the attempt for recovery. Never auto-resend.
+    Stop(StopReason),
+}
+
+/// Classifies a lease-write failure into retry vs stop. Only transport faults,
+/// genuinely retryable server errors (5xx / QUEUE_UNAVAILABLE), and unknown
+/// outcomes worth re-confirming retry; confirmed rejections and non-retryable
+/// protocol/auth faults stop the attempt (keeping its identity/token).
+fn classify_write_fault(e: &ClientError) -> FaultAction {
+    use ErrorKind::*;
+    match &e.kind {
+        Transport(_) => FaultAction::Retry,
+        Server { status, .. } if *status >= 500 => FaultAction::Retry,
+        Server { code, .. } if code == "QUEUE_UNAVAILABLE" => FaultAction::Retry,
+        Server { code, reason, .. } if code == "LEASE_EXPIRED" => {
+            FaultAction::Stop(StopReason::LeaseExpired {
+                reason: reason.clone(),
+            })
+        }
+        Unauthorized | Forbidden | IdentityMismatch { .. } => {
+            FaultAction::Stop(StopReason::IdentityRevoked)
+        }
+        Redirect(_) | Protocol(_) | TooLarge => FaultAction::Stop(StopReason::ProtocolError),
+        // Any other server decision is not a confirmed success; keep the
+        // attempt and stop rather than guessing.
+        Server { .. } => FaultAction::Stop(StopReason::LeaseUnconfirmed),
+    }
+}
+
+/// Delay for the `attempt`-th consecutive failure of a lease op, from the fixed
+/// heartbeat/start backoff schedule.
+fn lease_op_backoff(kind: OpKind, attempt: usize) -> Duration {
+    match kind {
+        OpKind::Heartbeat => heartbeat_backoff(attempt),
+        OpKind::Start => heartbeat_backoff(attempt),
+    }
+}
+
+/// Conservative mapping from a (claimed-phase) confirmed lease.
+fn lease_stop_reason(dispatched: bool) -> StopReason {
+    if dispatched {
+        StopReason::TaskTimedOut
+    } else {
+        StopReason::LeaseExpired { reason: None }
+    }
 }
 
 impl Worker {
@@ -425,7 +528,7 @@ impl Worker {
             .claim_replay(state, &job.job_id, &attempt_id, &req)
             .await?
         {
-            Some(active) => self.finish_claimed(state, active, stop_rx).await,
+            Some((active, lease)) => self.finish_claimed(state, active, lease, stop_rx).await,
             None => {
                 state.active = None;
                 let _ = state.persist(&self.workspace);
@@ -434,20 +537,42 @@ impl Worker {
         }
     }
 
-    /// Replays a claim until its result is known. Returns Some on Confirmed,
-    /// None on NotMine; fatal errors are `Err`.
+    /// Replays a claim until its result is known. Returns Some on Confirmed
+    /// (with a conservatively-confirmed initial lease), None on NotMine; fatal
+    /// errors are `Err`.
     async fn claim_replay(
         &mut self,
         state: &mut BridgeState,
         job_id: &str,
         attempt_id: &str,
         req: &ClaimRequest,
-    ) -> Result<Option<ActiveAttempt>, i32> {
-        let window_start = self.clock.now_boot();
+    ) -> Result<Option<(ActiveAttempt, Option<ConfirmedLease>)>, i32> {
+        let window_start = self.clock.now_boot().map_err(|_| 1)?;
         let mut attempt_no = 0usize;
         loop {
+            // Sample the boot clock before sending so round-trip time is
+            // conservatively subtracted from the confirmed lease.
+            let sent_boot = self.clock.now_boot().map_err(|_| 1)?;
             match self.client.claim(job_id, req).await {
                 Ok(ok) => {
+                    let lease =
+                        ConfirmedLease::from_execution(&ok.execution, &ok.server_time, sent_boot);
+                    if ok.execution.phase == "running" {
+                        // The Server already considers this attempt running; we
+                        // cannot prove local execution has not started. Preserve
+                        // state and require recovery — never resend the prompt.
+                        emit(
+                            "recovery_required",
+                            job_id,
+                            attempt_id,
+                            &self.workspace_ref,
+                            "claim_replayed_running",
+                        );
+                        let a = state.active.as_mut().unwrap();
+                        a.phase = LocalPhase::RecoveryRequired;
+                        let _ = state.persist(&self.workspace);
+                        return Err(1);
+                    }
                     let payload = ClaimPayload::from_wire(&ok.job);
                     let a = state.active.as_mut().unwrap();
                     a.phase = LocalPhase::Claimed;
@@ -455,7 +580,7 @@ impl Worker {
                     if state.persist(&self.workspace).is_err() {
                         return Err(1);
                     }
-                    return Ok(state.active.clone());
+                    return Ok(state.active.clone().map(|act| (act, lease)));
                 }
                 Err(e) => match e.kind {
                     ErrorKind::Server { code, .. }
@@ -495,7 +620,7 @@ impl Worker {
                         return Err(1);
                     }
                     _ => {
-                        let now = self.clock.now_boot();
+                        let now = self.clock.now_boot().map_err(|_| 1)?;
                         if now.saturating_sub(window_start)
                             > crate::bridge::lease::CLAIM_RECOVERY_WINDOW
                         {
@@ -518,10 +643,14 @@ impl Worker {
     }
 
     /// Runs an already-claimed attempt to local completion and finalizes it.
+    /// `lease` is the conservatively-confirmed initial lease from the claim
+    /// response (or `None` on a recovery resume, which re-establishes it via a
+    /// heartbeat at the top of the control loop).
     async fn finish_claimed(
         &mut self,
         state: &mut BridgeState,
         active: ActiveAttempt,
+        lease: Option<ConfirmedLease>,
         stop_rx: &mut watch::Receiver<Option<StopReason>>,
     ) -> Result<(), i32> {
         let job_id = active.job_id.clone();
@@ -550,7 +679,15 @@ impl Worker {
         .map_err(|_| 1)?;
 
         let receipt = self
-            .run_managed_attempt(state, &job_id, &attempt_id, &active, &prompt_path, stop_rx)
+            .run_managed_attempt(
+                state,
+                &job_id,
+                &attempt_id,
+                &active,
+                &prompt_path,
+                lease,
+                stop_rx,
+            )
             .await?;
 
         let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
@@ -583,8 +720,80 @@ enum Arm {
     ExternalStop,
     Signal(Option<(RunnerSignal, oneshot::Sender<()>)>),
     Watchdog,
-    Heartbeat(HbResult),
+    Lease(LeaseEvt),
     Done(Result<Result<TaskReceipt, RunnerError>, tokio::task::JoinError>),
+}
+
+/// Reads the boot clock, mapping a clock fault to a conservative stop reason.
+fn boot_now(clock: &dyn Clock) -> Result<BootTime, StopReason> {
+    clock.now_boot().map_err(|_| StopReason::LeaseUnconfirmed)
+}
+
+/// Builds a retained heartbeat future. It owns clones of the shared client and
+/// request strings so the in-flight request survives watchdog/stop ticks.
+fn make_heartbeat_future(
+    client: &Arc<BridgeClient>,
+    worker_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+    token: &str,
+) -> BoxFuture<'static, Result<HeartbeatOk, ClientError>> {
+    let c = Arc::clone(client);
+    let wid = worker_id.to_string();
+    let jid = job_id.to_string();
+    let aid = attempt_id.to_string();
+    let tok = token.to_string();
+    Box::pin(async move {
+        let req = LeaseOperationRequest {
+            worker_id: wid,
+            attempt_id: aid,
+            lease_token: tok,
+        };
+        c.heartbeat(&jid, &req).await
+    })
+}
+
+/// Builds a retained start future.
+fn make_start_future(
+    client: &Arc<BridgeClient>,
+    worker_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+    token: &str,
+) -> BoxFuture<'static, Result<StartOk, ClientError>> {
+    let c = Arc::clone(client);
+    let wid = worker_id.to_string();
+    let jid = job_id.to_string();
+    let aid = attempt_id.to_string();
+    let tok = token.to_string();
+    Box::pin(async move {
+        let req = LeaseOperationRequest {
+            worker_id: wid,
+            attempt_id: aid,
+            lease_token: tok,
+        };
+        c.start(&jid, &req).await
+    })
+}
+
+/// Merges a heartbeat-confirmed lease into the current one. A heartbeat may
+/// extend the lease expiry but never the Server-fixed execution/start deadline;
+/// the earliest confirmed phase deadline is retained.
+fn lease_after_heartbeat(prev: Option<ConfirmedLease>, new: ConfirmedLease) -> ConfirmedLease {
+    use crate::bridge::protocol::Phase;
+    let deadline = match prev {
+        Some(p) if p.phase == Phase::Running && new.phase == Phase::Running => {
+            p.phase_deadline_boot.min(new.phase_deadline_boot)
+        }
+        _ => new.phase_deadline_boot,
+    };
+    let stop_base = new.lease_valid_until_boot.min(deadline);
+    ConfirmedLease {
+        lease_valid_until_boot: new.lease_valid_until_boot,
+        phase_deadline_boot: deadline,
+        stop_at_boot: stop_base.checked_sub(STOP_MARGIN).unwrap_or(stop_base),
+        phase: new.phase,
+    }
 }
 
 impl Worker {
@@ -596,6 +805,7 @@ impl Worker {
         attempt_id: &str,
         active: &ActiveAttempt,
         prompt_path: &Path,
+        initial_lease: Option<ConfirmedLease>,
         stop_rx: &mut watch::Receiver<Option<StopReason>>,
     ) -> Result<TaskReceipt, i32> {
         {
@@ -620,9 +830,17 @@ impl Worker {
             stop_reason: None,
         };
 
-        let (runner_controls, mut ctl) = control_channel(self.clock.clone());
-        let mut permit: Option<oneshot::Sender<crate::runner::control::ExecutionPermit>> =
-            Some(ctl.permit_tx);
+        let (runner_controls, ctl) = control_channel(self.clock.clone());
+        let crate::runner::control::ControllerHandles {
+            signals_rx,
+            permit_tx,
+            stop_tx,
+            clock: _ctl_clock,
+        } = ctl;
+        let mut permit_tx: Option<oneshot::Sender<crate::runner::control::ExecutionPermit>> =
+            Some(permit_tx);
+        let mut signals_rx = signals_rx;
+        let stop_tx = stop_tx;
         let runner = self.runner.clone();
         let ws = self.workspace.clone();
         let jid = job_id.to_string();
@@ -646,28 +864,91 @@ impl Worker {
 
         let mut watchdog = tokio::time::interval(WATCHDOG_PERIOD);
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_hb = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
 
         let token = active.lease_token.clone();
-        let mut stopping: Option<StopReason> = None;
-        let mut stop_at: Option<BootTime> = None;
+        let mut lease = initial_lease;
+        let mut pending: Option<PendingOp> = None;
+        let mut due: Option<(OpKind, tokio::time::Instant)>;
+        let mut hb_fail = 0usize;
+        let mut start_fail = 0usize;
+        // PreparedForTask received and StartIntent persisted: a Server `start`
+        // must be confirmed (and replayable) before any business prompt.
+        let mut start_requested = false;
+        let mut start_done = false;
+        // True once the execution permit is sent (the business prompt may run).
         let mut at_execution = false;
+        let mut stopping: Option<StopReason> = None;
+
+        // Establish a confirmed lease promptly: dispatch an immediate heartbeat
+        // when none came from the claim, otherwise schedule the normal renewal.
+        let now = tokio::time::Instant::now();
+        let first_delay = if initial_lease.is_some() {
+            HEARTBEAT_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        due = Some((OpKind::Heartbeat, now + first_delay));
 
         loop {
+            // One-way stop: revoke the permit, request stop, then drop the
+            // controller channels so any Runner blocked on an ack/permit sees a
+            // closed channel (ControllerGone) and stops. A late success response
+            // can never reopen the permit: this branch already returned.
             if let Some(reason) = stopping.take() {
-                // Already signalled stop: wait for the Runner to finish.
-                let _ = ctl.stop_tx.send(Some(reason));
-                return self.collect_receipt((&mut handle).await).await;
+                drop(permit_tx.take());
+                let _ = stop_tx.send(Some(reason));
+                drop(stop_tx);
+                drop(signals_rx);
+                return self.collect_receipt(handle.await).await;
             }
+
+            // Re-read the boot clock and the current stop line every iteration.
+            let now_boot = match boot_now(self.clock.as_ref()) {
+                Ok(t) => t,
+                Err(stop) => {
+                    stopping = Some(stop);
+                    continue;
+                }
+            };
+            if let Some(l) = lease {
+                if now_boot >= l.stop_at_boot {
+                    stopping = Some(lease_stop_reason(at_execution));
+                    continue;
+                }
+            }
+
+            // Build the per-iteration lease arm: poll the retained in-flight op
+            // when one exists, otherwise sleep until the next scheduled dispatch.
+            // Because the in-flight HTTP future is stored in `pending` (not inside
+            // this arm), a watchdog/stop tick that cancels the arm never cancels
+            // the request.
+            let lease_fut: BoxFuture<LeaseEvt> = if let Some(p) = pending.as_mut() {
+                Box::pin(async move {
+                    match p {
+                        PendingOp::Heartbeat { sent_boot, future } => LeaseEvt::HeartbeatDone {
+                            sent: *sent_boot,
+                            res: future.as_mut().await,
+                        },
+                        PendingOp::Start { sent_boot, future } => LeaseEvt::StartDone {
+                            sent: *sent_boot,
+                            res: future.as_mut().await,
+                        },
+                    }
+                })
+            } else if let Some((kind, when)) = due {
+                Box::pin(async move {
+                    tokio::time::sleep_until(when).await;
+                    LeaseEvt::Due(kind)
+                })
+            } else {
+                Box::pin(std::future::pending())
+            };
 
             let arm = tokio::select! {
                 _ = stop_rx.changed() => Arm::ExternalStop,
-                sig = ctl.signals_rx.recv() => Arm::Signal(sig),
+                sig = signals_rx.recv() => Arm::Signal(sig),
                 _ = watchdog.tick() => Arm::Watchdog,
-                hb_res = async {
-                    tokio::time::sleep_until(next_hb).await;
-                    self.send_heartbeat(job_id, attempt_id, token.clone()).await
-                } => Arm::Heartbeat(hb_res),
+                ev = lease_fut => Arm::Lease(ev),
                 res = &mut handle => Arm::Done(res),
             };
 
@@ -678,114 +959,192 @@ impl Worker {
                         stopping = Some(reason);
                     }
                 }
-                Arm::Signal(sig) => {
-                    match sig {
-                        Some((RunnerSignal::ProcessSpawned(identity), ack)) => {
-                            let a = state.active.as_mut().unwrap();
-                            a.process = Some(identity);
-                            a.runner_boot_id = state::current_boot_id();
-                            let _ = state.persist(&self.workspace);
-                            let _ = ack.send(());
-                        }
-                        Some((RunnerSignal::PreparedForTask, ack)) => {
-                            let _ = ack.send(());
-                            if stopping.is_some() {
-                                // Do not start; release permit so Runner stops
-                                // with dispatch=false.
-                                return self.collect_receipt((&mut handle).await).await;
-                            }
-                            // Persist StartIntent, then call Server start.
-                            let a = state.active.as_mut().unwrap();
-                            a.phase = LocalPhase::StartIntent;
-                            if state.persist(&self.workspace).is_err() {
-                                let _ = ctl.stop_tx.send(Some(StopReason::LocalStateWriteFailed));
-                                return Err(1);
-                            }
-                            let req = LeaseOperationRequest {
-                                worker_id: self.worker_id.clone(),
-                                attempt_id: attempt_id.to_string(),
-                                lease_token: token.clone(),
-                            };
-                            let sent = self.clock.now_boot();
-                            match self.client.start(job_id, &req).await {
-                                Ok(ok) => {
-                                    if let Some(line) =
-                                        self.lease_line_from(&ok.execution, &ok.server_time, sent)
-                                    {
-                                        let a = state.active.as_mut().unwrap();
-                                        a.phase = LocalPhase::DispatchIntent;
-                                        a.task_dispatch_intent = true;
-                                        if state.persist(&self.workspace).is_err() {
-                                            let _ = ctl
-                                                .stop_tx
-                                                .send(Some(StopReason::LocalStateWriteFailed));
-                                            return Err(1);
-                                        }
-                                        stop_at = Some(line.stop_at);
-                                        at_execution = matches!(line.origin, StopOrigin::Execution);
-                                        if let Some(p) = permit.take() {
-                                            let _ =
-                                                p.send(crate::runner::control::ExecutionPermit {
-                                                    execution_deadline: line.stop_at,
-                                                });
-                                        }
-                                    } else {
-                                        stopping = Some(StopReason::LeaseUnconfirmed);
-                                    }
-                                }
-                                Err(e) => stopping = Some(start_error_to_stop(&e)),
-                            }
-                        }
-                        None => {
-                            return self.collect_receipt((&mut handle).await).await;
-                        }
-                    }
-                }
                 Arm::Watchdog => {
-                    let now = self.clock.now_boot();
-                    if let Some(sa) = stop_at {
-                        if now >= sa {
-                            stopping = Some(if at_execution {
-                                StopReason::TaskTimedOut
-                            } else {
-                                StopReason::LeaseExpired { reason: None }
-                            });
+                    // Lease expiry / clock fault were re-checked at the top of
+                    // this iteration; no extra work is needed here.
+                }
+                Arm::Signal(sig) => match sig {
+                    Some((RunnerSignal::ProcessSpawned(identity), ack)) => {
+                        let a = state.active.as_mut().unwrap();
+                        a.process = Some(identity);
+                        a.runner_boot_id = state::current_boot_id();
+                        if state.persist(&self.workspace).is_err() {
+                            stopping = Some(StopReason::LocalStateWriteFailed);
+                            continue;
+                        }
+                        let _ = ack.send(());
+                    }
+                    Some((RunnerSignal::PreparedForTask, ack)) => {
+                        let _ = ack.send(());
+                        if stopping.is_some() {
+                            continue;
+                        }
+                        // Persist StartIntent before issuing Server start.
+                        let a = state.active.as_mut().unwrap();
+                        a.phase = LocalPhase::StartIntent;
+                        if state.persist(&self.workspace).is_err() {
+                            stopping = Some(StopReason::LocalStateWriteFailed);
+                            continue;
+                        }
+                        start_requested = true;
+                        start_fail = 0;
+                        // Keep any in-flight heartbeat; once it completes, Start
+                        // is scheduled (never preempt an issued request).
+                        if pending.is_none() {
+                            due = Some((OpKind::Start, tokio::time::Instant::now()));
                         }
                     }
-                }
-                Arm::Heartbeat(hb) => {
-                    match hb {
-                        HbResult::Ok(line) => {
-                            stop_at = Some(line.stop_at);
-                            at_execution = matches!(line.origin, StopOrigin::Execution);
-                        }
-                        HbResult::Stopped(reason) => stopping = Some(reason),
-                        HbResult::Unconfirmed => stopping = Some(StopReason::LeaseUnconfirmed),
+                    None => {
+                        // Runner gone (its channels closed): stop.
+                        return self.collect_receipt(handle.await).await;
                     }
-                    next_hb = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
-                }
+                },
+                Arm::Lease(ev) => match ev {
+                    LeaseEvt::Due(kind) => {
+                        if lease
+                            .as_ref()
+                            .map(|l| now_boot >= l.stop_at_boot)
+                            .unwrap_or(false)
+                        {
+                            stopping = Some(lease_stop_reason(at_execution));
+                            continue;
+                        }
+                        let sent = match boot_now(self.clock.as_ref()) {
+                            Ok(t) => t,
+                            Err(stop) => {
+                                stopping = Some(stop);
+                                continue;
+                            }
+                        };
+                        match kind {
+                            OpKind::Heartbeat => {
+                                pending = Some(PendingOp::Heartbeat {
+                                    sent_boot: sent,
+                                    future: make_heartbeat_future(
+                                        &self.client,
+                                        &self.worker_id,
+                                        job_id,
+                                        attempt_id,
+                                        &token,
+                                    ),
+                                });
+                            }
+                            OpKind::Start => {
+                                pending = Some(PendingOp::Start {
+                                    sent_boot: sent,
+                                    future: make_start_future(
+                                        &self.client,
+                                        &self.worker_id,
+                                        job_id,
+                                        attempt_id,
+                                        &token,
+                                    ),
+                                });
+                            }
+                        }
+                        due = None;
+                    }
+                    LeaseEvt::HeartbeatDone { sent, res } => {
+                        pending = None;
+                        match res {
+                            Ok(ok) => {
+                                let new = match ConfirmedLease::from_execution(
+                                    &ok.execution,
+                                    &ok.server_time,
+                                    sent,
+                                ) {
+                                    Some(l) => l,
+                                    None => {
+                                        stopping = Some(StopReason::LeaseUnconfirmed);
+                                        continue;
+                                    }
+                                };
+                                lease = Some(lease_after_heartbeat(lease, new));
+                                hb_fail = 0;
+                                // After a confirmed Start is requested but not yet
+                                // done, proceed to Start (never infer approval from
+                                // a heartbeat). Otherwise schedule the next renewal.
+                                if start_requested && !start_done {
+                                    due = Some((OpKind::Start, tokio::time::Instant::now()));
+                                } else {
+                                    due = Some((
+                                        OpKind::Heartbeat,
+                                        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+                                    ));
+                                }
+                            }
+                            Err(e) => match classify_write_fault(&e) {
+                                FaultAction::Retry => {
+                                    hb_fail += 1;
+                                    let d = lease_op_backoff(OpKind::Heartbeat, hb_fail);
+                                    due =
+                                        Some((OpKind::Heartbeat, tokio::time::Instant::now() + d));
+                                }
+                                FaultAction::Stop(reason) => stopping = Some(reason),
+                            },
+                        }
+                    }
+                    LeaseEvt::StartDone { sent, res } => {
+                        pending = None;
+                        match res {
+                            Ok(ok) => {
+                                let new = match ConfirmedLease::from_execution(
+                                    &ok.execution,
+                                    &ok.server_time,
+                                    sent,
+                                ) {
+                                    Some(l) => l,
+                                    None => {
+                                        stopping = Some(StopReason::LeaseUnconfirmed);
+                                        continue;
+                                    }
+                                };
+                                if new.phase != crate::bridge::protocol::Phase::Running {
+                                    // start must confirm running; anything else is
+                                    // an unconfirmed / illegal transition.
+                                    stopping = Some(StopReason::LeaseUnconfirmed);
+                                    continue;
+                                }
+                                lease = Some(new);
+                                start_done = true;
+                                start_fail = 0;
+                                // Persist DispatchIntent *before* granting the
+                                // permit: once the permit is out the business
+                                // prompt may be sent, so record the intent first.
+                                let a = state.active.as_mut().unwrap();
+                                a.phase = LocalPhase::DispatchIntent;
+                                a.task_dispatch_intent = true;
+                                if state.persist(&self.workspace).is_err() {
+                                    stopping = Some(StopReason::LocalStateWriteFailed);
+                                    continue;
+                                }
+                                at_execution = true;
+                                if let Some(p) = permit_tx.take() {
+                                    let _ = p.send(crate::runner::control::ExecutionPermit {
+                                        execution_deadline: new.phase_deadline_boot,
+                                    });
+                                }
+                                due = Some((
+                                    OpKind::Heartbeat,
+                                    tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+                                ));
+                            }
+                            Err(e) => match classify_write_fault(&e) {
+                                FaultAction::Retry => {
+                                    start_fail += 1;
+                                    let d = lease_op_backoff(OpKind::Start, start_fail);
+                                    due = Some((OpKind::Start, tokio::time::Instant::now() + d));
+                                }
+                                FaultAction::Stop(reason) => stopping = Some(reason),
+                            },
+                        }
+                    }
+                },
             }
         }
     }
-
-    /// Sends one heartbeat. Returns the refreshed lease line on success, a stop
-    /// reason on a terminal failure, or Unconfirmed on an unusable response.
-    async fn send_heartbeat(&self, job_id: &str, attempt_id: &str, token: String) -> HbResult {
-        let req = LeaseOperationRequest {
-            worker_id: self.worker_id.clone(),
-            attempt_id: attempt_id.to_string(),
-            lease_token: token,
-        };
-        let sent = self.clock.now_boot();
-        match self.client.heartbeat(job_id, &req).await {
-            Ok(ok) => match self.lease_line_from(&ok.execution, &ok.server_time, sent) {
-                Some(line) => HbResult::Ok(line),
-                None => HbResult::Unconfirmed,
-            },
-            Err(e) => HbResult::Stopped(lease_error_to_stop(&e)),
-        }
-    }
-
+}
+impl Worker {
     async fn collect_receipt(
         &self,
         res: Result<Result<TaskReceipt, RunnerError>, tokio::task::JoinError>,
@@ -802,27 +1161,6 @@ impl Worker {
             }
         }
     }
-}
-
-fn start_error_to_stop(e: &ClientError) -> StopReason {
-    match e.kind {
-        ErrorKind::Server {
-            ref code,
-            ref reason,
-            ..
-        } if code == "LEASE_EXPIRED" => StopReason::LeaseExpired {
-            reason: reason.clone(),
-        },
-        ErrorKind::Unauthorized | ErrorKind::Forbidden | ErrorKind::IdentityMismatch { .. } => {
-            StopReason::IdentityRevoked
-        }
-        ErrorKind::Redirect(_) | ErrorKind::Protocol(_) => StopReason::ProtocolError,
-        _ => StopReason::LeaseUnconfirmed,
-    }
-}
-
-fn lease_error_to_stop(e: &ClientError) -> StopReason {
-    start_error_to_stop(e)
 }
 
 #[cfg(test)]
@@ -865,5 +1203,188 @@ mod tests {
         let stop = stop_at_from_remaining(sent, eff).unwrap();
         // 1000 + 90 - 5 = 1085
         assert_eq!(stop, Duration::from_secs(1085));
+    }
+
+    fn exec(phase: &str, start_deadline: &str, exec_deadline: Option<&str>) -> Execution {
+        Execution {
+            worker_id: "wrk-123e4567-e89b-12d3-a456-426614174000".to_string(),
+            attempt_id: "123e4567-e89b-12d3-a456-4266141740ff".to_string(),
+            phase: phase.to_string(),
+            claimed_at: "2026-09-07T00:00:00Z".to_string(),
+            start_deadline: start_deadline.to_string(),
+            started_at: exec_deadline.map(|_| "2026-09-07T00:00:10Z".to_string()),
+            lease_expires_at: "2026-09-07T00:01:30Z".to_string(),
+            execution_deadline: exec_deadline.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn confirmed_lease_maps_claimed_deadlines_conservatively() {
+        // server_time 00:00:00, sent at boot 1000. Claimed phase: lease expires
+        // 00:01:30 (90 s), start_deadline 00:05:00 (300 s). Effective stop uses
+        // the earlier lease, minus the 5 s margin.
+        let sent = Duration::from_secs(1000);
+        let e = exec("claimed", "2026-09-07T00:05:00Z", None);
+        let l = ConfirmedLease::from_execution(&e, "2026-09-07T00:00:00Z", sent).unwrap();
+        // lease_valid = sent + 90s; phase_deadline = sent + 300s.
+        assert_eq!(l.lease_valid_until_boot, Duration::from_secs(1090));
+        assert_eq!(l.phase_deadline_boot, Duration::from_secs(1300));
+        // stop = min(1090,1300) - 5s = 1085.
+        assert_eq!(l.stop_at_boot, Duration::from_secs(1085));
+        assert_eq!(l.phase, crate::bridge::protocol::Phase::Claimed);
+    }
+
+    #[test]
+    fn confirmed_lease_running_uses_execution_deadline() {
+        // Running: execution_deadline 00:06:00 (360 s) but lease 00:01:30 (90 s).
+        let sent = Duration::from_secs(1000);
+        let e = exec(
+            "running",
+            "2026-09-07T00:05:00Z",
+            Some("2026-09-07T00:06:00Z"),
+        );
+        let l = ConfirmedLease::from_execution(&e, "2026-09-07T00:00:00Z", sent).unwrap();
+        assert_eq!(l.phase_deadline_boot, Duration::from_secs(1360));
+        assert_eq!(l.lease_valid_until_boot, Duration::from_secs(1090));
+        // stop uses the earlier (lease) deadline minus margin.
+        assert_eq!(l.stop_at_boot, Duration::from_secs(1085));
+        assert_eq!(l.phase, crate::bridge::protocol::Phase::Running);
+    }
+
+    #[test]
+    fn confirmed_lease_none_when_server_time_past_deadline() {
+        // server_time already past lease expiry -> the lease is immediately gone.
+        let sent = Duration::from_secs(1000);
+        let e = exec("claimed", "2026-09-07T00:05:00Z", None);
+        assert!(ConfirmedLease::from_execution(&e, "2026-09-07T00:02:00Z", sent).is_none());
+    }
+
+    #[test]
+    fn heartbeat_never_extends_execution_deadline() {
+        use crate::bridge::protocol::Phase;
+        // Prior confirmed running lease: execution deadline at boot 1300.
+        let prev = ConfirmedLease {
+            lease_valid_until_boot: Duration::from_secs(1090),
+            phase_deadline_boot: Duration::from_secs(1300),
+            stop_at_boot: Duration::from_secs(1085),
+            phase: Phase::Running,
+        };
+        // A heartbeat response that would map execution deadline later (1400)
+        // and extends the lease (1200): the merged lease must keep the earlier
+        // phase deadline (1300) and recompute the stop from the earlier value.
+        let new = ConfirmedLease {
+            lease_valid_until_boot: Duration::from_secs(1200),
+            phase_deadline_boot: Duration::from_secs(1400),
+            stop_at_boot: Duration::from_secs(1195),
+            phase: Phase::Running,
+        };
+        let merged = lease_after_heartbeat(Some(prev), new);
+        // Execution/phase deadline must NOT be extended past 1300.
+        assert_eq!(merged.phase_deadline_boot, Duration::from_secs(1300));
+        // The heartbeat may still extend the lease valid-until bound.
+        assert_eq!(merged.lease_valid_until_boot, Duration::from_secs(1200));
+        // stop = min(1200,1300) - margin = 1195.
+        assert_eq!(merged.stop_at_boot, Duration::from_secs(1195));
+    }
+
+    fn err_of(kind: ErrorKind, unknown: bool) -> ClientError {
+        ClientError {
+            kind,
+            outcome_unknown: unknown,
+        }
+    }
+
+    #[test]
+    fn write_fault_classification_matrix() {
+        use ErrorKind::*;
+        // Transport faults retry.
+        assert!(matches!(
+            classify_write_fault(&err_of(Transport("t".into()), true)),
+            FaultAction::Retry
+        ));
+        // 5xx / QUEUE_UNAVAILABLE retry.
+        assert!(matches!(
+            classify_write_fault(&err_of(
+                Server {
+                    status: 500,
+                    code: "HTTP_500".into(),
+                    reason: None
+                },
+                false
+            )),
+            FaultAction::Retry
+        ));
+        assert!(matches!(
+            classify_write_fault(&err_of(
+                Server {
+                    status: 503,
+                    code: "QUEUE_UNAVAILABLE".into(),
+                    reason: None
+                },
+                false
+            )),
+            FaultAction::Retry
+        ));
+        // A confirmed LEASE_EXPIRED keeps the server's safe reason.
+        match classify_write_fault(&err_of(
+            Server {
+                status: 409,
+                code: "LEASE_EXPIRED".into(),
+                reason: Some("EXECUTION_DEADLINE_EXCEEDED".into()),
+            },
+            false,
+        )) {
+            FaultAction::Stop(StopReason::LeaseExpired { reason }) => {
+                assert_eq!(reason.as_deref(), Some("EXECUTION_DEADLINE_EXCEEDED"));
+            }
+            other => panic!("expected LeaseExpired stop, got {other:?}"),
+        }
+        // Auth and non-retryable protocol faults stop, never hot-loop.
+        assert!(matches!(
+            classify_write_fault(&err_of(Unauthorized, false)),
+            FaultAction::Stop(StopReason::IdentityRevoked)
+        ));
+        assert!(matches!(
+            classify_write_fault(&err_of(Redirect(302), true)),
+            FaultAction::Stop(StopReason::ProtocolError)
+        ));
+        assert!(matches!(
+            classify_write_fault(&err_of(Protocol("x".into()), true)),
+            FaultAction::Stop(StopReason::ProtocolError)
+        ));
+        // Any other server decision is not a confirmed success.
+        assert!(matches!(
+            classify_write_fault(&err_of(
+                Server {
+                    status: 409,
+                    code: "JOB_NOT_FOUND".into(),
+                    reason: None
+                },
+                false
+            )),
+            FaultAction::Stop(StopReason::LeaseUnconfirmed)
+        ));
+    }
+
+    #[test]
+    fn clock_failure_maps_to_conservative_stop() {
+        use crate::bridge::lease::{Clock, FailingClock};
+        let fc = FailingClock;
+        assert!(fc.now_boot().is_err());
+        // boot_now maps a clock fault to a stop reason, never to a time.
+        assert_eq!(boot_now(&fc).unwrap_err(), StopReason::LeaseUnconfirmed);
+    }
+
+    #[test]
+    fn backoff_schedules_cap_at_tail() {
+        assert_eq!(
+            lease_op_backoff(OpKind::Heartbeat, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(lease_op_backoff(OpKind::Start, 3), Duration::from_secs(5));
+        assert_eq!(
+            lease_op_backoff(OpKind::Heartbeat, 100),
+            Duration::from_secs(5)
+        );
     }
 }

@@ -10,28 +10,45 @@
 //! The controller never derives remaining lease from the local wall clock; it
 //! trusts only server-issued deadlines converted into boot-time offsets.
 
+use std::fmt;
 use std::time::Duration;
 
 /// A nanosecond-precision boot-time instant (time since boot).
 pub type BootTime = Duration;
 
+/// Failure reading the boot clock. A clock fault is a *control fault*: the
+/// caller must never authorize new execution, must not treat the lease as
+/// still valid, and must fall back to a confirmed stop line rather than to an
+/// invented local time. It never silently returns zero or swaps to the wall
+/// clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockError(pub String);
+
+impl fmt::Display for ClockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "boot clock error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ClockError {}
+
 /// Injectable source of boot-time. `SystemBootClock` is the production clock.
 pub trait Clock: Send + Sync {
-    /// Current boot time (nanoseconds since the kernel booted).
-    fn now_boot(&self) -> BootTime;
+    /// Current boot time (nanoseconds since the kernel booted), or an error
+    /// when the clock cannot be read safely.
+    fn now_boot(&self) -> Result<BootTime, ClockError>;
 }
 
 /// Production clock backed by `clock_gettime(CLOCK_BOOTTIME)` (Linux).
 pub struct SystemBootClock;
 
 impl Clock for SystemBootClock {
-    fn now_boot(&self) -> BootTime {
+    fn now_boot(&self) -> Result<BootTime, ClockError> {
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        // CLOCK_BOOTTIME is Linux-only. On non-Linux this crate targets Linux;
-        // the fallback keeps the type building on other unixes for porting.
+        // CLOCK_BOOTTIME is Linux-only. On non-Linux this crate targets Linux.
         #[cfg(target_os = "linux")]
         let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
         #[cfg(not(target_os = "linux"))]
@@ -40,13 +57,18 @@ impl Clock for SystemBootClock {
             -1
         };
         if rc != 0 {
-            // clock_gettime on boottime should never fail on Linux; fall back to
-            // zero so a syscall surprise cannot wedge the worker.
-            return Duration::ZERO;
+            return Err(ClockError(format!(
+                "clock_gettime(CLOCK_BOOTTIME): {}",
+                std::io::Error::last_os_error()
+            )));
         }
-        let secs: u64 = ts.tv_sec.max(0) as u64;
-        let nanos: u32 = ts.tv_nsec.max(0) as u32;
-        Duration::new(secs, nanos)
+        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+            return Err(ClockError(format!(
+                "clock_gettime returned an invalid instant (sec={}, nsec={})",
+                ts.tv_sec, ts.tv_nsec
+            )));
+        }
+        Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
     }
 }
 
@@ -73,14 +95,20 @@ impl ManualClock {
     pub fn advance(&self, by: Duration) {
         *self.inner.lock() += by;
     }
-    pub fn now(&self) -> BootTime {
-        self.now_boot()
-    }
 }
 
 impl Clock for ManualClock {
-    fn now_boot(&self) -> BootTime {
-        *self.inner.lock()
+    fn now_boot(&self) -> Result<BootTime, ClockError> {
+        Ok(*self.inner.lock())
+    }
+}
+
+/// A test clock that always fails, so clock-fault propagation is unit-testable.
+pub struct FailingClock;
+
+impl Clock for FailingClock {
+    fn now_boot(&self) -> Result<BootTime, ClockError> {
+        Err(ClockError("injected clock failure".to_string()))
     }
 }
 
@@ -230,8 +258,8 @@ mod tests {
     #[test]
     fn manual_clock_advances() {
         let c = ManualClock::new(Duration::from_secs(10));
-        assert_eq!(c.now_boot(), Duration::from_secs(10));
+        assert_eq!(c.now_boot().unwrap(), Duration::from_secs(10));
         c.advance(Duration::from_secs(90));
-        assert_eq!(c.now_boot(), Duration::from_secs(100));
+        assert_eq!(c.now_boot().unwrap(), Duration::from_secs(100));
     }
 }

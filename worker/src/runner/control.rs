@@ -201,6 +201,10 @@ impl ExecGate {
         let ExecGate::Bridge(c) = self else {
             return Ok(());
         };
+        // Never wait out a pending stop behind an ack we might not get.
+        if let Some(stop) = c.stop.borrow().clone() {
+            return Err(stop);
+        }
         let (tx, rx) = oneshot::channel::<()>();
         c.signals
             .send((signal, tx))
@@ -209,12 +213,14 @@ impl ExecGate {
         rx.await.map_err(|_| StopReason::ControllerGone)
     }
 
-    /// Awaits the execution permit (Bridge) and returns the execution deadline,
-    /// or returns the stop reason if the permit never arrives. `Local` returns
-    /// `None` (no external deadline).
     /// Awaits the execution permit (Bridge, consumes it) and returns the
     /// execution deadline, or returns the stop reason if the permit never
     /// arrives. `Local` returns `None` (no external deadline).
+    ///
+    /// While the permit is outstanding, a stop request on the shared watch
+    /// channel is observed and aborts the wait. A closed permit channel, or a
+    /// stop channel whose senders have all vanished, means the controller is
+    /// gone (`ControllerGone`) — a closed channel is never implicit approval.
     pub async fn await_permit(&mut self) -> Result<Option<BootTime>, StopReason> {
         let ExecGate::Bridge(c) = self else {
             return Ok(None);
@@ -223,19 +229,46 @@ impl ExecGate {
             // No outstanding permit to await (already consumed or never wired).
             return Err(StopReason::ControllerGone);
         };
-        match rx.await {
-            Ok(p) => Ok(Some(p.execution_deadline)),
-            Err(_) => Err(StopReason::ControllerGone),
+        let mut stop_rx = c.stop.clone();
+        // Check the current stop value first.
+        if let Some(stop) = stop_rx.borrow().clone() {
+            return Err(stop);
+        }
+        let mut permit = rx;
+        loop {
+            tokio::select! {
+                res = &mut permit => {
+                    return match res {
+                        Ok(p) => Ok(Some(p.execution_deadline)),
+                        Err(_) => Err(StopReason::ControllerGone),
+                    };
+                }
+                changed = stop_rx.changed() => {
+                    match changed {
+                        Ok(_) => {
+                            if let Some(stop) = stop_rx.borrow().clone() {
+                                return Err(stop);
+                            }
+                            // A no-op change; keep waiting for the permit.
+                        }
+                        Err(_) => return Err(StopReason::ControllerGone),
+                    }
+                }
+            }
         }
     }
 
     /// Whether execution must stop because the current boot time already passed
-    /// the (external) execution deadline minus the stop margin.
+    /// the (external) execution deadline minus the stop margin. A clock fault
+    /// fails closed (stop).
     pub fn past_execution_stop(&self, execution_deadline: BootTime) -> bool {
         match self.clock() {
             Some(clock) => {
                 use crate::bridge::lease::{execution_still_valid, is_past_deadline, STOP_MARGIN};
-                let now = clock.now_boot();
+                let now = match clock.now_boot() {
+                    Ok(n) => n,
+                    Err(_) => return true, // clock fault -> fail closed (stop)
+                };
                 let stop = execution_deadline.checked_sub(STOP_MARGIN).unwrap_or(now);
                 is_past_deadline(now, stop) || !execution_still_valid(now, execution_deadline)
             }
