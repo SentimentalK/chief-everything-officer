@@ -72,41 +72,110 @@ fn make_process_identity(pid: Option<u32>, pgid: Option<i32>) -> Option<ProcessI
     })
 }
 
+/// Structured, evidence-bearing result of terminating a managed process group.
+/// Each field is true only when that step was *confirmed*, not merely attempted.
+/// A false field means the caller cannot prove the group/drain stopped and must
+/// not claim a clean completion or continue as if the process were gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeardownReport {
+    /// No live (non-zombie) member of the process group remains.
+    pub group_confirmed_empty: bool,
+    /// The leader child was reaped via `wait()`.
+    pub leader_reaped: bool,
+    /// All stdout/stderr drain tasks finished (joined or aborted+awaited).
+    pub drains_ended: bool,
+}
+
+impl TeardownReport {
+    pub fn fully_stopped(&self) -> bool {
+        self.group_confirmed_empty && self.leader_reaped && self.drains_ended
+    }
+}
+
+/// Escalates to ProcessStopUnconfirmed when teardown could not be confirmed, so
+/// the caller never records a clean stop or continues as if the process were
+/// gone after an unconfirmed termination.
+fn teardown_stop(report: &TeardownReport, intended: StopReason) -> StopReason {
+    if report.fully_stopped() {
+        intended
+    } else {
+        StopReason::ProcessStopUnconfirmed
+    }
+}
+
+/// Joins a drain task within `budget`, aborting it (and awaiting the abort) on
+/// timeout. The JoinHandle is never dropped into a detached background task.
+/// Returns true only when the drain task actually finished.
+async fn join_or_abort(handle: JoinHandle<()>, budget: Duration) -> bool {
+    let mut h = handle;
+    let sleep = tokio::time::sleep(budget);
+    tokio::pin!(sleep);
+    tokio::select! {
+        _ = &mut h => true,
+        _ = &mut sleep => {
+            h.abort();
+            let _ = h.await;
+            false
+        }
+    }
+}
+
 /// Two-phase, bounded termination of the managed process group plus its log
-/// drains. Sequence: close stdin → SIGTERM the whole PGID → bounded grace
-/// (drains continue) → SIGKILL any remainder → bounded reap of the leader →
-/// join the drain tasks. Returns true only when no live group member remains.
-/// All early-exit branches and the completion path route through this so no
-/// background process or drain task is ever abandoned.
+/// drains under a single budget: close stdin → SIGTERM the whole PGID → up to
+/// 3 s for the group to empty (leader reaped while it drains) → SIGKILL any
+/// remainder → up to 2 s to reap the leader and confirm the group empty → join
+/// the drain tasks (aborting+awaiting on timeout, never detaching). Every step
+/// that cannot be confirmed is reported so the caller never treats the process
+/// as gone or the attempt as cleanly complete.
 async fn teardown_managed(
     child: &mut Box<dyn ManagedProcess>,
     drains: &mut Vec<JoinHandle<()>>,
-) -> bool {
+) -> TeardownReport {
     use tokio::time::timeout;
     let _ = child.close_stdin();
-    // Phase 1: graceful SIGTERM to the group; keep draining stdout/stderr while
-    // we wait up to 3 s for the group to empty (bail early once it does).
+    // Phase 1: graceful SIGTERM to the group; wait up to 3 s for it to empty.
     let _ = child.kill_group();
     for _ in 0..60 {
         let empty = match child.pgid() {
-            Some(pg) => !pgid_has_live_members(pg).unwrap_or(true),
-            None => true,
+            Some(pg) => match pgid_has_live_members(pg) {
+                Ok(has) => !has,
+                Err(_) => false, // scan fault -> cannot confirm empty
+            },
+            None => false, // no recorded pgid -> cannot confirm empty
         };
         if empty {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Phase 2: SIGKILL anything that ignored SIGTERM and reap the leader.
+    // Phase 2: SIGKILL anything that ignored SIGTERM, then reap the leader.
     let _ = child.force_kill_group();
-    let _ = timeout(std::time::Duration::from_secs(2), child.wait()).await;
-    // Join the drain tasks (bounded) so receipt snippets reflect full logs.
+    let leader_reaped = matches!(
+        timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    );
+    // Confirm the group is truly empty after reaping (scan faults are unknown,
+    // never treated as empty).
+    let group_confirmed_empty = if leader_reaped {
+        match child.pgid() {
+            Some(pg) => pgid_has_live_members(pg).map(|has| !has).unwrap_or(false),
+            None => false,
+        }
+    } else {
+        false
+    };
+    // Join the drain tasks (bounded), aborting + awaiting on timeout so no drain
+    // task is ever detached into the background.
+    let mut drains_ended = true;
     for handle in drains.drain(..) {
-        let _ = timeout(std::time::Duration::from_secs(2), handle).await;
+        if !join_or_abort(handle, Duration::from_secs(2)).await {
+            drains_ended = false;
+        }
     }
-    match child.pgid() {
-        Some(pg) => pgid_has_live_members(pg).map(|has| !has).unwrap_or(false),
-        None => false,
+    TeardownReport {
+        group_confirmed_empty,
+        leader_reaped,
+        drains_ended,
     }
 }
 
@@ -1204,14 +1273,14 @@ impl Runner {
         }
 
         // Teardown & Graceful Child Exit (bounded two-phase; joins drains).
-        teardown_managed(&mut child, &mut drain_handles).await;
+        let teardown = teardown_managed(&mut child, &mut drain_handles).await;
 
         if let Some(stop) = task_stopped {
             let executor = executor_info.clone();
             return self.finalize_attempt(
                 finalize_params,
                 AttemptOutcome::Stopped {
-                    stop_reason: stop,
+                    stop_reason: teardown_stop(&teardown, stop),
                     dispatched: true,
                     executor,
                 },
@@ -1258,6 +1327,21 @@ impl Runner {
             &baseline,
             &task_agent_response,
         );
+
+        if !teardown.fully_stopped() {
+            // The business turn finished, but the process group / drains could
+            // not be confirmed stopped. Never write a clean completion: the
+            // outcome is unverified under ProcessStopUnconfirmed.
+            let executor = executor_info.clone();
+            return self.finalize_attempt(
+                finalize_params,
+                AttemptOutcome::Stopped {
+                    stop_reason: StopReason::ProcessStopUnconfirmed,
+                    dispatched: true,
+                    executor,
+                },
+            );
+        }
 
         self.finalize_attempt(
             finalize_params,
@@ -1520,5 +1604,55 @@ impl Runner {
         }
 
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_report_fully_stopped_requires_all_confirmed() {
+        let full = TeardownReport {
+            group_confirmed_empty: true,
+            leader_reaped: true,
+            drains_ended: true,
+        };
+        assert!(full.fully_stopped());
+        // Each unconfirmed step alone means not fully stopped.
+        assert!(!TeardownReport {
+            group_confirmed_empty: false,
+            ..full
+        }
+        .fully_stopped());
+        assert!(!TeardownReport {
+            leader_reaped: false,
+            ..full
+        }
+        .fully_stopped());
+        assert!(!TeardownReport {
+            drains_ended: false,
+            ..full
+        }
+        .fully_stopped());
+    }
+
+    #[test]
+    fn teardown_stop_escalates_when_unconfirmed() {
+        let full = TeardownReport {
+            group_confirmed_empty: true,
+            leader_reaped: true,
+            drains_ended: true,
+        };
+        let intended = StopReason::UserRequested;
+        assert_eq!(teardown_stop(&full, intended.clone()), intended);
+        let partial = TeardownReport {
+            group_confirmed_empty: false,
+            ..full
+        };
+        assert_eq!(
+            teardown_stop(&partial, intended),
+            StopReason::ProcessStopUnconfirmed
+        );
     }
 }
