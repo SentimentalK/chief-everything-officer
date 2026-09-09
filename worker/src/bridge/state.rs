@@ -420,6 +420,17 @@ pub fn new_attempt_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Reads the kernel boot id (stable across one boot) from /proc, if readable.
+pub fn current_boot_id() -> Option<String> {
+    let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 /// Generates a 32-byte random lease token as 64 lowercase hex characters,
 /// reading `/dev/urandom` with `read_exact`. Fails (rather than falling back to
 /// timestamps or a PRNG) if randomness is unavailable.

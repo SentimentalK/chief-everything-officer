@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod controller;
 pub mod lease;
 pub mod protocol;
 pub mod state;

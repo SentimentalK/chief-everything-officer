@@ -1,13 +1,18 @@
 use ceo_worker::bridge::client::BridgeClient;
 use ceo_worker::bridge::config::{load_api_key, BridgeConfig};
+use ceo_worker::bridge::controller::Worker;
+use ceo_worker::bridge::lease::{Clock, SystemBootClock};
 use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
+use ceo_worker::local_state::ExecutionLock;
 use ceo_worker::observability::status::{JobStage, StatusTracker};
-use ceo_worker::runner::Runner;
+use ceo_worker::runner::{Runner, StopReason};
 use ceo_worker::verifier::BusinessOutcome;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
 #[command(name = "ceo-worker")]
@@ -85,6 +90,15 @@ enum BridgeCmd {
         /// Exclusive stream cursor to start discovery from
         #[arg(long, default_value = "0-0")]
         after: String,
+    },
+    /// Resident worker: claim and run discovered jobs under server leases
+    Run {
+        /// Path to the bridge config JSON file
+        #[arg(long)]
+        config: PathBuf,
+        /// Workspace alias to serve (must exist in the config)
+        #[arg(long)]
+        workspace_ref: String,
     },
 }
 
@@ -316,11 +330,101 @@ async fn main() {
                     }
                 }
             }
+            BridgeCmd::Run {
+                config,
+                workspace_ref,
+            } => {
+                let code = bridge_run(&config, &workspace_ref).await;
+                std::process::exit(code);
+            }
         },
     }
 }
 
-/// Runs the read-only `bridge check` connectivity verification.
+/// Runs the resident `bridge run` worker until stopped.
+async fn bridge_run(config_path: &Path, workspace_ref: &str) -> i32 {
+    let cfg = match BridgeConfig::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bridge run: config error: {e}");
+            return 1;
+        }
+    };
+    let canonical = match cfg.resolve_workspace(workspace_ref) {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("bridge run: workspace_ref {workspace_ref:?} is not configured");
+            return 1;
+        }
+    };
+    let api_key = match load_api_key(&cfg.api_key_file) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("bridge run: {e}");
+            return 1;
+        }
+    };
+
+    // Acquire the workspace execution lock (held until this process exits).
+    let _exec_lock = match ExecutionLock::acquire(&canonical) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "bridge run: another ceo-worker holds the workspace lock on {:?}: {e}",
+                canonical
+            );
+            return 1;
+        }
+    };
+
+    let client = match BridgeClient::new(cfg.server_base.clone(), api_key) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bridge run: failed to build bridge client: {e}");
+            return 1;
+        }
+    };
+
+    let worker_cfg = WorkerConfig::from_env();
+    let runner = Runner::new(worker_cfg, None);
+    let clock: Arc<dyn Clock> = Arc::new(SystemBootClock);
+    let expected = cfg.expected_identity.clone();
+    let worker = Worker::new(
+        &cfg,
+        expected,
+        workspace_ref,
+        canonical,
+        client,
+        clock,
+        runner,
+        String::new(),
+    );
+
+    // SIGINT/SIGTERM request a stop (cancel current, then exit 0).
+    let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
+    tokio::spawn(async move {
+        let mut sigint = signal(SignalKind::interrupt()).ok();
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let int = async {
+            if let Some(s) = sigint.as_mut() {
+                let _ = s.recv().await;
+            }
+        };
+        let term = async {
+            if let Some(s) = sigterm.as_mut() {
+                let _ = s.recv().await;
+            }
+        };
+        tokio::select! {
+            _ = int => {}
+            _ = term => {}
+        }
+        let _ = stop_tx.send(Some(StopReason::UserRequested));
+    });
+
+    let mut worker = worker;
+    worker.run(stop_rx).await
+}
 async fn bridge_check(
     config_path: &Path,
     workspace_ref: &str,

@@ -163,6 +163,7 @@ enum AttemptOutcome {
     },
 }
 
+#[derive(Clone)]
 pub struct Runner {
     config: WorkerConfig,
     echo_tx: Option<mpsc::Sender<String>>,
