@@ -824,3 +824,46 @@ fn start_error_to_stop(e: &ClientError) -> StopReason {
 fn lease_error_to_stop(e: &ClientError) -> StopReason {
     start_error_to_stop(e)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::lease::{claim_backoff, stop_at_from_remaining};
+
+    #[test]
+    fn remaining_to_is_none_when_past_deadline() {
+        // server 12:00:00, deadline 11:59:59 -> already expired.
+        assert!(remaining_to("2026-09-07T11:59:59Z", "2026-09-07T12:00:00Z").is_none());
+        // server 12:00:00, deadline 12:01:00 -> 60 s.
+        let d = remaining_to("2026-09-07T12:01:00Z", "2026-09-07T12:00:00Z").unwrap();
+        assert_eq!(d, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn stop_at_conservatively_subtracts_margin() {
+        // sent + 60 s remaining -> stop at sent + 55 s (5 s margin).
+        let sent = Duration::from_secs(1000);
+        assert_eq!(
+            stop_at_from_remaining(sent, Duration::from_secs(60)),
+            Some(Duration::from_secs(1055))
+        );
+    }
+
+    #[test]
+    fn claim_backoff_caps_at_schedule_tail() {
+        assert_eq!(claim_backoff(0), Duration::from_secs(1));
+        assert_eq!(claim_backoff(50), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn lease_line_uses_min_of_lease_and_start_deadline() {
+        let sent = Duration::from_secs(1000);
+        // lease expires in 90 s, start_deadline in 300 s -> effective 90 s.
+        let eff = remaining_to("2026-09-07T00:01:30Z", "2026-09-07T00:00:00Z").unwrap();
+        let sd = remaining_to("2026-09-07T00:05:00Z", "2026-09-07T00:00:00Z").unwrap();
+        assert!(sd > eff);
+        let stop = stop_at_from_remaining(sent, eff).unwrap();
+        // 1000 + 90 - 5 = 1085
+        assert_eq!(stop, Duration::from_secs(1085));
+    }
+}
