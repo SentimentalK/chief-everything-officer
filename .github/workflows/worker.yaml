@@ -104,6 +104,19 @@ jobs:
           CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker
           CEO_ACCEPTANCE_PORT: "3803"
 
+      - name: Cross-language execution acceptance (real Server + Redis)
+        run: |
+          bash worker/scripts/execution-acceptance.sh
+        env:
+          CEO_ACCEPTANCE_REDIS: redis://:ceo-worker-test-pass@127.0.0.1:6379
+          CEO_ACCEPTANCE_KEY: ceo-worker-acceptance-key
+          CEO_ACCEPTANCE_REMOTE: ${{ github.workspace }}/.tmp/acceptance/remote.git
+          CEO_ACCEPTANCE_ROOT: ${{ github.workspace }}/.tmp/acceptance/execrun
+          CEO_ACCEPTANCE_SERVER: ${{ github.workspace }}/services/server
+          CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker
+          CEO_ACCEPTANCE_STUB: ${{ github.workspace }}/worker/tests/fixtures/test_stub.sh
+          CEO_ACCEPTANCE_PORT: "3804"
+
       - name: Cleanup
         if: always()
         run: |
