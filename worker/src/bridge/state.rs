@@ -72,6 +72,7 @@ pub fn prompt_path(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf 
 /// directory mode is clamped on every call so later runs repair drift, but we
 /// never delete or relocate an existing control directory.
 pub fn ensure_control_dirs(workspace: &Path) -> std::io::Result<()> {
+    reject_control_ancestor_symlinks(workspace)?;
     use std::os::unix::fs::PermissionsExt;
     for dir in [
         bridge_dir(workspace),
@@ -80,6 +81,44 @@ pub fn ensure_control_dirs(workspace: &Path) -> std::io::Result<()> {
     ] {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// The fixed directory components of the managed control tree under a
+/// (canonical, already-resolved) workspace. IDs in job/attempt paths are
+/// validated to contain no path separators or `.`/`..`, so these are the only
+/// components an attacker could try to plant as a symlink to redirect control
+/// writes outside the intended location.
+fn control_tree_dirs(workspace: &Path) -> Vec<PathBuf> {
+    vec![
+        ceo_dir(workspace),
+        bridge_dir(workspace),
+        bridge_dir(workspace).join("requests"),
+        history_dir(workspace),
+        crate::config::jobs_dir(workspace),
+    ]
+}
+
+/// Rejects a symlink planted anywhere along the fixed `.ceo`/bridge/history/
+/// jobs ancestor chain. `O_NOFOLLOW` on the final component alone does not stop
+/// a write from following a symlink in an ancestor directory, so each fixed
+/// component is checked before any control write or mkdir. Missing components
+/// are fine (they will be created as real directories); an existing symlink is
+/// rejected.
+pub fn reject_control_ancestor_symlinks(workspace: &Path) -> std::io::Result<()> {
+    for dir in control_tree_dirs(workspace) {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("control ancestor is a symlink: {}", dir.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -604,5 +643,60 @@ mod tests {
         };
         let dbg = format!("{a:?}");
         assert!(!dbg.contains("secret-token-value"));
+    }
+
+    #[test]
+    fn ensure_dirs_reject_symlinked_ceo_ancestor() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        // Point .ceo at an external directory via a symlink.
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), t.path().join(".ceo")).unwrap();
+        let err = ensure_control_dirs(t.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // And the external sentinel directory was never populated.
+        let sentinel = outside.path().join("bridge");
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn reject_control_ancestor_symlinks_catches_bridge_level_link() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let ceo = t.path().join(".ceo");
+        std::fs::create_dir_all(&ceo).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // .ceo/bridge is a symlink to an external dir.
+        symlink(outside.path(), ceo.join("bridge")).unwrap();
+        assert!(reject_control_ancestor_symlinks(t.path()).is_err());
+    }
+
+    #[test]
+    fn persist_rejects_when_control_ancestor_is_symlink() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), t.path().join(".ceo")).unwrap();
+        let st = sample_state(t.path());
+        // persist() must fail (InvalidData), not silently write through the link.
+        let err = st.persist(t.path()).unwrap_err();
+        match err {
+            StateError::Io(_, msg) => assert!(msg.contains("symlink"), "{msg}"),
+            other => panic!("expected Io symlink rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_first_time_create_succeeds() {
+        let t = tempfile::tempdir().unwrap();
+        let st = sample_state(t.path());
+        st.persist(t.path()).unwrap();
+        assert!(state_path(t.path()).exists());
+        // .ceo/bridge is a real directory, not a symlink.
+        assert!(!bridge_dir(t.path())
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

@@ -109,6 +109,17 @@ async fn main() {
 
     match cli.command {
         Commands::Doctor { workspace, force } => {
+            let lock = match ExecutionLock::acquire(&workspace) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "doctor: another ceo-worker holds the workspace lock on {:?}: {e}",
+                        workspace
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let _lock = lock;
             let runner = Runner::new(config, None);
             match runner
                 .run_standalone_doctor_with_options(&workspace, force)
@@ -134,6 +145,17 @@ async fn main() {
             no_stream,
             force_doctor,
         } => {
+            let lock = match ExecutionLock::acquire(&workspace) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "run: another ceo-worker holds the workspace lock on {:?}: {e}",
+                        workspace
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let _lock = lock;
             let (echo_tx, echo_rx) = if !no_stream {
                 let (tx, rx) = mpsc::channel(1024);
                 (Some(tx), Some(rx))

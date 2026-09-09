@@ -388,7 +388,13 @@ fn job_dir_has_attempts(workspace: &Path, job_id: &str) -> bool {
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    Ok(sha256_of(&String::from_utf8_lossy(&bytes)))
+    Ok(sha256_of_bytes(&bytes))
+}
+
+fn sha256_of_bytes(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
 }
 
 /// The two kinds of server lease-write this loop performs.
@@ -691,7 +697,21 @@ impl Worker {
             .await?;
 
         let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
-        let rec_sha = sha256_file(&attempt_dir.join("receipt.json")).unwrap_or_default();
+        // Hash the finalized receipt over its raw bytes (never lossy-UTF-8 text),
+        // so a hash mismatch means the on-disk evidence differs byte-for-byte.
+        let rec_sha = match sha256_file(&attempt_dir.join("receipt.json")) {
+            Ok(s) => s,
+            Err(_) => {
+                emit(
+                    "bridge_stopped",
+                    &job_id,
+                    &attempt_id,
+                    &self.workspace_ref,
+                    "receipt_unreadable",
+                );
+                return Err(1);
+            }
+        };
         let history = AttemptHistoryRecord {
             job_id: job_id.clone(),
             attempt_id: attempt_id.clone(),
@@ -699,9 +719,11 @@ impl Worker {
             receipt_sha256: rec_sha,
             finalized_at: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = history.persist(&self.workspace);
+        // A durable history must be recorded before the active attempt is
+        // cleared; neither step may be swallowed.
+        history.persist(&self.workspace).map_err(|_| 1)?;
         state.active = None;
-        let _ = state.persist(&self.workspace);
+        state.persist(&self.workspace).map_err(|_| 1)?;
         emit(
             "local_result_saved",
             &job_id,
