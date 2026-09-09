@@ -485,6 +485,45 @@ fn lease_stop_reason(dispatched: bool) -> StopReason {
     }
 }
 
+/// What the daemon should do after one attempt reaches a local end state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptDisposition {
+    /// Cleanly finalized and safe to claim the next job.
+    Continue,
+    /// Finalized but the daemon should stop (control/lease/doctor-blocked), not
+    /// consume more jobs from the batch.
+    StopDaemon,
+    /// Teardown/stop was not confirmed: the process may still be running. Keep
+    /// the attempt active for recovery; do not finalize or clear it.
+    KeepActiveRecovery,
+}
+
+/// Classifies a local attempt outcome into a daemon disposition. Only an
+/// explicitly-confirmed unconfirmed-stop (PROCESS_STOP_UNCONFIRMED) keeps the
+/// attempt for recovery; every other result is first finalized, then either
+/// lets the daemon continue (clean completion, single business failure, task
+/// timeout, user-requested cancel) or stops it (doctor/preflight BLOCKED, and
+/// lease/control interruptions) so a bad environment is not re-consumed.
+fn classify_disposition(receipt: &TaskReceipt) -> AttemptDisposition {
+    let code = receipt
+        .error
+        .as_ref()
+        .map(|e| e.code.as_str())
+        .unwrap_or("");
+    if code == "PROCESS_STOP_UNCONFIRMED" {
+        return AttemptDisposition::KeepActiveRecovery;
+    }
+    match receipt.execution_status.as_str() {
+        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" => AttemptDisposition::Continue,
+        // BLOCKED means NotStarted (Doctor/preflight/environment denied): stop
+        // so the daemon does not burn the whole queue against a bad workspace.
+        "BLOCKED" => AttemptDisposition::StopDaemon,
+        // INTERRUPTED = lease/control failure with the attempt finalized.
+        "INTERRUPTED" => AttemptDisposition::StopDaemon,
+        _ => AttemptDisposition::StopDaemon,
+    }
+}
+
 impl Worker {
     /// Claim and run one discovery candidate to local completion.
     async fn claim_and_run(
@@ -696,6 +735,26 @@ impl Worker {
             )
             .await?;
 
+        // Decide, from the local execution result + teardown evidence, what the
+        // daemon does next. An unconfirmed stop means the process may still be
+        // running: never finalize or clear that attempt — keep it for recovery.
+        let disposition = classify_disposition(&receipt);
+        if disposition == AttemptDisposition::KeepActiveRecovery {
+            emit(
+                "recovery_required",
+                &job_id,
+                &attempt_id,
+                &self.workspace_ref,
+                "stop_unconfirmed",
+            );
+            let a = state.active.as_mut().unwrap();
+            a.phase = LocalPhase::RecoveryRequired;
+            if state.persist(&self.workspace).is_err() {
+                return Err(1);
+            }
+            return Err(1);
+        }
+
         let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
         // Hash the finalized receipt over its raw bytes (never lossy-UTF-8 text),
         // so a hash mismatch means the on-disk evidence differs byte-for-byte.
@@ -756,6 +815,11 @@ impl Worker {
             &self.workspace_ref,
             "server_result_reported:false",
         );
+        if disposition == AttemptDisposition::StopDaemon {
+            // The attempt is finalized (history recorded, active cleared), but
+            // the daemon stops rather than consuming further jobs.
+            return Err(1);
+        }
         let _ = receipt;
         Ok(())
     }
@@ -1457,5 +1521,92 @@ mod tests {
         assert!(env.contains(a), "acceptance truncated: {env:?}");
         // The source-prompt hash must be over the verbatim claimed text bytes.
         assert_eq!(sha256_of(p), sha256_of_bytes(p.as_bytes()));
+    }
+
+    fn skeleton_receipt(status: &str, code: Option<&str>) -> TaskReceipt {
+        use crate::receipt::{ExecutorInfo, LogSummary, ReceiptError, TimestampsInfo};
+        use crate::verifier::BusinessOutcome;
+        TaskReceipt {
+            job_id: "j".to_string(),
+            attempt_id: "a".to_string(),
+            workspace: "/w".to_string(),
+            prompt_file: "/w/p.md".to_string(),
+            prompt_sha256: "0".repeat(64),
+            execution_status: status.to_string(),
+            business_outcome: BusinessOutcome::Failed,
+            executor: ExecutorInfo {
+                executor_type: "test_stub".to_string(),
+                version: "v".to_string(),
+                conversation_id: None,
+            },
+            doctor: None,
+            doctor_cache_hit: false,
+            local_check_duration_ms: 0,
+            current_doctor_metrics: None,
+            cached_doctor_metrics: None,
+            timestamps: TimestampsInfo {
+                started_at: chrono::Utc::now(),
+                finished_at: chrono::Utc::now(),
+                duration_ms: 0,
+            },
+            artifacts: Vec::new(),
+            logs: LogSummary {
+                events_path: String::new(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                stdout_snippet: String::new(),
+                stderr_snippet: String::new(),
+                dropped_lines_count: 0,
+                log_truncated: false,
+            },
+            error: code.map(|c| ReceiptError {
+                stage: "x".to_string(),
+                code: c.to_string(),
+                message: String::new(),
+            }),
+            bridge_context: None,
+        }
+    }
+
+    #[test]
+    fn disposition_classification() {
+        // Business results that finalize cleanly let the daemon continue.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt("COMPLETED", None)),
+            AttemptDisposition::Continue
+        );
+        assert_eq!(
+            classify_disposition(&skeleton_receipt("FAILED", Some("TASK_EXECUTION_FAILED"))),
+            AttemptDisposition::Continue
+        );
+        assert_eq!(
+            classify_disposition(&skeleton_receipt("TIMED_OUT", Some("TIMEOUT"))),
+            AttemptDisposition::Continue
+        );
+        assert_eq!(
+            classify_disposition(&skeleton_receipt("CANCELLED", Some("USER_REQUESTED"))),
+            AttemptDisposition::Continue
+        );
+        // Doctor/preflight BLOCKED (NotStarted) stops the daemon.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "BLOCKED",
+                Some("DOCTOR_VERIFICATION_FAILED")
+            )),
+            AttemptDisposition::StopDaemon
+        );
+        // Lease/control interruptions finalize then stop the daemon.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt("INTERRUPTED", Some("LEASE_EXPIRED"))),
+            AttemptDisposition::StopDaemon
+        );
+        // An unconfirmed process stop must NOT be finalized: keep for recovery.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "INTERRUPTED",
+                Some("PROCESS_STOP_UNCONFIRMED")
+            )),
+            AttemptDisposition::KeepActiveRecovery
+        );
     }
 }
