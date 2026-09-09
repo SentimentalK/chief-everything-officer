@@ -476,12 +476,34 @@ fn lease_op_backoff(kind: OpKind, attempt: usize) -> Duration {
     }
 }
 
-/// Conservative mapping from a (claimed-phase) confirmed lease.
-fn lease_stop_reason(dispatched: bool) -> StopReason {
-    if dispatched {
-        StopReason::TaskTimedOut
-    } else {
-        StopReason::LeaseExpired { reason: None }
+/// Stop reason derived from the *actual* confirmed-lease deadlines once the
+/// local stop line (`stop_at_boot`, the earlier of lease expiry and the
+/// phase deadline, minus the margin) is reached. The classification never
+/// depends on `at_execution` (whether business may have started): a lease that
+/// lapsed before the execution deadline is a lease/control fault, not a task
+/// timeout, so the daemon does not mislabel it and continue consuming jobs.
+fn stop_reason_at_deadline(lease: &ConfirmedLease, now: BootTime) -> Option<StopReason> {
+    if now < lease.stop_at_boot {
+        return None;
+    }
+    use crate::bridge::protocol::Phase;
+    let phase_bound = lease.phase_deadline_boot;
+    let lease_bound = lease.lease_valid_until_boot;
+    match lease.phase {
+        // Running: the phase deadline is the Server-fixed *execution*
+        // deadline. If it is strictly earlier than the lease expiry, the task
+        // actually ran out of its execution budget -> TaskTimedOut. A lease
+        // that expires first (or at the same instant) is a lease/control
+        // fault, conservatively classified as unconfirmed (stop the daemon).
+        Phase::Running if phase_bound < lease_bound => Some(StopReason::TaskTimedOut),
+        // Claimed: the phase deadline is the Server *start* deadline. If it is
+        // the binding bound, the server's own safe reason applies.
+        Phase::Claimed if phase_bound < lease_bound => Some(StopReason::LeaseExpired {
+            reason: Some("START_DEADLINE_EXCEEDED".to_string()),
+        }),
+        // Lease bound is earlier or the two deadlines coincide: fail closed on
+        // a lease/control fault rather than guessing that execution may run.
+        _ => Some(StopReason::LeaseUnconfirmed),
     }
 }
 
@@ -498,19 +520,30 @@ enum AttemptDisposition {
     KeepActiveRecovery,
 }
 
-/// Classifies a local attempt outcome into a daemon disposition. Only an
-/// explicitly-confirmed unconfirmed-stop (PROCESS_STOP_UNCONFIRMED) keeps the
-/// attempt for recovery; every other result is first finalized, then either
-/// lets the daemon continue (clean completion, single business failure, task
-/// timeout, user-requested cancel) or stops it (doctor/preflight BLOCKED, and
-/// lease/control interruptions) so a bad environment is not re-consumed.
+/// Classifies a local attempt outcome into a daemon disposition.
+///
+/// Two control faults always keep the attempt active for recovery, because in
+/// both cases the worker cannot prove a safe, finalized end state:
+///   * `PROCESS_STOP_UNCONFIRMED` — the process group/drains could not be
+///     confirmed stopped, so the process may still be running;
+///   * `LOCAL_STATE_WRITE_FAILED` — a mandatory local-state write failed, so
+///     the persisted phase/dispatch intent cannot be trusted. Writing history
+///     and clearing `active` after an untrusted state write would hide that the
+///     attempt may have progressed further than the record claims.
+///
+/// These take precedence over any execution_status (a FAILED/COMPLETED label
+/// must never downgrade an unconfirmed stop). Every other result is first
+/// finalized, then either lets the daemon continue (clean completion, single
+/// business failure, task timeout, user-requested cancel) or stops it
+/// (doctor/preflight BLOCKED, and lease/control interruptions) so a bad
+/// environment is not re-consumed.
 fn classify_disposition(receipt: &TaskReceipt) -> AttemptDisposition {
     let code = receipt
         .error
         .as_ref()
         .map(|e| e.code.as_str())
         .unwrap_or("");
-    if code == "PROCESS_STOP_UNCONFIRMED" {
+    if code == "PROCESS_STOP_UNCONFIRMED" || code == "LOCAL_STATE_WRITE_FAILED" {
         return AttemptDisposition::KeepActiveRecovery;
     }
     match receipt.execution_status.as_str() {
@@ -986,8 +1019,6 @@ impl Worker {
         // must be confirmed (and replayable) before any business prompt.
         let mut start_requested = false;
         let mut start_done = false;
-        // True once the execution permit is sent (the business prompt may run).
-        let mut at_execution = false;
         let mut stopping: Option<StopReason> = None;
 
         // Establish a confirmed lease promptly: dispatch an immediate heartbeat
@@ -1021,9 +1052,9 @@ impl Worker {
                     continue;
                 }
             };
-            if let Some(l) = lease {
-                if now_boot >= l.stop_at_boot {
-                    stopping = Some(lease_stop_reason(at_execution));
+            if let Some(l) = &lease {
+                if let Some(reason) = stop_reason_at_deadline(l, now_boot) {
+                    stopping = Some(reason);
                     continue;
                 }
             }
@@ -1112,13 +1143,11 @@ impl Worker {
                 },
                 Arm::Lease(ev) => match ev {
                     LeaseEvt::Due(kind) => {
-                        if lease
-                            .as_ref()
-                            .map(|l| now_boot >= l.stop_at_boot)
-                            .unwrap_or(false)
-                        {
-                            stopping = Some(lease_stop_reason(at_execution));
-                            continue;
+                        if let Some(l) = &lease {
+                            if let Some(reason) = stop_reason_at_deadline(l, now_boot) {
+                                stopping = Some(reason);
+                                continue;
+                            }
                         }
                         let sent = match boot_now(self.clock.as_ref()) {
                             Ok(t) => t,
@@ -1229,7 +1258,6 @@ impl Worker {
                                     stopping = Some(StopReason::LocalStateWriteFailed);
                                     continue;
                                 }
-                                at_execution = true;
                                 if let Some(p) = permit_tx.take() {
                                     let _ = p.send(crate::runner::control::ExecutionPermit {
                                         execution_deadline: new.phase_deadline_boot,
@@ -1568,6 +1596,108 @@ mod tests {
         }
     }
 
+    fn running_lease(lease_at: u64, phase_deadline_at: u64) -> ConfirmedLease {
+        use crate::bridge::protocol::Phase;
+        let lease_at = Duration::from_secs(lease_at);
+        let phase_deadline = Duration::from_secs(phase_deadline_at);
+        let stop_at = lease_at.min(phase_deadline) - Duration::from_secs(5);
+        ConfirmedLease {
+            lease_valid_until_boot: lease_at,
+            phase_deadline_boot: phase_deadline,
+            stop_at_boot: stop_at,
+            phase: Phase::Running,
+        }
+    }
+
+    #[test]
+    fn stop_reason_not_reached_is_none() {
+        // now is before the stop line -> nothing to do yet.
+        let l = running_lease(1090, 1300);
+        assert_eq!(stop_reason_at_deadline(&l, Duration::from_secs(1084)), None);
+        assert_eq!(stop_reason_at_deadline(&l, Duration::from_secs(1000)), None);
+    }
+
+    #[test]
+    fn stop_reason_running_lease_expired_first_is_lease_control_fault() {
+        // Running: lease expires (1090) strictly before the execution deadline
+        // (1300); stop line = 1085. Reaching it is a lease/control fault, never
+        // TaskTimedOut, so the daemon does not mislabel it and continue.
+        let l = running_lease(1090, 1300);
+        assert_eq!(
+            stop_reason_at_deadline(&l, Duration::from_secs(1085)),
+            Some(StopReason::LeaseUnconfirmed)
+        );
+        assert_eq!(
+            stop_reason_at_deadline(&l, Duration::from_secs(2000)),
+            Some(StopReason::LeaseUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn stop_reason_running_execution_deadline_first_is_task_timeout() {
+        // Running: execution deadline (1300) strictly before the lease expiry
+        // (1400) -> reaching the line is a genuine TaskTimedOut.
+        let l = running_lease(1400, 1300);
+        assert_eq!(
+            stop_reason_at_deadline(&l, Duration::from_secs(1295)),
+            Some(StopReason::TaskTimedOut)
+        );
+    }
+
+    #[test]
+    fn stop_reason_equal_deadlines_fail_closed_to_lease() {
+        // Identical lease/phase deadlines: conservative classification picks the
+        // lease/control fault over guessing that execution may keep running.
+        let l = running_lease(1300, 1300);
+        assert_eq!(
+            stop_reason_at_deadline(&l, Duration::from_secs(1295)),
+            Some(StopReason::LeaseUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn stop_reason_claimed_start_deadline_first_is_lease_expired() {
+        use crate::bridge::protocol::Phase;
+        // Claimed: phase deadline is the Server *start* deadline. If it binds
+        // before the lease expiry, the server's safe reason is kept (not a task
+        // timeout, since business never began).
+        let lease_at = Duration::from_secs(1200);
+        let phase_deadline = Duration::from_secs(1090);
+        let stop_at = phase_deadline - Duration::from_secs(5);
+        let l = ConfirmedLease {
+            lease_valid_until_boot: lease_at,
+            phase_deadline_boot: phase_deadline,
+            stop_at_boot: stop_at,
+            phase: Phase::Claimed,
+        };
+        match stop_reason_at_deadline(&l, Duration::from_secs(1085)) {
+            Some(StopReason::LeaseExpired { reason }) => {
+                assert_eq!(reason.as_deref(), Some("START_DEADLINE_EXCEEDED"));
+            }
+            other => panic!("expected LeaseExpired start-deadline stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_claimed_lease_first_fails_closed() {
+        use crate::bridge::protocol::Phase;
+        // Claimed with the lease expiry binding (1090 < start deadline 1300):
+        // an unconfirmed lease fault, never a task timeout.
+        let lease_at = Duration::from_secs(1090);
+        let phase_deadline = Duration::from_secs(1300);
+        let stop_at = lease_at - Duration::from_secs(5);
+        let l = ConfirmedLease {
+            lease_valid_until_boot: lease_at,
+            phase_deadline_boot: phase_deadline,
+            stop_at_boot: stop_at,
+            phase: Phase::Claimed,
+        };
+        assert_eq!(
+            stop_reason_at_deadline(&l, Duration::from_secs(1085)),
+            Some(StopReason::LeaseUnconfirmed)
+        );
+    }
+
     #[test]
     fn disposition_classification() {
         // Business results that finalize cleanly let the daemon continue.
@@ -1604,6 +1734,48 @@ mod tests {
         assert_eq!(
             classify_disposition(&skeleton_receipt(
                 "INTERRUPTED",
+                Some("PROCESS_STOP_UNCONFIRMED")
+            )),
+            AttemptDisposition::KeepActiveRecovery
+        );
+    }
+
+    #[test]
+    fn disposition_keeps_active_on_local_state_write_failure() {
+        // A mandatory local-state write failed; the persisted phase/dispatch
+        // intent cannot be trusted, so the attempt must never be cleared or
+        // finalized as if it were an ordinary interruption.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "INTERRUPTED",
+                Some("LOCAL_STATE_WRITE_FAILED")
+            )),
+            AttemptDisposition::KeepActiveRecovery
+        );
+    }
+
+    #[test]
+    fn disposition_unconfirmed_stop_wins_over_business_status() {
+        // PROCESS_STOP_UNCONFIRMED takes precedence over any execution_status:
+        // even if a FAILED/COMPLETED label somehow coexists, the attempt is kept
+        // active — an unconfirmed stop is never downgraded to a clean continue.
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "FAILED",
+                Some("PROCESS_STOP_UNCONFIRMED")
+            )),
+            AttemptDisposition::KeepActiveRecovery
+        );
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "COMPLETED",
+                Some("PROCESS_STOP_UNCONFIRMED")
+            )),
+            AttemptDisposition::KeepActiveRecovery
+        );
+        assert_eq!(
+            classify_disposition(&skeleton_receipt(
+                "TIMED_OUT",
                 Some("PROCESS_STOP_UNCONFIRMED")
             )),
             AttemptDisposition::KeepActiveRecovery
