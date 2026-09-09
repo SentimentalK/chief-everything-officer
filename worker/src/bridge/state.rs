@@ -489,23 +489,111 @@ pub fn generate_lease_token() -> Result<String, std::io::Error> {
 // History records
 // ---------------------------------------------------------------------------
 
+/// Schema version of the per-attempt control-history record. Older records
+/// without the full evidence fields are not auto-migrated: a load that finds
+/// them returns an error and the caller treats the attempt as needing recovery.
+pub const HISTORY_SCHEMA_VERSION: u32 = 2;
+
 /// A per-attempt control-history record written (0600) at local completion so a
-/// restart can tell "already finalized" from "needs recovery". Carries the
-/// token only inside the 0600 control tree; it never reaches the receipt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// restart can tell "already finalized" from "needs recovery". It is a
+/// self-describing, verifiable evidence snapshot: every association field a
+/// later result-upload or audit needs is preserved here (0600-only), including
+/// the claim token, plus hashes over the source prompt, acceptance, actual
+/// envelope bytes, and the finalized receipt bytes. Secrets in this record
+/// (the claim token) live only in the 0600 control tree — never in the public
+/// receipt, stdout, ordinary logs, or the Agent prompt.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptHistoryRecord {
+    pub schema_version: u32,
+    pub server_origin: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub workspace_ref: String,
     pub job_id: String,
     pub attempt_id: String,
     pub worker_id: String,
+    /// sha256 over the raw Server prompt as claimed (verbatim, pre-envelope).
+    pub source_prompt_sha256: String,
+    /// sha256 over the raw acceptance text as claimed.
+    pub acceptance_sha256: String,
+    /// sha256 over the actual envelope bytes written to disk (the prompt that
+    /// was really made available to the executor).
+    pub envelope_sha256: String,
     /// sha256 over the finalized receipt bytes (so we refuse to overwrite an
     /// inconsistent history with a different receipt).
     pub receipt_sha256: String,
+    /// True when the business prompt may have been dispatched (DispatchIntent).
+    pub task_dispatch_intent: bool,
+    /// 0600-only claim token preserved so a future result-upload can still
+    /// authenticate after `active` is cleared. Never leaves the control tree.
+    pub claim_token: String,
     pub finalized_at: String,
 }
 
+impl fmt::Debug for AttemptHistoryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttemptHistoryRecord")
+            .field("schema_version", &self.schema_version)
+            .field("server_origin", &self.server_origin)
+            .field("user_id", &self.user_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_ref", &self.workspace_ref)
+            .field("job_id", &self.job_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("worker_id", &self.worker_id)
+            .field("source_prompt_sha256", &self.source_prompt_sha256)
+            .field("acceptance_sha256", &self.acceptance_sha256)
+            .field("envelope_sha256", &self.envelope_sha256)
+            .field("receipt_sha256", &self.receipt_sha256)
+            .field("task_dispatch_intent", &self.task_dispatch_intent)
+            .field("claim_token", &"[redacted]")
+            .field("finalized_at", &self.finalized_at)
+            .finish()
+    }
+}
+
 impl AttemptHistoryRecord {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != HISTORY_SCHEMA_VERSION {
+            return Err(format!(
+                "history schema_version {} != {}",
+                self.schema_version, HISTORY_SCHEMA_VERSION
+            ));
+        }
+        for (name, v) in [
+            ("server_origin", &self.server_origin),
+            ("user_id", &self.user_id),
+            ("workspace_id", &self.workspace_id),
+            ("workspace_ref", &self.workspace_ref),
+            ("worker_id", &self.worker_id),
+            ("claim_token", &self.claim_token),
+        ] {
+            if v.trim().is_empty() {
+                return Err(format!("history missing {name}"));
+            }
+        }
+        validate_id("job_id", &self.job_id).map_err(|e| e.to_string())?;
+        validate_id("attempt_id", &self.attempt_id).map_err(|e| e.to_string())?;
+        if !self.worker_id.starts_with("wrk-") {
+            return Err("history worker_id malformed".to_string());
+        }
+        for (name, h) in [
+            ("source_prompt_sha256", &self.source_prompt_sha256),
+            ("acceptance_sha256", &self.acceptance_sha256),
+            ("envelope_sha256", &self.envelope_sha256),
+            ("receipt_sha256", &self.receipt_sha256),
+        ] {
+            if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("history {name} is not a valid sha256"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn persist(&self, workspace: &Path) -> Result<(), StateError> {
+        self.validate()
+            .map_err(|e| StateError::Invalid(format!("{LOCAL_STATE_INVALID}: {e}")))?;
         ensure_control_dirs(workspace).map_err(|e| StateError::io(&state_path(workspace), &e))?;
         let p = history_record_path(workspace, &self.job_id, &self.attempt_id);
         reject_symlink_target(&p).map_err(|e| StateError::io(&p, &e))?;
@@ -525,7 +613,42 @@ impl AttemptHistoryRecord {
         };
         let rec: AttemptHistoryRecord = serde_json::from_str(&text)
             .map_err(|e| StateError::Invalid(format!("history parse error: {e}")))?;
+        rec.validate()
+            .map_err(|e| StateError::Invalid(format!("history invalid: {e}")))?;
         Ok(Some(rec))
+    }
+}
+
+/// Builds a self-describing, verifiable history record for a finalized attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn new_history_record(
+    binding: &BridgeBinding,
+    worker_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+    source_prompt_sha256: &str,
+    acceptance_sha256: &str,
+    envelope_sha256: &str,
+    receipt_sha256: &str,
+    task_dispatch_intent: bool,
+    claim_token: &str,
+) -> AttemptHistoryRecord {
+    AttemptHistoryRecord {
+        schema_version: HISTORY_SCHEMA_VERSION,
+        server_origin: binding.server_origin.clone(),
+        user_id: binding.user_id.clone(),
+        workspace_id: binding.workspace_id.clone(),
+        workspace_ref: binding.workspace_ref.clone(),
+        job_id: job_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        worker_id: worker_id.to_string(),
+        source_prompt_sha256: source_prompt_sha256.to_string(),
+        acceptance_sha256: acceptance_sha256.to_string(),
+        envelope_sha256: envelope_sha256.to_string(),
+        receipt_sha256: receipt_sha256.to_string(),
+        task_dispatch_intent,
+        claim_token: claim_token.to_string(),
+        finalized_at: chrono::Utc::now().to_rfc3339(),
     }
 }
 
@@ -698,5 +821,56 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    fn sample_history(ws: &Path, h: &str) -> AttemptHistoryRecord {
+        new_history_record(
+            &binding(ws),
+            "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "job-123e4567-e89b-12d3-a456-4266141740ff",
+            "123e4567-e89b-12d3-a456-426614174000",
+            h,
+            h,
+            h,
+            h,
+            true,
+            &"ab".repeat(32),
+        )
+    }
+
+    #[test]
+    fn history_roundtrip_valid() {
+        let t = tempfile::tempdir().unwrap();
+        let h = "a".repeat(64);
+        let rec = sample_history(t.path(), &h);
+        rec.persist(t.path()).unwrap();
+        let loaded = AttemptHistoryRecord::load(t.path(), &rec.job_id, &rec.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.claim_token, rec.claim_token);
+        assert_eq!(loaded.receipt_sha256, h);
+        assert_eq!(loaded.schema_version, HISTORY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn history_rejects_wrong_schema_and_bad_hashes() {
+        let t = tempfile::tempdir().unwrap();
+        let h = "a".repeat(64);
+        let mut rec = sample_history(t.path(), &h);
+        rec.schema_version = 1;
+        assert!(rec.persist(t.path()).is_err());
+        rec.schema_version = HISTORY_SCHEMA_VERSION;
+        rec.receipt_sha256 = "not-a-sha256".to_string();
+        assert!(rec.persist(t.path()).is_err());
+        rec.receipt_sha256 = String::new();
+        assert!(rec.persist(t.path()).is_err());
+    }
+
+    #[test]
+    fn history_token_never_in_debug() {
+        let t = tempfile::tempdir().unwrap();
+        let rec = sample_history(t.path(), &"b".repeat(64));
+        let dbg = format!("{rec:?}");
+        assert!(!dbg.contains("ababab"), "{dbg}");
     }
 }

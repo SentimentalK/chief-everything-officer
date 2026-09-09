@@ -60,8 +60,8 @@ fn build_envelope(canonical: &Path, payload: &ClaimPayload) -> String {
          there. Follow the workspace AGENTS.md and Doctor constraints.\n\n\
          ## Task goal\n\n{}\n\n## Acceptance requirements\n\n{}",
         canonical.display(),
-        payload.prompt.trim_end(),
-        payload.acceptance.trim_end(),
+        payload.prompt,
+        payload.acceptance,
     )
 }
 
@@ -712,13 +712,38 @@ impl Worker {
                 return Err(1);
             }
         };
-        let history = AttemptHistoryRecord {
-            job_id: job_id.clone(),
-            attempt_id: attempt_id.clone(),
-            worker_id: self.worker_id.clone(),
-            receipt_sha256: rec_sha,
-            finalized_at: chrono::Utc::now().to_rfc3339(),
+        // Actual envelope bytes hash: the prompt that was really written and made
+        // available to the executor (distinct from the raw claimed prompt).
+        let envelope_sha = match sha256_file(&prompt_path) {
+            Ok(s) => s,
+            Err(_) => {
+                emit(
+                    "bridge_stopped",
+                    &job_id,
+                    &attempt_id,
+                    &self.workspace_ref,
+                    "envelope_unreadable",
+                );
+                return Err(1);
+            }
         };
+        let dispatch_happened = receipt
+            .bridge_context
+            .as_ref()
+            .map(|bc| bc.task_dispatch_intent)
+            .unwrap_or(false);
+        let history = state::new_history_record(
+            &self.binding(),
+            &self.worker_id,
+            &job_id,
+            &attempt_id,
+            &sha256_of(&payload.prompt),
+            &sha256_of(&payload.acceptance),
+            &envelope_sha,
+            &rec_sha,
+            dispatch_happened,
+            &active.lease_token,
+        );
         // A durable history must be recorded before the active attempt is
         // cleared; neither step may be swallowed.
         history.persist(&self.workspace).map_err(|_| 1)?;
@@ -1408,5 +1433,29 @@ mod tests {
             lease_op_backoff(OpKind::Heartbeat, 100),
             Duration::from_secs(5)
         );
+    }
+
+    fn payload(prompt: &str, acceptance: &str) -> ClaimPayload {
+        ClaimPayload {
+            workspace_ref: "tools".to_string(),
+            resource_id: None,
+            prompt: prompt.to_string(),
+            acceptance: acceptance.to_string(),
+            timeout_seconds: 300,
+            payload_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn envelope_keeps_prompt_verbatim_with_unicode_and_trailing_ws() {
+        // Trailing spaces/newlines and non-ASCII must survive the envelope
+        // untouched (they are never trimmed away).
+        let p = "step one  \nstep two\n尾随空格   \n";
+        let a = "accept a\t\naccept b";
+        let env = build_envelope(Path::new("/ws"), &payload(p, a));
+        assert!(env.contains(p), "prompt truncated: {env:?}");
+        assert!(env.contains(a), "acceptance truncated: {env:?}");
+        // The source-prompt hash must be over the verbatim claimed text bytes.
+        assert_eq!(sha256_of(p), sha256_of_bytes(p.as_bytes()));
     }
 }
