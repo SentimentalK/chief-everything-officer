@@ -12,6 +12,14 @@ import {
 } from "./schema.js";
 import { LEASE_SCRIPT } from "./lease-script.js";
 import {
+  type AssignmentJobRecord,
+  type AssignmentScriptResult,
+  type AssignmentState,
+  type ClaimAssignmentInput,
+  type StartAssignmentInput,
+} from "./assignment-schema.js";
+import { ASSIGNMENT_SCRIPT } from "./assignment-script.js";
+import {
   ClientClosedError,
   ClientOfflineError,
   ConnectionTimeoutError,
@@ -141,6 +149,7 @@ export function isNoScriptError(error: unknown): boolean {
 export class RedisJobStore {
   private cachedSha: string | null = null;
   private leaseSha: string | null = null;
+  private assignmentSha: string | null = null;
 
   constructor(private readonly redis: RedisRunner) {}
 
@@ -210,6 +219,14 @@ export class RedisJobStore {
     this.leaseSha = sha;
   }
 
+  getAssignmentShaForTest(): string | null {
+    return this.assignmentSha;
+  }
+
+  setAssignmentShaForTest(sha: string | null): void {
+    this.assignmentSha = sha;
+  }
+
   private async loadLeaseScript(redisLike: RedisRunner): Promise<string> {
     return redisLike.scriptLoad(LEASE_SCRIPT);
   }
@@ -235,6 +252,100 @@ export class RedisJobStore {
       }
       throw new StoreError("QUEUE_UNAVAILABLE", "Redis lease EVALSHA failed.", { cause: String(error) });
     }
+  }
+
+  private async loadAssignmentScript(redisLike: RedisRunner): Promise<string> {
+    return redisLike.scriptLoad(ASSIGNMENT_SCRIPT);
+  }
+
+  private async evalshaAssignment(
+    redisLike: RedisRunner,
+    keys: string[],
+    args: string[],
+  ): Promise<AssignmentScriptResult> {
+    if (!this.assignmentSha) {
+      this.assignmentSha = await this.loadAssignmentScript(redisLike);
+    }
+    const doRun = async (sha: string): Promise<AssignmentScriptResult> => {
+      const res = await redisLike.evalsha(sha, keys.length, keys, args);
+      return parseAssignmentResult(res);
+    };
+    try {
+      return await doRun(this.assignmentSha);
+    } catch (error) {
+      if (isNoScriptError(error)) {
+        this.assignmentSha = await this.loadAssignmentScript(redisLike);
+        try {
+          return await doRun(this.assignmentSha);
+        } catch (retryError) {
+          throw new StoreError(
+            "QUEUE_UNAVAILABLE",
+            "Redis assignment EVALSHA retry failed after NOSCRIPT reload.",
+            { cause: String(retryError) },
+          );
+        }
+      }
+      throw new StoreError("QUEUE_UNAVAILABLE", "Redis assignment EVALSHA failed.", {
+        cause: String(error),
+      });
+    }
+  }
+
+  private async runAssignment(
+    scope: AuthScope,
+    operation: string,
+    jobId: string,
+    argsIn: {
+      workerId?: string;
+      attemptId?: string;
+      workspaceRef?: string;
+      tokenSha?: string;
+    },
+  ): Promise<AssignmentScriptResult> {
+    this.keyCheck();
+    const args = [
+      operation,
+      jobId,
+      scope.user_id,
+      scope.workspace_id,
+      argsIn.workerId ?? "",
+      argsIn.attemptId ?? "",
+      argsIn.workspaceRef ?? "",
+      argsIn.tokenSha ?? "",
+    ];
+    return this.evalshaAssignment(this.redis, [jobKey(jobId)], args);
+  }
+
+  async inspectAssignment(
+    scope: AuthScope,
+    jobId: string,
+  ): Promise<AssignmentScriptResult> {
+    return this.runAssignment(scope, "inspect", jobId, {});
+  }
+
+  async claimAssignment(
+    scope: AuthScope,
+    jobId: string,
+    input: ClaimAssignmentInput,
+  ): Promise<AssignmentScriptResult> {
+    return this.runAssignment(scope, "claim", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      workspaceRef: input.workspace_ref,
+      tokenSha: input.claim_token_sha256,
+    });
+  }
+
+  async startAssignment(
+    scope: AuthScope,
+    jobId: string,
+    input: StartAssignmentInput,
+  ): Promise<AssignmentScriptResult> {
+    return this.runAssignment(scope, "start", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      tokenSha: input.claim_token_sha256,
+    });
   }
 
   /** Shared single-key lease executor. Empty optional fields are passed as "". */
@@ -460,6 +571,44 @@ function parseLeaseResult(res: unknown): LeaseScriptResult {
     server_time_ms: serverTimeMs,
     state: obj.state as JobState,
     reason,
+    replayed: obj.replayed === true,
+  };
+}
+
+function parseAssignmentResult(res: unknown): AssignmentScriptResult {
+  const s = typeof res === "string" ? res : String(res);
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(s) as Record<string, unknown>;
+  } catch (error) {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment script reply: ${s}`, {
+      cause: String(error),
+    });
+  }
+  if (!obj || typeof obj !== "object") {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment script reply: ${s}`);
+  }
+  const ok = obj.ok === true;
+  if (!ok) {
+    const code = typeof obj.code === "string" ? obj.code : "QUEUE_UNAVAILABLE";
+    const reason = obj.reason == null ? null : String(obj.reason);
+    return { ok: false, code, reason };
+  }
+  const record = obj.record as unknown;
+  const serverTimeMs = obj.server_time_ms;
+  if (
+    !record ||
+    typeof record !== "object" ||
+    typeof serverTimeMs !== "number" ||
+    typeof obj.state !== "string"
+  ) {
+    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment success reply: ${s}`);
+  }
+  return {
+    ok: true,
+    record: record as AssignmentJobRecord,
+    server_time_ms: serverTimeMs,
+    state: obj.state as AssignmentState,
     replayed: obj.replayed === true,
   };
 }
