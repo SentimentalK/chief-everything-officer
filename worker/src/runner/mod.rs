@@ -1541,10 +1541,18 @@ impl Runner {
                 &baseline,
                 &task_agent_response,
             );
+            // Generic artifact checking and self-reported completion status are
+            // insufficient to prove business acceptance for Bridge-managed tasks.
+            let business_outcome =
+                if gate.is_bridge() && verification.outcome == BusinessOutcome::Verified {
+                    BusinessOutcome::Unverified
+                } else {
+                    verification.outcome
+                };
             AttemptOutcome::Success {
                 executor: executor_info.clone(),
                 artifacts: verification.verified_artifacts,
-                business_outcome: verification.outcome,
+                business_outcome,
             }
         };
 
@@ -2756,5 +2764,143 @@ time.sleep(300)
             receipt.business_outcome,
             crate::verifier::BusinessOutcome::NotStarted
         );
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[tokio::test]
+    async fn bridge_self_reported_verified_maps_to_unverified() {
+        use crate::bridge::lease::{Clock, ManualClock};
+        use crate::config::{ExecutorType, WorkerConfig};
+        use crate::runner::control::{
+            control_channel, ControllerHandles, ExecutionPermit, RunnerSignal,
+        };
+        use sha2::Digest;
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let (ws, prompt, bin) = managed_workspace(temp.path());
+
+        let mut config = WorkerConfig::default();
+        config.workspace_dir = ws.clone();
+        config.executor_type = ExecutorType::TestStub;
+        config.agent_executable = bin;
+
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
+        let job_id = "job-bridge-verified-map";
+        let attempt_id = "attempt-bridge-verified-map-1";
+        let hex64 = "d".repeat(64);
+
+        let context = BridgeReceiptContext {
+            server_origin: "https://ceo.example".to_string(),
+            user_id: "usr_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            workspace_ref: "tools".to_string(),
+            worker_id: "wrk-test".to_string(),
+            job_id: job_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            source_prompt_sha256: hex64.clone(),
+            acceptance_sha256: hex64,
+            task_dispatch_intent: false,
+            stop_reason: None,
+        };
+
+        let (runner_controls, ctl) = control_channel(clock.clone());
+        let ControllerHandles {
+            mut signals_rx,
+            permit_tx,
+            stop_tx: _stop_tx,
+            clock: _c,
+            dispatch_intent,
+        } = ctl;
+
+        let runner = Runner::new(config.clone(), None);
+        let ws_run = ws.clone();
+        let run = tokio::spawn(async move {
+            runner
+                .run_managed(
+                    &ws_run,
+                    job_id,
+                    attempt_id,
+                    &prompt,
+                    60,
+                    false,
+                    runner_controls,
+                    context,
+                )
+                .await
+        });
+
+        // Ack ProcessSpawned and PreparedForTask
+        let mut got = 0usize;
+        while got < 2 {
+            let (signal, ack) = signals_rx.recv().await.expect("runner must send signals");
+            match signal {
+                RunnerSignal::ProcessSpawned(_) => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+                RunnerSignal::PreparedForTask => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+            }
+        }
+
+        // Commit dispatch intent and grant permit
+        dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
+        permit_tx
+            .send(ExecutionPermit {
+                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
+            })
+            .unwrap();
+
+        let receipt = run.await.expect("join run").expect("run result ok");
+        assert_eq!(receipt.execution_status, "COMPLETED");
+        assert_eq!(
+            receipt.business_outcome,
+            crate::verifier::BusinessOutcome::Unverified,
+            "Bridge receipt must map self-reported verified to UNVERIFIED"
+        );
+
+        // Check artifacts
+        assert!(!receipt.artifacts.is_empty(), "artifacts must be preserved");
+        let art = &receipt.artifacts[0];
+        assert_eq!(art.path, "output_artifact.txt");
+        let art_file = ws.join("output_artifact.txt");
+        let art_bytes = std::fs::read(&art_file).expect("read artifact file");
+        assert_eq!(art.size_bytes, art_bytes.len() as u64);
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &art_bytes);
+        let expected_sha256 = format!("{:x}", sha2::Digest::finalize(hasher));
+        assert_eq!(art.sha256, expected_sha256);
+
+        // Check bridge context
+        let bc = receipt.bridge_context.expect("bridge context present");
+        assert_eq!(bc.job_id, job_id);
+        assert_eq!(bc.attempt_id, attempt_id);
+        assert!(bc.task_dispatch_intent);
+        assert!(bc.stop_reason.is_none());
+
+        // Check persisted receipt.json on disk
+        let disk_receipt_path = ws
+            .join(".ceo")
+            .join("jobs")
+            .join(job_id)
+            .join("attempts")
+            .join(attempt_id)
+            .join("receipt.json");
+        let disk_receipt_str =
+            std::fs::read_to_string(&disk_receipt_path).expect("read persisted receipt");
+        let disk_receipt: TaskReceipt =
+            serde_json::from_str(&disk_receipt_str).expect("deserialize persisted receipt");
+        assert_eq!(disk_receipt.execution_status, "COMPLETED");
+        assert_eq!(
+            disk_receipt.business_outcome,
+            crate::verifier::BusinessOutcome::Unverified
+        );
+        assert_eq!(disk_receipt.artifacts.len(), receipt.artifacts.len());
+        assert_eq!(disk_receipt.artifacts[0].sha256, art.sha256);
     }
 }
