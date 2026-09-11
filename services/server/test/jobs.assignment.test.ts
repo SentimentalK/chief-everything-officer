@@ -5,11 +5,11 @@ import {
   RedisJobStore,
   createRedisRunnerFromClient,
   type RedisRunner,
-  requestKey,
 } from "../src/jobs/redis-store.js";
 import {
   makeJobId,
   jobKey,
+  requestKey,
   KEY_STREAM,
   type RequestPlaceholder,
 } from "../src/jobs/schema.js";
@@ -59,6 +59,60 @@ function baseRecordV2(
     ...patch,
   };
 }
+
+describe("assignment script error sanitization (offline mock)", () => {
+  const MARKER = "TEST_PRIVATE_ASSIGNMENT_PAYLOAD";
+
+  const cases: Array<{ name: string; response: string }> = [
+    {
+      name: "corrupt non-JSON containing sensitive marker",
+      response: `invalid-json-${MARKER}`,
+    },
+    {
+      name: "valid JSON with missing required fields and marker in record",
+      response: JSON.stringify({
+        ok: true,
+        record: { secret_payload: MARKER },
+      }),
+    },
+  ];
+
+  for (const tc of cases) {
+    it(`sanitizes error message and details for: ${tc.name}`, async () => {
+      const fakeRunner: RedisRunner = {
+        ready: () => true,
+        get: async () => null,
+        set: async () => {},
+        xaddStream: async () => "1-0",
+        xlen: async () => 0,
+        xrange: async () => [],
+        scriptLoad: async () => "fake_sha_123",
+        evalsha: async () => tc.response,
+        scriptExists: async () => true,
+        flush: async () => {},
+      };
+      const store = new RedisJobStore(fakeRunner);
+
+      let caughtError: unknown = null;
+      try {
+        await store.inspectAssignment(scopeA, "job-123");
+      } catch (err) {
+        caughtError = err;
+      }
+
+      expect(caughtError).not.toBeNull();
+      const err = caughtError as {
+        code?: string;
+        message?: string;
+        details?: Record<string, unknown>;
+      };
+      expect(err.code).toBe("QUEUE_UNAVAILABLE");
+      expect(err.message).toBe("Invalid assignment script response.");
+      expect(err.message).not.toContain(MARKER);
+      expect(JSON.stringify(err.details ?? {})).not.toContain(MARKER);
+    });
+  }
+});
 
 describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)", () => {
   let client: RedisClientType;
@@ -682,5 +736,201 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     // Verify stream length is unchanged (no new entries, no deletions)
     const streamLenAfter = await client.xLen(KEY_STREAM);
     expect(streamLenAfter).toBe(streamLenBefore);
+  });
+
+  it("12. table-driven: rejects invalid claim/start arguments with INVALID_ARGUMENT without altering Redis", async () => {
+    const job = baseRecordV2(scopeA);
+    await putJob(job);
+    const rawBefore = await getRawJob(job.job_id);
+
+    const invalidArgs = [
+      { name: "worker is 'abc'", worker: "abc", attempt: ATT1 },
+      {
+        name: "worker uuid contains invalid chars",
+        worker: "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5g",
+        attempt: ATT1,
+      },
+      {
+        name: "worker uuid segment length wrong",
+        worker: "wrk-0a1b2c3-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+        attempt: ATT1,
+      },
+      { name: "attempt is 'abc'", worker: WRK, attempt: "abc" },
+      {
+        name: "attempt uuid uses uppercase hex",
+        worker: WRK,
+        attempt: "123E4567-E89B-12D3-A456-4266141740AA",
+      },
+    ];
+
+    for (const tc of invalidArgs) {
+      // Test claimAssignment input validation
+      const claimRes = await store.claimAssignment(scopeA, job.job_id, {
+        worker_id: tc.worker,
+        attempt_id: tc.attempt,
+        workspace_ref: "tools",
+        claim_token_sha256: TOKEN_SHA,
+      });
+      expect(claimRes.ok, `claim with ${tc.name} must fail`).toBe(false);
+      if (!claimRes.ok) {
+        expect(claimRes.code).toBe("QUEUE_UNAVAILABLE");
+        expect(claimRes.reason).toBe("INVALID_ARGUMENT");
+      }
+
+      // Test startAssignment input validation
+      const startRes = await store.startAssignment(scopeA, job.job_id, {
+        worker_id: tc.worker,
+        attempt_id: tc.attempt,
+        claim_token_sha256: TOKEN_SHA,
+      });
+      expect(startRes.ok, `start with ${tc.name} must fail`).toBe(false);
+      if (!startRes.ok) {
+        expect(startRes.code).toBe("QUEUE_UNAVAILABLE");
+        expect(startRes.reason).toBe("INVALID_ARGUMENT");
+      }
+
+      // Assert Redis JSON bytes completely identical
+      expect(await getRawJob(job.job_id)).toBe(rawBefore);
+    }
+  });
+
+  it("13. table-driven: rejects corrupt existing execution IDs with CORRUPT_RECORD without overwriting", async () => {
+    const invalidExecutions = [
+      { name: "worker is 'abc'", worker: "abc", attempt: ATT1 },
+      {
+        name: "worker uuid contains invalid chars",
+        worker: "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5g",
+        attempt: ATT1,
+      },
+      { name: "attempt is 'abc'", worker: WRK, attempt: "abc" },
+      {
+        name: "attempt uuid uses uppercase hex",
+        worker: WRK,
+        attempt: "123E4567-E89B-12D3-A456-4266141740AA",
+      },
+    ];
+
+    for (const tc of invalidExecutions) {
+      const corruptJob = {
+        ...baseRecordV2(scopeA),
+        execution: {
+          worker_id: tc.worker,
+          attempt_id: tc.attempt,
+          claim_token_sha256: TOKEN_SHA,
+          phase: "claimed",
+          claimed_at_ms: Date.now(),
+          started_at_ms: null,
+        },
+      };
+      await putJob(corruptJob);
+      const rawBefore = await getRawJob(corruptJob.job_id);
+
+      // Inspect fails as CORRUPT_RECORD
+      const insp = await store.inspectAssignment(scopeA, corruptJob.job_id);
+      expect(insp.ok).toBe(false);
+      if (!insp.ok) {
+        expect(insp.code).toBe("QUEUE_UNAVAILABLE");
+        expect(insp.reason).toBe("CORRUPT_RECORD");
+      }
+
+      // Claim fails as CORRUPT_RECORD and does NOT overwrite or treat as unclaimed
+      const claimRes = await store.claimAssignment(scopeA, corruptJob.job_id, {
+        worker_id: WRK,
+        attempt_id: ATT1,
+        workspace_ref: "tools",
+        claim_token_sha256: TOKEN_SHA,
+      });
+      expect(claimRes.ok).toBe(false);
+      if (!claimRes.ok) {
+        expect(claimRes.code).toBe("QUEUE_UNAVAILABLE");
+        expect(claimRes.reason).toBe("CORRUPT_RECORD");
+      }
+
+      // Original JSON unchanged
+      expect(await getRawJob(corruptJob.job_id)).toBe(rawBefore);
+    }
+  });
+
+  it("14. table-driven: rejects invalid timestamps across all four fields as CORRUPT_RECORD without altering Redis", async () => {
+    const badValues = [-1, 1.5, 9007199254740992];
+    const now = 1700000000000;
+
+    for (const bad of badValues) {
+      // 1. bad created_at_ms
+      const badCreated = baseRecordV2(scopeA, {
+        created_at_ms: bad,
+        claim_deadline_ms: now + 100000,
+      });
+      await putJob(badCreated);
+      const rawCreatedBefore = await getRawJob(badCreated.job_id);
+      const resCreated = await store.inspectAssignment(scopeA, badCreated.job_id);
+      expect(resCreated.ok).toBe(false);
+      if (!resCreated.ok) {
+        expect(resCreated.code).toBe("QUEUE_UNAVAILABLE");
+        expect(resCreated.reason).toBe("CORRUPT_RECORD");
+      }
+      expect(await getRawJob(badCreated.job_id)).toBe(rawCreatedBefore);
+
+      // 2. bad claim_deadline_ms
+      const badDeadline = baseRecordV2(scopeA, {
+        created_at_ms: now,
+        claim_deadline_ms: bad,
+      });
+      await putJob(badDeadline);
+      const rawDeadlineBefore = await getRawJob(badDeadline.job_id);
+      const resDeadline = await store.inspectAssignment(scopeA, badDeadline.job_id);
+      expect(resDeadline.ok).toBe(false);
+      if (!resDeadline.ok) {
+        expect(resDeadline.code).toBe("QUEUE_UNAVAILABLE");
+        expect(resDeadline.reason).toBe("CORRUPT_RECORD");
+      }
+      expect(await getRawJob(badDeadline.job_id)).toBe(rawDeadlineBefore);
+
+      // 3. bad execution.claimed_at_ms
+      const badClaimed = baseRecordV2(scopeA, {
+        created_at_ms: now,
+        claim_deadline_ms: now + 100000,
+        execution: {
+          worker_id: WRK,
+          attempt_id: ATT1,
+          claim_token_sha256: TOKEN_SHA,
+          phase: "claimed",
+          claimed_at_ms: bad,
+          started_at_ms: null,
+        },
+      });
+      await putJob(badClaimed);
+      const rawClaimedBefore = await getRawJob(badClaimed.job_id);
+      const resClaimed = await store.inspectAssignment(scopeA, badClaimed.job_id);
+      expect(resClaimed.ok).toBe(false);
+      if (!resClaimed.ok) {
+        expect(resClaimed.code).toBe("QUEUE_UNAVAILABLE");
+        expect(resClaimed.reason).toBe("CORRUPT_RECORD");
+      }
+      expect(await getRawJob(badClaimed.job_id)).toBe(rawClaimedBefore);
+
+      // 4. bad execution.started_at_ms (on running execution)
+      const badStarted = baseRecordV2(scopeA, {
+        created_at_ms: now,
+        claim_deadline_ms: now + 100000,
+        execution: {
+          worker_id: WRK,
+          attempt_id: ATT1,
+          claim_token_sha256: TOKEN_SHA,
+          phase: "running",
+          claimed_at_ms: now,
+          started_at_ms: bad,
+        },
+      });
+      await putJob(badStarted);
+      const rawStartedBefore = await getRawJob(badStarted.job_id);
+      const resStarted = await store.inspectAssignment(scopeA, badStarted.job_id);
+      expect(resStarted.ok).toBe(false);
+      if (!resStarted.ok) {
+        expect(resStarted.code).toBe("QUEUE_UNAVAILABLE");
+        expect(resStarted.reason).toBe("CORRUPT_RECORD");
+      }
+      expect(await getRawJob(badStarted.job_id)).toBe(rawStartedBefore);
+    }
   });
 });

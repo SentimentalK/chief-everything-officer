@@ -273,11 +273,17 @@ export class RedisJobStore {
     try {
       return await doRun(this.assignmentSha);
     } catch (error) {
+      if (error instanceof StoreError) {
+        throw error;
+      }
       if (isNoScriptError(error)) {
         this.assignmentSha = await this.loadAssignmentScript(redisLike);
         try {
           return await doRun(this.assignmentSha);
         } catch (retryError) {
+          if (retryError instanceof StoreError) {
+            throw retryError;
+          }
           throw new StoreError(
             "QUEUE_UNAVAILABLE",
             "Redis assignment EVALSHA retry failed after NOSCRIPT reload.",
@@ -580,13 +586,19 @@ function parseAssignmentResult(res: unknown): AssignmentScriptResult {
   let obj: Record<string, unknown>;
   try {
     obj = JSON.parse(s) as Record<string, unknown>;
-  } catch (error) {
-    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment script reply: ${s}`, {
-      cause: String(error),
-    });
+  } catch {
+    throw new StoreError(
+      "QUEUE_UNAVAILABLE",
+      "Invalid assignment script response.",
+      { reason: "INVALID_SCRIPT_RESPONSE" },
+    );
   }
   if (!obj || typeof obj !== "object") {
-    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment script reply: ${s}`);
+    throw new StoreError(
+      "QUEUE_UNAVAILABLE",
+      "Invalid assignment script response.",
+      { reason: "INVALID_SCRIPT_RESPONSE" },
+    );
   }
   const ok = obj.ok === true;
   if (!ok) {
@@ -602,7 +614,11 @@ function parseAssignmentResult(res: unknown): AssignmentScriptResult {
     typeof serverTimeMs !== "number" ||
     typeof obj.state !== "string"
   ) {
-    throw new StoreError("QUEUE_UNAVAILABLE", `Unexpected assignment success reply: ${s}`);
+    throw new StoreError(
+      "QUEUE_UNAVAILABLE",
+      "Invalid assignment script response.",
+      { reason: "INVALID_SCRIPT_RESPONSE" },
+    );
   }
   return {
     ok: true,

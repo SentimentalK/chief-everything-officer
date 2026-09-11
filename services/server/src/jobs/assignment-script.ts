@@ -37,6 +37,41 @@ local function okRes(job, state, replayed, server_time_ms)
   })
 end
 
+local MAX_SAFE_INTEGER = 9007199254740991
+
+local function validTimestamp(value)
+  return type(value) == 'number'
+    and value >= 0
+    and value <= MAX_SAFE_INTEGER
+    and value % 1 == 0
+end
+
+local function validUuid(s)
+  if type(s) ~= 'string' or #s ~= 36 then
+    return false
+  end
+
+  local a, b, c, d, e =
+    s:match('^([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)%-([0-9a-f]+)$')
+
+  return a ~= nil
+    and #a == 8
+    and #b == 4
+    and #c == 4
+    and #d == 4
+    and #e == 12
+end
+
+local function validWorkerId(s)
+  return type(s) == 'string'
+    and s:sub(1, 4) == 'wrk-'
+    and validUuid(s:sub(5))
+end
+
+local function validSha(s)
+  return type(s) == 'string' and #s == 64 and not s:find('[^0-9a-f]')
+end
+
 -- 1. Key type check
 local t = redis.call('TYPE', KEYS[1])
 local tt = type(t) == 'table' and t.ok or tostring(t)
@@ -83,8 +118,9 @@ if type(toc) ~= 'number' or toc % 1 ~= 0 or toc < 60 or toc > 7200 then
 end
 local cr = job.created_at_ms
 local cd = job.claim_deadline_ms
-if type(cr) ~= 'number' or cr % 1 ~= 0 then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
-if type(cd) ~= 'number' or cd % 1 ~= 0 then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
+if not validTimestamp(cr) or not validTimestamp(cd) then
+  return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+end
 if cd < cr then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if job.resource_id ~= nil and job.resource_id ~= cjson.null and type(job.resource_id) ~= 'string' then
   return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
@@ -104,18 +140,13 @@ if ex ~= nil then
   if ex.phase ~= 'claimed' and ex.phase ~= 'running' then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
-  if type(ex.worker_id) ~= 'string' or ex.worker_id == '' then
+  if not validWorkerId(ex.worker_id) or not validUuid(ex.attempt_id) then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
-  if type(ex.attempt_id) ~= 'string' or ex.attempt_id == '' then
+  if not validSha(ex.claim_token_sha256) then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
-  if type(ex.claim_token_sha256) ~= 'string'
-     or string.len(ex.claim_token_sha256) ~= 64
-     or string.find(ex.claim_token_sha256, '[^0-9a-f]') then
-    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
-  end
-  if type(ex.claimed_at_ms) ~= 'number' or ex.claimed_at_ms % 1 ~= 0 or ex.claimed_at_ms < 0 then
+  if not validTimestamp(ex.claimed_at_ms) then
     return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
   end
   if ex.phase == 'claimed' then
@@ -123,7 +154,7 @@ if ex ~= nil then
       return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
     end
   else
-    if type(ex.started_at_ms) ~= 'number' or ex.started_at_ms % 1 ~= 0 or ex.started_at_ms < ex.claimed_at_ms then
+    if not validTimestamp(ex.started_at_ms) or ex.started_at_ms < ex.claimed_at_ms then
       return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
     end
   end
@@ -138,20 +169,13 @@ if not committed then
 end
 
 -- 6. Validate operation inputs
-local function validId(s)
-  return type(s) == 'string' and string.len(s) > 0 and not string.find(s, '[^%w%-_]')
-end
-local function validSha(s)
-  return type(s) == 'string' and string.len(s) == 64 and not string.find(s, '[^0-9a-f]')
-end
-
 if operation == 'claim' then
-  if not validId(worker_id) or not validId(attempt_id) or not validSha(token_sha)
-     or type(workspace_ref) ~= 'string' or string.len(workspace_ref) == 0 then
+  if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha)
+     or type(workspace_ref) ~= 'string' or #workspace_ref == 0 then
     return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
   end
 elseif operation == 'start' then
-  if not validId(worker_id) or not validId(attempt_id) or not validSha(token_sha) then
+  if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha) then
     return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
   end
 elseif operation ~= 'inspect' then
