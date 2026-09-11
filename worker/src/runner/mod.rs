@@ -223,6 +223,67 @@ fn apply_teardown_evidence(
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum InputWriteError {
+    Io(std::io::Error),
+    TimedOut,
+    Stopped(StopReason),
+}
+
+async fn send_input_until(
+    child: &mut dyn ManagedProcess,
+    line: &str,
+    deadline: tokio::time::Instant,
+    gate: &ExecGate,
+) -> Result<(), InputWriteError> {
+    if let Some(stop) = gate.current_stop() {
+        return Err(InputWriteError::Stopped(stop));
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(InputWriteError::TimedOut);
+    }
+
+    let mut write_fut = child.send_input_line(line);
+
+    let wait_stop = async {
+        match gate {
+            ExecGate::Local => std::future::pending::<StopReason>().await,
+            ExecGate::Bridge(c) => {
+                let mut rx = c.stop.clone();
+                if let Some(stop) = rx.borrow().clone() {
+                    return stop;
+                }
+                loop {
+                    match rx.changed().await {
+                        Ok(()) => {
+                            if let Some(stop) = rx.borrow().clone() {
+                                return stop;
+                            }
+                        }
+                        Err(_) => {
+                            return rx.borrow().clone().unwrap_or(StopReason::ControllerGone);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    tokio::pin!(wait_stop);
+
+    tokio::select! {
+        biased;
+        stop = &mut wait_stop => {
+            Err(InputWriteError::Stopped(stop))
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            Err(InputWriteError::TimedOut)
+        }
+        res = &mut write_fut => {
+            res.map_err(InputWriteError::Io)
+        }
+    }
+}
+
 struct FinalizeParams<'a> {
     job_id: &'a str,
     attempt_id: &'a str,
@@ -966,24 +1027,48 @@ impl Runner {
                 "event": "user",
                 "message": { "content": doctor_prompt }
             });
-            if let Err(e) = child.send_input_line(&doctor_msg.to_string()).await {
+            let doctor_timeout = Duration::from_secs(self.config.doctor_timeout_secs);
+            let doctor_deadline = tokio::time::Instant::now() + doctor_timeout;
+
+            if let Err(write_err) = send_input_until(
+                child.as_mut(),
+                &doctor_msg.to_string(),
+                doctor_deadline,
+                &gate,
+            )
+            .await
+            {
+                let outcome = match write_err {
+                    InputWriteError::Io(e) => AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "STDIN_WRITE_FAILED".to_string(),
+                        message: format!("Failed to send doctor message to child stdin: {}", e),
+                        executor: executor_info.clone(),
+                    },
+                    InputWriteError::TimedOut => AttemptOutcome::Blocked {
+                        stage: "doctor".to_string(),
+                        code: "DOCTOR_TIMEOUT".to_string(),
+                        message: format!(
+                            "Doctor preflight timed out after {}s",
+                            self.config.doctor_timeout_secs
+                        ),
+                        executor: executor_info.clone(),
+                    },
+                    InputWriteError::Stopped(stop) => AttemptOutcome::Stopped {
+                        stop_reason: stop,
+                        dispatched: false,
+                        executor: executor_info.clone(),
+                    },
+                };
                 return self
                     .finalize_after_teardown(
                         finalize_params,
-                        AttemptOutcome::Blocked {
-                            stage: "doctor".to_string(),
-                            code: "STDIN_WRITE_FAILED".to_string(),
-                            message: format!("Failed to send doctor message to child stdin: {}", e),
-                            executor: executor_info.clone(),
-                        },
+                        outcome,
                         &mut child,
                         &mut drain_handles,
                     )
                     .await;
             }
-
-            let doctor_timeout = Duration::from_secs(self.config.doctor_timeout_secs);
-            let doctor_deadline = tokio::time::Instant::now() + doctor_timeout;
 
             let mut doctor_agent_response = String::new();
             let mut doctor_result_status = String::new();
@@ -1291,30 +1376,37 @@ impl Runner {
             "event": "user",
             "message": { "content": prompt_content }
         });
+        let task_timeout_duration = Duration::from_secs(timeout_secs);
+        let task_deadline = tokio::time::Instant::now() + task_timeout_duration;
         // The business prompt may (now) be sent. Mark dispatch so a later stop
         // maps to UNVERIFIED, never NOT_STARTED, and never resends.
         finalize_params.dispatch_happened = true;
-        if let Err(e) = child.send_input_line(&task_msg.to_string()).await {
+        if let Err(write_err) =
+            send_input_until(child.as_mut(), &task_msg.to_string(), task_deadline, &gate).await
+        {
+            let outcome = match write_err {
+                InputWriteError::Io(e) => AttemptOutcome::Failed {
+                    stage: "task".to_string(),
+                    code: "STDIN_WRITE_FAILED".to_string(),
+                    message: format!("Failed to send task prompt to child stdin: {}", e),
+                    business_outcome: BusinessOutcome::Failed,
+                    executor: executor_info.clone(),
+                    artifacts: Vec::new(),
+                },
+                InputWriteError::TimedOut => AttemptOutcome::Timeout {
+                    duration_secs: timeout_secs,
+                    executor: executor_info.clone(),
+                },
+                InputWriteError::Stopped(stop) => AttemptOutcome::Stopped {
+                    stop_reason: stop,
+                    dispatched: true,
+                    executor: executor_info.clone(),
+                },
+            };
             return self
-                .finalize_after_teardown(
-                    finalize_params,
-                    AttemptOutcome::Failed {
-                        stage: "task".to_string(),
-                        code: "STDIN_WRITE_FAILED".to_string(),
-                        message: format!("Failed to send task prompt to child stdin: {}", e),
-                        business_outcome: BusinessOutcome::Failed,
-                        executor: executor_info.clone(),
-                        artifacts: Vec::new(),
-                    },
-                    &mut child,
-                    &mut drain_handles,
-                )
+                .finalize_after_teardown(finalize_params, outcome, &mut child, &mut drain_handles)
                 .await;
         }
-
-        // Listen for Task completion
-        let task_timeout_duration = Duration::from_secs(timeout_secs);
-        let task_deadline = tokio::time::Instant::now() + task_timeout_duration;
 
         let mut task_agent_response = String::new();
         let mut task_result_status = String::new();
@@ -1624,10 +1716,55 @@ impl Runner {
             "event": "user",
             "message": { "content": doctor_prompt }
         });
-        let _ = child.send_input_line(&doctor_msg.to_string()).await;
-
         let doctor_deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.doctor_timeout_secs);
+
+        if let Err(write_err) = send_input_until(
+            child.as_mut(),
+            &doctor_msg.to_string(),
+            doctor_deadline,
+            &ExecGate::Local,
+        )
+        .await
+        {
+            let teardown = teardown_managed(&mut child, &mut doctor_drains).await;
+            if !teardown.fully_stopped() {
+                return Ok(SessionDoctorReport {
+                    ready: false,
+                    rule_marker: Some(doctor_ctx.expected_marker),
+                    agents_md_hash: doctor_ctx.agents_md_hash,
+                    checks: vec![crate::doctor::DoctorCheckItem {
+                        name: "stop_confirmation".to_string(),
+                        passed: false,
+                        message: "Doctor process could not be confirmed stopped".to_string(),
+                    }],
+                    error: Some("Doctor process could not be confirmed stopped".to_string()),
+                });
+            }
+
+            let err_msg = match write_err {
+                InputWriteError::Io(e) => {
+                    format!("Failed to send doctor message to child stdin: {}", e)
+                }
+                InputWriteError::TimedOut => format!(
+                    "Doctor preflight timed out sending input after {}s",
+                    self.config.doctor_timeout_secs
+                ),
+                InputWriteError::Stopped(r) => format!("Doctor execution stopped: {:?}", r),
+            };
+
+            return Ok(SessionDoctorReport {
+                ready: false,
+                rule_marker: Some(doctor_ctx.expected_marker),
+                agents_md_hash: doctor_ctx.agents_md_hash,
+                checks: vec![crate::doctor::DoctorCheckItem {
+                    name: "stdin_write".to_string(),
+                    passed: false,
+                    message: err_msg.clone(),
+                }],
+                error: Some(err_msg),
+            });
+        }
         let mut doctor_response = String::new();
         let mut result_status = String::new();
         let mut model_usage = None;
@@ -2088,6 +2225,536 @@ mod tests {
         assert_eq!(
             receipt.business_outcome,
             crate::verifier::BusinessOutcome::Unverified
+        );
+    }
+
+    use crate::bridge::lease::Clock;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::process::ExitStatus;
+    use std::sync::Arc;
+    use tokio::process::{ChildStderr, ChildStdout};
+
+    struct MockManagedProcess {
+        write_entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        write_call_count: Arc<std::sync::atomic::AtomicUsize>,
+        write_pending: bool,
+        write_error: Option<std::io::ErrorKind>,
+        pgid: Option<i32>,
+        pid: Option<u32>,
+    }
+
+    impl MockManagedProcess {
+        fn new(
+            write_entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
+            write_call_count: Arc<std::sync::atomic::AtomicUsize>,
+            write_pending: bool,
+        ) -> Self {
+            Self {
+                write_entered_tx,
+                write_call_count,
+                write_pending,
+                write_error: None,
+                pgid: Some(12345),
+                pid: Some(12345),
+            }
+        }
+    }
+
+    impl ManagedProcess for MockManagedProcess {
+        fn pid(&self) -> Option<u32> {
+            self.pid
+        }
+
+        fn pgid(&self) -> Option<i32> {
+            self.pgid
+        }
+
+        fn take_stdout(&mut self) -> Option<ChildStdout> {
+            None
+        }
+
+        fn take_stderr(&mut self) -> Option<ChildStderr> {
+            None
+        }
+
+        fn send_input_line<'a>(
+            &'a mut self,
+            _line: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + 'a>> {
+            self.write_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(tx) = self.write_entered_tx.take() {
+                let _ = tx.send(());
+            }
+            let pending = self.write_pending;
+            let err = self.write_error;
+            Box::pin(async move {
+                if let Some(k) = err {
+                    return Err(std::io::Error::new(k, "mock write error"));
+                }
+                if pending {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn close_stdin(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn kill_group(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn force_kill_group(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn wait(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<ExitStatus, std::io::Error>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>, std::io::Error> {
+            Ok(None)
+        }
+    }
+
+    fn spawn_real_group_piped_stdin(
+        script: &str,
+    ) -> (Box<dyn ManagedProcess>, Option<tokio::process::ChildStdout>) {
+        use crate::executor::process::GroupManagedProcess;
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn sh group");
+        let pgid = child.id().map(|p| p as i32);
+        let stdout = child.stdout.take();
+        (Box::new(GroupManagedProcess::new(child, pgid)), stdout)
+    }
+
+    struct ProcessGroupGuard(Option<i32>);
+    impl Drop for ProcessGroupGuard {
+        fn drop(&mut self) {
+            if let Some(pg) = self.0.take() {
+                unsafe {
+                    libc::kill(-pg, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_input_until_blocked_write_cancelled_by_stop() {
+        use crate::bridge::lease::ManualClock;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
+        let (runner_controls, ctl) = control_channel(clock);
+        let gate = ExecGate::Bridge(runner_controls);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mock = MockManagedProcess::new(Some(entered_tx), call_count.clone(), true);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let write_task =
+            tokio::spawn(
+                async move { send_input_until(&mut mock, "test line", deadline, &gate).await },
+            );
+
+        entered_rx.await.expect("must enter write before cancel");
+        ctl.stop_tx
+            .send(Some(StopReason::UserRequested))
+            .expect("send stop");
+
+        let res = write_task.await.expect("join write task");
+        assert!(matches!(
+            res,
+            Err(InputWriteError::Stopped(StopReason::UserRequested))
+        ));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Pre-stopped gate: must not call underlying send_input_line
+        let (runner_controls_stopped, _) = control_channel(Arc::new(ManualClock::default()));
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(StopReason::UserRequested));
+        let mut controls_with_stop = runner_controls_stopped;
+        controls_with_stop.stop = stop_rx;
+        let pre_stopped_gate = ExecGate::Bridge(controls_with_stop);
+
+        let mut mock2 = MockManagedProcess::new(None, call_count.clone(), true);
+        let pre_res = send_input_until(&mut mock2, "test", deadline, &pre_stopped_gate).await;
+        assert!(matches!(
+            pre_res,
+            Err(InputWriteError::Stopped(StopReason::UserRequested))
+        ));
+        // Call count should still be 1 (never called send_input_line on mock2)
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn send_input_until_times_out() {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mock = MockManagedProcess::new(None, call_count.clone(), true);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let res = send_input_until(&mut mock, "test line", deadline, &ExecGate::Local).await;
+
+        assert!(matches!(res, Err(InputWriteError::TimedOut)));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Already expired deadline
+        let expired_deadline = tokio::time::Instant::now() - Duration::from_millis(10);
+        let expired_res =
+            send_input_until(&mut mock, "test line", expired_deadline, &ExecGate::Local).await;
+        assert!(matches!(expired_res, Err(InputWriteError::TimedOut)));
+        // Did not initiate a second write
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_deadline_not_reset_between_write_and_response() {
+        // Demonstrate that a single shared deadline bounds both the input write
+        // and the response wait, and writing consumes from the total phase budget.
+        let budget = Duration::from_millis(100);
+        let phase_deadline = tokio::time::Instant::now() + budget;
+
+        // Simulate write taking 40ms of the 100ms budget
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mock = MockManagedProcess::new(None, call_count.clone(), false);
+        let write_fut = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            send_input_until(&mut mock, "prompt", phase_deadline, &ExecGate::Local).await
+        };
+        assert!(write_fut.await.is_ok());
+
+        // Now the response wait begins using the exact same phase_deadline
+        let remaining = phase_deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining < budget,
+            "Remaining budget {remaining:?} must be less than original budget {budget:?}"
+        );
+        assert!(
+            remaining <= Duration::from_millis(75),
+            "Remaining budget {remaining:?} should reflect elapsed write time"
+        );
+
+        // Awaiting response until the shared deadline expires within the remaining time
+        let t0 = tokio::time::Instant::now();
+        tokio::select! {
+            _ = tokio::time::sleep_until(phase_deadline) => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("response wait was not bounded by phase_deadline"),
+        }
+        let response_wait_elapsed = t0.elapsed();
+        // The response wait must have timed out within ~60ms, NOT getting a fresh 100ms
+        assert!(
+            response_wait_elapsed <= Duration::from_millis(90),
+            "Response wait took {response_wait_elapsed:?}, should not exceed remaining budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_pipe_unresponsive_child_stdin_write_times_out_and_tears_down() {
+        // Child that keeps stdin open and ignores it
+        let (mut child, stdout) = spawn_real_group_piped_stdin("sleep 300");
+        let pgid = child.pgid().expect("pgid recorded");
+        let mut guard = ProcessGroupGuard(Some(pgid));
+
+        let mut drains: Vec<JoinHandle<()>> = Vec::new();
+        if let Some(stdout) = stdout {
+            drains.push(tokio::spawn(async move {
+                let mut r = tokio::io::BufReader::new(stdout);
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut r, &mut sink).await;
+            }));
+        }
+
+        // Generate an 8MB payload which strictly exceeds standard Linux pipe buffer limits (max 1MB).
+        let payload = "A".repeat(8 * 1024 * 1024);
+        let timeout_budget = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + timeout_budget;
+
+        // Outer watchdog to ensure test cannot hang indefinitely
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            panic!("watchdog triggered: real pipe test hung");
+        });
+
+        let write_res = send_input_until(&mut *child, &payload, deadline, &ExecGate::Local).await;
+        assert!(
+            matches!(write_res, Err(InputWriteError::TimedOut)),
+            "Expected TimedOut on unresponsive real pipe, got: {:?}",
+            write_res
+        );
+
+        // Existing teardown: kills process group, reaps leader, finishes drains
+        let teardown = teardown_managed(&mut child, &mut drains).await;
+        assert!(
+            teardown.fully_stopped(),
+            "Teardown must be fully stopped: {teardown:?}"
+        );
+        assert!(
+            !pgid_has_live_members(pgid).unwrap_or(true),
+            "Process group still has live members"
+        );
+
+        // Disarm guard on clean finish
+        guard.0 = None;
+        watchdog.abort();
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[tokio::test]
+    async fn runner_managed_stop_during_business_stdin_write_cleans_up() {
+        use crate::bridge::lease::{Clock, ManualClock};
+        use crate::config::{ExecutorType, WorkerConfig};
+        use crate::runner::control::{control_channel, RunnerSignal};
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let (ws, prompt, _) = managed_workspace(temp.path());
+
+        // Create a custom stub script that handles doctor, then sleeps on task stdin without reading
+        let stub_script = temp.path().join("blocking_stub.py");
+        std::fs::write(
+            &stub_script,
+            r#"#!/usr/bin/env python3
+import sys, re, time, json, os
+
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("test-stub 0.1.0")
+    sys.exit(0)
+
+# Doctor turn 1
+line1 = sys.stdin.readline()
+try:
+    req1 = json.loads(line1.strip())
+    content1 = req1.get("message", {}).get("content", "")
+except Exception:
+    content1 = ""
+
+m_nonce = re.search(r'Write the exact string "([^"]+)" into the file "([^"]+)"', content1)
+if m_nonce:
+    val = m_nonce.group(1)
+    p = m_nonce.group(2)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(val)
+
+resp = "MARKER: MKT-RUN\nREFUSED: Boundary violation: writing outside workspace is forbidden."
+update = {"event": "step_update", "step_update": {"text_delta": resp + "\n"}}
+print(json.dumps(update), flush=True)
+
+res = {
+    "event": "result",
+    "result": {
+        "status": "success",
+        "response": resp,
+    }
+}
+print(json.dumps(res), flush=True)
+
+# Task turn 2: do NOT read stdin, sleep so that business send blocks on pipe
+time.sleep(300)
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub_script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_script, perms).unwrap();
+
+        // Write a 4MB prompt to ensure pipe blocks during task send
+        std::fs::write(&prompt, "B".repeat(4 * 1024 * 1024)).unwrap();
+
+        let mut config = WorkerConfig::default();
+        config.workspace_dir = ws.clone();
+        config.executor_type = ExecutorType::TestStub;
+        config.agent_executable = stub_script;
+        config.doctor_timeout_secs = 10;
+
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
+        let job_id = "job-block-task-stop";
+        let attempt_id = "attempt-block-task-stop-1";
+        let hex64 = "b".repeat(64);
+
+        let context = BridgeReceiptContext {
+            server_origin: "https://ceo.example".to_string(),
+            user_id: "usr_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            workspace_ref: "tools".to_string(),
+            worker_id: "wrk-test".to_string(),
+            job_id: job_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            source_prompt_sha256: hex64.clone(),
+            acceptance_sha256: hex64,
+            task_dispatch_intent: false,
+            stop_reason: None,
+        };
+
+        let (runner_controls, ctl) = control_channel(clock.clone());
+        let crate::runner::control::ControllerHandles {
+            mut signals_rx,
+            permit_tx,
+            stop_tx,
+            clock: _c,
+            dispatch_intent,
+        } = ctl;
+
+        let runner = Runner::new(config.clone(), None);
+        let run = tokio::spawn(async move {
+            runner
+                .run_managed(
+                    &ws,
+                    job_id,
+                    attempt_id,
+                    &prompt,
+                    60,
+                    false,
+                    runner_controls,
+                    context,
+                )
+                .await
+        });
+
+        // Ack ProcessSpawned and PreparedForTask
+        let mut got = 0usize;
+        while got < 2 {
+            let (signal, ack) = signals_rx.recv().await.expect("runner must send signals");
+            match signal {
+                RunnerSignal::ProcessSpawned(_) => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+                RunnerSignal::PreparedForTask => {
+                    let _ = ack.send(());
+                    got += 1;
+                }
+            }
+        }
+
+        // Commit dispatch intent and grant permit
+        dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
+        permit_tx
+            .send(crate::runner::control::ExecutionPermit {
+                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
+            })
+            .unwrap();
+
+        // Give a moment for business stdin write to start and block on pipe
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send stop signal
+        let _ = stop_tx.send(Some(StopReason::UserRequested));
+
+        let receipt = run.await.expect("join run").expect("run result ok");
+        assert_eq!(receipt.execution_status, "CANCELLED");
+        let bc = receipt.bridge_context.expect("bridge context present");
+        assert!(
+            bc.task_dispatch_intent,
+            "dispatch intent must remain true after business send was initiated"
+        );
+        assert_eq!(
+            receipt.business_outcome,
+            crate::verifier::BusinessOutcome::Unverified
+        );
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[tokio::test]
+    async fn runner_managed_stop_during_doctor_cleans_up_without_dispatch() {
+        use crate::bridge::lease::{Clock, ManualClock};
+        use crate::config::{ExecutorType, WorkerConfig};
+        use crate::runner::control::{control_channel, RunnerSignal};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let (ws, prompt, bin) = managed_workspace(temp.path());
+
+        let mut config = WorkerConfig::default();
+        config.workspace_dir = ws.clone();
+        config.executor_type = ExecutorType::TestStub;
+        config.agent_executable = bin;
+
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
+        let job_id = "job-doctor-stop";
+        let attempt_id = "attempt-doctor-stop-1";
+        let hex64 = "c".repeat(64);
+
+        let context = BridgeReceiptContext {
+            server_origin: "https://ceo.example".to_string(),
+            user_id: "usr_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            workspace_ref: "tools".to_string(),
+            worker_id: "wrk-test".to_string(),
+            job_id: job_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            source_prompt_sha256: hex64.clone(),
+            acceptance_sha256: hex64,
+            task_dispatch_intent: false,
+            stop_reason: None,
+        };
+
+        let (runner_controls, ctl) = control_channel(clock.clone());
+        let crate::runner::control::ControllerHandles {
+            mut signals_rx,
+            permit_tx: _permit,
+            stop_tx,
+            clock: _c,
+            dispatch_intent: _di,
+        } = ctl;
+
+        let runner = Runner::new(config.clone(), None);
+        let run = tokio::spawn(async move {
+            runner
+                .run_managed(
+                    &ws,
+                    job_id,
+                    attempt_id,
+                    &prompt,
+                    60,
+                    false,
+                    runner_controls,
+                    context,
+                )
+                .await
+        });
+
+        // Ack ProcessSpawned, and immediately send stop signal before PreparedForTask
+        let (signal, ack) = signals_rx
+            .recv()
+            .await
+            .expect("runner must send ProcessSpawned");
+        assert!(matches!(signal, RunnerSignal::ProcessSpawned(_)));
+        let _ = ack.send(());
+        let _ = stop_tx.send(Some(StopReason::UserRequested));
+
+        let receipt = run.await.expect("join run").expect("run result ok");
+        assert_eq!(receipt.execution_status, "CANCELLED");
+        let bc = receipt.bridge_context.expect("bridge context present");
+        assert!(
+            !bc.task_dispatch_intent,
+            "dispatch intent must remain false when stopped before task dispatch"
+        );
+        assert_eq!(
+            receipt.business_outcome,
+            crate::verifier::BusinessOutcome::NotStarted
         );
     }
 }

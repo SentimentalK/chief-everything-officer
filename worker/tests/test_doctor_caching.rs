@@ -582,3 +582,40 @@ async fn test_10_force_doctor_flag() {
         "Subsequent run without force_doctor must HIT cache"
     );
 }
+
+#[tokio::test]
+async fn test_11_standalone_doctor_stdin_write_failure_reports_not_ready() {
+    let temp = tempdir().unwrap();
+    let (ws, _prompt) = setup_test_workspace(temp.path(), "RULE-MARKER-C11", "normal");
+    // Create an executable that exits immediately without reading stdin
+    let exit_bin = temp.path().join("exit_stub.sh");
+    fs::write(&exit_bin, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut perms = fs::metadata(&exit_bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&exit_bin, perms).unwrap();
+
+    let mut config = WorkerConfig::default();
+    config.workspace_dir = ws.clone();
+    config.executor_type = ExecutorType::TestStub;
+    config.agent_executable = exit_bin;
+
+    let runner = Runner::new(config, None);
+    let report = runner.run_standalone_doctor(&ws).await.unwrap();
+
+    assert!(!report.ready);
+    let err = report.error.expect("error message present");
+    assert!(
+        err.contains("Failed to send doctor message to child stdin"),
+        "error must point to stdin write failure: {err}"
+    );
+    let stdin_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "stdin_write")
+        .expect("stdin_write check item must be present");
+    assert!(!stdin_check.passed);
+    assert!(
+        !doctor_cache_file(&ws).exists(),
+        "cache must not be updated on stdin failure"
+    );
+}
