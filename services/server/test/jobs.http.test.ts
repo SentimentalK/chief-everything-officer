@@ -1,15 +1,31 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import express, { type Express, type RequestHandler } from "express";
 import { rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createClient, type RedisClientType } from "redis";
 import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createJobAssignmentRouter } from "../src/jobs/router.js";
 import { JobService, JobError, type AssignmentResult } from "../src/jobs/service.js";
-import { RedisJobStore, createRedisRunnerFromClient } from "../src/jobs/redis-store.js";
+import {
+  RedisJobStore,
+  StoreError,
+  createRedisRunnerFromClient,
+  type RedisRunner,
+} from "../src/jobs/redis-store.js";
+import {
+  makeJobId,
+  jobKey,
+  requestKey,
+  KEY_STREAM,
+  businessDigest,
+  type PersistedJobRecord,
+} from "../src/jobs/schema.js";
 import { fixture, createIdentityService } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
+const URL = process.env.CEO_REDIS_URL;
 const API_KEY = "http-jobs-key";
 const JOB = "job-123e4567-e89b-12d3-a456-426614174000";
 const WRK = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
@@ -73,7 +89,9 @@ function errCode(code: string): never {
   throw new JobError(code as never, `boom ${code}`);
 }
 
-async function buildServer(service: JobService | null): Promise<{ baseUrl: string }> {
+async function buildServer(
+  service: JobService | null,
+): Promise<{ baseUrl: string; identity: { user_id: string; workspace_id: string } }> {
   const item = await fixture();
   cleanupDirs.push(item.root);
   const identityService = createIdentityService(item.config, API_KEY);
@@ -94,7 +112,7 @@ async function buildServer(service: JobService | null): Promise<{ baseUrl: strin
   });
   cleanupServers.push(server);
   const port = (server.address() as AddressInfo).port;
-  return { baseUrl: `http://127.0.0.1:${port}` };
+  return { baseUrl: `http://127.0.0.1:${port}`, identity: identityService.workspaceIdentityValue };
 }
 
 async function captureStderr(fn: () => Promise<void>): Promise<string[]> {
@@ -442,5 +460,521 @@ describe("worker assignment HTTP error mapping", () => {
       body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
     });
     expect(hb.status).toBe(404);
+  });
+});
+
+describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)", () => {
+  let client: RedisClientType;
+  let runner: RedisRunner & { dispose(): Promise<void> };
+  let store: RedisJobStore;
+  let service: JobService;
+
+  beforeAll(async () => {
+    client = createClient({ url: URL, socket: { reconnectStrategy: false } });
+    client.on("error", () => void 0);
+    await client.connect();
+
+    runner = createRedisRunnerFromClient(
+      () =>
+        createClient({
+          url: URL,
+          socket: { reconnectStrategy: false },
+          disableOfflineQueue: true,
+        }),
+      { opTimeoutMs: 2500 },
+    );
+
+    const waitForReady = (ms = 5000) =>
+      new Promise<void>((resolve, reject) => {
+        const s = Date.now();
+        const tick = () => {
+          if (runner.ready()) return resolve();
+          if (Date.now() - s > ms) return reject(new Error("runner not ready"));
+          setTimeout(tick, 20);
+        };
+        tick();
+      });
+
+    try {
+      await waitForReady();
+      store = new RedisJobStore(runner);
+      service = new JobService({ store }, () => true);
+    } catch (err) {
+      await runner.dispose();
+      throw err;
+    }
+  });
+
+  afterAll(async () => {
+    await runner?.dispose();
+    if (client?.isOpen) await client.quit();
+  });
+
+  it("completes full assignment protocol lifecycle: submit, claim, start, replays, and persists status", async () => {
+    const { baseUrl, identity } = await buildServer(service);
+    const requestId = "123e4567-e89b-12d3-a456-426614174101";
+    let jobId = "";
+
+    try {
+      // 1. Submit job
+      const submitRes = await service.submit(identity, {
+        request_id: requestId,
+        workspace_ref: "tools",
+        prompt: "integration prompt",
+        acceptance: "integration acceptance",
+        timeout_seconds: 120,
+      });
+      expect(submitRes.ok).toBe(true);
+      jobId = submitRes.view!.job_id;
+
+      // 2. Confirmed in pending queue
+      const pending1 = await service.pending(identity, {});
+      expect(pending1.jobs.some((j) => j.job_id === jobId)).toBe(true);
+
+      // 3. HTTP claim with valid claim_token
+      const claimRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(claimRes.status).toBe(200);
+      const claimBody = (await claimRes.json()) as {
+        ok: boolean;
+        replayed: boolean;
+        execution: { phase: string; worker_id: string; attempt_id: string; started_at: string | null };
+        job: Record<string, unknown>;
+      };
+      expect(claimBody.ok).toBe(true);
+      expect(claimBody.replayed).toBe(false);
+      expect(claimBody.execution.phase).toBe("claimed");
+      expect(claimBody.execution.worker_id).toBe(WRK);
+      expect(claimBody.execution.attempt_id).toBe(ATT);
+      expect(claimBody.execution.started_at).toBeNull();
+
+      // Verify returned job fields whitelist
+      const jobKeys = Object.keys(claimBody.job).sort();
+      expect(jobKeys).toEqual(["acceptance", "job_id", "prompt", "resource_id", "timeout_seconds", "workspace_ref"]);
+      expect(claimBody.job.job_id).toBe(jobId);
+      expect(claimBody.job.workspace_ref).toBe("tools");
+      expect(claimBody.job.prompt).toBe("integration prompt");
+      expect(claimBody.job.acceptance).toBe("integration acceptance");
+      expect(claimBody.job.timeout_seconds).toBe(120);
+      expect(claimBody.job.resource_id).toBeNull();
+      expect(claimBody.job).not.toHaveProperty("user_id");
+      expect(claimBody.job).not.toHaveProperty("workspace_id");
+      expect(claimBody.job).not.toHaveProperty("claim_token");
+      expect(claimBody.job).not.toHaveProperty("claim_token_hash");
+
+      // Verify SHA-256 hash in Redis, no plaintext token
+      const rawInRedis = JSON.parse((await client.get(jobKey(jobId)))!);
+      const expectedTokenHash = createHash("sha256").update(TOKEN, "utf8").digest("hex");
+      expect(rawInRedis.execution.claim_token_hash).toBe(expectedTokenHash);
+      expect(JSON.stringify(rawInRedis)).not.toContain(TOKEN);
+
+      // 4. Replay identical claim request
+      const replayClaimRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(replayClaimRes.status).toBe(200);
+      const replayClaimBody = (await replayClaimRes.json()) as {
+        ok: boolean;
+        replayed: boolean;
+        execution: { phase: string; worker_id: string; attempt_id: string };
+      };
+      expect(replayClaimBody.ok).toBe(true);
+      expect(replayClaimBody.replayed).toBe(true);
+      expect(replayClaimBody.execution.phase).toBe("claimed");
+      expect(replayClaimBody.execution.worker_id).toBe(WRK);
+      expect(replayClaimBody.execution.attempt_id).toBe(ATT);
+
+      // 5. HTTP start
+      const startRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          claim_token: TOKEN,
+        }),
+      });
+      expect(startRes.status).toBe(200);
+      const startBody = (await startRes.json()) as {
+        ok: boolean;
+        replayed: boolean;
+        execution: { phase: string; started_at: string | null };
+      };
+      expect(startBody.ok).toBe(true);
+      expect(startBody.replayed).toBe(false);
+      expect(startBody.execution.phase).toBe("running");
+      expect(startBody.execution.started_at).not.toBeNull();
+
+      // 6. Replay HTTP start
+      const replayStartRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          claim_token: TOKEN,
+        }),
+      });
+      expect(replayStartRes.status).toBe(200);
+      const replayStartBody = (await replayStartRes.json()) as {
+        ok: boolean;
+        replayed: boolean;
+        execution: { phase: string };
+      };
+      expect(replayStartBody.ok).toBe(true);
+      expect(replayStartBody.replayed).toBe(true);
+      expect(replayStartBody.execution.phase).toBe("running");
+
+      // 7. Replay HTTP claim after start
+      const claimAfterStartRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(claimAfterStartRes.status).toBe(200);
+      const claimAfterStartBody = (await claimAfterStartRes.json()) as {
+        ok: boolean;
+        replayed: boolean;
+        execution: { phase: string };
+      };
+      expect(claimAfterStartBody.ok).toBe(true);
+      expect(claimAfterStartBody.replayed).toBe(true);
+      expect(claimAfterStartBody.execution.phase).toBe("running");
+
+      // 8. Service get confirms running state
+      const getRes = await service.get(identity, { job_id: jobId });
+      expect(getRes.ok).toBe(true);
+      expect(getRes.view?.state).toBe("running");
+
+      // 9. Pending list no longer contains this job
+      const pendingAfter = await service.pending(identity, {});
+      expect(pendingAfter.jobs.some((j) => j.job_id === jobId)).toBe(false);
+    } finally {
+      if (jobId) await client.del(jobKey(jobId));
+      await client.del(requestKey(identity.workspace_id, requestId));
+      await client.del(KEY_STREAM);
+    }
+  });
+
+  it("first-claim deadline expires unclaimed jobs but never restricts execution of claimed jobs", async () => {
+    const { baseUrl, identity } = await buildServer(service);
+    const reqA = "123e4567-e89b-12d3-a456-426614174201";
+    const reqB = "123e4567-e89b-12d3-a456-426614174202";
+    let jobIdA = "";
+    let jobIdB = "";
+
+    try {
+      // Scenario A: Unclaimed task past claim_deadline
+      const submitA = await service.submit(identity, {
+        request_id: reqA,
+        workspace_ref: "tools",
+        prompt: "task A prompt",
+        acceptance: "task A acceptance",
+        timeout_seconds: 60,
+      });
+      expect(submitA.ok).toBe(true);
+      jobIdA = submitA.view!.job_id;
+
+      const now = Date.now();
+      const rawA = JSON.parse((await client.get(jobKey(jobIdA)))!);
+      rawA.created_at_ms = now - 600_000;
+      rawA.claim_deadline_ms = now - 300_000;
+      await client.set(jobKey(jobIdA), JSON.stringify(rawA));
+
+      // Filtered out from pending
+      const pendingA = await service.pending(identity, {});
+      expect(pendingA.jobs.some((j) => j.job_id === jobIdA)).toBe(false);
+
+      // Claim rejected with 409 JOB_EXPIRED
+      const claimResA = await fetch(`${baseUrl}/api/worker/jobs/${jobIdA}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(claimResA.status).toBe(409);
+      const claimBodyA = (await claimResA.json()) as { code: string };
+      expect(claimBodyA.code).toBe("JOB_EXPIRED");
+
+      // Scenario B: Claimed task execution with historical claim_deadline
+      const submitB = await service.submit(identity, {
+        request_id: reqB,
+        workspace_ref: "tools",
+        prompt: "task B prompt",
+        acceptance: "task B acceptance",
+        timeout_seconds: 60,
+      });
+      expect(submitB.ok).toBe(true);
+      jobIdB = submitB.view!.job_id;
+
+      const claimResB = await fetch(`${baseUrl}/api/worker/jobs/${jobIdB}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(claimResB.status).toBe(200);
+
+      // Tamper timestamps to 8 days ago (beyond 7-day claim window)
+      const rawB = JSON.parse((await client.get(jobKey(jobIdB)))!);
+      const eightDaysAgo = now - 8 * 24 * 60 * 60 * 1000;
+      rawB.created_at_ms = eightDaysAgo - 1000;
+      rawB.claim_deadline_ms = eightDaysAgo;
+      await client.set(jobKey(jobIdB), JSON.stringify(rawB));
+
+      // Start succeeds despite expired claim_deadline
+      const startResB = await fetch(`${baseUrl}/api/worker/jobs/${jobIdB}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          claim_token: TOKEN,
+        }),
+      });
+      expect(startResB.status).toBe(200);
+      const startBodyB = (await startResB.json()) as { execution: { phase: string } };
+      expect(startBodyB.execution.phase).toBe("running");
+
+      // Replay start succeeds
+      const replayStartResB = await fetch(`${baseUrl}/api/worker/jobs/${jobIdB}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          claim_token: TOKEN,
+        }),
+      });
+      expect(replayStartResB.status).toBe(200);
+      const replayStartBodyB = (await replayStartResB.json()) as { replayed: boolean; execution: { phase: string } };
+      expect(replayStartBodyB.replayed).toBe(true);
+      expect(replayStartBodyB.execution.phase).toBe("running");
+    } finally {
+      if (jobIdA) await client.del(jobKey(jobIdA));
+      await client.del(requestKey(identity.workspace_id, reqA));
+      if (jobIdB) await client.del(jobKey(jobIdB));
+      await client.del(requestKey(identity.workspace_id, reqB));
+      await client.del(KEY_STREAM);
+    }
+  });
+
+  it("rejects unsupported schema version records without silent conversion or migration hints", async () => {
+    const { baseUrl, identity } = await buildServer(service);
+    const jobIdV1 = makeJobId();
+    const reqV1 = "123e4567-e89b-12d3-a456-426614174301";
+    const payloadV1 = {
+      request_id: reqV1,
+      workspace_ref: "tools",
+      prompt: "v1 test prompt",
+      acceptance: "v1 test acceptance",
+      timeout_seconds: 60,
+    };
+    const digestV1 = businessDigest(payloadV1);
+
+    try {
+      const v1Record = {
+        schema_version: 1,
+        job_id: jobIdV1,
+        request_id: reqV1,
+        user_id: identity.user_id,
+        workspace_id: identity.workspace_id,
+        workspace_ref: payloadV1.workspace_ref,
+        resource_id: null,
+        prompt: payloadV1.prompt,
+        acceptance: payloadV1.acceptance,
+        execution_timeout_seconds: payloadV1.timeout_seconds,
+        request_digest: digestV1,
+        status: "queued",
+        stream_entry_id: "1-0",
+        created_at_ms: Date.now(),
+      };
+      await client.set(jobKey(jobIdV1), JSON.stringify(v1Record));
+      await client.set(
+        requestKey(identity.workspace_id, reqV1),
+        JSON.stringify({ job_id: jobIdV1, request_digest: digestV1 }),
+      );
+      await client.xAdd(KEY_STREAM, "*", {
+        schema_version: "1",
+        job_id: jobIdV1,
+        workspace_id: identity.workspace_id,
+        user_id: identity.user_id,
+        request_digest: digestV1,
+      });
+
+      // service.get throws UNSUPPORTED_SCHEMA_VERSION with exact sanitized message
+      await expect(service.get(identity, { job_id: jobIdV1 })).rejects.toMatchObject({
+        code: "QUEUE_UNAVAILABLE",
+        message: "Job record schema version is not supported by this server.",
+        details: { reason: "UNSUPPORTED_SCHEMA_VERSION" },
+      });
+
+      // Replaying submit throws same UNSUPPORTED_SCHEMA_VERSION error
+      await expect(service.submit(identity, payloadV1)).rejects.toMatchObject({
+        code: "QUEUE_UNAVAILABLE",
+        message: "Job record schema version is not supported by this server.",
+        details: { reason: "UNSUPPORTED_SCHEMA_VERSION" },
+      });
+
+      // HTTP claim returns 503 UNSUPPORTED_SCHEMA_VERSION
+      const claimRes = await fetch(`${baseUrl}/api/worker/jobs/${jobIdV1}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          workspace_ref: "tools",
+          claim_token: TOKEN,
+        }),
+      });
+      expect(claimRes.status).toBe(503);
+      const claimBody = (await claimRes.json()) as { code: string; message: string; details?: { reason?: string } };
+      expect(claimBody.code).toBe("QUEUE_UNAVAILABLE");
+      expect(claimBody.message).toBe("Job record schema version is not supported by this server.");
+      expect(claimBody.details?.reason).toBe("UNSUPPORTED_SCHEMA_VERSION");
+
+      // HTTP start returns 503 UNSUPPORTED_SCHEMA_VERSION
+      const startRes = await fetch(`${baseUrl}/api/worker/jobs/${jobIdV1}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          worker_id: WRK,
+          attempt_id: ATT,
+          claim_token: TOKEN,
+        }),
+      });
+      expect(startRes.status).toBe(503);
+      const startBody = (await startRes.json()) as { code: string; message: string; details?: { reason?: string } };
+      expect(startBody.code).toBe("QUEUE_UNAVAILABLE");
+      expect(startBody.message).toBe("Job record schema version is not supported by this server.");
+      expect(startBody.details?.reason).toBe("UNSUPPORTED_SCHEMA_VERSION");
+
+      // Discovery pending ignores v1 job and does not throw
+      const pendingRes = await service.pending(identity, {});
+      expect(pendingRes.jobs.some((j) => j.job_id === jobIdV1)).toBe(false);
+
+      // Redis record is completely unchanged: schema_version remains 1, no v2 fields added
+      const rawAfter = JSON.parse((await client.get(jobKey(jobIdV1)))!);
+      expect(rawAfter.schema_version).toBe(1);
+      expect(rawAfter).not.toHaveProperty("claim_deadline_ms");
+      expect(rawAfter).not.toHaveProperty("execution");
+    } finally {
+      await client.del(jobKey(jobIdV1));
+      await client.del(requestKey(identity.workspace_id, reqV1));
+      await client.del(KEY_STREAM);
+    }
+  });
+
+  it("preserves safe diagnostic store reasons and withholds unknown internal messages across real Service and HTTP", async () => {
+    const makeFaultRunner = (errorToThrow: unknown): RedisRunner => ({
+      ready: () => true,
+      get: async () => null,
+      set: async () => {},
+      xaddStream: async () => "1-0",
+      xlen: async () => 0,
+      xrange: async () => [],
+      scriptLoad: async () => "dummy_sha",
+      evalsha: async () => {
+        throw errorToThrow;
+      },
+      scriptExists: async () => true,
+      flush: async () => {},
+    });
+
+    // 1. Safe diagnostic reason preserved, internal message sanitized
+    {
+      const runner = makeFaultRunner(
+        new StoreError("INVALID_SCRIPT_RESPONSE", "mock bad lua output secret details", {
+          reason: "INVALID_SCRIPT_RESPONSE",
+        }),
+      );
+      const faultStore = new RedisJobStore(runner);
+      const faultService = new JobService({ store: faultStore }, () => true);
+      const { baseUrl } = await buildServer(faultService);
+
+      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(claimBody()),
+      });
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { code: string; message: string; details?: { reason?: string } };
+      expect(body.code).toBe("QUEUE_UNAVAILABLE");
+      expect(body.message).toBe("Queue backend is not available.");
+      expect(body.message).not.toContain("mock bad lua output");
+      expect(body.details?.reason).toBe("INVALID_SCRIPT_RESPONSE");
+    }
+
+    // 2. Unknown reason is withheld
+    {
+      const runner = makeFaultRunner(
+        new StoreError("UNKNOWN_BACKEND_ERR", "sensitive internal db message", {
+          reason: "INTERNAL_SECRET_REASON",
+        }),
+      );
+      const faultStore = new RedisJobStore(runner);
+      const faultService = new JobService({ store: faultStore }, () => true);
+      const { baseUrl } = await buildServer(faultService);
+
+      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(claimBody()),
+      });
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { code: string; message: string; details?: { reason?: string } };
+      expect(body.code).toBe("QUEUE_UNAVAILABLE");
+      expect(body.message).toBe("Queue backend is not available.");
+      expect(body.message).not.toContain("sensitive internal db message");
+      expect(body.details?.reason).toBeUndefined();
+    }
+
+    // 3. Plain unexpected Error is withheld
+    {
+      const runner = makeFaultRunner(new Error("unexpected connection failure with internal tokens"));
+      const faultStore = new RedisJobStore(runner);
+      const faultService = new JobService({ store: faultStore }, () => true);
+      const { baseUrl } = await buildServer(faultService);
+
+      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(claimBody()),
+      });
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as { code: string; message: string; details?: { reason?: string } };
+      expect(body.code).toBe("QUEUE_UNAVAILABLE");
+      expect(body.message).toBe("Queue backend is not available.");
+      expect(body.message).not.toContain("unexpected connection failure");
+      expect(body.details?.reason).toBeUndefined();
+    }
   });
 });

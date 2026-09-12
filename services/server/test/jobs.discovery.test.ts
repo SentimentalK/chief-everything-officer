@@ -104,14 +104,26 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     if (client?.isOpen) await client.quit();
   });
 
-  it("discovers an existing A2.1 queued task without migration", async () => {
+  it("discovers a newly submitted v2 job through the v1 stream envelope", async () => {
     await store.resetForTest();
     const sub = await serviceA.submit(scopeA, submitBody());
     expect(sub.ok).toBe(true);
+    const jobId = sub.view!.job_id;
+
+    // Assert JobRecord version is 2
+    const rec = await getRawJob(jobId);
+    expect(rec.schema_version).toBe(2);
+
+    // Assert Stream envelope version is "1"
+    const streamEntries = await store.readStreamEntries("0-0", 10);
+    const entry = streamEntries.find((e) => e.fields.job_id === jobId);
+    expect(entry).toBeDefined();
+    expect(entry!.fields.schema_version).toBe("1");
+
     const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
     expect(res.ok).toBe(true);
     expect(res.jobs.length).toBe(1);
-    expect(res.jobs[0]!.job_id).toBe(sub.view!.job_id);
+    expect(res.jobs[0]!.job_id).toBe(jobId);
     expect(res.jobs[0]!.workspace_ref).toBe("tools");
     expect(res.has_more).toBe(false);
   });
@@ -143,8 +155,14 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     // Expired (no execution, past 7-day claim window)
     const expired = await serviceA.submit(scopeA, submitBody());
     const exRec = await getRawJob(expired.view!.job_id);
-    exRec.claim_deadline_ms = 1_000_000;
+    const now = Date.now();
+    exRec.created_at_ms = now - 100_000;
+    exRec.claim_deadline_ms = now - 50_000;
     await setJob(exRec);
+
+    const gotExpired = await serviceA.get(scopeA, { job_id: expired.view!.job_id });
+    expect(gotExpired.ok).toBe(true);
+    expect(gotExpired.view?.state).toBe("expired");
 
     const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);

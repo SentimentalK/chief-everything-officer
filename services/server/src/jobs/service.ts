@@ -26,7 +26,7 @@ import {
   type ExecutionAssignmentView,
   type AssignmentScriptResult,
 } from "./assignment-schema.js";
-import { RedisJobStore } from "./redis-store.js";
+import { RedisJobStore, StoreError } from "./redis-store.js";
 
 /** Trusted, already-authenticated identity. Never accepted from the payload. */
 export interface JobAuthScope {
@@ -166,7 +166,7 @@ function queueErrorMessage(reason: string | null): string {
     return "Queue record is corrupt.";
   }
   if (reason === "UNSUPPORTED_SCHEMA_VERSION") {
-    return "Record schema version is not supported; migration is required.";
+    return "Job record schema version is not supported by this server.";
   }
   return "Queue backend is not available.";
 }
@@ -624,9 +624,23 @@ function assignmentErr(code: JobErrorCode, message: string): AssignmentResult {
   return { ok: false, code, message };
 }
 
+const PUBLIC_STORE_REASONS = new Set([
+  "INVALID_SCRIPT_RESPONSE",
+  "CORRUPT_RECORD",
+  "CORRUPT_PLACEHOLDER",
+]);
+
 function wrapStore(error: unknown): JobError {
   if (error instanceof JobError) return error;
-  return new JobError("QUEUE_UNAVAILABLE", "Queue backend is not available.", {
-    error: error instanceof Error ? error.message : String(error),
-  });
+  const reason =
+    error instanceof StoreError &&
+    typeof error.details.reason === "string" &&
+    PUBLIC_STORE_REASONS.has(error.details.reason)
+      ? error.details.reason
+      : undefined;
+  return new JobError(
+    "QUEUE_UNAVAILABLE",
+    "Queue backend is not available.",
+    reason ? { reason } : {},
+  );
 }
