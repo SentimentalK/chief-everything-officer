@@ -4,7 +4,9 @@
 
 use ceo_worker::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use ceo_worker::bridge::config::load_api_key;
-use ceo_worker::bridge::protocol::{ClaimRequest, LeaseOperationRequest};
+use ceo_worker::bridge::protocol::{
+    AssignmentClaimRequest, AssignmentStartRequest, ClaimRequest, LeaseOperationRequest,
+};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -89,21 +91,16 @@ async fn spawn_server(handler: Handler) -> Server {
                     .unwrap_or(0);
                 let mut body = Vec::new();
                 if content_len > 0 {
-                    let have = header_end;
-                    if head.len() < have + content_len {
-                        let need = have + content_len - head.len();
-                        let mut rest = vec![0u8; need];
-                        let mut read = 0;
-                        while read < need {
-                            let n = sock.read(&mut rest[read..]).await.unwrap_or(0);
-                            if n == 0 {
-                                break;
-                            }
-                            read += n;
+                    let initial_body = &head[header_end..];
+                    let initial_len = initial_body.len().min(content_len);
+                    body.extend_from_slice(&initial_body[..initial_len]);
+                    while body.len() < content_len {
+                        let mut rest = vec![0u8; content_len - body.len()];
+                        let n = sock.read(&mut rest).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
                         }
-                        body.extend_from_slice(&rest[..read]);
-                    } else {
-                        body.extend_from_slice(&head[have..have + content_len]);
+                        body.extend_from_slice(&rest[..n]);
                     }
                 }
                 let target = request_line
@@ -267,6 +264,71 @@ fn sent_token(server: &Server, needle: &str) -> bool {
         })
 }
 
+fn sent_claim_token(server: &Server, needle: &str) -> bool {
+    server
+        .recorded
+        .lock()
+        .iter()
+        .filter(|r| r.target.contains(needle))
+        .any(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .map(|v| v["claim_token"] == serde_json::Value::String(TOKEN.into()))
+                .unwrap_or(false)
+        })
+}
+
+fn assignment_claim_request() -> AssignmentClaimRequest {
+    AssignmentClaimRequest {
+        worker_id: WRK.into(),
+        attempt_id: ATT.into(),
+        workspace_ref: "tools".into(),
+        claim_token: TOKEN.into(),
+    }
+}
+
+fn assignment_start_request() -> AssignmentStartRequest {
+    AssignmentStartRequest {
+        worker_id: WRK.into(),
+        attempt_id: ATT.into(),
+        claim_token: TOKEN.into(),
+    }
+}
+
+fn assignment_claimed_exec_json() -> String {
+    format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z","started_at":null}}"#
+    )
+}
+
+fn assignment_running_exec_json() -> String {
+    format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"running","claimed_at":"2026-09-07T00:00:00Z","started_at":"2026-09-07T00:00:02Z"}}"#
+    )
+}
+
+fn assignment_claim_ok_claimed() -> String {
+    format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{}}}"#,
+        claim_job_json(),
+        assignment_claimed_exec_json()
+    )
+}
+
+fn assignment_claim_ok_replayed_running() -> String {
+    format!(
+        r#"{{"ok":true,"replayed":true,"server_time":"2026-09-07T00:00:05Z","job":{},"execution":{}}}"#,
+        claim_job_json(),
+        assignment_running_exec_json()
+    )
+}
+
+fn assignment_start_ok_running(replayed: bool) -> String {
+    format!(
+        r#"{{"ok":true,"replayed":{replayed},"server_time":"2026-09-07T00:00:05Z","execution":{}}}"#,
+        assignment_running_exec_json()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Normal (valid) client behaviours
 // ---------------------------------------------------------------------------
@@ -346,11 +408,11 @@ async fn redirect_not_followed_and_target_gets_no_credentials() {
 }
 
 #[tokio::test]
-async fn lease_expired_reason_preserved_through_server_error() {
+async fn assignment_mismatch_reason_preserved_through_server_error() {
     let server = spawn_server(Box::new(|_| Action::Respond {
         status: 409,
         headers: vec![("content-type".into(), "application/json".into())],
-        body: br#"{"ok":false,"code":"LEASE_EXPIRED","message":"Execution lease has expired.","details":{"reason":"EXECUTION_DEADLINE_EXCEEDED"}}"#.to_vec(),
+        body: br#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","message":"Assignment clock regression.","details":{"reason":"CLOCK_REGRESSION"}}"#.to_vec(),
     }))
     .await;
     let c = client(&server.url);
@@ -362,8 +424,8 @@ async fn lease_expired_reason_preserved_through_server_error() {
             reason,
         } => {
             assert_eq!(status, 409);
-            assert_eq!(code, "LEASE_EXPIRED");
-            assert_eq!(reason.as_deref(), Some("EXECUTION_DEADLINE_EXCEEDED"));
+            assert_eq!(code, "ASSIGNMENT_MISMATCH");
+            assert_eq!(reason.as_deref(), Some("CLOCK_REGRESSION"));
         }
         other => panic!("expected server error, got {other:?}"),
     }
@@ -796,7 +858,10 @@ async fn outcome_unknown_matrix_for_writes() {
     assert_write_outcome(status_json(502, "{}"), "/start", true).await;
     assert_write_outcome(status_json(504, "{}"), "/start", true).await;
     assert_write_outcome(
-        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH","message":"m"}"#),
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","message":"m"}"#,
+        ),
         "/claim",
         false,
     )
@@ -894,8 +959,7 @@ async fn confirmed_rejection_valid_pairings() {
         (409, "JOB_ALREADY_CLAIMED"),
         (409, "IDEMPOTENCY_CONFLICT"),
         (409, "JOB_NOT_CLAIMED"),
-        (409, "LEASE_MISMATCH"),
-        (409, "LEASE_EXPIRED"),
+        (409, "ASSIGNMENT_MISMATCH"),
         (409, "WORKSPACE_MISMATCH"),
         (503, "BRIDGE_DISABLED"),
     ];
@@ -919,10 +983,10 @@ async fn confirmed_rejection_through_start_and_heartbeat() {
     )
     .await;
     assert_server_business_error(
-        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH"}"#),
+        status_json(409, r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH"}"#),
         "heartbeat",
         409,
-        "LEASE_MISMATCH",
+        "ASSIGNMENT_MISMATCH",
         false,
     )
     .await;
@@ -936,10 +1000,10 @@ async fn mismatched_pairings_leave_write_outcome_unknown() {
     let cases: &[(u16, &str)] = &[
         (502, "BRIDGE_DISABLED"),
         (504, "BRIDGE_DISABLED"),
-        (400, "LEASE_MISMATCH"),
+        (400, "ASSIGNMENT_MISMATCH"),
         (404, "INVALID_INPUT"),
         (409, "BRIDGE_DISABLED"),
-        (503, "LEASE_MISMATCH"),
+        (503, "ASSIGNMENT_MISMATCH"),
         (503, "QUEUE_UNAVAILABLE"),
     ];
     for &(status, code) in cases {
@@ -980,10 +1044,10 @@ async fn ambiguous_envelope_leaves_write_outcome_unknown() {
     // Not a Bridge-only rule: a valid 409 pairing with a missing `ok` is also
     // not a confirmed rejection.
     assert_server_business_error(
-        status_json(409, r#"{"code":"LEASE_MISMATCH"}"#),
+        status_json(409, r#"{"code":"ASSIGNMENT_MISMATCH"}"#),
         "heartbeat",
         409,
-        "LEASE_MISMATCH",
+        "ASSIGNMENT_MISMATCH",
         true,
     )
     .await;
@@ -995,7 +1059,10 @@ async fn ambiguous_envelope_leaves_write_outcome_unknown() {
 async fn reads_ignore_write_rejection_classification() {
     // A confirmed rejection envelope on a read path stays outcome_unknown=false.
     let s1 = spawn_server(Box::new(|_| {
-        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH","message":"m"}"#)
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","message":"m"}"#,
+        )
     }))
     .await;
     let e = client(&s1.url).pending("tools", "0-0").await.unwrap_err();
@@ -1013,7 +1080,10 @@ async fn reads_ignore_write_rejection_classification() {
 #[tokio::test]
 async fn write_attempt_token_not_replaced_on_business_error() {
     let server = spawn_server(Box::new(|_| {
-        status_json(409, r#"{"ok":false,"code":"LEASE_MISMATCH","message":"m"}"#)
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","message":"m"}"#,
+        )
     }))
     .await;
     let e = client(&server.url)
@@ -1093,7 +1163,7 @@ async fn unknown_code_reason_message_and_typed_values_never_leak() {
     let s2 = spawn_server(Box::new(move |_| status_json(
         409,
         &format!(
-            r#"{{"ok":false,"code":"LEASE_MISMATCH","details":{{"reason":"{secret_reason}"}},"message":"{secret_msg}"}}"#
+            r#"{{"ok":false,"code":"ASSIGNMENT_MISMATCH","details":{{"reason":"{secret_reason}"}},"message":"{secret_msg}"}}"#
         ),
     )))
     .await;
@@ -1157,4 +1227,557 @@ async fn lease_and_claim_debug_redact_secrets() {
     let dbg = format!("{ok:?}");
     assert!(!dbg.contains("do the thing"), "prompt leaked in Debug");
     assert!(!dbg.contains("thing done"), "acceptance leaked in Debug");
+}
+
+// ---------------------------------------------------------------------------
+// Persistent Assignment Protocol Tests (Step 3.1)
+// ---------------------------------------------------------------------------
+
+// 7.2 Success paths
+#[tokio::test]
+async fn claim_assignment_sends_exact_protocol_fields_and_accepts_claimed() {
+    let server = spawn_server(Box::new(|_| json_response(&assignment_claim_ok_claimed()))).await;
+    let ok = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap();
+
+    assert_eq!(ok.execution.phase, "claimed");
+    assert_eq!(ok.execution.started_at, None);
+    assert!(!ok.replayed);
+    assert_eq!(count_hits(&server, "/claim"), 1);
+
+    let recorded = server.recorded.lock();
+    let req = recorded
+        .iter()
+        .find(|r| r.target.contains("/claim"))
+        .unwrap();
+    assert_eq!(req.target, format!("/api/worker/jobs/{JOB}/claim"));
+    assert_eq!(
+        req.headers.get("authorization").map(|s| s.as_str()),
+        Some("Bearer test-secret-key")
+    );
+
+    let val: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let obj = val.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["attempt_id", "claim_token", "worker_id", "workspace_ref"]
+    );
+    assert_eq!(obj["worker_id"], WRK);
+    assert_eq!(obj["attempt_id"], ATT);
+    assert_eq!(obj["workspace_ref"], "tools");
+    assert_eq!(obj["claim_token"], TOKEN);
+    assert!(!obj.contains_key("lease_token"));
+    assert!(!obj.contains_key("user_id"));
+    assert!(!obj.contains_key("workspace_id"));
+    drop(recorded);
+    assert!(
+        sent_claim_token(&server, "/claim"),
+        "the claim token must be sent verbatim"
+    );
+}
+
+#[tokio::test]
+async fn claim_assignment_replayed_running_is_accepted() {
+    let server = spawn_server(Box::new(|_| {
+        json_response(&assignment_claim_ok_replayed_running())
+    }))
+    .await;
+    let ok = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap();
+
+    assert!(ok.replayed);
+    assert_eq!(ok.execution.phase, "running");
+    assert_eq!(
+        ok.execution.started_at.as_deref(),
+        Some("2026-09-07T00:00:02Z")
+    );
+}
+
+#[tokio::test]
+async fn start_assignment_sends_exact_protocol_fields_and_accepts_running() {
+    let server = spawn_server(Box::new(|_| {
+        json_response(&assignment_start_ok_running(false))
+    }))
+    .await;
+    let ok = client(&server.url)
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap();
+
+    assert_eq!(ok.execution.phase, "running");
+    assert_eq!(
+        ok.execution.started_at.as_deref(),
+        Some("2026-09-07T00:00:02Z")
+    );
+    assert!(!ok.replayed);
+    assert_eq!(count_hits(&server, "/start"), 1);
+
+    {
+        let recorded = server.recorded.lock();
+        let req = recorded
+            .iter()
+            .find(|r| r.target.contains("/start"))
+            .unwrap();
+        assert_eq!(req.target, format!("/api/worker/jobs/{JOB}/start"));
+        let val: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let obj = val.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["attempt_id", "claim_token", "worker_id"]);
+        assert_eq!(obj["worker_id"], WRK);
+        assert_eq!(obj["attempt_id"], ATT);
+        assert_eq!(obj["claim_token"], TOKEN);
+        assert!(!obj.contains_key("workspace_ref"));
+        assert!(!obj.contains_key("lease_token"));
+    }
+    assert!(
+        sent_claim_token(&server, "/start"),
+        "the claim token must be sent verbatim"
+    );
+
+    // Also accepts replayed start
+    let server2 = spawn_server(Box::new(|_| {
+        json_response(&assignment_start_ok_running(true))
+    }))
+    .await;
+    let ok2 = client(&server2.url)
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap();
+    assert!(ok2.replayed);
+    assert_eq!(ok2.execution.phase, "running");
+}
+
+// 7.3 Response validation matrix (mutations return outcome_unknown = true)
+#[tokio::test]
+async fn assignment_started_at_missing_key_rejected() {
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z"}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{bad_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_claimed_with_non_null_started_at_rejected() {
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z","started_at":"2026-09-07T00:00:02Z"}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{bad_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_running_with_null_started_at_rejected() {
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"running","claimed_at":"2026-09-07T00:00:00Z","started_at":null}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:05Z","execution":{bad_exec}}}"#
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_running_with_started_at_earlier_than_claimed_at_rejected() {
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"running","claimed_at":"2026-09-07T00:00:05Z","started_at":"2026-09-07T00:00:02Z"}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:05Z","execution":{bad_exec}}}"#
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_invalid_timestamp_formats_rejected() {
+    // Bad server_time
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"not-a-timestamp","job":{},"execution":{}}}"#,
+        claim_job_json(),
+        assignment_claimed_exec_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+
+    // Bad claimed_at
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"claimed","claimed_at":"not-rfc3339","started_at":null}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{bad_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_invalid_phase_rejected() {
+    let bad_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"pending","claimed_at":"2026-09-07T00:00:00Z","started_at":null}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{bad_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_claim_fresh_running_rejected() {
+    // replayed: false with running phase must be rejected
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:05Z","job":{},"execution":{}}}"#,
+        claim_job_json(),
+        assignment_running_exec_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_start_claimed_rejected() {
+    // start returning claimed phase must be rejected
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","execution":{}}}"#,
+        assignment_claimed_exec_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_associations_mismatch_rejected() {
+    // Job ID mismatch
+    let other_job_json = r#"{"job_id":"job-99999999-9999-9999-9999-999999999999","workspace_ref":"tools","resource_id":null,"prompt":"p","acceptance":"a","timeout_seconds":120}"#;
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{other_job_json},"execution":{}}}"#,
+        assignment_claimed_exec_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+
+    // Workspace alias mismatch
+    let other_ws_job = format!(
+        r#"{{"job_id":"{JOB}","workspace_ref":"otherws","resource_id":null,"prompt":"p","acceptance":"a","timeout_seconds":120}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{other_ws_job},"execution":{}}}"#,
+        assignment_claimed_exec_json()
+    );
+    let server2 = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err2 = client(&server2.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err2.outcome_unknown);
+
+    // Worker ID mismatch
+    let other_worker_exec = format!(
+        r#"{{"worker_id":"wrk-99999999-9999-9999-9999-999999999999","attempt_id":"{ATT}","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z","started_at":null}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{other_worker_exec}}}"#,
+        claim_job_json()
+    );
+    let server3 = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err3 = client(&server3.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err3.outcome_unknown);
+
+    // Attempt ID mismatch
+    let other_att_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"99999999-9999-9999-9999-999999999999","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z","started_at":null}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{other_att_exec}}}"#,
+        claim_job_json()
+    );
+    let server4 = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err4 = client(&server4.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err4.outcome_unknown);
+}
+
+#[tokio::test]
+async fn assignment_execution_with_legacy_lease_fields_rejected() {
+    // Execution has old start_deadline / lease_expires_at / execution_deadline:
+    // our strict deserializer must reject unexpected fields.
+    let legacy_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"claimed","claimed_at":"2026-09-07T00:00:00Z","started_at":null,"start_deadline":"2026-09-07T00:05:00Z","lease_expires_at":"2026-09-07T00:01:30Z"}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":false,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{legacy_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err.outcome_unknown);
+    assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+}
+
+#[tokio::test]
+async fn assignment_ancient_timestamps_accepted() {
+    // Persistent assignments have no lease expiry; an ancient claimed_at / started_at is valid
+    let ancient_exec = format!(
+        r#"{{"worker_id":"{WRK}","attempt_id":"{ATT}","phase":"running","claimed_at":"2020-01-01T00:00:00Z","started_at":"2020-01-01T01:00:00Z"}}"#
+    );
+    let resp = format!(
+        r#"{{"ok":true,"replayed":true,"server_time":"2026-09-07T00:00:00Z","job":{},"execution":{ancient_exec}}}"#,
+        claim_job_json()
+    );
+    let server = spawn_server(Box::new(move |_| json_response(&resp))).await;
+    let ok = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap();
+    assert!(ok.replayed);
+    assert_eq!(ok.execution.claimed_at, "2020-01-01T00:00:00Z");
+}
+
+// 7.4 Error, timeout, secret redaction, and retry boundaries
+#[tokio::test]
+async fn assignment_mismatch_confirmed_rejection() {
+    let server = spawn_server(Box::new(|_| {
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","message":"already assigned"}"#,
+        )
+    }))
+    .await;
+    let err = client(&server.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(
+        !err.outcome_unknown,
+        "409 ASSIGNMENT_MISMATCH is a confirmed rejection"
+    );
+    match err.kind {
+        ErrorKind::Server { status, code, .. } => {
+            assert_eq!(status, 409);
+            assert_eq!(code, "ASSIGNMENT_MISMATCH");
+        }
+        other => panic!("expected server error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn assignment_reason_sanitization() {
+    // Known reason (CORRUPT_RECORD) is preserved
+    let s1 = spawn_server(Box::new(|_| {
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","details":{"reason":"CORRUPT_RECORD"},"message":"raw db error"}"#,
+        )
+    }))
+    .await;
+    let err = client(&s1.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    match &err.kind {
+        ErrorKind::Server { reason, .. } => {
+            assert_eq!(reason.as_deref(), Some("CORRUPT_RECORD"));
+        }
+        other => panic!("expected server error, got {other:?}"),
+    }
+    assert!(!err.to_string().contains("raw db error"));
+
+    // Unknown reason is sanitized
+    let s2 = spawn_server(Box::new(|_| {
+        status_json(
+            409,
+            r#"{"ok":false,"code":"ASSIGNMENT_MISMATCH","details":{"reason":"UNKNOWN_SECRET_REASON"},"message":"raw db error"}"#,
+        )
+    }))
+    .await;
+    let err2 = client(&s2.url)
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    match &err2.kind {
+        ErrorKind::Server { reason, .. } => {
+            assert_eq!(reason, &None);
+        }
+        other => panic!("expected server error, got {other:?}"),
+    }
+    assert!(!err2.to_string().contains("UNKNOWN_SECRET_REASON"));
+    assert!(!format!("{err2:?}").contains("UNKNOWN_SECRET_REASON"));
+}
+
+#[tokio::test]
+async fn assignment_transport_faults_mark_outcome_unknown_and_do_not_resend() {
+    // Drop connection
+    let s1 = spawn_server(Box::new(|_| Action::DropConnection)).await;
+    let c1 = client(&s1.url);
+    let err1 = c1
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err1.outcome_unknown);
+    assert_eq!(count_hits(&s1, "/claim"), 1);
+
+    // Silent timeout
+    let s2 = spawn_server(Box::new(|_| Action::HoldSilent)).await;
+    let c2 = client_with(
+        &s2.url,
+        Duration::from_millis(200),
+        Duration::from_millis(600),
+    );
+    let err2 = c2
+        .claim_assignment(JOB, &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(err2.outcome_unknown);
+    assert_eq!(count_hits(&s2, "/claim"), 1);
+
+    // Headers then stop timeout
+    let s3 = spawn_server(Box::new(|_| Action::HeadersThenStop)).await;
+    let c3 = client_with(
+        &s3.url,
+        Duration::from_millis(200),
+        Duration::from_millis(600),
+    );
+    let err3 = c3
+        .start_assignment(JOB, &assignment_start_request())
+        .await
+        .unwrap_err();
+    assert!(err3.outcome_unknown);
+    assert_eq!(count_hits(&s3, "/start"), 1);
+}
+
+#[tokio::test]
+async fn assignment_requests_redact_secrets_in_debug() {
+    let claim_dbg = format!("{:?}", assignment_claim_request());
+    assert!(!claim_dbg.contains(TOKEN));
+    assert!(claim_dbg.contains("[redacted]"));
+
+    let start_dbg = format!("{:?}", assignment_start_request());
+    assert!(!start_dbg.contains(TOKEN));
+    assert!(start_dbg.contains("[redacted]"));
+}
+
+// 7.5 Pre-send rejections (outcome_unknown = false, hits = 0)
+#[tokio::test]
+async fn assignment_pre_send_validation_rejections() {
+    let server = spawn_server(Box::new(|_| json_response(&assignment_claim_ok_claimed()))).await;
+    let c = client(&server.url);
+
+    // Invalid job_id
+    let err = c
+        .claim_assignment("invalid-job-id", &assignment_claim_request())
+        .await
+        .unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
+
+    // Invalid worker_id
+    let mut bad_req = assignment_claim_request();
+    bad_req.worker_id = "wrk-invalid".into();
+    let err = c.claim_assignment(JOB, &bad_req).await.unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
+
+    // Invalid attempt_id
+    let mut bad_req = assignment_claim_request();
+    bad_req.attempt_id = "not-a-uuid".into();
+    let err = c.claim_assignment(JOB, &bad_req).await.unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
+
+    // Invalid workspace_ref
+    let mut bad_req = assignment_claim_request();
+    bad_req.workspace_ref = "invalid workspace with spaces".into();
+    let err = c.claim_assignment(JOB, &bad_req).await.unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
+
+    // Invalid claim_token (uppercase or bad len)
+    let mut bad_req = assignment_claim_request();
+    bad_req.claim_token = "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333444455556666777788889999".into();
+    let err = c.claim_assignment(JOB, &bad_req).await.unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
+
+    // Start pre-send checks
+    let mut bad_start = assignment_start_request();
+    bad_start.claim_token = "too-short".into();
+    let err = c.start_assignment(JOB, &bad_start).await.unwrap_err();
+    assert!(!err.outcome_unknown);
+    assert_eq!(server.recorded.lock().len(), 0);
 }

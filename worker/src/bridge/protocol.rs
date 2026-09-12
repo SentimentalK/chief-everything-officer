@@ -96,6 +96,43 @@ pub struct Pending {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct AssignmentClaimRequest {
+    pub worker_id: String,
+    pub attempt_id: String,
+    pub workspace_ref: String,
+    pub claim_token: String,
+}
+
+impl fmt::Debug for AssignmentClaimRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssignmentClaimRequest")
+            .field("worker_id", &self.worker_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("workspace_ref", &self.workspace_ref)
+            .field("claim_token", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AssignmentStartRequest {
+    pub worker_id: String,
+    pub attempt_id: String,
+    pub claim_token: String,
+}
+
+impl fmt::Debug for AssignmentStartRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssignmentStartRequest")
+            .field("worker_id", &self.worker_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("claim_token", &"[redacted]")
+            .finish()
+    }
+}
+
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
     pub worker_id: String,
     pub attempt_id: String,
@@ -116,6 +153,7 @@ impl fmt::Debug for ClaimRequest {
     }
 }
 
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LeaseOperationRequest {
     pub worker_id: String,
@@ -152,6 +190,67 @@ impl Phase {
     }
 }
 
+/// Execution view returned by persistent assignment claim/start.
+/// Exactly 5 fields: `worker_id`, `attempt_id`, `phase`, `claimed_at`, and `started_at`.
+/// All 5 fields are required keys; `started_at` may be explicit null.
+/// Any unexpected fields (e.g. lease deadlines) cause a deserialization error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentExecution {
+    pub worker_id: String,
+    pub attempt_id: String,
+    pub phase: String,
+    pub claimed_at: String,
+    pub started_at: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AssignmentExecution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = AssignmentExecution;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an assignment execution object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<AssignmentExecution, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut worker_id: Option<String> = None;
+                let mut attempt_id: Option<String> = None;
+                let mut phase: Option<String> = None;
+                let mut claimed_at: Option<String> = None;
+                let mut started_at: Option<Option<String>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "worker_id" => worker_id = Some(map.next_value()?),
+                        "attempt_id" => attempt_id = Some(map.next_value()?),
+                        "phase" => phase = Some(map.next_value()?),
+                        "claimed_at" => claimed_at = Some(map.next_value()?),
+                        "started_at" => started_at = Some(map.next_value()?),
+                        _ => {
+                            return Err(A::Error::custom(
+                                "unexpected field in assignment execution",
+                            ));
+                        }
+                    }
+                }
+                Ok(AssignmentExecution {
+                    worker_id: worker_id.ok_or_else(|| A::Error::missing_field("worker_id"))?,
+                    attempt_id: attempt_id.ok_or_else(|| A::Error::missing_field("attempt_id"))?,
+                    phase: phase.ok_or_else(|| A::Error::missing_field("phase"))?,
+                    claimed_at: claimed_at.ok_or_else(|| A::Error::missing_field("claimed_at"))?,
+                    started_at: started_at.ok_or_else(|| A::Error::missing_field("started_at"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Public execution view returned by claim/start/heartbeat. All fields are
 /// required keys; `started_at` and `execution_deadline` may be explicit null.
 #[derive(Debug, Clone)]
@@ -300,6 +399,26 @@ impl<'de> Deserialize<'de> for ClaimedJob {
     }
 }
 
+/// Successful assignment claim response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssignmentClaimOk {
+    pub ok: bool,
+    pub replayed: bool,
+    pub server_time: String,
+    pub job: ClaimedJob,
+    pub execution: AssignmentExecution,
+}
+
+/// Successful assignment start response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssignmentStartOk {
+    pub ok: bool,
+    pub replayed: bool,
+    pub server_time: String,
+    pub execution: AssignmentExecution,
+}
+
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Successful claim response. Claim always carries `job` and `execution`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaimOk {
@@ -310,6 +429,7 @@ pub struct ClaimOk {
     pub execution: Execution,
 }
 
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Successful start response. Distinct from a heartbeat: start carries the
 /// required `replayed` boolean while a heartbeat does not.
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +440,7 @@ pub struct StartOk {
     pub execution: Execution,
 }
 
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Successful heartbeat response (no `replayed` field on the wire).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatOk {

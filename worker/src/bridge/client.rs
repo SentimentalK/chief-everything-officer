@@ -15,8 +15,9 @@
 
 use crate::bridge::config::ApiKey;
 use crate::bridge::protocol::{
-    ClaimOk, ClaimRequest, ClaimedJob, Execution, HeartbeatOk, IdentityInfo, LeaseOperationRequest,
-    Pending, Phase, StartOk,
+    AssignmentClaimOk, AssignmentClaimRequest, AssignmentExecution, AssignmentStartOk,
+    AssignmentStartRequest, ClaimOk, ClaimRequest, ClaimedJob, Execution, HeartbeatOk,
+    IdentityInfo, LeaseOperationRequest, Pending, Phase, StartOk,
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -37,6 +38,7 @@ const RESOURCE_ID_RE: &str = r"^res-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const WORKSPACE_ALIAS_RE: &str = r"^[A-Za-z0-9_-]{1,64}$";
 const UUID_RE: &str = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
 const WORKER_ID_RE: &str = r"^wrk-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+const CLAIM_TOKEN_RE: &str = r"^[0-9a-f]{64}$";
 const STREAM_ID_RE: &str = r"^([0-9]+)-([0-9]+)$";
 const MIN_TIMEOUT_SECONDS: i64 = 60;
 const MAX_TIMEOUT_SECONDS: i64 = 7200;
@@ -57,19 +59,21 @@ const KNOWN_CODES: &[&str] = &[
     "JOB_EXPIRED",
     "JOB_ALREADY_CLAIMED",
     "JOB_NOT_CLAIMED",
-    "LEASE_MISMATCH",
-    "LEASE_EXPIRED",
+    "ASSIGNMENT_MISMATCH",
     "WORKSPACE_MISMATCH",
 ];
 
-/// Known lease `details.reason` values preserved verbatim; anything else is
+/// Known diagnostic `details.reason` values preserved verbatim; anything else is
 /// dropped (never surfaced).
 const KNOWN_REASONS: &[&str] = &[
-    "EXECUTION_DEADLINE_EXCEEDED",
-    "START_DEADLINE_EXCEEDED",
-    "LEASE_EXPIRED",
     "CORRUPT_RECORD",
+    "CORRUPT_PLACEHOLDER",
     "INCOMPLETE_SUBMISSION",
+    "UNSUPPORTED_SCHEMA_VERSION",
+    "INVALID_SCRIPT_RESPONSE",
+    "INVALID_ARGUMENT",
+    "UNSUPPORTED_OPERATION",
+    "CLOCK_REGRESSION",
 ];
 
 #[derive(Debug)]
@@ -320,6 +324,74 @@ impl BridgeClient {
         Ok(p)
     }
 
+    /// POST /api/worker/jobs/{job}/claim using persistent assignment protocol.
+    pub async fn claim_assignment(
+        &self,
+        job_id: &str,
+        req: &AssignmentClaimRequest,
+    ) -> CResult<AssignmentClaimOk> {
+        if !job_id_ok(job_id) {
+            return Err(ClientError::protocol("invalid job id"));
+        }
+        if !worker_id_ok(&req.worker_id) {
+            return Err(ClientError::protocol("invalid worker id"));
+        }
+        if !uuid_ok(&req.attempt_id) {
+            return Err(ClientError::protocol("invalid attempt id"));
+        }
+        if !workspace_alias_ok(&req.workspace_ref) {
+            return Err(ClientError::protocol("invalid workspace alias"));
+        }
+        if !claim_token_ok(&req.claim_token) {
+            return Err(ClientError::protocol("invalid claim token"));
+        }
+
+        let body = serde_json::to_string(req)
+            .map_err(|_| ClientError::protocol("encode claim request"))?;
+        let path = format!("/api/worker/jobs/{job_id}/claim");
+        let ok: AssignmentClaimOk = self.post_json(&path, body, true).await?;
+        if !ok.ok {
+            return Err(ClientError::write_protocol(
+                "claim response marked ok=false",
+            ));
+        }
+        validate_assignment_claim_ok(&ok, job_id, req).map_err(ClientError::write_protocol)?;
+        Ok(ok)
+    }
+
+    /// POST /api/worker/jobs/{job}/start using persistent assignment protocol.
+    pub async fn start_assignment(
+        &self,
+        job_id: &str,
+        req: &AssignmentStartRequest,
+    ) -> CResult<AssignmentStartOk> {
+        if !job_id_ok(job_id) {
+            return Err(ClientError::protocol("invalid job id"));
+        }
+        if !worker_id_ok(&req.worker_id) {
+            return Err(ClientError::protocol("invalid worker id"));
+        }
+        if !uuid_ok(&req.attempt_id) {
+            return Err(ClientError::protocol("invalid attempt id"));
+        }
+        if !claim_token_ok(&req.claim_token) {
+            return Err(ClientError::protocol("invalid claim token"));
+        }
+
+        let body = serde_json::to_string(req)
+            .map_err(|_| ClientError::protocol("encode start request"))?;
+        let path = format!("/api/worker/jobs/{job_id}/start");
+        let ok: AssignmentStartOk = self.post_json(&path, body, true).await?;
+        if !ok.ok {
+            return Err(ClientError::write_protocol(
+                "start response marked ok=false",
+            ));
+        }
+        validate_assignment_start_ok(&ok, job_id, req).map_err(ClientError::write_protocol)?;
+        Ok(ok)
+    }
+
+    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
     /// POST /api/worker/jobs/{job}/claim (write; outcome unknown on transport
     /// fault or an ambiguous success).
     pub async fn claim(&self, job_id: &str, req: &ClaimRequest) -> CResult<ClaimOk> {
@@ -336,6 +408,7 @@ impl BridgeClient {
         Ok(ok)
     }
 
+    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
     /// POST /api/worker/jobs/{job}/start (write; outcome unknown on transport
     /// fault or an ambiguous success).
     pub async fn start(&self, job_id: &str, req: &LeaseOperationRequest) -> CResult<StartOk> {
@@ -360,6 +433,7 @@ impl BridgeClient {
         Ok(ok)
     }
 
+    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
     /// POST /api/worker/jobs/{job}/heartbeat (write; outcome unknown on
     /// transport fault or an ambiguous success).
     pub async fn heartbeat(
@@ -547,8 +621,7 @@ fn is_confirmed_rejection(status: u16, code: Option<&str>, explicitly_failed: bo
                         | "JOB_ALREADY_CLAIMED"
                         | "IDEMPOTENCY_CONFLICT"
                         | "JOB_NOT_CLAIMED"
-                        | "LEASE_MISMATCH"
-                        | "LEASE_EXPIRED"
+                        | "ASSIGNMENT_MISMATCH"
                         | "WORKSPACE_MISMATCH"
                 )
             )
@@ -574,6 +647,9 @@ fn uuid_ok(s: &str) -> bool {
 }
 fn worker_id_ok(s: &str) -> bool {
     regex_ok(WORKER_ID_RE, s)
+}
+fn claim_token_ok(s: &str) -> bool {
+    regex_ok(CLAIM_TOKEN_RE, s)
 }
 
 fn regex_ok(re: &str, s: &str) -> bool {
@@ -643,6 +719,99 @@ fn validate_pending(p: &Pending, workspace_ref: &str, after: &str) -> Result<(),
     Ok(())
 }
 
+/// Validates a successful persistent assignment Claim response against the request.
+fn validate_assignment_claim_ok(
+    ok: &AssignmentClaimOk,
+    job_id: &str,
+    req: &AssignmentClaimRequest,
+) -> Result<(), String> {
+    let job = &ok.job;
+    if job.job_id != job_id {
+        return Err("response job id does not match request".to_string());
+    }
+    if job.workspace_ref != req.workspace_ref {
+        return Err("response workspace_ref does not match request".to_string());
+    }
+    validate_claimed_job(job)?;
+    let allowed: &[Phase] = if ok.replayed {
+        &[Phase::Claimed, Phase::Running]
+    } else {
+        &[Phase::Claimed]
+    };
+    validate_assignment_execution(
+        &ok.execution,
+        &req.worker_id,
+        &req.attempt_id,
+        &ok.server_time,
+        allowed,
+    )?;
+    Ok(())
+}
+
+/// Validates a successful persistent assignment Start response against the request.
+fn validate_assignment_start_ok(
+    ok: &AssignmentStartOk,
+    _job_id: &str,
+    req: &AssignmentStartRequest,
+) -> Result<(), String> {
+    validate_assignment_execution(
+        &ok.execution,
+        &req.worker_id,
+        &req.attempt_id,
+        &ok.server_time,
+        &[Phase::Running],
+    )?;
+    Ok(())
+}
+
+/// Validates a persistent assignment Execution view against the request.
+fn validate_assignment_execution(
+    exec: &AssignmentExecution,
+    worker_id: &str,
+    attempt_id: &str,
+    server_time: &str,
+    allowed: &[Phase],
+) -> Result<(), String> {
+    if exec.worker_id != worker_id || exec.attempt_id != attempt_id {
+        return Err("response identity mismatch".to_string());
+    }
+    if !worker_id_ok(&exec.worker_id) {
+        return Err("invalid worker id".to_string());
+    }
+    if !uuid_ok(&exec.attempt_id) {
+        return Err("invalid attempt id".to_string());
+    }
+    let phase = match exec.phase.as_str() {
+        "claimed" => Phase::Claimed,
+        "running" => Phase::Running,
+        _ => return Err("invalid execution phase".to_string()),
+    };
+    if !allowed.contains(&phase) {
+        return Err("execution phase not allowed for this operation".to_string());
+    }
+    let claimed = rfc3339(&exec.claimed_at).ok_or("invalid claimed_at")?;
+    let _server = rfc3339(server_time).ok_or("invalid server_time")?;
+    match phase {
+        Phase::Claimed => {
+            if exec.started_at.is_some() {
+                return Err("claimed execution must not have started_at".to_string());
+            }
+        }
+        Phase::Running => {
+            let started_str = exec
+                .started_at
+                .as_deref()
+                .ok_or("running execution missing started_at")?;
+            let started = rfc3339(started_str).ok_or("invalid started_at")?;
+            if started < claimed {
+                return Err("started_at earlier than claimed_at".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Validates a successful Claim response against the request.
 fn validate_claim_ok(ok: &ClaimOk, job_id: &str, req: &ClaimRequest) -> Result<(), String> {
     let job = &ok.job;
@@ -702,6 +871,7 @@ fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     Ok(())
 }
 
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Validates an execution/lease response against the write request. `job` is
 /// Some only for claims (so the execution_deadline == started_at + timeout
 /// equality can be checked). `allowed` restricts the permitted phases for the
@@ -737,6 +907,7 @@ fn validate_lease_ok(
     validate_execution_times(exec, phase, job, server_time)
 }
 
+// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
 /// Time/order invariants (section 2.4), using only parsed response times.
 fn validate_execution_times(
     exec: &Execution,
