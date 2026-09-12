@@ -18,7 +18,7 @@ on:
 
 jobs:
   redis-integration:
-    name: Real-Redis jobs leases integration + auth bridge + restart persistence
+    name: Real-Redis jobs assignments integration + auth bridge + restart persistence
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,7 +72,7 @@ jobs:
       - name: Jobs integration tests (serial, must NOT skip)
         run: |
           cd services/server
-          for f in jobs.redis.test.ts jobs.lease.test.ts jobs.assignment.test.ts jobs.discovery.test.ts jobs.http.test.ts; do
+          for f in jobs.redis.test.ts jobs.assignment.test.ts jobs.discovery.test.ts jobs.http.test.ts; do
             mkdir -p .tmp
             log=".tmp/${f}.log"
             npx vitest run "test/${f}" > "${log}" 2>&1 || { cat "${log}"; exit 1; }
@@ -133,12 +133,10 @@ jobs:
               });
               if (!sub.ok) throw new Error("submit failed: " + JSON.stringify(sub));
               const jobId = sub.view.job_id;
-              const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", lease_token: tok });
+              const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", claim_token: tok });
               if (!c.ok) throw new Error("claim failed: " + JSON.stringify(c));
-              const s = await bridge.service.start(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+              const s = await bridge.service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
               if (!s.ok) throw new Error("start failed: " + JSON.stringify(s));
-              const h = await bridge.service.heartbeat(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
-              if (!h.ok) throw new Error("heartbeat failed: " + JSON.stringify(h));
               const g = await bridge.service.get(scope, { job_id: jobId });
               if (!g.ok || g.view.state !== "running") throw new Error("get failed: " + JSON.stringify(g));
               console.log("Production bridge acceptance PASS state=" + g.view.state);
@@ -147,7 +145,7 @@ jobs:
             }
           '
 
-      - name: Capture pre-restart durable job and execution lease metadata
+      - name: Capture pre-restart durable job and execution assignment metadata
         run: |
           cd services/server
           node --input-type=module -e '
@@ -197,11 +195,10 @@ jobs:
             if (!res.ok) throw new Error("Failed pre-restart submit: " + JSON.stringify(res));
 
             const jobId = res.view.job_id;
-            const claim = await service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", lease_token: tok });
+            const claim = await service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", claim_token: tok });
             if (!claim.ok) throw new Error("pre-restart claim failed: " + JSON.stringify(claim));
-            const start = await service.start(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
+            const start = await service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
             if (!start.ok) throw new Error("pre-restart start failed: " + JSON.stringify(start));
-            await service.heartbeat(scope, jobId, { worker_id: wrk, attempt_id: att, lease_token: tok });
 
             const job = await store.getJob(jobId);
             if (!job) throw new Error("Job not found immediately after submit");
@@ -226,8 +223,6 @@ jobs:
               execution_phase: job.execution && job.execution.phase,
               execution_claimed_at_ms: job.execution && job.execution.claimed_at_ms,
               execution_started_at_ms: job.execution && job.execution.started_at_ms,
-              execution_deadline_ms: job.execution && job.execution.execution_deadline_ms,
-              execution_lease_expires_at_ms: job.execution && job.execution.lease_expires_at_ms,
               stream_length_before: streamLen,
             };
             mkdirSync(".tmp", { recursive: true });
@@ -255,7 +250,7 @@ jobs:
           done
           docker exec ceo-redis-ci-restarted redis-cli -a "${REDIS_PASS}" --no-auth-warning ping
 
-      - name: Verify job, dedupe, stream AND execution lease survived the forced restart
+      - name: Verify job, dedupe, stream AND execution assignment survived the forced restart
         run: |
           cd services/server
           node --input-type=module -e '
@@ -297,7 +292,7 @@ jobs:
             const att = "123e4567-e89b-12d3-a456-4266141740ab";
             const tok = "e".repeat(64);
 
-            // 1. Exact match on persisted job record incl. the execution lease.
+            // 1. Exact match on persisted job record incl. the execution assignment.
             const job = await store.getJob(expected.job_id);
             if (!job) throw new Error("Job missing after restart");
             if (job.job_id !== expected.job_id) throw new Error("job_id mismatch");
@@ -307,22 +302,20 @@ jobs:
             if (job.claim_deadline_ms !== expected.claim_deadline_ms) throw new Error("claim_deadline_ms mismatch");
             if (job.stream_entry_id !== expected.stream_entry_id) throw new Error("stream_entry_id mismatch");
             if (job.status !== "queued") throw new Error("status mismatch: " + job.status);
-            if (!job.execution) throw new Error("execution lease missing after restart");
+            if (!job.execution) throw new Error("execution assignment missing after restart");
             if (job.execution.worker_id !== expected.execution_worker_id) throw new Error("execution.worker_id mismatch");
             if (job.execution.attempt_id !== expected.execution_attempt_id) throw new Error("execution.attempt_id mismatch");
             if (job.execution.phase !== expected.execution_phase) throw new Error("execution.phase mismatch");
             if (job.execution.claimed_at_ms !== expected.execution_claimed_at_ms) throw new Error("execution.claimed_at_ms mismatch");
             if (job.execution.started_at_ms !== expected.execution_started_at_ms) throw new Error("execution.started_at_ms mismatch");
-            if (job.execution.execution_deadline_ms !== expected.execution_deadline_ms) throw new Error("execution.execution_deadline_ms mismatch");
-            if (job.execution.lease_expires_at_ms !== expected.execution_lease_expires_at_ms) throw new Error("execution.lease_expires_at_ms mismatch");
 
-            // 2. get still derives running from the persisted lease.
+            // 2. get still derives running from the persisted assignment.
             const got = await service.get(scope, { job_id: expected.job_id });
             if (!got.ok || got.view.state !== "running") throw new Error("get did not derive running: " + JSON.stringify(got));
 
-            // 3. The original attempt can still heartbeat after the restart.
-            const hb = await service.heartbeat(scope, expected.job_id, { worker_id: wrk, attempt_id: att, lease_token: tok });
-            if (!hb.ok) throw new Error("post-restart heartbeat failed: " + JSON.stringify(hb));
+            // 3. The original attempt can still start after the restart (idempotent replay).
+            const startReplay = await service.start(scope, expected.job_id, { worker_id: wrk, attempt_id: att, claim_token: tok });
+            if (!startReplay.ok || !startReplay.replayed) throw new Error("post-restart start replay failed: " + JSON.stringify(startReplay));
 
             // 4. Dedupe placeholder + replay submit return running (no re-queue).
             const ph = await store.getPlaceholder(scope, expected.request_id);
@@ -346,7 +339,7 @@ jobs:
               throw new Error(`Stream length changed from ${expected.stream_length_before} to ${streamLenAfter}`);
             }
 
-            console.log("Post-restart persistence, execution lease, replay dedupe, and stream invariants verified successfully!");
+            console.log("Post-restart persistence, execution assignment, replay dedupe, and stream invariants verified successfully!");
             } finally {
               await runner.dispose();
             }

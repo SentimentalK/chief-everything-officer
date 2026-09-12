@@ -1,13 +1,13 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import type { JobService, JobAuthScope, JobErrorCode, LeaseResult } from "./service.js";
+import type { JobService, JobAuthScope, JobErrorCode, AssignmentResult } from "./service.js";
 import { JOB_ID_RE, WORKER_ID_RE, ATTEMPT_ID_RE } from "./schema.js";
 
 /**
- * Identity-scoped worker lease HTTP endpoints. Mounted behind
+ * Identity-scoped worker assignment HTTP endpoints. Mounted behind
  * Host -> Origin -> Identity middlewares (order enforced by server.ts); the
  * ownership scope comes ONLY from res.locals.identity, never from the body,
  * query, or any custom identity header. These are client-protocol endpoints,
- * so no MCP tools are added for claim/start/heartbeat.
+ * so no MCP tools are added for claim/start.
  */
 
 const OP_STATUS: Record<string, number> = {
@@ -17,8 +17,7 @@ const OP_STATUS: Record<string, number> = {
   JOB_ALREADY_CLAIMED: 409,
   IDEMPOTENCY_CONFLICT: 409,
   JOB_NOT_CLAIMED: 409,
-  LEASE_MISMATCH: 409,
-  LEASE_EXPIRED: 409,
+  ASSIGNMENT_MISMATCH: 409,
   WORKSPACE_MISMATCH: 409,
   BRIDGE_DISABLED: 503,
   QUEUE_UNAVAILABLE: 503,
@@ -31,7 +30,7 @@ function logLine(fields: Record<string, unknown>): void {
     if (v === undefined || v === null) continue;
     out[k] = v;
   }
-  process.stderr.write(`job-lease ${JSON.stringify(out)}\n`);
+  process.stderr.write(`job-assignment ${JSON.stringify(out)}\n`);
 }
 
 function safeBodyIds(body: unknown): { worker_id: string | null; attempt_id: string | null } {
@@ -66,7 +65,7 @@ function respondError(res: Response, e: Errorish): void {
   res.status(status).json(body);
 }
 
-export function createJobLeaseRouter(service: JobService | null): Router {
+export function createJobAssignmentRouter(service: JobService | null): Router {
   const router = Router();
 
   router.use((_req: Request, res: Response, next: NextFunction) => {
@@ -75,8 +74,8 @@ export function createJobLeaseRouter(service: JobService | null): Router {
   });
 
   const handle = (
-    op: "claim" | "start" | "heartbeat",
-    call: (svc: JobService, scope: JobAuthScope, jobId: string, body: unknown) => Promise<LeaseResult>,
+    op: "claim" | "start",
+    call: (svc: JobService, scope: JobAuthScope, jobId: string, body: unknown) => Promise<AssignmentResult>,
   ) => {
     return async (req: Request, res: Response): Promise<void> => {
       const started = Date.now();
@@ -87,10 +86,10 @@ export function createJobLeaseRouter(service: JobService | null): Router {
       const wsid = scope?.workspace_id ?? null;
       const event = op;
 
-      const finish = (result: LeaseResult | Errorish): void => {
+      const finish = (result: AssignmentResult | Errorish): void => {
         const latencyMs = Date.now() - started;
-        if (typeof (result as LeaseResult).ok === "boolean" && (result as LeaseResult).ok) {
-          const ok = result as Extract<LeaseResult, { ok: true }>;
+        if (typeof (result as AssignmentResult).ok === "boolean" && (result as AssignmentResult).ok) {
+          const ok = result as Extract<AssignmentResult, { ok: true }>;
           logLine({
             event,
             job_id: jobId,
@@ -163,7 +162,6 @@ export function createJobLeaseRouter(service: JobService | null): Router {
 
   router.post("/:job_id/claim", handle("claim", (svc, scope, jobId, body) => svc.claim(scope, jobId, body)));
   router.post("/:job_id/start", handle("start", (svc, scope, jobId, body) => svc.start(scope, jobId, body)));
-  router.post("/:job_id/heartbeat", handle("heartbeat", (svc, scope, jobId, body) => svc.heartbeat(scope, jobId, body)));
 
   router.get("/pending", async (req: Request, res: Response) => {
     const started = Date.now();

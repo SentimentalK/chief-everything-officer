@@ -10,7 +10,7 @@ import {
   JOBS_SCHEMA_VERSION,
   DISCOVERY_PAGE_SIZE,
   type PersistedJobRecord,
-  type JobExecution,
+  type JobAssignment,
 } from "../src/jobs/schema.js";
 
 // Real-Redis task discovery integration (CI-gated; MUST run serially with the
@@ -131,36 +131,20 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     expect(ids).not.toContain(bJob.view!.job_id);
   });
 
-  it("excludes claimed/running/expired/interrupted executions from candidates", async () => {
+  it("excludes claimed/running/expired executions from candidates", async () => {
     await store.resetForTest();
     const q = await serviceA.submit(scopeA, submitBody()); // queued
     const claimed = await serviceA.submit(scopeA, submitBody());
-    await serviceA.claim(scopeA, claimed.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", lease_token: TOKEN });
+    await serviceA.claim(scopeA, claimed.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN });
     const running = await serviceA.submit(scopeA, submitBody());
-    await serviceA.claim(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", lease_token: TOKEN });
-    await serviceA.start(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, lease_token: TOKEN });
+    await serviceA.claim(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN });
+    await serviceA.start(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, claim_token: TOKEN });
 
-    // Expired (no execution, past 7-day claim window) and interrupted (running
-    // whose execution deadline has passed, internally ordered).
+    // Expired (no execution, past 7-day claim window)
     const expired = await serviceA.submit(scopeA, submitBody());
     const exRec = await getRawJob(expired.view!.job_id);
     exRec.claim_deadline_ms = 1_000_000;
     await setJob(exRec);
-    const interrupted = await serviceA.submit(scopeA, submitBody());
-    const now = Date.now();
-    const irRec = await getRawJob(interrupted.view!.job_id);
-    irRec.execution = {
-      worker_id: WRK,
-      attempt_id: ATT1,
-      lease_token_sha256: sha(TOKEN),
-      phase: "running",
-      claimed_at_ms: now - 200_000,
-      start_deadline_ms: now - 200_000 + 300_000,
-      started_at_ms: now - 180_000,
-      execution_deadline_ms: now - 180_000 + 120_000,
-      lease_expires_at_ms: now - 180_000 + 120_000,
-    };
-    await setJob(irRec);
 
     const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
@@ -168,7 +152,6 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     expect(ids).not.toContain(claimed.view!.job_id);
     expect(ids).not.toContain(running.view!.job_id);
     expect(ids).not.toContain(expired.view!.job_id);
-    expect(ids).not.toContain(interrupted.view!.job_id);
   });
 
   it("execution:null is not treated as a queued candidate", async () => {
@@ -176,7 +159,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const good = await serviceA.submit(scopeA, submitBody());
     const bad = await serviceA.submit(scopeA, submitBody());
     const rec = await getRawJob(bad.view!.job_id);
-    rec.execution = null as unknown as JobExecution;
+    rec.execution = null as unknown as JobAssignment;
     await setJob(rec);
     const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
@@ -281,12 +264,12 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
     expect(res.jobs.map((j) => j.job_id)).toEqual([sub.view!.job_id]);
     const results = await Promise.allSettled([
-      serviceA.claim(scopeA, sub.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", lease_token: TOKEN }),
+      serviceA.claim(scopeA, sub.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN }),
       serviceA.claim(scopeA, sub.view!.job_id, {
         worker_id: WRK,
         attempt_id: "123e4567-e89b-12d3-a456-4266141740bb",
         workspace_ref: "tools",
-        lease_token: "b".repeat(64),
+        claim_token: "b".repeat(64),
       }),
     ]);
     const fulfilled = results.filter((r) => r.status === "fulfilled");

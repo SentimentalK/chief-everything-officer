@@ -11,7 +11,7 @@ import { IdentityService } from "./identity/service.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
-import { createJobLeaseRouter } from "./jobs/router.js";
+import { createJobAssignmentRouter } from "./jobs/router.js";
 import { resolveResourceLocation } from "./resource/locator.js";
 
 function fatal(prefix: string, error: unknown): never {
@@ -102,14 +102,14 @@ const jobBridge = openJobBridge({
   return loc !== null;
 });
 
-// Worker execution-lease endpoints: Host -> Origin -> Identity -> router ->
+// Worker assignment endpoints: Host -> Origin -> Identity -> router ->
 // JobService. Identity scope is taken from the authenticated locals only.
 app.use(
   "/api/worker/jobs",
   createHostGuard(config.allowedHosts),
   createOriginGuard(config.allowedOrigins),
   createIdentityAuthMiddleware(identityService),
-  createJobLeaseRouter(jobBridge.service),
+  createJobAssignmentRouter(jobBridge.service),
 );
 
 // MCP handler (dedicated to /mcp)

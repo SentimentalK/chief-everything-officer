@@ -4,8 +4,8 @@ import { rm } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
-import { createJobLeaseRouter } from "../src/jobs/router.js";
-import { JobService, JobError, type LeaseResult } from "../src/jobs/service.js";
+import { createJobAssignmentRouter } from "../src/jobs/router.js";
+import { JobService, JobError, type AssignmentResult } from "../src/jobs/service.js";
 import { RedisJobStore, createRedisRunnerFromClient } from "../src/jobs/redis-store.js";
 import { fixture, createIdentityService } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
@@ -16,7 +16,7 @@ const WRK = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
 const ATT = "123e4567-e89b-12d3-a456-4266141740ab";
 const TOKEN = "c".repeat(64);
 
-const claimBody = () => ({ worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", lease_token: TOKEN });
+const claimBody = () => ({ worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", claim_token: TOKEN });
 
 const cleanupDirs: string[] = [];
 const cleanupServers: HttpServer[] = [];
@@ -34,16 +34,18 @@ afterEach(async () => {
 
 /** Thin test double standing in for the real JobService under test. */
 function stubService(
-  impl: { claim?: (scope: unknown, jobId: string, body: unknown) => Promise<LeaseResult> | LeaseResult; start?: (scope: unknown, jobId: string, body: unknown) => Promise<LeaseResult> | LeaseResult; heartbeat?: (scope: unknown, jobId: string, body: unknown) => Promise<LeaseResult> | LeaseResult },
+  impl: {
+    claim?: (scope: unknown, jobId: string, body: unknown) => Promise<AssignmentResult> | AssignmentResult;
+    start?: (scope: unknown, jobId: string, body: unknown) => Promise<AssignmentResult> | AssignmentResult;
+  },
 ): JobService {
   return {
     claim: async (s, j, b) => (impl.claim ? await impl.claim(s, j, b) : errCode("INVALID_INPUT")),
     start: async (s, j, b) => (impl.start ? await impl.start(s, j, b) : errCode("INVALID_INPUT")),
-    heartbeat: async (s, j, b) => (impl.heartbeat ? await impl.heartbeat(s, j, b) : errCode("INVALID_INPUT")),
   } as unknown as JobService;
 }
 
-function okLease(patch: Record<string, unknown> = {}): LeaseResult {
+function okAssignment(patch: Record<string, unknown> = {}): AssignmentResult {
   return {
     ok: true,
     replayed: false,
@@ -53,10 +55,7 @@ function okLease(patch: Record<string, unknown> = {}): LeaseResult {
       attempt_id: ATT,
       phase: "claimed",
       claimed_at: "2026-09-07T00:00:00.000Z",
-      start_deadline: "2026-09-07T00:05:00.000Z",
       started_at: null,
-      lease_expires_at: "2026-09-07T00:01:30.000Z",
-      execution_deadline: null,
     },
     job: {
       job_id: JOB,
@@ -87,7 +86,7 @@ async function buildServer(service: JobService | null): Promise<{ baseUrl: strin
     createHostGuard(item.config.allowedHosts) as RequestHandler,
     createOriginGuard(item.config.allowedOrigins) as RequestHandler,
     createIdentityAuthMiddleware(identityService) as RequestHandler,
-    createJobLeaseRouter(service) as unknown as RequestHandler,
+    createJobAssignmentRouter(service) as unknown as RequestHandler,
   );
 
   const server = await new Promise<HttpServer>((resolve) => {
@@ -141,14 +140,14 @@ describe("worker lease HTTP authentication", () => {
   });
 });
 
-describe("worker lease HTTP input and routing", () => {
+describe("worker assignment HTTP input and routing", () => {
   it("returns INVALID_INPUT for a malformed job_id in the URL path", async () => {
     let called = false;
     const { baseUrl } = await buildServer(
       stubService({
         claim: async () => {
           called = true;
-          return okLease();
+          return okAssignment();
         },
       }),
     );
@@ -175,17 +174,18 @@ function deadStoreService(): JobService {
   return new JobService({ store: new RedisJobStore(runner) }, () => true);
 }
 
-describe("worker lease HTTP strict input validation (real schema, not a throw-all mock)", () => {
-  // These drive the real workerClaimSchema / workerLeaseOperationSchema through
+describe("worker assignment HTTP strict input validation (real schema, not a throw-all mock)", () => {
+  // These drive the real workerClaimSchema / workerStartSchema through
   // an actual JobService. Because schema rejection happens before any backend
   // access, an invalid body must yield INVALID_INPUT (400) even though the
   // store is never reachable - never a QUEUE_UNAVAILABLE (503).
   const cases: Array<{ name: string; body: Record<string, unknown> }> = [
     { name: "forged user_id (unknown field)", body: { ...claimBody(), user_id: "usr_evil" } },
     { name: "forged workspace_id (unknown field)", body: { ...claimBody(), workspace_id: "ws_evil" } },
-    { name: "missing attempt_id", body: { worker_id: WRK, workspace_ref: "tools", lease_token: TOKEN } },
+    { name: "missing attempt_id", body: { worker_id: WRK, workspace_ref: "tools", claim_token: TOKEN } },
     { name: "malformed worker_id", body: { ...claimBody(), worker_id: "wrk-NOTHEX" } },
-    { name: "malformed lease_token", body: { ...claimBody(), lease_token: "not-hex" } },
+    { name: "malformed claim_token", body: { ...claimBody(), claim_token: "not-hex" } },
+    { name: "legacy lease_token rejected", body: { worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", lease_token: TOKEN } },
     { name: "malformed workspace_ref", body: { ...claimBody(), workspace_ref: "tools/../evil" } },
   ];
   for (const c of cases) {
@@ -206,9 +206,21 @@ describe("worker lease HTTP strict input validation (real schema, not a throw-al
     });
   }
 
-  it("rejects unknown fields on start/heartbeat too (real schema)", async () => {
+  it("rejects unknown fields on start (real schema)", async () => {
     const { baseUrl } = await buildServer(deadStoreService());
-    const body = { worker_id: WRK, attempt_id: ATT, lease_token: TOKEN, lease_duration_ms: 1234 };
+    const body = { worker_id: WRK, attempt_id: ATT, claim_token: TOKEN, lease_duration_ms: 1234 };
+    const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/start`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
+  });
+
+  it("rejects legacy lease_token on start (real schema)", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const body = { worker_id: WRK, attempt_id: ATT, lease_token: TOKEN };
     const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/start`, {
       method: "POST",
       headers: authHeaders(),
@@ -295,13 +307,13 @@ describe("worker discovery HTTP (GET /pending)", () => {
   });
 });
 
-describe("worker lease HTTP success output whitelist + no-store", () => {
+describe("worker assignment HTTP success output whitelist + no-store", () => {
   it("returns claim output that is a strict whitelist (no token/hash/secret extras)", async () => {
-      const secretMarker = "TOP_SECRET_MARKER";
+    const secretMarker = "TOP_SECRET_MARKER";
     const { baseUrl } = await buildServer(
       stubService({
         claim: async () => {
-          const result = okLease();
+          const result = okAssignment();
           (result as unknown as Record<string, unknown>).secret = secretMarker;
           return result;
         },
@@ -323,6 +335,10 @@ describe("worker lease HTTP success output whitelist + no-store", () => {
     // Whitelist: raw token never appears and the injected secret marker is dropped.
     expect(text).not.toContain(TOKEN);
     expect(text).not.toContain(secretMarker);
+    expect(text).not.toContain("claim_token_sha256");
+    expect(text).not.toContain("lease_expires_at");
+    expect(text).not.toContain("start_deadline");
+    expect(text).not.toContain("execution_deadline");
     // Full prompt IS returned for claim (job target), but never the token.
     expect((body.job as Record<string, unknown>).prompt).toBeTruthy();
   });
@@ -330,7 +346,7 @@ describe("worker lease HTTP success output whitelist + no-store", () => {
   it("successful calls log only allow-listed fields, never the token", async () => {
     const { baseUrl } = await buildServer(
       stubService({
-        claim: async () => okLease(),
+        claim: async () => okAssignment(),
       }),
     );
     const lines = await captureStderr(async () => {
@@ -343,21 +359,20 @@ describe("worker lease HTTP success output whitelist + no-store", () => {
     });
     const joined = lines.join("");
     expect(joined).not.toContain(TOKEN);
-    expect(joined).toContain("job-lease");
+    expect(joined).toContain("job-assignment");
     expect(joined).toContain(JOB);
     expect(joined).toContain(WRK);
   });
 });
 
-describe("worker lease HTTP error mapping", () => {
+describe("worker assignment HTTP error mapping", () => {
   const cases: Array<{ code: string; status: number }> = [
     { code: "JOB_NOT_FOUND", status: 404 },
     { code: "JOB_EXPIRED", status: 409 },
     { code: "JOB_ALREADY_CLAIMED", status: 409 },
     { code: "IDEMPOTENCY_CONFLICT", status: 409 },
     { code: "JOB_NOT_CLAIMED", status: 409 },
-    { code: "LEASE_MISMATCH", status: 409 },
-    { code: "LEASE_EXPIRED", status: 409 },
+    { code: "ASSIGNMENT_MISMATCH", status: 409 },
     { code: "WORKSPACE_MISMATCH", status: 409 },
     { code: "QUEUE_UNAVAILABLE", status: 503 },
   ];
@@ -373,7 +388,7 @@ describe("worker lease HTTP error mapping", () => {
       const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/start`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, lease_token: TOKEN }),
+        body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
       });
       expect(res.status).toBe(c.status);
       const body = (await res.json()) as { code: string; message: string };
@@ -401,30 +416,31 @@ describe("worker lease HTTP error mapping", () => {
     expect(body.details?.reason).toBe("CORRUPT_RECORD");
   });
 
-  it("start success carries replayed and heartbeat success omits it", async () => {
+  it("start success carries replayed and phase running", async () => {
     const { baseUrl } = await buildServer(
       stubService({
-        start: async () => okLease({ replayed: true, execution: { ...okLease().execution, phase: "running" } }),
-        heartbeat: async () => okLease(),
+        start: async () =>
+          okAssignment({ replayed: true, execution: { ...okAssignment().execution, phase: "running" } }),
       }),
     );
     const start = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/start`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, lease_token: TOKEN }),
+      body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
     });
     const startBody = (await start.json()) as { replayed: boolean; execution: { phase: string } };
     expect(start.status).toBe(200);
     expect(startBody.replayed).toBe(true);
     expect(startBody.execution.phase).toBe("running");
+  });
 
+  it("heartbeat endpoint returns 404 (removed from router)", async () => {
+    const { baseUrl } = await buildServer(stubService({}));
     const hb = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/heartbeat`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, lease_token: TOKEN }),
+      body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
     });
-    const hbBody = (await hb.json()) as Record<string, unknown>;
-    expect(hb.status).toBe(200);
-    expect("replayed" in hbBody).toBe(false);
+    expect(hb.status).toBe(404);
   });
 });

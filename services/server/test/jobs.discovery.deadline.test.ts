@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { JobService, type JobAuthScope } from "../src/jobs/service.js";
 import type { RedisJobStore } from "../src/jobs/redis-store.js";
-import type {
-  LeaseScriptResult,
-  PersistedJobRecord,
+import {
+  JOBS_SCHEMA_VERSION,
+  type PersistedJobRecord,
 } from "../src/jobs/schema.js";
+import type { AssignmentScriptResult } from "../src/jobs/assignment-schema.js";
 
 // Deterministic unit tests for the discovery page deadline (section 6). They
 // drive the REAL JobService.pending() over a fake store whose per-record I/O
@@ -30,7 +31,7 @@ function makeClock(): FakeClock {
 
 function makeQueued(jobId: string, streamEntryId: string): PersistedJobRecord {
   return {
-    schema_version: 1,
+    schema_version: JOBS_SCHEMA_VERSION,
     job_id: jobId,
     request_id: "123e4567-e89b-12d3-a456-000000000001",
     user_id: scope.user_id,
@@ -50,9 +51,9 @@ function makeQueued(jobId: string, streamEntryId: string): PersistedJobRecord {
 
 interface FakeSource {
   entries: Array<{ id: string; record: PersistedJobRecord }>;
-  /** ms added to the fake clock each time inspect() runs (simulated I/O). */
+  /** ms added to the fake clock each time inspectAssignment() runs (simulated I/O). */
   inspectCostMs: number;
-  /** Optional real delay (ms) injected into inspect() to outlive the deadline. */
+  /** Optional real delay (ms) injected into inspectAssignment() to outlive the deadline. */
   inspectDelayMs?: number;
   reads: number;
   inspects: number;
@@ -61,7 +62,7 @@ interface FakeSource {
 
 /**
  * A store that stands in for the parts of RedisJobStore pending() touches:
- * readiness, XRANGE, and the lease inspect. Each inspect advances the injected
+ * readiness, XRANGE, and the assignment inspect. Each inspect advances the injected
  * clock by `inspectCostMs` (or, when `inspectDelayMs` is set, really sleeps so
  * the outer wall-clock deadline can fire mid-command).
  */
@@ -81,7 +82,7 @@ function fakeStore(src: FakeSource): RedisJobStore {
         },
       }));
     },
-    async inspect(_s: JobAuthScope, jobId: string): Promise<LeaseScriptResult> {
+    async inspectAssignment(_s: JobAuthScope, jobId: string): Promise<AssignmentScriptResult> {
       src.inspects += 1;
       if (src.inspectDelayMs) {
         const { promise, resolve } = Promise.withResolvers<void>();
@@ -99,7 +100,6 @@ function fakeStore(src: FakeSource): RedisJobStore {
         record,
         server_time_ms: Date.now(),
         state: "queued",
-        reason: null,
         replayed: false,
       };
     },

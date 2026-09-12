@@ -1,6 +1,7 @@
 import type { PersistedJobRecord } from "./schema.js";
+import { JOBS_SCHEMA_VERSION } from "./schema.js";
 
-export const ASSIGNMENT_SCHEMA_VERSION = 2 as const;
+export const ASSIGNMENT_SCHEMA_VERSION = JOBS_SCHEMA_VERSION;
 
 export interface JobAssignment {
   worker_id: string;
@@ -11,10 +12,15 @@ export interface JobAssignment {
   started_at_ms: number | null;
 }
 
-export type AssignmentJobRecord = Omit<PersistedJobRecord, "schema_version" | "execution"> & {
-  schema_version: typeof ASSIGNMENT_SCHEMA_VERSION;
-  execution?: JobAssignment;
-};
+export interface ExecutionAssignmentView {
+  worker_id: string;
+  attempt_id: string;
+  phase: "claimed" | "running";
+  claimed_at: string;
+  started_at: string | null;
+}
+
+export type AssignmentJobRecord = PersistedJobRecord;
 
 export type AssignmentState = "queued" | "expired" | "claimed" | "running";
 

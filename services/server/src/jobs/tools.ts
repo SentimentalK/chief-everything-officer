@@ -97,7 +97,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Submit a worker task (queue only)",
       description:
-        "Enqueue a task for the configured worker bridge. A first submission returns state 'queued'; it only enqueues - submission itself does not start the task, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (e.g. claimed/running/interrupted) rather than queuing again. worker_get reflects queue and execution-eligibility state; do not poll intensely. Retry with the same request_id when the submit outcome is unknown.",
+        "Enqueue a task for the configured worker bridge. Submission queues work; it does not require an online Worker, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (which may already be claimed/running) rather than queuing again. worker_get reflects queue and assignment state; do not poll intensely. Retry with the original request_id when the submit outcome is unknown.",
       inputSchema: workerSubmitSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -129,7 +129,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Get worker job status",
       description:
-        "Show queue and execution-eligibility state for a job: derived state (queued/expired/claimed/running/interrupted), created time, the seven-day claim expiry (expires_at, NOT an execution deadline), and the current execution lease when claimed. 'interrupted' only means the server can no longer confirm the current attempt holds execution eligibility - it does NOT confirm a remote process stopped or that the task succeeded/cancelled. The full prompt/acceptance is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
+        "Show queue and assignment state for a job: returns the last recorded state (queued/expired/claimed/running), created time, the seven-day claim expiry (expires_at applies only before the first claim, not as an execution deadline), and the current execution assignment when claimed. Claimed/running is not proof the Worker is currently online. The full prompt/acceptance is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
       inputSchema: workerGetSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },

@@ -6,22 +6,26 @@ import {
   parseSubmit,
   parseJobGet,
   parseClaim,
-  parseLeaseOperation,
+  parseStart,
   parsePendingQuery,
   CLAIM_TTL_MS,
   JOBS_SCHEMA_VERSION,
+  JOB_STREAM_SCHEMA_VERSION,
   DISCOVERY_PAGE_SIZE,
   DISCOVERY_BUDGET_MS,
   JOB_ID_RE,
   type NormalizedSubmit,
   type JobRequest,
   type PersistedJobRecord,
-  type JobExecution,
+  type JobAssignment,
   type JobState,
-  type LeaseScriptResult,
   type PendingJobsResult,
   type PendingJob,
 } from "./schema.js";
+import {
+  type ExecutionAssignmentView,
+  type AssignmentScriptResult,
+} from "./assignment-schema.js";
 import { RedisJobStore } from "./redis-store.js";
 
 /** Trusted, already-authenticated identity. Never accepted from the payload. */
@@ -41,8 +45,7 @@ export type JobErrorCode =
   | "JOB_EXPIRED"
   | "JOB_ALREADY_CLAIMED"
   | "JOB_NOT_CLAIMED"
-  | "LEASE_MISMATCH"
-  | "LEASE_EXPIRED"
+  | "ASSIGNMENT_MISMATCH"
   | "WORKSPACE_MISMATCH";
 
 export class JobError extends Error {
@@ -56,17 +59,7 @@ export class JobError extends Error {
   }
 }
 
-/** Get output execution sub-object (worker_get). No phase; reason on interrupt. */
-export interface ExecutionGetView {
-  worker_id: string;
-  attempt_id: string;
-  claimed_at: string;
-  start_deadline: string;
-  started_at: string | null;
-  lease_expires_at: string;
-  execution_deadline: string | null;
-  reason: string | null;
-}
+export { type ExecutionAssignmentView } from "./assignment-schema.js";
 
 export interface JobView {
   ok: true;
@@ -77,7 +70,7 @@ export interface JobView {
   workspace_ref: string;
   resource_id: string | null;
   replayed: boolean;
-  execution: ExecutionGetView | null;
+  execution: ExecutionAssignmentView | null;
 }
 
 export interface SubmitResult {
@@ -86,18 +79,6 @@ export interface SubmitResult {
   code?: JobErrorCode;
   message?: string;
   details?: Record<string, unknown>;
-}
-
-/** Lease HTTP execution sub-object (claim/start/heartbeat). Includes phase. */
-export interface ExecutionLeaseView {
-  worker_id: string;
-  attempt_id: string;
-  phase: "claimed" | "running";
-  claimed_at: string;
-  start_deadline: string;
-  started_at: string | null;
-  lease_expires_at: string;
-  execution_deadline: string | null;
 }
 
 export interface ClaimJobInfo {
@@ -109,8 +90,8 @@ export interface ClaimJobInfo {
   timeout_seconds: number;
 }
 
-export type LeaseResult =
-  | { ok: true; replayed: boolean; server_time: string; execution: ExecutionLeaseView; job?: ClaimJobInfo }
+export type AssignmentResult =
+  | { ok: true; replayed: boolean; server_time: string; execution: ExecutionAssignmentView; job?: ClaimJobInfo }
   | { ok: false; code?: JobErrorCode; message?: string; reason?: string | null };
 
 export interface JobServiceDeps {
@@ -123,35 +104,18 @@ function iso(ms: number): string {
   return utcIsoFromMs(ms);
 }
 
-function executionGetView(rec: PersistedJobRecord, reason: string | null): ExecutionGetView | null {
-  const ex = rec.execution;
+function executionAssignmentView(ex: JobAssignment | null | undefined): ExecutionAssignmentView | null {
   if (!ex) return null;
-  return {
-    worker_id: ex.worker_id,
-    attempt_id: ex.attempt_id,
-    claimed_at: iso(ex.claimed_at_ms),
-    start_deadline: iso(ex.start_deadline_ms),
-    started_at: ex.started_at_ms == null ? null : iso(ex.started_at_ms),
-    lease_expires_at: iso(ex.lease_expires_at_ms),
-    execution_deadline: ex.execution_deadline_ms == null ? null : iso(ex.execution_deadline_ms),
-    reason,
-  };
-}
-
-function executionLeaseView(ex: JobExecution): ExecutionLeaseView {
   return {
     worker_id: ex.worker_id,
     attempt_id: ex.attempt_id,
     phase: ex.phase,
     claimed_at: iso(ex.claimed_at_ms),
-    start_deadline: iso(ex.start_deadline_ms),
     started_at: ex.started_at_ms == null ? null : iso(ex.started_at_ms),
-    lease_expires_at: iso(ex.lease_expires_at_ms),
-    execution_deadline: ex.execution_deadline_ms == null ? null : iso(ex.execution_deadline_ms),
   };
 }
 
-function viewFromLease(res: Extract<LeaseScriptResult, { ok: true }>, replayed: boolean): JobView {
+function viewFromAssignment(res: Extract<AssignmentScriptResult, { ok: true }>, replayed: boolean): JobView {
   const rec = res.record;
   return {
     ok: true,
@@ -162,17 +126,14 @@ function viewFromLease(res: Extract<LeaseScriptResult, { ok: true }>, replayed: 
     workspace_ref: rec.workspace_ref,
     resource_id: rec.resource_id,
     replayed,
-    execution: executionGetView(rec, res.state === "interrupted" ? res.reason : null),
+    execution: executionAssignmentView(rec.execution),
   };
 }
 
-/** Map a Lua lease error into a JobError with an explicit, stable message. */
-function leaseToError(res: Extract<LeaseScriptResult, { ok: false }>): JobError {
+/** Map a Lua assignment error into a JobError with an explicit, stable message. */
+function assignmentToError(res: Extract<AssignmentScriptResult, { ok: false }>): JobError {
   const code = res.code as JobErrorCode;
   const reason = res.reason;
-  // A specific reason (e.g. EXECUTION_DEADLINE_EXCEEDED, START_DEADLINE_EXCEEDED,
-  // LEASE_EXPIRED, CORRUPT_RECORD, INCOMPLETE_SUBMISSION) is preserved on the
-  // error so HTTP consumers can distinguish why an attempt was rejected.
   const details = reason ? { reason } : {};
   const msg = (m: string) => new JobError(code, m, details);
   switch (code) {
@@ -186,25 +147,26 @@ function leaseToError(res: Extract<LeaseScriptResult, { ok: false }>): JobError 
       return msg("Attempt reused with different credentials.");
     case "JOB_NOT_CLAIMED":
       return msg("Job is not claimed.");
-    case "LEASE_MISMATCH":
+    case "ASSIGNMENT_MISMATCH":
       return msg("Execution credentials do not match.");
-    case "LEASE_EXPIRED":
-      return msg("Execution lease has expired.");
     case "WORKSPACE_MISMATCH":
       return msg("Workspace does not match the job.");
     case "QUEUE_UNAVAILABLE":
-      return msg(incompleteQueueMessage(reason));
+      return msg(queueErrorMessage(reason));
     default:
-      return msg(incompleteQueueMessage(reason));
+      return msg(queueErrorMessage(reason));
   }
 }
 
-function incompleteQueueMessage(reason: string | null): string {
+function queueErrorMessage(reason: string | null): string {
   if (reason === "INCOMPLETE_SUBMISSION") {
     return "This job record is incomplete and not yet queued.";
   }
   if (reason === "CORRUPT_RECORD") {
     return "Queue record is corrupt.";
+  }
+  if (reason === "UNSUPPORTED_SCHEMA_VERSION") {
+    return "Record schema version is not supported; migration is required.";
   }
   return "Queue backend is not available.";
 }
@@ -275,16 +237,16 @@ export class JobService {
     }
   }
 
-  /** Single source of truth for building a JobView: always via the lease inspect. */
+  /** Single source of truth for building a JobView: always via the assignment inspect. */
   private async inspectView(scope: JobAuthScope, jobId: string, replayed: boolean): Promise<JobView> {
-    let res: LeaseScriptResult;
+    let res: AssignmentScriptResult;
     try {
-      res = await this.deps.store.inspect(scope, jobId);
+      res = await this.deps.store.inspectAssignment(scope, jobId);
     } catch (error) {
       throw wrapStore(error);
     }
-    if (!res.ok) throw leaseToError(res);
-    return viewFromLease(res, replayed);
+    if (!res.ok) throw assignmentToError(res);
+    return viewFromAssignment(res, replayed);
   }
 
   async submit(scope: JobAuthScope, raw: unknown): Promise<SubmitResult> {
@@ -445,39 +407,41 @@ export class JobService {
     return { kind: "replay", jobId: rec.job_id };
   }
 
-  /** sha256 hex of the raw lease token (the only form stored/compared). */
-  private static hashLeaseToken(leaseToken: string): string {
-    return createHash("sha256").update(leaseToken, "utf8").digest("hex");
+  /** sha256 hex of the raw claim token (the only form stored/compared). */
+  private static hashClaimToken(claimToken: string): string {
+    return createHash("sha256").update(claimToken, "utf8").digest("hex");
   }
 
-  async claim(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
+  async claim(scope: JobAuthScope, jobId: string, raw: unknown): Promise<AssignmentResult> {
     this.assertSelf(scope);
     const parsed = parseClaim(raw);
     if (!parsed.ok) {
-      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
+      return assignmentErr(parsed.reason as JobErrorCode, parsed.issue);
     }
     const input = parsed.value;
     this.assertAvailable();
-    let res: LeaseScriptResult;
+    let res: AssignmentScriptResult;
     try {
-      res = await this.deps.store.claimLease(scope, jobId, {
+      res = await this.deps.store.claimAssignment(scope, jobId, {
         worker_id: input.worker_id,
         attempt_id: input.attempt_id,
         workspace_ref: input.workspace_ref,
-        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
+        claim_token_sha256: JobService.hashClaimToken(input.claim_token),
       });
     } catch (error) {
       throw wrapStore(error);
     }
-    if (!res.ok) throw leaseToError(res);
+    if (!res.ok) throw assignmentToError(res);
     const ex = res.record.execution;
     if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Claim did not attach an execution record.");
+    const view = executionAssignmentView(ex);
+    if (!view) throw new JobError("QUEUE_UNAVAILABLE", "Claim did not attach an execution record.");
     const rec = res.record;
     return {
       ok: true,
       replayed: res.replayed,
       server_time: iso(res.server_time_ms),
-      execution: executionLeaseView(ex),
+      execution: view,
       job: {
         job_id: rec.job_id,
         workspace_ref: rec.workspace_ref,
@@ -489,68 +453,41 @@ export class JobService {
     };
   }
 
-  async start(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
+  async start(scope: JobAuthScope, jobId: string, raw: unknown): Promise<AssignmentResult> {
     this.assertSelf(scope);
-    const parsed = parseLeaseOperation(raw);
+    const parsed = parseStart(raw);
     if (!parsed.ok) {
-      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
+      return assignmentErr(parsed.reason as JobErrorCode, parsed.issue);
     }
     const input = parsed.value;
     this.assertAvailable();
-    let res: LeaseScriptResult;
+    let res: AssignmentScriptResult;
     try {
-      res = await this.deps.store.startLease(scope, jobId, {
+      res = await this.deps.store.startAssignment(scope, jobId, {
         worker_id: input.worker_id,
         attempt_id: input.attempt_id,
-        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
+        claim_token_sha256: JobService.hashClaimToken(input.claim_token),
       });
     } catch (error) {
       throw wrapStore(error);
     }
-    if (!res.ok) throw leaseToError(res);
+    if (!res.ok) throw assignmentToError(res);
     const ex = res.record.execution;
     if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Start did not produce an execution record.");
+    const view = executionAssignmentView(ex);
+    if (!view) throw new JobError("QUEUE_UNAVAILABLE", "Start did not produce an execution record.");
     return {
       ok: true,
       replayed: res.replayed,
       server_time: iso(res.server_time_ms),
-      execution: executionLeaseView(ex),
-    };
-  }
-
-  async heartbeat(scope: JobAuthScope, jobId: string, raw: unknown): Promise<LeaseResult> {
-    this.assertSelf(scope);
-    const parsed = parseLeaseOperation(raw);
-    if (!parsed.ok) {
-      return leaseErr(parsed.reason as JobErrorCode, parsed.issue);
-    }
-    const input = parsed.value;
-    this.assertAvailable();
-    let res: LeaseScriptResult;
-    try {
-      res = await this.deps.store.heartbeatLease(scope, jobId, {
-        worker_id: input.worker_id,
-        attempt_id: input.attempt_id,
-        lease_token_sha256: JobService.hashLeaseToken(input.lease_token),
-      });
-    } catch (error) {
-      throw wrapStore(error);
-    }
-    if (!res.ok) throw leaseToError(res);
-    const ex = res.record.execution;
-    if (!ex) throw new JobError("QUEUE_UNAVAILABLE", "Heartbeat did not produce an execution record.");
-    return {
-      ok: true,
-      replayed: false,
-      server_time: iso(res.server_time_ms),
-      execution: executionLeaseView(ex),
+      execution: view,
     };
   }
 
   /**
    * Task discovery: read a bounded window of committed stream entries after an
    * exclusive cursor, then return those belonging to THIS identity/workspace_ref
-   * whose authoritative state (via the shared lease inspect, Redis TIME) is
+   * whose authoritative state (via the shared assignment inspect, Redis TIME) is
    * still "queued". Only read-only queries happen; claim ownership is decided
    * later by the atomic claim. Records are never mutated or re-queued.
    *
@@ -609,15 +546,15 @@ export class JobService {
           if (entryUser !== scope.user_id || entryWs !== scope.workspace_id) continue;
         }
         // Owned (or unidentifiable) entry must still be structurally valid.
-        if (f.schema_version !== "1" || typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
+        if (f.schema_version !== String(JOB_STREAM_SCHEMA_VERSION) || typeof jobId !== "string" || !JOB_ID_RE.test(jobId)) {
           diag("ENTRY_MALFORMED", entry.id, typeof jobId === "string" ? jobId : null);
           continue;
         }
         // (3) Before each inspect.
         budget.ensure(`inspect ${jobId}`);
-        let res: LeaseScriptResult;
+        let res: AssignmentScriptResult;
         try {
-          res = await this.deps.store.inspect(scope, jobId);
+          res = await this.deps.store.inspectAssignment(scope, jobId);
         } catch (error) {
           // Transport/timeout is an infrastructure fault -> fail the whole page.
           throw wrapStore(error);
@@ -683,7 +620,7 @@ function err(code: string, message: string): SubmitResult {
   return { ok: false, code: code as JobErrorCode, message };
 }
 
-function leaseErr(code: JobErrorCode, message: string): LeaseResult {
+function assignmentErr(code: JobErrorCode, message: string): AssignmentResult {
   return { ok: false, code, message };
 }
 
