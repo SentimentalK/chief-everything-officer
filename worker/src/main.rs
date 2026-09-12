@@ -1,7 +1,6 @@
 use ceo_worker::bridge::client::BridgeClient;
 use ceo_worker::bridge::config::{load_api_key, BridgeConfig};
 use ceo_worker::bridge::controller::Worker;
-use ceo_worker::bridge::lease::{Clock, SystemBootClock};
 use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
 use ceo_worker::local_state::ExecutionLock;
 use ceo_worker::observability::status::{JobStage, StatusTracker};
@@ -9,7 +8,6 @@ use ceo_worker::runner::{Runner, StopReason};
 use ceo_worker::verifier::BusinessOutcome;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -91,7 +89,7 @@ enum BridgeCmd {
         #[arg(long, default_value = "0-0")]
         after: String,
     },
-    /// Resident worker: claim and run discovered jobs under server leases
+    /// Resident worker: acquire and run discovered jobs under persistent assignments
     Run {
         /// Path to the bridge config JSON file
         #[arg(long)]
@@ -409,7 +407,6 @@ async fn bridge_run(config_path: &Path, workspace_ref: &str) -> i32 {
 
     let worker_cfg = WorkerConfig::from_env();
     let runner = Runner::new(worker_cfg, None);
-    let clock: Arc<dyn Clock> = Arc::new(SystemBootClock);
     let expected = cfg.expected_identity.clone();
     let worker = Worker::new(
         &cfg,
@@ -417,7 +414,6 @@ async fn bridge_run(config_path: &Path, workspace_ref: &str) -> i32 {
         workspace_ref,
         canonical,
         client,
-        clock,
         runner,
         String::new(),
     );

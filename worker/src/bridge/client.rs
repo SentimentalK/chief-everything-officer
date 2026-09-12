@@ -16,8 +16,7 @@
 use crate::bridge::config::ApiKey;
 use crate::bridge::protocol::{
     AssignmentClaimOk, AssignmentClaimRequest, AssignmentExecution, AssignmentStartOk,
-    AssignmentStartRequest, ClaimOk, ClaimRequest, ClaimedJob, Execution, HeartbeatOk,
-    IdentityInfo, LeaseOperationRequest, Pending, Phase, StartOk,
+    AssignmentStartRequest, ClaimedJob, IdentityInfo, Pending, Phase,
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -390,77 +389,6 @@ impl BridgeClient {
         validate_assignment_start_ok(&ok, job_id, req).map_err(ClientError::write_protocol)?;
         Ok(ok)
     }
-
-    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-    /// POST /api/worker/jobs/{job}/claim (write; outcome unknown on transport
-    /// fault or an ambiguous success).
-    pub async fn claim(&self, job_id: &str, req: &ClaimRequest) -> CResult<ClaimOk> {
-        let body = serde_json::to_string(req)
-            .map_err(|_| ClientError::protocol("encode claim request"))?;
-        let path = format!("/api/worker/jobs/{job_id}/claim");
-        let ok: ClaimOk = self.post_json(&path, body, true).await?;
-        if !ok.ok {
-            return Err(ClientError::write_protocol(
-                "claim response marked ok=false",
-            ));
-        }
-        validate_claim_ok(&ok, job_id, req).map_err(ClientError::write_protocol)?;
-        Ok(ok)
-    }
-
-    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-    /// POST /api/worker/jobs/{job}/start (write; outcome unknown on transport
-    /// fault or an ambiguous success).
-    pub async fn start(&self, job_id: &str, req: &LeaseOperationRequest) -> CResult<StartOk> {
-        let body = serde_json::to_string(req)
-            .map_err(|_| ClientError::protocol("encode start request"))?;
-        let path = format!("/api/worker/jobs/{job_id}/start");
-        let ok: StartOk = self.post_json(&path, body, true).await?;
-        if !ok.ok {
-            return Err(ClientError::write_protocol(
-                "start response marked ok=false",
-            ));
-        }
-        validate_lease_ok(
-            &ok.execution,
-            &req.worker_id,
-            &req.attempt_id,
-            None,
-            &[Phase::Running],
-            &ok.server_time,
-        )
-        .map_err(ClientError::write_protocol)?;
-        Ok(ok)
-    }
-
-    // NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-    /// POST /api/worker/jobs/{job}/heartbeat (write; outcome unknown on
-    /// transport fault or an ambiguous success).
-    pub async fn heartbeat(
-        &self,
-        job_id: &str,
-        req: &LeaseOperationRequest,
-    ) -> CResult<HeartbeatOk> {
-        let body = serde_json::to_string(req)
-            .map_err(|_| ClientError::protocol("encode heartbeat request"))?;
-        let path = format!("/api/worker/jobs/{job_id}/heartbeat");
-        let ok: HeartbeatOk = self.post_json(&path, body, true).await?;
-        if !ok.ok {
-            return Err(ClientError::write_protocol(
-                "heartbeat response marked ok=false",
-            ));
-        }
-        validate_lease_ok(
-            &ok.execution,
-            &req.worker_id,
-            &req.attempt_id,
-            None,
-            &[Phase::Claimed, Phase::Running],
-            &ok.server_time,
-        )
-        .map_err(ClientError::write_protocol)?;
-        Ok(ok)
-    }
 }
 
 /// Reads the body with a hard streaming cap (never trusts Content-Length alone).
@@ -811,35 +739,6 @@ fn validate_assignment_execution(
     Ok(())
 }
 
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Validates a successful Claim response against the request.
-fn validate_claim_ok(ok: &ClaimOk, job_id: &str, req: &ClaimRequest) -> Result<(), String> {
-    let job = &ok.job;
-    if job.job_id != job_id {
-        return Err("response job id does not match request".to_string());
-    }
-    if job.workspace_ref != req.workspace_ref {
-        return Err("response workspace_ref does not match request".to_string());
-    }
-    validate_claimed_job(job)?;
-    // A fresh claim must be claimed; an idempotent replay may be claimed or
-    // running (the client may already have started after the original claim).
-    let allowed: &[Phase] = if ok.replayed {
-        &[Phase::Claimed, Phase::Running]
-    } else {
-        &[Phase::Claimed]
-    };
-    validate_lease_ok(
-        &ok.execution,
-        &req.worker_id,
-        &req.attempt_id,
-        Some(job),
-        allowed,
-        &ok.server_time,
-    )?;
-    Ok(())
-}
-
 /// Validates a ClaimedJob's value fields (format/limits/range).
 fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     if !job_id_ok(&job.job_id) {
@@ -867,104 +766,6 @@ fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     }
     if job.timeout_seconds < MIN_TIMEOUT_SECONDS || job.timeout_seconds > MAX_TIMEOUT_SECONDS {
         return Err("timeout_seconds out of range".to_string());
-    }
-    Ok(())
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Validates an execution/lease response against the write request. `job` is
-/// Some only for claims (so the execution_deadline == started_at + timeout
-/// equality can be checked). `allowed` restricts the permitted phases for the
-/// specific operation.
-fn validate_lease_ok(
-    exec: &Execution,
-    worker_id: &str,
-    attempt_id: &str,
-    job: Option<&ClaimedJob>,
-    allowed: &[Phase],
-    server_time: &str,
-) -> Result<(), String> {
-    if exec.worker_id != worker_id {
-        return Err("response identity mismatch".to_string());
-    }
-    if exec.attempt_id != attempt_id {
-        return Err("response identity mismatch".to_string());
-    }
-    if !worker_id_ok(&exec.worker_id) {
-        return Err("invalid worker id".to_string());
-    }
-    if !uuid_ok(&exec.attempt_id) {
-        return Err("invalid attempt id".to_string());
-    }
-    let phase = match exec.phase.as_str() {
-        "claimed" => Phase::Claimed,
-        "running" => Phase::Running,
-        _ => return Err("invalid execution phase".to_string()),
-    };
-    if !allowed.contains(&phase) {
-        return Err("execution phase not allowed for this operation".to_string());
-    }
-    validate_execution_times(exec, phase, job, server_time)
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Time/order invariants (section 2.4), using only parsed response times.
-fn validate_execution_times(
-    exec: &Execution,
-    phase: Phase,
-    job: Option<&ClaimedJob>,
-    server_time: &str,
-) -> Result<(), String> {
-    let claimed = rfc3339(&exec.claimed_at).ok_or("invalid claimed_at")?;
-    let start_deadline = rfc3339(&exec.start_deadline).ok_or("invalid start_deadline")?;
-    let lease = rfc3339(&exec.lease_expires_at).ok_or("invalid lease_expires_at")?;
-    let server = rfc3339(server_time).ok_or("invalid server_time")?;
-    let started = match &exec.started_at {
-        Some(s) => Some(rfc3339(s).ok_or("invalid started_at")?),
-        None => None,
-    };
-    let exec_deadline = match &exec.execution_deadline {
-        Some(s) => Some(rfc3339(s).ok_or("invalid execution_deadline")?),
-        None => None,
-    };
-
-    match phase {
-        Phase::Claimed => {
-            if claimed > lease || lease > start_deadline {
-                return Err("lease time ordering invalid".to_string());
-            }
-            // server_time < lease_expires_at && server_time < start_deadline
-            if server >= lease || server >= start_deadline {
-                return Err("server_time not inside claimed lease window".to_string());
-            }
-            if exec.started_at.is_some() {
-                return Err("claimed execution must not have started_at".to_string());
-            }
-            if exec.execution_deadline.is_some() {
-                return Err("claimed execution must not have execution_deadline".to_string());
-            }
-        }
-        Phase::Running => {
-            let started = started.ok_or("running execution missing started_at")?;
-            let exec_deadline =
-                exec_deadline.ok_or("running execution missing execution_deadline")?;
-            if claimed > started || started > lease || lease > exec_deadline {
-                return Err("lease time ordering invalid".to_string());
-            }
-            if started >= start_deadline {
-                return Err("started_at not before start_deadline".to_string());
-            }
-            // server_time < lease_expires_at && server_time < execution_deadline
-            if server >= lease || server >= exec_deadline {
-                return Err("server_time not inside running lease window".to_string());
-            }
-            if let Some(job) = job {
-                let timeout = chrono::Duration::seconds(job.timeout_seconds);
-                if exec_deadline.signed_duration_since(started) != timeout {
-                    return Err("execution_deadline != started_at + timeout".to_string());
-                }
-            }
-        }
     }
     Ok(())
 }

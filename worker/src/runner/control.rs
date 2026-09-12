@@ -10,27 +10,21 @@
 //!   acknowledged with a per-signal oneshot; the Runner will not advance past
 //!   that gate until its ack arrives.
 //! * controller → Runner: a one-shot [`ExecutionPermit`] (sent exactly once,
-//!   after StartIntent + a successful Server `start`) and a
+//!   after StartIntent + Server start evaluation) and a
 //!   `watch::Receiver<Option<StopReason>>` stop channel.
 //!
 //! If the controller is gone, or either ack/permit channel closes, the Runner
-//! must stop — a closed channel is never treated as implicit approval. The
-//! Runner and the controller share the same boot [`Clock`] so that the Runner's
-//! own deadline checks agree with the controller's lease math.
+//! must stop — a closed channel is never treated as implicit approval.
 
-use crate::bridge::lease::{BootTime, Clock};
 use crate::bridge::state::{ProcessIdentity, SafeStopError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// One-time permission to send the business prompt. Carried from the controller
-/// (which sends it) to the Runner (which receives it). Carries the execution
-/// deadline derived from the Server `start` response.
+/// (which sends it) to the Runner (which receives it).
 #[derive(Debug, Clone, Copy)]
-pub struct ExecutionPermit {
-    pub execution_deadline: BootTime,
-}
+pub struct ExecutionPermit;
 
 /// A progress notification from the Runner that the controller must
 /// acknowledge before the Runner proceeds to the next irreversible step.
@@ -40,7 +34,7 @@ pub enum RunnerSignal {
     /// persist its [`ProcessIdentity`] before the Doctor prompt may be sent.
     ProcessSpawned(ProcessIdentity),
     /// Doctor passed (or a valid cache hit) and local preparation is complete;
-    /// the controller must persist StartIntent, call Server `start`, then send
+    /// the controller must persist StartIntent, evaluate Server start, then send
     /// the [`ExecutionPermit`].
     PreparedForTask,
 }
@@ -51,12 +45,6 @@ pub enum RunnerSignal {
 pub enum StopReason {
     /// SIGINT/SIGTERM: stop claiming and cancel the current execution.
     UserRequested,
-    /// The Server reported the lease expired / a deadline was exceeded. The
-    /// preserved safe reason (e.g. `EXECUTION_DEADLINE_EXCEEDED`) is kept.
-    LeaseExpired { reason: Option<String> },
-    /// A lease-write response could not be confirmed and there is no confirmable
-    /// older lease to keep running on.
-    LeaseUnconfirmed,
     /// The live identity was revoked or no longer matches the binding.
     IdentityRevoked,
     /// A protocol/identity/configuration error is not recoverable by retry.
@@ -76,8 +64,6 @@ impl StopReason {
     pub fn code(&self) -> &'static str {
         match self {
             StopReason::UserRequested => "USER_REQUESTED",
-            StopReason::LeaseExpired { .. } => "LEASE_EXPIRED",
-            StopReason::LeaseUnconfirmed => "LEASE_UNCONFIRMED",
             StopReason::IdentityRevoked => "IDENTITY_REVOKED",
             StopReason::ProtocolError => "PROTOCOL_ERROR",
             StopReason::LocalStateWriteFailed => "LOCAL_STATE_WRITE_FAILED",
@@ -87,12 +73,9 @@ impl StopReason {
         }
     }
 
-    /// Safe reason for the receipt/control record (only LeaseExpired keeps one).
+    /// Safe reason for the receipt/control record.
     pub fn safe_reason(&self) -> Option<String> {
-        match self {
-            StopReason::LeaseExpired { reason } => reason.clone(),
-            _ => None,
-        }
+        None
     }
 
     pub fn as_safe_error(&self) -> SafeStopError {
@@ -133,7 +116,6 @@ pub struct RunnerControls {
     pub permit_rx: Option<oneshot::Receiver<ExecutionPermit>>,
     /// Stop channel (controller sets `Some(reason)` to request a stop).
     pub stop: watch::Receiver<Option<StopReason>>,
-    pub clock: Arc<dyn Clock>,
     /// One-way shared dispatch-intent marker (shared with the controller). The
     /// controller sets it to `true` once it has committed `DispatchIntent`
     /// (business execution is authorized and may have begun). It never resets
@@ -147,15 +129,14 @@ pub struct ControllerHandles {
     pub signals_rx: mpsc::Receiver<(RunnerSignal, oneshot::Sender<()>)>,
     pub permit_tx: oneshot::Sender<ExecutionPermit>,
     pub stop_tx: watch::Sender<Option<StopReason>>,
-    pub clock: Arc<dyn Clock>,
     /// One-way shared dispatch-intent marker; see [`RunnerControls`].
     pub dispatch_intent: Arc<AtomicBool>,
 }
 
-/// Builds the paired Runner/controller channels sharing one boot clock. The
-/// controller must hold onto [`ControllerHandles`]; when it is dropped the
-/// Runner observes closed ack/permit/stop channels and stops.
-pub fn control_channel(clock: Arc<dyn Clock>) -> (RunnerControls, ControllerHandles) {
+/// Builds the paired Runner/controller channels. The controller must hold onto
+/// [`ControllerHandles`]; when it is dropped the Runner observes closed
+/// ack/permit/stop channels and stops.
+pub fn control_channel() -> (RunnerControls, ControllerHandles) {
     let (signals_tx, signals_rx) = mpsc::channel::<(RunnerSignal, oneshot::Sender<()>)>(16);
     let (permit_tx, permit_rx) = oneshot::channel::<ExecutionPermit>();
     let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
@@ -165,14 +146,12 @@ pub fn control_channel(clock: Arc<dyn Clock>) -> (RunnerControls, ControllerHand
             signals: signals_tx,
             permit_rx: Some(permit_rx),
             stop: stop_rx,
-            clock: clock.clone(),
             dispatch_intent: dispatch_intent.clone(),
         },
         ControllerHandles {
             signals_rx,
             permit_tx,
             stop_tx,
-            clock,
             dispatch_intent,
         },
     )
@@ -211,13 +190,6 @@ impl ExecGate {
         }
     }
 
-    fn clock(&self) -> Option<&dyn Clock> {
-        match self {
-            ExecGate::Local => None,
-            ExecGate::Bridge(c) => Some(c.clock.as_ref()),
-        }
-    }
-
     /// Sends a signal and waits for its ack. `Local` is a no-op `Ok(())`. On a
     /// closed channel the Runner must stop.
     pub async fn signal_and_ack(&self, signal: RunnerSignal) -> Result<(), StopReason> {
@@ -236,17 +208,17 @@ impl ExecGate {
         rx.await.map_err(|_| StopReason::ControllerGone)
     }
 
-    /// Awaits the execution permit (Bridge, consumes it) and returns the
-    /// execution deadline, or returns the stop reason if the permit never
-    /// arrives. `Local` returns `None` (no external deadline).
+    /// Awaits the execution permit (Bridge, consumes it), or returns the stop
+    /// reason if the permit never arrives. `Local` returns `Ok(())`.
     ///
     /// While the permit is outstanding, a stop request on the shared watch
     /// channel is observed and aborts the wait. A closed permit channel, or a
     /// stop channel whose senders have all vanished, means the controller is
     /// gone (`ControllerGone`) — a closed channel is never implicit approval.
-    pub async fn await_permit(&mut self) -> Result<Option<BootTime>, StopReason> {
+    /// If stop and permit are simultaneously ready, stop takes priority.
+    pub async fn await_permit(&mut self) -> Result<(), StopReason> {
         let ExecGate::Bridge(c) = self else {
-            return Ok(None);
+            return Ok(());
         };
         let Some(rx) = c.permit_rx.take() else {
             // No outstanding permit to await (already consumed or never wired).
@@ -260,12 +232,7 @@ impl ExecGate {
         let mut permit = rx;
         loop {
             tokio::select! {
-                res = &mut permit => {
-                    return match res {
-                        Ok(p) => Ok(Some(p.execution_deadline)),
-                        Err(_) => Err(StopReason::ControllerGone),
-                    };
-                }
+                biased;
                 changed = stop_rx.changed() => {
                     match changed {
                         Ok(_) => {
@@ -277,25 +244,16 @@ impl ExecGate {
                         Err(_) => return Err(StopReason::ControllerGone),
                     }
                 }
+                res = &mut permit => {
+                    if let Some(stop) = stop_rx.borrow().clone() {
+                        return Err(stop);
+                    }
+                    return match res {
+                        Ok(_) => Ok(()),
+                        Err(_) => Err(StopReason::ControllerGone),
+                    };
+                }
             }
-        }
-    }
-
-    /// Whether execution must stop because the current boot time already passed
-    /// the (external) execution deadline minus the stop margin. A clock fault
-    /// fails closed (stop).
-    pub fn past_execution_stop(&self, execution_deadline: BootTime) -> bool {
-        match self.clock() {
-            Some(clock) => {
-                use crate::bridge::lease::{execution_still_valid, is_past_deadline, STOP_MARGIN};
-                let now = match clock.now_boot() {
-                    Ok(n) => n,
-                    Err(_) => return true, // clock fault -> fail closed (stop)
-                };
-                let stop = execution_deadline.checked_sub(STOP_MARGIN).unwrap_or(now);
-                is_past_deadline(now, stop) || !execution_still_valid(now, execution_deadline)
-            }
-            None => false,
         }
     }
 }

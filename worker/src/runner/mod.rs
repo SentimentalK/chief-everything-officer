@@ -516,7 +516,7 @@ impl Runner {
                         Some(ReceiptError {
                             stage: "execution".to_string(),
                             code: stop_reason.code().to_string(),
-                            message: "execution stopped under lease/control".to_string(),
+                            message: "execution stopped under control policy".to_string(),
                         }),
                         stage,
                     )
@@ -1075,9 +1075,8 @@ impl Runner {
             let mut doctor_turn_finished = false;
             let mut doctor_model_usage = None;
             let mut doctor_stopped: Option<StopReason> = None;
-            let mut doctor_lease_tick =
-                tokio::time::interval(std::time::Duration::from_millis(100));
-            doctor_lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut doctor_stop_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            doctor_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
@@ -1134,7 +1133,7 @@ impl Runner {
                             )
                             .await;
                     }
-                    _ = doctor_lease_tick.tick(), if gate.is_bridge() => {
+                    _ = doctor_stop_tick.tick(), if gate.is_bridge() => {
                         if let Some(stop) = gate.current_stop() {
                             doctor_stopped = Some(stop);
                             break;
@@ -1308,30 +1307,13 @@ impl Runner {
                     .await;
             }
             match gate.await_permit().await {
-                Ok(Some(deadline)) => {
+                Ok(()) => {
                     // Permit granted: the controller committed DispatchIntent
                     // (shared marker set + persisted) before sending the permit.
                     // From here a stop is Unverified, never NotStarted, even if
                     // the business send itself was never observed.
                     finalize_params.dispatch_happened = true;
-                    if gate.past_execution_stop(deadline) {
-                        return self
-                            .finalize_after_teardown(
-                                finalize_params,
-                                AttemptOutcome::Stopped {
-                                    stop_reason: StopReason::LeaseExpired {
-                                        reason: Some("EXECUTION_DEADLINE_EXCEEDED".to_string()),
-                                    },
-                                    dispatched: true,
-                                    executor: executor_info.clone(),
-                                },
-                                &mut child,
-                                &mut drain_handles,
-                            )
-                            .await;
-                    }
                 }
-                Ok(None) => {}
                 Err(stop) => {
                     // Permit never arrived (a stop preceded it). The controller
                     // may still have committed dispatch intent right before it
@@ -1413,8 +1395,8 @@ impl Runner {
         let mut task_turn_finished = false;
         let mut task_authorized_permission_failure = false;
         let mut task_stopped: Option<StopReason> = None;
-        let mut lease_tick = tokio::time::interval(std::time::Duration::from_millis(100));
-        lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut task_stop_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        task_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -1480,7 +1462,7 @@ impl Runner {
                         )
                         .await;
                 }
-                _ = lease_tick.tick(), if gate.is_bridge() => {
+                _ = task_stop_tick.tick(), if gate.is_bridge() => {
                     if let Some(stop) = gate.current_stop() {
                         task_stopped = Some(stop);
                         break;
@@ -2135,11 +2117,8 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn bridge_gated_stop_after_permit_preserves_dispatch_intent() {
-        use crate::bridge::lease::{Clock, ManualClock};
         use crate::config::{ExecutorType, WorkerConfig};
         use crate::runner::control::{control_channel, RunnerSignal};
-        use std::sync::Arc;
-        use std::time::Duration as StdDuration;
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
@@ -2150,7 +2129,6 @@ mod tests {
         config.executor_type = ExecutorType::TestStub;
         config.agent_executable = bin;
 
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
         let job_id = "job-bridge-stop";
         let attempt_id = "attempt-bridge-stop-1";
         let hex64 = "a".repeat(64);
@@ -2169,12 +2147,11 @@ mod tests {
             stop_reason: None,
         };
 
-        let (runner_controls, ctl) = control_channel(clock.clone());
+        let (runner_controls, ctl) = control_channel();
         let crate::runner::control::ControllerHandles {
             mut signals_rx,
             permit_tx,
             stop_tx,
-            clock: _c,
             dispatch_intent,
         } = ctl;
 
@@ -2213,9 +2190,7 @@ mod tests {
         // request a user stop right after.
         dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
         permit_tx
-            .send(crate::runner::control::ExecutionPermit {
-                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
-            })
+            .send(crate::runner::control::ExecutionPermit)
             .unwrap();
         let _ = stop_tx.send(Some(StopReason::UserRequested));
 
@@ -2235,8 +2210,6 @@ mod tests {
             crate::verifier::BusinessOutcome::Unverified
         );
     }
-
-    use crate::bridge::lease::Clock;
     use std::future::Future;
     use std::pin::Pin;
     use std::process::ExitStatus;
@@ -2368,9 +2341,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_until_blocked_write_cancelled_by_stop() {
-        use crate::bridge::lease::ManualClock;
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
-        let (runner_controls, ctl) = control_channel(clock);
+        let (runner_controls, ctl) = control_channel();
         let gate = ExecGate::Bridge(runner_controls);
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -2397,7 +2368,7 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // Pre-stopped gate: must not call underlying send_input_line
-        let (runner_controls_stopped, _) = control_channel(Arc::new(ManualClock::default()));
+        let (runner_controls_stopped, _) = control_channel();
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(Some(StopReason::UserRequested));
         let mut controls_with_stop = runner_controls_stopped;
         controls_with_stop.stop = stop_rx;
@@ -2527,11 +2498,8 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn runner_managed_stop_during_business_stdin_write_cleans_up() {
-        use crate::bridge::lease::{Clock, ManualClock};
         use crate::config::{ExecutorType, WorkerConfig};
         use crate::runner::control::{control_channel, RunnerSignal};
-        use std::sync::Arc;
-        use std::time::Duration as StdDuration;
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
@@ -2596,7 +2564,6 @@ time.sleep(300)
         config.agent_executable = stub_script;
         config.doctor_timeout_secs = 10;
 
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
         let job_id = "job-block-task-stop";
         let attempt_id = "attempt-block-task-stop-1";
         let hex64 = "b".repeat(64);
@@ -2615,12 +2582,11 @@ time.sleep(300)
             stop_reason: None,
         };
 
-        let (runner_controls, ctl) = control_channel(clock.clone());
+        let (runner_controls, ctl) = control_channel();
         let crate::runner::control::ControllerHandles {
             mut signals_rx,
             permit_tx,
             stop_tx,
-            clock: _c,
             dispatch_intent,
         } = ctl;
 
@@ -2659,9 +2625,7 @@ time.sleep(300)
         // Commit dispatch intent and grant permit
         dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
         permit_tx
-            .send(crate::runner::control::ExecutionPermit {
-                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
-            })
+            .send(crate::runner::control::ExecutionPermit)
             .unwrap();
 
         // Give a moment for business stdin write to start and block on pipe
@@ -2686,10 +2650,8 @@ time.sleep(300)
     #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn runner_managed_stop_during_doctor_cleans_up_without_dispatch() {
-        use crate::bridge::lease::{Clock, ManualClock};
         use crate::config::{ExecutorType, WorkerConfig};
         use crate::runner::control::{control_channel, RunnerSignal};
-        use std::sync::Arc;
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
@@ -2700,7 +2662,6 @@ time.sleep(300)
         config.executor_type = ExecutorType::TestStub;
         config.agent_executable = bin;
 
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
         let job_id = "job-doctor-stop";
         let attempt_id = "attempt-doctor-stop-1";
         let hex64 = "c".repeat(64);
@@ -2719,12 +2680,11 @@ time.sleep(300)
             stop_reason: None,
         };
 
-        let (runner_controls, ctl) = control_channel(clock.clone());
+        let (runner_controls, ctl) = control_channel();
         let crate::runner::control::ControllerHandles {
             mut signals_rx,
             permit_tx: _permit,
             stop_tx,
-            clock: _c,
             dispatch_intent: _di,
         } = ctl;
 
@@ -2769,14 +2729,11 @@ time.sleep(300)
     #[allow(clippy::field_reassign_with_default)]
     #[tokio::test]
     async fn bridge_self_reported_verified_maps_to_unverified() {
-        use crate::bridge::lease::{Clock, ManualClock};
         use crate::config::{ExecutorType, WorkerConfig};
         use crate::runner::control::{
             control_channel, ControllerHandles, ExecutionPermit, RunnerSignal,
         };
         use sha2::Digest;
-        use std::sync::Arc;
-        use std::time::Duration as StdDuration;
         use tempfile::tempdir;
 
         let temp = tempdir().unwrap();
@@ -2787,7 +2744,6 @@ time.sleep(300)
         config.executor_type = ExecutorType::TestStub;
         config.agent_executable = bin;
 
-        let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
         let job_id = "job-bridge-verified-map";
         let attempt_id = "attempt-bridge-verified-map-1";
         let hex64 = "d".repeat(64);
@@ -2806,12 +2762,11 @@ time.sleep(300)
             stop_reason: None,
         };
 
-        let (runner_controls, ctl) = control_channel(clock.clone());
+        let (runner_controls, ctl) = control_channel();
         let ControllerHandles {
             mut signals_rx,
             permit_tx,
             stop_tx: _stop_tx,
-            clock: _c,
             dispatch_intent,
         } = ctl;
 
@@ -2850,11 +2805,7 @@ time.sleep(300)
 
         // Commit dispatch intent and grant permit
         dispatch_intent.store(true, std::sync::atomic::Ordering::SeqCst);
-        permit_tx
-            .send(ExecutionPermit {
-                execution_deadline: clock.now_boot().unwrap() + StdDuration::from_secs(300),
-            })
-            .unwrap();
+        permit_tx.send(ExecutionPermit).unwrap();
 
         let receipt = run.await.expect("join run").expect("run result ok");
         assert_eq!(receipt.execution_status, "COMPLETED");

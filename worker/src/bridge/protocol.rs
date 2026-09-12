@@ -15,8 +15,8 @@
 //!     client (see client.rs).
 //!
 //! Nullable-but-required keys (explicit `null` allowed, missing rejected):
-//! `PendingJob.resource_id`, `ClaimedJob.resource_id`, `Execution.started_at`,
-//! `Execution.execution_deadline`.
+//! `PendingJob.resource_id`, `ClaimedJob.resource_id`,
+//! `AssignmentExecution.started_at`.
 
 use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -131,46 +131,6 @@ impl fmt::Debug for AssignmentStartRequest {
     }
 }
 
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ClaimRequest {
-    pub worker_id: String,
-    pub attempt_id: String,
-    pub workspace_ref: String,
-    pub lease_token: String,
-}
-
-// The lease token is a client secret; it must never print. The write-request
-// Debug is redacted so a stray log (or a test unwrap_err) cannot leak it.
-impl fmt::Debug for ClaimRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClaimRequest")
-            .field("worker_id", &self.worker_id)
-            .field("attempt_id", &self.attempt_id)
-            .field("workspace_ref", &self.workspace_ref)
-            .field("lease_token", &"[redacted]")
-            .finish()
-    }
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct LeaseOperationRequest {
-    pub worker_id: String,
-    pub attempt_id: String,
-    pub lease_token: String,
-}
-
-impl fmt::Debug for LeaseOperationRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LeaseOperationRequest")
-            .field("worker_id", &self.worker_id)
-            .field("attempt_id", &self.attempt_id)
-            .field("lease_token", &"[redacted]")
-            .finish()
-    }
-}
-
 /// Execution phase value. Only `claimed`/`running` are valid; the client
 /// validates the wire string into a [`Phase`] during semantic checks so a bad
 /// phase becomes a distinct "invalid execution phase" error (never echoing the
@@ -243,78 +203,6 @@ impl<'de> Deserialize<'de> for AssignmentExecution {
                     phase: phase.ok_or_else(|| A::Error::missing_field("phase"))?,
                     claimed_at: claimed_at.ok_or_else(|| A::Error::missing_field("claimed_at"))?,
                     started_at: started_at.ok_or_else(|| A::Error::missing_field("started_at"))?,
-                })
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Public execution view returned by claim/start/heartbeat. All fields are
-/// required keys; `started_at` and `execution_deadline` may be explicit null.
-#[derive(Debug, Clone)]
-pub struct Execution {
-    pub worker_id: String,
-    pub attempt_id: String,
-    pub phase: String,
-    pub claimed_at: String,
-    pub start_deadline: String,
-    pub started_at: Option<String>,
-    pub lease_expires_at: String,
-    pub execution_deadline: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for Execution {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Execution;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an execution object")
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Execution, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut worker_id: Option<String> = None;
-                let mut attempt_id: Option<String> = None;
-                let mut phase: Option<String> = None;
-                let mut claimed_at: Option<String> = None;
-                let mut start_deadline: Option<String> = None;
-                let mut started_at: Option<Option<String>> = None;
-                let mut lease_expires_at: Option<String> = None;
-                let mut execution_deadline: Option<Option<String>> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "worker_id" => worker_id = Some(map.next_value()?),
-                        "attempt_id" => attempt_id = Some(map.next_value()?),
-                        "phase" => phase = Some(map.next_value()?),
-                        "claimed_at" => claimed_at = Some(map.next_value()?),
-                        "start_deadline" => start_deadline = Some(map.next_value()?),
-                        "started_at" => started_at = Some(map.next_value()?),
-                        "lease_expires_at" => lease_expires_at = Some(map.next_value()?),
-                        "execution_deadline" => execution_deadline = Some(map.next_value()?),
-                        _ => {
-                            let _: IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-                Ok(Execution {
-                    worker_id: worker_id.ok_or_else(|| A::Error::missing_field("worker_id"))?,
-                    attempt_id: attempt_id.ok_or_else(|| A::Error::missing_field("attempt_id"))?,
-                    phase: phase.ok_or_else(|| A::Error::missing_field("phase"))?,
-                    claimed_at: claimed_at.ok_or_else(|| A::Error::missing_field("claimed_at"))?,
-                    start_deadline: start_deadline
-                        .ok_or_else(|| A::Error::missing_field("start_deadline"))?,
-                    started_at: started_at.ok_or_else(|| A::Error::missing_field("started_at"))?,
-                    lease_expires_at: lease_expires_at
-                        .ok_or_else(|| A::Error::missing_field("lease_expires_at"))?,
-                    execution_deadline: execution_deadline
-                        .ok_or_else(|| A::Error::missing_field("execution_deadline"))?,
                 })
             }
         }
@@ -416,37 +304,6 @@ pub struct AssignmentStartOk {
     pub replayed: bool,
     pub server_time: String,
     pub execution: AssignmentExecution,
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Successful claim response. Claim always carries `job` and `execution`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClaimOk {
-    pub ok: bool,
-    pub replayed: bool,
-    pub server_time: String,
-    pub job: ClaimedJob,
-    pub execution: Execution,
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Successful start response. Distinct from a heartbeat: start carries the
-/// required `replayed` boolean while a heartbeat does not.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StartOk {
-    pub ok: bool,
-    pub replayed: bool,
-    pub server_time: String,
-    pub execution: Execution,
-}
-
-// NOTE: Retained temporarily for controller backward compatibility; to be removed in 3.3.
-/// Successful heartbeat response (no `replayed` field on the wire).
-#[derive(Debug, Clone, Deserialize)]
-pub struct HeartbeatOk {
-    pub ok: bool,
-    pub server_time: String,
-    pub execution: Execution,
 }
 
 /// Server business-error envelope (also tolerates the auth middleware's

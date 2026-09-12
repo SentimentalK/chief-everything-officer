@@ -151,15 +151,6 @@ if [ -z "$RECEIPT" ]; then
   echo "execution acceptance: no receipt within timeout"; cat "$E/worker.stderr.log"; cat "$E/worker.stdout.log"; exit 1
 fi
 
-node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-  const job=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
-  if(r.job_id!==job.job_id){console.error("receipt job_id mismatch");process.exit(1)}
-  if(r.execution_status!=="COMPLETED"){console.error("expected COMPLETED, got "+r.execution_status);process.exit(1)}
-  if(!r.bridge_context){console.error("bridge receipt missing bridge_context");process.exit(1)}
-  if(r.bridge_context.worker_id!==""){ /* worker id filled from state at runtime */ }
-  console.log("PASS local receipt", r.job_id, r.execution_status, r.bridge_context.attempt_id);' \
-  "$RECEIPT" "$E/job.json"
-
 # 6) SIGTERM the worker: it must stop cleanly (the current task already done).
 kill -TERM "$WORKER_PID" 2>/dev/null || true
 exited=0
@@ -171,24 +162,95 @@ if [ "$exited" != "1" ]; then
   kill -KILL "$WORKER_PID" 2>/dev/null || true
   echo "execution acceptance: worker did not exit on SIGTERM"; exit 1
 fi
+wait "$WORKER_PID" || true
 echo "PASS worker exited cleanly on SIGTERM"
 
-# 7) Confirm a real claim/start occurred server-side and matches the receipt.
-node -e 'const fs=require("fs");
-  const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-  const log=fs.readFileSync(process.argv[2],"utf8");
-  const srvlog=fs.readFileSync(process.argv[3],"utf8");
-  const job=JSON.parse(fs.readFileSync(process.argv[4],"utf8"));
-  const attempt=r.bridge_context.attempt_id;
-  const worker=r.bridge_context.worker_id;
-  if(!log.includes("local_result_saved")||!log.includes("server_result_reported:false")){
-    console.error("worker stdout missing local_result_saved"); process.exit(1);}
-  if(!srvlog.includes(attempt)){console.error("server log missing attempt "+attempt); process.exit(1);}
-  if(!srvlog.includes("worker_id")){console.error("server log missing worker"); process.exit(1);}
-  if(!srvlog.includes("claim")||!srvlog.includes("start")){console.error("server log missing claim/start"); process.exit(1);}
-  if(worker===""){console.error("receipt worker_id empty"); process.exit(1);}
-  if(!srvlog.includes(worker)){console.error("server worker != receipt worker "+worker); process.exit(1);}
-  console.log("PASS server saw claim/start for attempt "+attempt+" worker "+worker);' \
-  "$RECEIPT" "$E/worker.stdout.log" "$E/logs/server.log" "$E/job.json"
+# 7) Confirm a real claim/start occurred server-side, matches Redis store, and active state cleared.
+cd "$SRV"
+REDIS="$REDIS" SRV="$SRV" RECEIPT="$RECEIPT" JOB="$E/job.json" WLOG="$E/worker.stdout.log" SLOG="$E/logs/server.log" STATE="$E/workspace/tools/.ceo/bridge_state.json" ART="$E/workspace/tools/output_artifact.txt" \
+node --input-type=module -e '
+import { readFileSync, existsSync } from "node:fs";
+import { createClient } from "redis";
+import { pathToFileURL } from "node:url";
+import path from "node:path";
+
+const base = process.env.SRV;
+const storeMod = await import(pathToFileURL(path.join(base, "dist/jobs/redis-store.js")).href);
+const r = JSON.parse(readFileSync(process.env.RECEIPT, "utf8"));
+const job = JSON.parse(readFileSync(process.env.JOB, "utf8"));
+const log = readFileSync(process.env.WLOG, "utf8");
+const srvlog = readFileSync(process.env.SLOG, "utf8");
+
+const attempt = r.bridge_context?.attempt_id;
+const worker = r.bridge_context?.worker_id;
+
+if (r.job_id !== job.job_id) { console.error("receipt job_id mismatch"); process.exit(1); }
+if (r.execution_status !== "COMPLETED") { console.error("expected COMPLETED, got " + r.execution_status); process.exit(1); }
+if (r.business_outcome !== "UNVERIFIED") { console.error("expected UNVERIFIED, got " + r.business_outcome); process.exit(1); }
+if (!attempt) { console.error("receipt missing attempt_id"); process.exit(1); }
+if (!worker) { console.error("receipt missing worker_id"); process.exit(1); }
+
+if (!log.includes("local_result_saved") || !log.includes("server_result_reported:false")) {
+  console.error("worker stdout missing local_result_saved or server_result_reported:false");
+  process.exit(1);
+}
+if (!srvlog.includes(attempt)) { console.error("server log missing attempt " + attempt); process.exit(1); }
+if (!srvlog.includes(worker)) { console.error("server log missing worker " + worker); process.exit(1); }
+if (!srvlog.includes("claim") || !srvlog.includes("start")) { console.error("server log missing claim/start"); process.exit(1); }
+
+// Verify artifact exists and matches receipt
+if (!existsSync(process.env.ART)) { console.error("output artifact missing on disk"); process.exit(1); }
+if (!r.artifacts || r.artifacts.length === 0) { console.error("receipt missing artifacts"); process.exit(1); }
+
+// Verify bridge state: active attempt must be cleared, history recorded
+if (existsSync(process.env.STATE)) {
+  const state = JSON.parse(readFileSync(process.env.STATE, "utf8"));
+  if (state.active !== null && state.active !== undefined) {
+    console.error("bridge active state not cleared: " + JSON.stringify(state.active));
+    process.exit(1);
+  }
+  const hist = state.history?.[job.job_id];
+  if (!hist || hist.attempt_id !== attempt) {
+    console.error("bridge history missing or attempt mismatch: " + JSON.stringify(hist));
+    process.exit(1);
+  }
+}
+
+// Connect to Redis and inspect the actual server JobRecord
+const runner = storeMod.createRedisRunnerFromClient(
+  () => createClient({ url: process.env.REDIS, socket: { reconnectStrategy: false }, disableOfflineQueue: true }),
+  { opTimeoutMs: 2500 }
+);
+const store = new storeMod.RedisJobStore(runner);
+const wait = (ms=8000) => new Promise((res, rej) => {
+  const s = Date.now();
+  (function t(){ if (runner.ready()) return res(); if (Date.now()-s>ms) return rej(new Error("redis not ready")); setTimeout(t,20); })();
+});
+await wait();
+
+const rec = await store.getJob(job.job_id);
+if (!rec) { console.error("job not found in redis: " + job.job_id); process.exit(1); }
+if (!rec.execution) { console.error("job execution record missing in redis"); process.exit(1); }
+
+if (rec.execution.phase !== "running") {
+  console.error("expected redis execution phase to be running, got: " + rec.execution.phase);
+  process.exit(1);
+}
+if (rec.execution.worker_id !== worker) {
+  console.error(`worker_id mismatch: redis=${rec.execution.worker_id} receipt=${worker}`);
+  process.exit(1);
+}
+if (rec.execution.attempt_id !== attempt) {
+  console.error(`attempt_id mismatch: redis=${rec.execution.attempt_id} receipt=${attempt}`);
+  process.exit(1);
+}
+if (typeof rec.execution.started_at_ms !== "number" || rec.execution.started_at_ms <= 0) {
+  console.error("started_at_ms missing or invalid in redis: " + rec.execution.started_at_ms);
+  process.exit(1);
+}
+
+await runner.dispose();
+console.log("PASS redis store verified: phase=running, started_at_ms=" + rec.execution.started_at_ms + ", matching worker=" + worker + ", attempt=" + attempt);
+'
 
 echo "ALL_EXECUTION_ACCEPTANCE_PASS"
