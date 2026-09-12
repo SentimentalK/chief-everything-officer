@@ -383,7 +383,7 @@ impl Worker {
         let mut pages = 0usize;
         let mut consecutive_failures = 0usize;
         loop {
-            if let Some(reason) = stop_rx.borrow().clone() {
+            if let Some(reason) = current_stop_or_closed(stop_rx) {
                 return stop_exit(&reason);
             }
             let page = match self.client.pending(&self.workspace_ref, &cursor).await {
@@ -391,48 +391,47 @@ impl Worker {
                     consecutive_failures = 0;
                     p
                 }
-                Err(e) => match e.kind {
-                    ErrorKind::Unauthorized
-                    | ErrorKind::Forbidden
-                    | ErrorKind::Redirect(_)
-                    | ErrorKind::IdentityMismatch { .. } => {
-                        emit("bridge_stopped", "", "", &self.workspace_ref, "auth");
-                        return 1;
-                    }
-                    ErrorKind::Server { ref code, .. } if code == "BRIDGE_DISABLED" => {
-                        emit(
-                            "bridge_stopped",
-                            "",
-                            "",
-                            &self.workspace_ref,
-                            "bridge_disabled",
-                        );
-                        return 1;
-                    }
-                    ErrorKind::Server { ref code, .. } if code != "QUEUE_UNAVAILABLE" => {
-                        emit("bridge_stopped", "", "", &self.workspace_ref, "protocol");
-                        return 1;
-                    }
-                    _ => {
-                        let delay = claim_backoff(consecutive_failures);
-                        consecutive_failures += 1;
-                        tokio::select! {
-                            biased;
-                            _ = stop_rx.changed() => {
-                                if let Some(reason) = stop_rx.borrow().clone() {
-                                    return stop_exit(&reason);
-                                }
+                Err(e) => {
+                    if !is_retryable_client_error(&e) {
+                        let reason_str = match &e.kind {
+                            ErrorKind::Unauthorized
+                            | ErrorKind::Forbidden
+                            | ErrorKind::Redirect(_)
+                            | ErrorKind::IdentityMismatch { .. } => "auth",
+                            ErrorKind::Server { ref code, .. } if code == "BRIDGE_DISABLED" => {
+                                "bridge_disabled"
                             }
-                            _ = tokio::time::sleep(delay) => {}
-                        }
-                        continue;
+                            ErrorKind::Protocol(_) | ErrorKind::TooLarge => "protocol",
+                            ErrorKind::Server {
+                                ref code,
+                                ref reason,
+                                ..
+                            } if code == "QUEUE_UNAVAILABLE"
+                                && is_integrity_reason(reason.as_deref()) =>
+                            {
+                                "corrupt_record"
+                            }
+                            _ => "fatal",
+                        };
+                        emit("bridge_stopped", "", "", &self.workspace_ref, reason_str);
+                        return 1;
                     }
-                },
+                    let delay = claim_backoff(consecutive_failures);
+                    consecutive_failures += 1;
+                    tokio::select! {
+                        biased;
+                        res = stop_rx.changed() => {
+                            return stop_exit(&read_stop_or_closed(res, stop_rx));
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
             };
 
             if !page.jobs.is_empty() {
                 for job in &page.jobs {
-                    if let Some(reason) = stop_rx.borrow().clone() {
+                    if let Some(reason) = current_stop_or_closed(stop_rx) {
                         return stop_exit(&reason);
                     }
                     if let Err(code) = self.acquire_and_run(state, &job.job_id, stop_rx).await {
@@ -447,10 +446,8 @@ impl Worker {
                 if pages >= 4 {
                     tokio::select! {
                         biased;
-                        _ = stop_rx.changed() => {
-                            if let Some(reason) = stop_rx.borrow().clone() {
-                                return stop_exit(&reason);
-                            }
+                        res = stop_rx.changed() => {
+                            return stop_exit(&read_stop_or_closed(res, stop_rx));
                         }
                         _ = tokio::time::sleep(PAGE_PAUSE) => {}
                     }
@@ -459,10 +456,8 @@ impl Worker {
             } else {
                 tokio::select! {
                     biased;
-                    _ = stop_rx.changed() => {
-                        if let Some(reason) = stop_rx.borrow().clone() {
-                            return stop_exit(&reason);
-                        }
+                    res = stop_rx.changed() => {
+                        return stop_exit(&read_stop_or_closed(res, stop_rx));
                     }
                     _ = tokio::time::sleep(TAIL_POLL) => {}
                 }
@@ -491,7 +486,7 @@ impl Worker {
 
         let mut consecutive_failures = 0usize;
         loop {
-            if let Some(reason) = stop_rx.borrow().clone() {
+            if let Some(reason) = current_stop_or_closed(stop_rx) {
                 return Err(stop_exit(&reason));
             }
 
@@ -531,10 +526,8 @@ impl Worker {
                         consecutive_failures += 1;
                         tokio::select! {
                             biased;
-                            _ = stop_rx.changed() => {
-                                if let Some(reason) = stop_rx.borrow().clone() {
-                                    return Err(stop_exit(&reason));
-                                }
+                            res = stop_rx.changed() => {
+                                return Err(stop_exit(&read_stop_or_closed(res, stop_rx)));
                             }
                             _ = tokio::time::sleep(delay) => {}
                         }
@@ -611,7 +604,7 @@ impl Worker {
             }
         };
 
-        let receipt = self
+        let (receipt, local_write_failed) = self
             .run_managed_attempt(state, &job_id, &attempt_id, &active, &prompt_path, stop_rx)
             .await?;
 
@@ -619,19 +612,21 @@ impl Worker {
         // daemon does next. An unconfirmed stop means the process may still be
         // running: never finalize or clear that attempt — keep it for recovery.
         let disposition = classify_disposition(&receipt);
-        if disposition == AttemptDisposition::KeepActiveRecovery {
+        if local_write_failed || disposition == AttemptDisposition::KeepActiveRecovery {
             emit(
                 "recovery_required",
                 &job_id,
                 &attempt_id,
                 &self.workspace_ref,
-                "stop_unconfirmed",
+                if local_write_failed {
+                    "local_state_write_failed"
+                } else {
+                    "stop_unconfirmed"
+                },
             );
             let a = state.active.as_mut().unwrap();
             a.phase = LocalPhase::RecoveryRequired;
-            if state.persist(&self.workspace).is_err() {
-                return Err(1);
-            }
+            let _ = state.persist(&self.workspace);
             return Err(1);
         }
 
@@ -690,7 +685,7 @@ impl Worker {
         active: &ActiveAttempt,
         prompt_path: &Path,
         stop_rx: &mut watch::Receiver<Option<StopReason>>,
-    ) -> Result<TaskReceipt, i32> {
+    ) -> Result<(TaskReceipt, bool), i32> {
         {
             let a = state.active.as_mut().unwrap();
             a.phase = LocalPhase::RunnerIntent;
@@ -749,6 +744,7 @@ impl Worker {
         let mut pending_start: Option<BoxFuture<'static, Result<AssignmentStartOk, ClientError>>> =
             None;
         let mut stopping: Option<StopReason> = None;
+        let mut local_write_failed = false;
 
         loop {
             // One-way stop: revoke the permit, request stop, then drop the
@@ -760,7 +756,8 @@ impl Worker {
                 let _ = stop_tx.send(Some(reason));
                 drop(stop_tx);
                 drop(signals_rx);
-                return self.collect_receipt(handle.await).await;
+                let receipt = self.collect_receipt(handle.await).await?;
+                return Ok((receipt, local_write_failed));
             }
 
             let start_fut = async {
@@ -772,18 +769,19 @@ impl Worker {
 
             let arm = tokio::select! {
                 biased;
-                _ = stop_rx.changed() => Arm::ExternalStop,
+                res = stop_rx.changed() => Arm::ExternalStop(read_stop_or_closed(res, stop_rx)),
                 sig = signals_rx.recv() => Arm::Signal(sig),
                 res = start_fut => Arm::StartDone(res),
                 res = &mut handle => Arm::Done(Box::new(res)),
             };
 
             match arm {
-                Arm::Done(res) => return self.collect_receipt(*res).await,
-                Arm::ExternalStop => {
-                    if let Some(reason) = stop_rx.borrow().clone() {
-                        stopping = Some(reason);
-                    }
+                Arm::Done(res) => {
+                    let receipt = self.collect_receipt(*res).await?;
+                    return Ok((receipt, local_write_failed));
+                }
+                Arm::ExternalStop(reason) => {
+                    stopping = Some(reason);
                 }
                 Arm::Signal(sig) => match sig {
                     Some((RunnerSignal::ProcessSpawned(identity), ack)) => {
@@ -791,13 +789,16 @@ impl Worker {
                         a.process = Some(identity);
                         a.runner_boot_id = state::current_boot_id();
                         if state.persist(&self.workspace).is_err() {
+                            local_write_failed = true;
+                            let _ = stop_tx.send(Some(StopReason::LocalStateWriteFailed));
                             stopping = Some(StopReason::LocalStateWriteFailed);
+                            drop(ack);
                             continue;
                         }
                         let _ = ack.send(());
                     }
                     Some((RunnerSignal::PreparedForTask, ack)) => {
-                        if let Some(reason) = stop_rx.borrow().clone() {
+                        if let Some(reason) = current_stop_or_closed(stop_rx) {
                             stopping = Some(reason);
                             continue;
                         }
@@ -805,7 +806,10 @@ impl Worker {
                         let a = state.active.as_mut().unwrap();
                         a.phase = LocalPhase::StartIntent;
                         if state.persist(&self.workspace).is_err() {
+                            local_write_failed = true;
+                            let _ = stop_tx.send(Some(StopReason::LocalStateWriteFailed));
                             stopping = Some(StopReason::LocalStateWriteFailed);
+                            drop(ack);
                             continue;
                         }
                         let _ = ack.send(());
@@ -825,7 +829,8 @@ impl Worker {
                         }));
                     }
                     None => {
-                        return self.collect_receipt(handle.await).await;
+                        let receipt = self.collect_receipt(handle.await).await?;
+                        return Ok((receipt, local_write_failed));
                     }
                 },
                 Arm::StartDone(res) => {
@@ -847,7 +852,9 @@ impl Worker {
                                 &dispatch_intent,
                                 &mut permit_tx,
                                 stop_rx,
+                                &stop_tx,
                                 &mut stopping,
+                                &mut local_write_failed,
                             );
                         }
                         StartEvaluation::Dispatch => {
@@ -856,7 +863,9 @@ impl Worker {
                                 &dispatch_intent,
                                 &mut permit_tx,
                                 stop_rx,
+                                &stop_tx,
                                 &mut stopping,
+                                &mut local_write_failed,
                             );
                         }
                     }
@@ -865,15 +874,18 @@ impl Worker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_permit(
         &self,
         state: &mut BridgeState,
         dispatch_intent: &std::sync::atomic::AtomicBool,
         permit_tx: &mut Option<oneshot::Sender<crate::runner::control::ExecutionPermit>>,
         stop_rx: &watch::Receiver<Option<StopReason>>,
+        stop_tx: &watch::Sender<Option<StopReason>>,
         stopping: &mut Option<StopReason>,
+        local_write_failed: &mut bool,
     ) {
-        if let Some(reason) = stop_rx.borrow().clone() {
+        if let Some(reason) = current_stop_or_closed(stop_rx) {
             *stopping = Some(reason);
             return;
         }
@@ -885,6 +897,8 @@ impl Worker {
         a.phase = LocalPhase::DispatchIntent;
         a.task_dispatch_intent = true;
         if state.persist(&self.workspace).is_err() {
+            *local_write_failed = true;
+            let _ = stop_tx.send(Some(StopReason::LocalStateWriteFailed));
             *stopping = Some(StopReason::LocalStateWriteFailed);
             return;
         }
@@ -912,7 +926,7 @@ impl Worker {
 }
 
 enum Arm {
-    ExternalStop,
+    ExternalStop(StopReason),
     Signal(Option<(RunnerSignal, oneshot::Sender<()>)>),
     StartDone(Result<AssignmentStartOk, ClientError>),
     Done(Box<Result<Result<TaskReceipt, RunnerError>, tokio::task::JoinError>>),
@@ -920,6 +934,28 @@ enum Arm {
 
 fn attempt_dir_for(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf {
     crate::config::attempt_dir(workspace, job_id, attempt_id)
+}
+
+fn current_stop_or_closed(stop_rx: &watch::Receiver<Option<StopReason>>) -> Option<StopReason> {
+    if let Some(reason) = stop_rx.borrow().clone() {
+        return Some(reason);
+    }
+    if stop_rx.has_changed().is_err() {
+        return Some(StopReason::ControllerGone);
+    }
+    None
+}
+
+fn read_stop_or_closed(
+    res: Result<(), tokio::sync::watch::error::RecvError>,
+    stop_rx: &watch::Receiver<Option<StopReason>>,
+) -> StopReason {
+    match res {
+        Ok(()) | Err(_) => stop_rx
+            .borrow()
+            .clone()
+            .unwrap_or(StopReason::ControllerGone),
+    }
 }
 
 fn stop_exit(reason: &StopReason) -> i32 {
@@ -1620,5 +1656,121 @@ accept b";
             classify_disposition(&blocked_receipt),
             AttemptDisposition::StopDaemon
         );
+    }
+
+    #[tokio::test]
+    async fn test_signal_and_ack_preserves_published_stop_reason_on_ack_drop() {
+        let (controls, ctl) = control_channel();
+        let gate = crate::runner::control::ExecGate::Bridge(controls);
+
+        let mut signals_rx = ctl.signals_rx;
+        let stop_tx = ctl.stop_tx.clone();
+        let waiter = tokio::spawn(async move {
+            let (_sig, ack) = signals_rx.recv().await.unwrap();
+            let _ = stop_tx.send(Some(StopReason::LocalStateWriteFailed));
+            drop(ack); // Simulates persistence failure dropping ack
+        });
+
+        let res = gate.signal_and_ack(RunnerSignal::PreparedForTask).await;
+        assert_eq!(res, Err(StopReason::LocalStateWriteFailed));
+        waiter.await.unwrap();
+
+        // 2. When no stop reason is set, dropping ack returns ControllerGone
+        let (controls2, ctl2) = control_channel();
+        let gate2 = crate::runner::control::ExecGate::Bridge(controls2);
+        let mut signals_rx2 = ctl2.signals_rx;
+        let waiter2 = tokio::spawn(async move {
+            let (_sig, ack) = signals_rx2.recv().await.unwrap();
+            drop(ack);
+        });
+
+        let res2 = gate2.signal_and_ack(RunnerSignal::PreparedForTask).await;
+        assert_eq!(res2, Err(StopReason::ControllerGone));
+        waiter2.await.unwrap();
+    }
+
+    #[test]
+    fn test_retryable_client_error_classification() {
+        // Transport errors are retryable
+        let transport_err = ClientError {
+            kind: ErrorKind::Transport("connection reset".to_string()),
+            outcome_unknown: false,
+        };
+        assert!(is_retryable_client_error(&transport_err));
+
+        // QUEUE_UNAVAILABLE without integrity reason is retryable
+        let queue_unavail = ClientError {
+            kind: ErrorKind::Server {
+                status: 503,
+                code: "QUEUE_UNAVAILABLE".to_string(),
+                reason: None,
+            },
+            outcome_unknown: false,
+        };
+        assert!(is_retryable_client_error(&queue_unavail));
+
+        let queue_transient = ClientError {
+            kind: ErrorKind::Server {
+                status: 503,
+                code: "QUEUE_UNAVAILABLE".to_string(),
+                reason: Some("REDIS_TIMEOUT".to_string()),
+            },
+            outcome_unknown: false,
+        };
+        assert!(is_retryable_client_error(&queue_transient));
+
+        // Protocol, TooLarge, and QUEUE_UNAVAILABLE with integrity reason are NOT retryable
+        let proto_err = ClientError {
+            kind: ErrorKind::Protocol("unexpected json".to_string()),
+            outcome_unknown: false,
+        };
+        assert!(!is_retryable_client_error(&proto_err));
+
+        let too_large_err = ClientError {
+            kind: ErrorKind::TooLarge,
+            outcome_unknown: false,
+        };
+        assert!(!is_retryable_client_error(&too_large_err));
+
+        let corrupt_err = ClientError {
+            kind: ErrorKind::Server {
+                status: 503,
+                code: "QUEUE_UNAVAILABLE".to_string(),
+                reason: Some("CORRUPT_RECORD".to_string()),
+            },
+            outcome_unknown: false,
+        };
+        assert!(!is_retryable_client_error(&corrupt_err));
+
+        let invalid_arg_err = ClientError {
+            kind: ErrorKind::Server {
+                status: 503,
+                code: "QUEUE_UNAVAILABLE".to_string(),
+                reason: Some("INVALID_ARGUMENT".to_string()),
+            },
+            outcome_unknown: false,
+        };
+        assert!(!is_retryable_client_error(&invalid_arg_err));
+    }
+
+    #[tokio::test]
+    async fn test_stop_channel_closed_handling() {
+        let (stop_tx, stop_rx) = watch::channel(None);
+        assert_eq!(current_stop_or_closed(&stop_rx), None);
+
+        // Sender drop produces ControllerGone
+        drop(stop_tx);
+        assert_eq!(
+            current_stop_or_closed(&stop_rx),
+            Some(StopReason::ControllerGone)
+        );
+
+        // An error on changed() translates to ControllerGone
+        let (stop_tx2, mut stop_rx2) = watch::channel(None);
+        drop(stop_tx2);
+        let err = stop_rx2.changed().await;
+        assert!(err.is_err());
+        let read = read_stop_or_closed(err, &stop_rx2);
+        assert_eq!(read, StopReason::ControllerGone);
     }
 }

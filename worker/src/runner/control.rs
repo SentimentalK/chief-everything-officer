@@ -201,11 +201,18 @@ impl ExecGate {
             return Err(stop);
         }
         let (tx, rx) = oneshot::channel::<()>();
-        c.signals
-            .send((signal, tx))
-            .await
-            .map_err(|_| StopReason::ControllerGone)?;
-        rx.await.map_err(|_| StopReason::ControllerGone)
+        c.signals.send((signal, tx)).await.map_err(|_| {
+            c.stop
+                .borrow()
+                .clone()
+                .unwrap_or(StopReason::ControllerGone)
+        })?;
+        rx.await.map_err(|_| {
+            c.stop
+                .borrow()
+                .clone()
+                .unwrap_or(StopReason::ControllerGone)
+        })
     }
 
     /// Awaits the execution permit (Bridge, consumes it), or returns the stop
