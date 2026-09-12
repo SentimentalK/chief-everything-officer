@@ -132,23 +132,38 @@ node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.arg
   fs.writeFileSync(process.argv[1].replace(/ids\.json$/,"bridge.json"), JSON.stringify(cfg,null,2));' \
   "$E/ids.json" "$E/workspace/tools" "$PORT"
 
+# Workspace path comes from the same bridge.json the worker loaded.
+WS="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(!c.workspaces||!c.workspaces.tools){process.stderr.write("bridge.json missing workspaces.tools\n"); process.exit(1)} process.stdout.write(c.workspaces.tools)' "$E/bridge.json")"
+
 # 5) Run the resident worker against the real server using the hermetic agent.
-cd "$E/workspace/tools"
-env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$E/workspace/tools" \
+cd "$WS"
+env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
   "$WRK" bridge run --config "$E/bridge.json" --workspace-ref tools \
   > "$E/worker.stdout.log" 2> "$E/worker.stderr.log" &
 WORKER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
-# Wait up to 60s for a final receipt to be saved locally.
+# Wait up to 60s for local completion: receipt, history, and cleared active.
 RECEIPT=""
+JOB_ID="$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).job_id)' "$E/job.json")"
 for i in $(seq 1 200); do
-  RECEIPT=$(find "$E/workspace/tools/.ceo/jobs" -name receipt.json 2>/dev/null | head -1 || true)
-  if [ -n "$RECEIPT" ]; then break; fi
+  RECEIPT=$(find "$WS/.ceo/jobs" -name receipt.json 2>/dev/null | head -1 || true)
+  if [ -n "$RECEIPT" ]; then
+    ATTEMPT="$(node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const a=r.bridge_context&&r.bridge_context.attempt_id; if(!a){process.exit(2)} process.stdout.write(a)' "$RECEIPT" || true)"
+    if [ -n "${ATTEMPT:-}" ] && [ -f "$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json" ]; then
+      ACTIVE="$(node -e 'const fs=require("fs"); const p=process.argv[1]; if(!fs.existsSync(p)){process.exit(2)} const s=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(s.active===null||s.active===undefined?"null":"set")' "$WS/.ceo/bridge/state.json" || true)"
+      if [ "$ACTIVE" = "null" ]; then
+        break
+      fi
+    fi
+  fi
   sleep 0.3
 done
-if [ -z "$RECEIPT" ]; then
-  echo "execution acceptance: no receipt within timeout"; cat "$E/worker.stderr.log"; cat "$E/worker.stdout.log"; exit 1
+if [ -z "$RECEIPT" ] || [ -z "${ATTEMPT:-}" ] || [ ! -f "$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json" ] || [ "${ACTIVE:-}" != "null" ]; then
+  echo "execution acceptance: receipt/history/cleared-active not ready within timeout"
+  cat "$E/worker.stderr.log"
+  cat "$E/worker.stdout.log"
+  exit 1
 fi
 
 # 6) SIGTERM the worker: it must stop cleanly (the current task already done).
@@ -162,15 +177,21 @@ if [ "$exited" != "1" ]; then
   kill -KILL "$WORKER_PID" 2>/dev/null || true
   echo "execution acceptance: worker did not exit on SIGTERM"; exit 1
 fi
+set +e
 wait "$WORKER_PID"
+worker_ec=$?
+set -e
+if [ "$worker_ec" != "0" ]; then
+  echo "execution acceptance: worker exited $worker_ec"
+  cat "$E/worker.stderr.log"
+  exit 1
+fi
 echo "PASS worker exited cleanly on SIGTERM"
 
 # 7) Confirm a real claim/start occurred server-side, matches Redis store, and active state cleared.
 cd "$SRV"
 REDIS="$REDIS" SRV="$SRV" RECEIPT="$RECEIPT" JOB="$E/job.json" WLOG="$E/worker.stdout.log" SLOG="$E/logs/server.log" \
-  STATE="$E/workspace/tools/.ceo/bridge/state.json" \
-  HIST_DIR="$E/workspace/tools/.ceo/bridge/history" \
-  ART="$E/workspace/tools/output_artifact.txt" \
+  BRIDGE="$E/bridge.json" \
 node --input-type=module -e '
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -180,7 +201,14 @@ import path from "node:path";
 
 const base = process.env.SRV;
 const storeMod = await import(pathToFileURL(path.join(base, "dist/jobs/redis-store.js")).href);
-const r = JSON.parse(readFileSync(process.env.RECEIPT, "utf8"));
+const bridge = JSON.parse(readFileSync(process.env.BRIDGE, "utf8"));
+const ws = bridge.workspaces && bridge.workspaces.tools;
+if (!ws) { console.error("bridge.json missing workspaces.tools"); process.exit(1); }
+const statePath = path.join(ws, ".ceo", "bridge", "state.json");
+const histDir = path.join(ws, ".ceo", "bridge", "history");
+const artPath = path.join(ws, "output_artifact.txt");
+const receiptBytes = readFileSync(process.env.RECEIPT);
+const r = JSON.parse(receiptBytes);
 const job = JSON.parse(readFileSync(process.env.JOB, "utf8"));
 const log = readFileSync(process.env.WLOG, "utf8");
 const srvlog = readFileSync(process.env.SLOG, "utf8");
@@ -203,55 +231,56 @@ if (!srvlog.includes(worker)) { console.error("server log missing worker " + wor
 if (!srvlog.includes("claim") || !srvlog.includes("start")) { console.error("server log missing claim/start"); process.exit(1); }
 
 // Verify artifact exists and matches receipt
-if (!existsSync(process.env.ART)) { console.error("output artifact missing on disk"); process.exit(1); }
-const artBytes = readFileSync(process.env.ART);
-const artStat = statSync(process.env.ART);
+if (!existsSync(artPath)) { console.error("output artifact missing on disk"); process.exit(1); }
+const artBytes = readFileSync(artPath);
+const artStat = statSync(artPath);
 const artSha = createHash("sha256").update(artBytes).digest("hex");
 
 if (!Array.isArray(r.artifacts) || r.artifacts.length === 0) { console.error("receipt missing artifacts"); process.exit(1); }
 const artClaim = r.artifacts.find(a => a.path === "output_artifact.txt");
-if (!artClaim) { console.error("receipt missing output_artifact.txt claim: " + JSON.stringify(r.artifacts)); process.exit(1); }
+if (!artClaim) { console.error("receipt missing output_artifact.txt claim"); process.exit(1); }
 if (artClaim.size_bytes !== artStat.size) {
-  console.error(`artifact size mismatch: claim=${artClaim.size_bytes} disk=${artStat.size}`);
+  console.error("artifact size mismatch");
   process.exit(1);
 }
 if (artClaim.sha256 !== artSha) {
-  console.error(`artifact sha256 mismatch: claim=${artClaim.sha256} disk=${artSha}`);
+  console.error("artifact sha256 mismatch");
   process.exit(1);
 }
 
 // Verify bridge state: active attempt must be cleared
-if (!existsSync(process.env.STATE)) {
-  console.error("bridge state.json missing on disk: " + process.env.STATE);
+if (!existsSync(statePath)) {
+  console.error("bridge state.json missing on disk");
   process.exit(1);
 }
-const state = JSON.parse(readFileSync(process.env.STATE, "utf8"));
+const state = JSON.parse(readFileSync(statePath, "utf8"));
 if (state.active !== null && state.active !== undefined) {
-  console.error("bridge active state not cleared: " + JSON.stringify(state.active));
+  console.error("bridge active state not cleared");
   process.exit(1);
 }
 if (state.worker_id !== worker) {
-  console.error(`bridge state worker_id mismatch: state=${state.worker_id} receipt=${worker}`);
+  console.error("bridge state worker_id mismatch");
   process.exit(1);
 }
 
-// Verify history record: must exist and match job/attempt
-const histFile = path.join(process.env.HIST_DIR, `${job.job_id}.${attempt}.json`);
+// Verify history record: must exist, match job/attempt, and hash receipt bytes
+const histFile = path.join(histDir, `${job.job_id}.${attempt}.json`);
 if (!existsSync(histFile)) {
-  console.error("bridge history file missing on disk: " + histFile);
+  console.error("bridge history file missing on disk");
   process.exit(1);
 }
 const hist = JSON.parse(readFileSync(histFile, "utf8"));
 if (hist.job_id !== job.job_id || hist.attempt_id !== attempt) {
-  console.error("bridge history job/attempt mismatch: " + JSON.stringify(hist));
+  console.error("bridge history job/attempt mismatch");
   process.exit(1);
 }
 if (hist.worker_id !== worker) {
-  console.error("bridge history worker_id mismatch: " + JSON.stringify(hist));
+  console.error("bridge history worker_id mismatch");
   process.exit(1);
 }
-if (typeof hist.receipt_sha256 !== "string" || hist.receipt_sha256.length !== 64) {
-  console.error("bridge history receipt_sha256 invalid: " + JSON.stringify(hist));
+const receiptSha = createHash("sha256").update(receiptBytes).digest("hex");
+if (typeof hist.receipt_sha256 !== "string" || hist.receipt_sha256 !== receiptSha) {
+  console.error("bridge history receipt_sha256 does not match receipt bytes");
   process.exit(1);
 }
 
