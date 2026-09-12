@@ -129,7 +129,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Get worker job status",
       description:
-        "Show queue and assignment state for a job: returns the last recorded state (queued/expired/claimed/running), created time, the seven-day claim expiry (expires_at applies only before the first claim, not as an execution deadline), and the current execution assignment when claimed. Claimed/running is not proof the Worker is currently online. The full prompt/acceptance is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
+        "Show queue, assignment, and reported execution outcome for a job. Reported terminal states describe the Worker's execution report. COMPLETED does not establish independent business verification or artifact upload. If no report exists, claimed/running is only the last recorded assignment state. expires_at applies only before the first claim, not as an execution deadline. The full prompt/acceptance is not returned. A missing job or one not owned by this identity is reported uniformly as JOB_NOT_FOUND.",
       inputSchema: workerGetSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -155,6 +155,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           workspace_ref: v.workspace_ref,
           resource_id: v.resource_id,
           execution: v.execution,
+          report: v.report ?? null,
         });
       } catch (error) {
         const info = errInfo(error);

@@ -11,6 +11,11 @@ import {
   MAX_TIMEOUT_SECONDS,
 } from "../src/jobs/schema.js";
 import {
+  EXECUTION_STATUSES,
+  MAX_REPORT_ERROR_MESSAGE_BYTES,
+  parseReport,
+} from "../src/jobs/report-schema.js";
+import {
   isNoScriptError,
   createRedisRunnerFromClient,
   StoreError,
@@ -85,6 +90,88 @@ describe("worker get schema", () => {
   it("rejects obvious bad shape / unknown fields", () => {
     expect(parseJobGet({ job_id: "nope" }).ok).toBe(false);
     expect(parseJobGet({ job_id: `job-${uuid}`, extra: 1 }).ok).toBe(false);
+  });
+});
+
+describe("worker execution report schema", () => {
+  const token = "a".repeat(64);
+  const receipt = "b".repeat(64);
+  const wrk = "wrk-123e4567-e89b-12d3-a456-426614174000";
+  const attempt = uuid;
+
+  function body(patch: Record<string, unknown> = {}, reportPatch: Record<string, unknown> = {}) {
+    return {
+      worker_id: wrk,
+      attempt_id: attempt,
+      claim_token: token,
+      report: {
+        schema_version: 1,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        finished_at_ms: 1_789_255_887_000,
+        receipt_sha256: receipt,
+        error: null,
+        ...reportPatch,
+      },
+      ...patch,
+    };
+  }
+
+  for (const status of EXECUTION_STATUSES) {
+    it(`accepts execution_status ${status}`, () => {
+      const r = parseReport(body({}, { execution_status: status }));
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value.report.execution_status).toBe(status);
+    });
+  }
+
+  it("rejects unknown fields at top, report, and error levels", () => {
+    expect(parseReport(body({ user_id: "usr_x" })).ok).toBe(false);
+    expect(parseReport(body({ workspace_id: "ws_x" })).ok).toBe(false);
+    expect(parseReport(body({ resource_id: "res-x" })).ok).toBe(false);
+    expect(parseReport(body({}, { local_path: "/tmp/out" })).ok).toBe(false);
+    expect(parseReport(body({}, {
+      error: { stage: "task", code: "X", message: "m", extra: true },
+    })).ok).toBe(false);
+  });
+
+  it("rejects invalid ids, token, hash, version, and unsafe timestamps", () => {
+    expect(parseReport(body({ worker_id: "wrk-NOT" })).ok).toBe(false);
+    expect(parseReport(body({ attempt_id: "not-a-uuid" })).ok).toBe(false);
+    expect(parseReport(body({ claim_token: "ZZ" })).ok).toBe(false);
+    expect(parseReport(body({}, { receipt_sha256: "ABC" })).ok).toBe(false);
+    expect(parseReport(body({}, { schema_version: 2 })).ok).toBe(false);
+    expect(parseReport(body({}, { finished_at_ms: -1 })).ok).toBe(false);
+    expect(parseReport(body({}, { finished_at_ms: 1.5 })).ok).toBe(false);
+    expect(parseReport(body({}, { finished_at_ms: Number.MAX_SAFE_INTEGER + 1 })).ok).toBe(false);
+  });
+
+  it("rejects VERIFIED and accepts explicit null error", () => {
+    expect(parseReport(body({}, { business_outcome: "VERIFIED" })).ok).toBe(false);
+    const okNull = parseReport(body({}, { error: null }));
+    expect(okNull.ok).toBe(true);
+    const missingError = {
+      worker_id: wrk,
+      attempt_id: attempt,
+      claim_token: token,
+      report: {
+        schema_version: 1,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        finished_at_ms: 1,
+        receipt_sha256: receipt,
+      },
+    };
+    expect(parseReport(missingError).ok).toBe(false);
+  });
+
+  it("enforces the UTF-8 error-message limit and rejects whitespace-only messages", () => {
+    const atLimit = "x".repeat(MAX_REPORT_ERROR_MESSAGE_BYTES);
+    expect(parseReport(body({}, { error: { stage: "task", code: "CODE", message: atLimit } })).ok).toBe(true);
+    expect(parseReport(body({}, {
+      error: { stage: "task", code: "CODE", message: atLimit + "y" },
+    })).ok).toBe(false);
+    expect(parseReport(body({}, { error: { stage: "task", code: "CODE", message: "   " } })).ok).toBe(false);
   });
 });
 
@@ -260,6 +347,76 @@ describe("MCP protocol layer enforcement and audit tracing", () => {
     expect(trace3.status).toBe("error");
     const out3 = JSON.parse(trace3.output_json);
     expect(out3.job_id).toBeNull();
+
+    await client.close();
+    await server.close();
+  });
+
+  it("projects the report through worker_get and withholds the report body from audit", async () => {
+    const SENTINEL = "UNIT_REPORT_SENTINEL_MESSAGE";
+    const traces: TraceRecordInput[] = [];
+    const mockAuditStore: AuditStore = {
+      recordTrace: (t: TraceRecordInput) => {
+        traces.push(t);
+      },
+    } as AuditStore;
+
+    const mockJobService: JobService = {
+      submit: async () => ({ ok: true, view: {} }) as never,
+      get: async () => ({
+        ok: true,
+        view: {
+          ok: true,
+          job_id: `job-${uuid}`,
+          state: "failed",
+          created_at: "2026-09-12T23:20:00.000Z",
+          expires_at: "2026-09-19T23:20:00.000Z",
+          workspace_ref: "tools",
+          resource_id: null,
+          replayed: false,
+          execution: {
+            worker_id: "wrk-123e4567-e89b-12d3-a456-426614174000",
+            attempt_id: uuid,
+            phase: "running",
+            claimed_at: "2026-09-12T23:21:00.000Z",
+            started_at: "2026-09-12T23:21:01.000Z",
+          },
+          report: {
+            schema_version: 1,
+            execution_status: "FAILED",
+            business_outcome: "FAILED",
+            finished_at_ms: 1_789_255_887_000,
+            receipt_sha256: "b".repeat(64),
+            error: { stage: "task", code: "STDIN_WRITE_FAILED", message: SENTINEL },
+            received_at: "2026-09-12T23:31:28.000Z",
+          },
+        },
+      }),
+    } as JobService;
+
+    const server = new McpServer({ name: "ceo-server-test", version: "1.0.0" });
+    registerJobTools(server, {
+      service: mockJobService,
+      scope: { user_id: "usr_test", workspace_id: "ws_test" },
+      auditStore: mockAuditStore,
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "client", version: "1.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const listed = await client.listTools();
+    const desc = listed.tools.find((t) => t.name === "worker_get")?.description ?? "";
+    expect(desc).toContain("Reported terminal states describe the Worker's execution report");
+    expect(desc).toContain("If no report exists, claimed/running is only the last recorded assignment state");
+
+    const res = await client.callTool({ name: "worker_get", arguments: { job_id: `job-${uuid}` } });
+    expect(res.isError).toBeFalsy();
+    const out = res.structuredContent as { report: { error: { message: string } }; state: string };
+    expect(out.state).toBe("failed");
+    expect(out.report.error.message).toBe(SENTINEL);
+
+    expect(JSON.stringify(traces)).not.toContain(SENTINEL);
 
     await client.close();
     await server.close();

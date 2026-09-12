@@ -72,7 +72,7 @@ jobs:
       - name: Jobs integration tests (serial, must NOT skip)
         run: |
           cd services/server
-          for f in jobs.redis.test.ts jobs.assignment.test.ts jobs.discovery.test.ts jobs.http.test.ts; do
+          for f in jobs.redis.test.ts jobs.assignment.test.ts jobs.discovery.test.ts jobs.http.test.ts jobs.report.test.ts; do
             mkdir -p .tmp
             log=".tmp/${f}.log"
             npx vitest run "test/${f}" > "${log}" 2>&1 || { cat "${log}"; exit 1; }
@@ -199,6 +199,20 @@ jobs:
             if (!claim.ok) throw new Error("pre-restart claim failed: " + JSON.stringify(claim));
             const start = await service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
             if (!start.ok) throw new Error("pre-restart start failed: " + JSON.stringify(start));
+            const report = await service.report(scope, jobId, {
+              worker_id: wrk,
+              attempt_id: att,
+              claim_token: tok,
+              report: {
+                schema_version: 1,
+                execution_status: "COMPLETED",
+                business_outcome: "UNVERIFIED",
+                finished_at_ms: 1789255887000,
+                receipt_sha256: "f".repeat(64),
+                error: null,
+              },
+            });
+            if (!report.ok) throw new Error("pre-restart report failed: " + JSON.stringify(report));
 
             const job = await store.getJob(jobId);
             if (!job) throw new Error("Job not found immediately after submit");
@@ -223,6 +237,12 @@ jobs:
               execution_phase: job.execution && job.execution.phase,
               execution_claimed_at_ms: job.execution && job.execution.claimed_at_ms,
               execution_started_at_ms: job.execution && job.execution.started_at_ms,
+              report_execution_status: job.report && job.report.execution_status,
+              report_business_outcome: job.report && job.report.business_outcome,
+              report_finished_at_ms: job.report && job.report.finished_at_ms,
+              report_receipt_sha256: job.report && job.report.receipt_sha256,
+              report_error: job.report && job.report.error,
+              report_received_at_ms: job.report && job.report.received_at_ms,
               stream_length_before: streamLen,
             };
             mkdirSync(".tmp", { recursive: true });
@@ -308,16 +328,54 @@ jobs:
             if (job.execution.phase !== expected.execution_phase) throw new Error("execution.phase mismatch");
             if (job.execution.claimed_at_ms !== expected.execution_claimed_at_ms) throw new Error("execution.claimed_at_ms mismatch");
             if (job.execution.started_at_ms !== expected.execution_started_at_ms) throw new Error("execution.started_at_ms mismatch");
+            if (!job.report) throw new Error("execution report missing after restart");
+            if (job.report.execution_status !== expected.report_execution_status) throw new Error("report.execution_status mismatch");
+            if (job.report.business_outcome !== expected.report_business_outcome) throw new Error("report.business_outcome mismatch");
+            if (job.report.finished_at_ms !== expected.report_finished_at_ms) throw new Error("report.finished_at_ms mismatch");
+            if (job.report.receipt_sha256 !== expected.report_receipt_sha256) throw new Error("report.receipt_sha256 mismatch");
+            if (JSON.stringify(job.report.error) !== JSON.stringify(expected.report_error)) throw new Error("report.error mismatch");
+            if (job.report.received_at_ms !== expected.report_received_at_ms) throw new Error("report.received_at_ms mismatch");
 
-            // 2. get still derives running from the persisted assignment.
+            // 2. get / worker_get derive the reported terminal state.
             const got = await service.get(scope, { job_id: expected.job_id });
-            if (!got.ok || got.view.state !== "running") throw new Error("get did not derive running: " + JSON.stringify(got));
+            if (!got.ok || got.view.state !== "completed") throw new Error("get did not derive completed: " + JSON.stringify(got));
+            if (!got.view.report || got.view.report.execution_status !== "COMPLETED") {
+              throw new Error("worker_get missing persisted report: " + JSON.stringify(got));
+            }
+            if (got.view.report.received_at !== new Date(expected.report_received_at_ms).toISOString()) {
+              throw new Error("worker_get received_at changed: " + JSON.stringify(got.view.report));
+            }
 
-            // 3. The original attempt can still start after the restart (idempotent replay).
-            const startReplay = await service.start(scope, expected.job_id, { worker_id: wrk, attempt_id: att, claim_token: tok });
-            if (!startReplay.ok || !startReplay.replayed) throw new Error("post-restart start replay failed: " + JSON.stringify(startReplay));
+            // 3. Identical report after restart is a replay; start cannot reopen.
+            const reportReplay = await service.report(scope, expected.job_id, {
+              worker_id: wrk,
+              attempt_id: att,
+              claim_token: tok,
+              report: {
+                schema_version: 1,
+                execution_status: "COMPLETED",
+                business_outcome: "UNVERIFIED",
+                finished_at_ms: 1789255887000,
+                receipt_sha256: "f".repeat(64),
+                error: null,
+              },
+            });
+            if (!reportReplay.ok || !reportReplay.replayed) {
+              throw new Error("post-restart report replay failed: " + JSON.stringify(reportReplay));
+            }
+            if (reportReplay.received_at !== new Date(expected.report_received_at_ms).toISOString()) {
+              throw new Error("replay changed received_at: " + reportReplay.received_at);
+            }
+            try {
+              const startReplay = await service.start(scope, expected.job_id, { worker_id: wrk, attempt_id: att, claim_token: tok });
+              throw new Error("post-restart start should be JOB_FINISHED: " + JSON.stringify(startReplay));
+            } catch (err) {
+              if (!err || err.code !== "JOB_FINISHED") {
+                throw err;
+              }
+            }
 
-            // 4. Dedupe placeholder + replay submit return running (no re-queue).
+            // 4. Dedupe placeholder + replay submit return the terminal state (no re-queue).
             const ph = await store.getPlaceholder(scope, expected.request_id);
             if (!ph) throw new Error("Dedupe placeholder missing after restart");
             if (ph.job_id !== expected.job_id) throw new Error("placeholder job_id mismatch");
@@ -331,7 +389,7 @@ jobs:
             if (!replayRes.ok) throw new Error("Replay submission failed: " + JSON.stringify(replayRes));
             if (!replayRes.view.replayed) throw new Error("Expected replayed: true on post-restart submit");
             if (replayRes.view.job_id !== expected.job_id) throw new Error("Replay returned different job_id");
-            if (replayRes.view.state !== "running") throw new Error("Replay state not running: " + replayRes.view.state);
+            if (replayRes.view.state !== "completed") throw new Error("Replay state not completed: " + replayRes.view.state);
 
             // 5. Stream length unchanged (no duplicate XADD on replay).
             const streamLenAfter = await store.streamLength();

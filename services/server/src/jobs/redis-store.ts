@@ -14,6 +14,7 @@ import {
   type AssignmentState,
   type ClaimAssignmentInput,
   type StartAssignmentInput,
+  type ReportAssignmentInput,
 } from "./assignment-schema.js";
 import { ASSIGNMENT_SCRIPT } from "./assignment-script.js";
 import {
@@ -267,6 +268,7 @@ export class RedisJobStore {
       attemptId?: string;
       workspaceRef?: string;
       tokenSha?: string;
+      reportJson?: string;
     },
   ): Promise<AssignmentScriptResult> {
     this.keyCheck();
@@ -279,6 +281,7 @@ export class RedisJobStore {
       argsIn.attemptId ?? "",
       argsIn.workspaceRef ?? "",
       argsIn.tokenSha ?? "",
+      argsIn.reportJson ?? "",
     ];
     return this.evalshaAssignment(this.redis, [jobKey(jobId)], args);
   }
@@ -312,6 +315,19 @@ export class RedisJobStore {
       workerId: input.worker_id,
       attemptId: input.attempt_id,
       tokenSha: input.claim_token_sha256,
+    });
+  }
+
+  async reportAssignment(
+    scope: AuthScope,
+    jobId: string,
+    input: ReportAssignmentInput,
+  ): Promise<AssignmentScriptResult> {
+    return this.runAssignment(scope, "report", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      tokenSha: input.claim_token_sha256,
+      reportJson: JSON.stringify(input.report),
     });
   }
 

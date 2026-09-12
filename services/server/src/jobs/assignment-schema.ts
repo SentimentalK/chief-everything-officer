@@ -22,7 +22,17 @@ export interface ExecutionAssignmentView {
 
 export type AssignmentJobRecord = PersistedJobRecord;
 
-export type AssignmentState = "queued" | "expired" | "claimed" | "running";
+export type AssignmentState =
+  | "queued"
+  | "expired"
+  | "claimed"
+  | "running"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "blocked"
+  | "interrupted";
 
 export type AssignmentScriptResult =
   | {
@@ -51,5 +61,19 @@ export interface StartAssignmentInput {
   claim_token_sha256: string;
 }
 
-export type AssignmentOperation = "inspect" | "claim" | "start";
-export const ASSIGNMENT_OPERATIONS = ["inspect", "claim", "start"] as const;
+export interface ReportAssignmentInput {
+  worker_id: string;
+  attempt_id: string;
+  claim_token_sha256: string;
+  report: {
+    schema_version: 1;
+    execution_status: string;
+    business_outcome: string;
+    finished_at_ms: number;
+    receipt_sha256: string;
+    error: { stage: string; code: string; message: string } | null;
+  };
+}
+
+export type AssignmentOperation = "inspect" | "claim" | "start" | "report";
+export const ASSIGNMENT_OPERATIONS = ["inspect", "claim", "start", "report"] as const;

@@ -26,6 +26,11 @@ import {
   type ExecutionAssignmentView,
   type AssignmentScriptResult,
 } from "./assignment-schema.js";
+import {
+  parseReport,
+  type ExecutionReportView,
+  type PersistedExecutionReport,
+} from "./report-schema.js";
 import { RedisJobStore, StoreError } from "./redis-store.js";
 
 /** Trusted, already-authenticated identity. Never accepted from the payload. */
@@ -46,7 +51,9 @@ export type JobErrorCode =
   | "JOB_ALREADY_CLAIMED"
   | "JOB_NOT_CLAIMED"
   | "ASSIGNMENT_MISMATCH"
-  | "WORKSPACE_MISMATCH";
+  | "WORKSPACE_MISMATCH"
+  | "REPORT_CONFLICT"
+  | "JOB_FINISHED";
 
 export class JobError extends Error {
   constructor(
@@ -60,6 +67,7 @@ export class JobError extends Error {
 }
 
 export { type ExecutionAssignmentView } from "./assignment-schema.js";
+export type { ExecutionReportView } from "./report-schema.js";
 
 export interface JobView {
   ok: true;
@@ -71,6 +79,7 @@ export interface JobView {
   resource_id: string | null;
   replayed: boolean;
   execution: ExecutionAssignmentView | null;
+  report: ExecutionReportView | null;
 }
 
 export interface SubmitResult {
@@ -94,6 +103,18 @@ export type AssignmentResult =
   | { ok: true; replayed: boolean; server_time: string; execution: ExecutionAssignmentView; job?: ClaimJobInfo }
   | { ok: false; code?: JobErrorCode; message?: string; reason?: string | null };
 
+export type ReportResult =
+  | {
+      ok: true;
+      job_id: string;
+      attempt_id: string;
+      state: JobState;
+      report_received: true;
+      received_at: string;
+      replayed: boolean;
+    }
+  | { ok: false; code?: JobErrorCode; message?: string; reason?: string | null };
+
 export interface JobServiceDeps {
   store: RedisJobStore;
   /** Existence check for a resource_id within the calling workspace (only for NEW tasks). */
@@ -115,6 +136,19 @@ function executionAssignmentView(ex: JobAssignment | null | undefined): Executio
   };
 }
 
+function reportView(r: PersistedExecutionReport | undefined): ExecutionReportView | null {
+  if (!r) return null;
+  return {
+    schema_version: r.schema_version,
+    execution_status: r.execution_status,
+    business_outcome: r.business_outcome,
+    finished_at_ms: r.finished_at_ms,
+    receipt_sha256: r.receipt_sha256,
+    error: r.error,
+    received_at: iso(r.received_at_ms),
+  };
+}
+
 function viewFromAssignment(res: Extract<AssignmentScriptResult, { ok: true }>, replayed: boolean): JobView {
   const rec = res.record;
   return {
@@ -127,6 +161,7 @@ function viewFromAssignment(res: Extract<AssignmentScriptResult, { ok: true }>, 
     resource_id: rec.resource_id,
     replayed,
     execution: executionAssignmentView(rec.execution),
+    report: reportView(rec.report),
   };
 }
 
@@ -151,6 +186,10 @@ function assignmentToError(res: Extract<AssignmentScriptResult, { ok: false }>):
       return msg("Execution credentials do not match.");
     case "WORKSPACE_MISMATCH":
       return msg("Workspace does not match the job.");
+    case "REPORT_CONFLICT":
+      return msg("A different execution report was already accepted.");
+    case "JOB_FINISHED":
+      return msg("Job already has an accepted execution report.");
     case "QUEUE_UNAVAILABLE":
       return msg(queueErrorMessage(reason));
     default:
@@ -481,6 +520,46 @@ export class JobService {
       replayed: res.replayed,
       server_time: iso(res.server_time_ms),
       execution: view,
+    };
+  }
+
+  async report(scope: JobAuthScope, jobId: string, raw: unknown): Promise<ReportResult> {
+    this.assertSelf(scope);
+    const parsed = parseReport(raw);
+    if (!parsed.ok) {
+      return { ok: false, code: parsed.reason as JobErrorCode, message: parsed.issue };
+    }
+    const input = parsed.value;
+    this.assertAvailable();
+    let res: AssignmentScriptResult;
+    try {
+      res = await this.deps.store.reportAssignment(scope, jobId, {
+        worker_id: input.worker_id,
+        attempt_id: input.attempt_id,
+        claim_token_sha256: JobService.hashClaimToken(input.claim_token),
+        report: input.report,
+      });
+    } catch (error) {
+      const wrapped = wrapStore(error);
+      throw new JobError(
+        wrapped.code,
+        "Queue backend is not available. Retry the same report for the same attempt.",
+        wrapped.details,
+      );
+    }
+    if (!res.ok) throw assignmentToError(res);
+    const stored = res.record.report;
+    if (!stored) {
+      throw new JobError("QUEUE_UNAVAILABLE", "Report did not persist.");
+    }
+    return {
+      ok: true,
+      job_id: res.record.job_id,
+      attempt_id: res.record.execution?.attempt_id ?? input.attempt_id,
+      state: res.state,
+      report_received: true,
+      received_at: iso(stored.received_at_ms),
+      replayed: res.replayed,
     };
   }
 

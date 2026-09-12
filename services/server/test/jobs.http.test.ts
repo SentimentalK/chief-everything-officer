@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { createClient, type RedisClientType } from "redis";
 import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createJobAssignmentRouter } from "../src/jobs/router.js";
-import { JobService, JobError, type AssignmentResult } from "../src/jobs/service.js";
+import { JobService, JobError, type AssignmentResult, type ReportResult } from "../src/jobs/service.js";
 import {
   RedisJobStore,
   StoreError,
@@ -30,6 +30,19 @@ const ATT = "123e4567-e89b-12d3-a456-4266141740ab";
 const TOKEN = "c".repeat(64);
 
 const claimBody = () => ({ worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", claim_token: TOKEN });
+const reportBody = () => ({
+  worker_id: WRK,
+  attempt_id: ATT,
+  claim_token: TOKEN,
+  report: {
+    schema_version: 1,
+    execution_status: "COMPLETED",
+    business_outcome: "UNVERIFIED",
+    finished_at_ms: 1_789_255_887_000,
+    receipt_sha256: "b".repeat(64),
+    error: null,
+  },
+});
 
 const cleanupDirs: string[] = [];
 const cleanupServers: HttpServer[] = [];
@@ -50,11 +63,13 @@ function stubService(
   impl: {
     claim?: (scope: unknown, jobId: string, body: unknown) => Promise<AssignmentResult> | AssignmentResult;
     start?: (scope: unknown, jobId: string, body: unknown) => Promise<AssignmentResult> | AssignmentResult;
+    report?: (scope: unknown, jobId: string, body: unknown) => Promise<ReportResult> | ReportResult;
   },
 ): JobService {
   return {
     claim: async (s, j, b) => (impl.claim ? await impl.claim(s, j, b) : errCode("INVALID_INPUT")),
     start: async (s, j, b) => (impl.start ? await impl.start(s, j, b) : errCode("INVALID_INPUT")),
+    report: async (s, j, b) => (impl.report ? await impl.report(s, j, b) : errCode("INVALID_INPUT")),
   } as unknown as JobService;
 }
 
@@ -245,6 +260,47 @@ describe("worker assignment HTTP strict input validation (real schema, not a thr
     expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
   });
 
+  it("rejects report unknown fields, VERIFIED, and missing nullable error via the real schema", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const cases: Array<Record<string, unknown>> = [
+      { ...reportBody(), user_id: "usr_evil" },
+      { ...reportBody(), report: { ...reportBody().report, local_path: "/tmp/x" } },
+      { ...reportBody(), report: { ...reportBody().report, business_outcome: "VERIFIED" } },
+      {
+        worker_id: WRK,
+        attempt_id: ATT,
+        claim_token: TOKEN,
+        report: {
+          schema_version: 1,
+          execution_status: "COMPLETED",
+          business_outcome: "UNVERIFIED",
+          finished_at_ms: 1,
+          receipt_sha256: "b".repeat(64),
+        },
+      },
+    ];
+    for (const body of cases) {
+      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/report`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { code: string }).code).toBe("INVALID_INPUT");
+    }
+  });
+
+  it("a schema-valid report on an unreachable backend is QUEUE_UNAVAILABLE, not a validation error", async () => {
+    const { baseUrl } = await buildServer(deadStoreService());
+    const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/report`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(reportBody()),
+    });
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { code: string }).code).toBe("QUEUE_UNAVAILABLE");
+  });
+
   it("a schema-valid claim on an unreachable backend is QUEUE_UNAVAILABLE, not a validation error", async () => {
     // Proves the real service validated the body successfully and only then hit
     // the (never-ready) backend - distinguishing validation from availability.
@@ -389,6 +445,8 @@ describe("worker assignment HTTP error mapping", () => {
     { code: "JOB_NOT_CLAIMED", status: 409 },
     { code: "ASSIGNMENT_MISMATCH", status: 409 },
     { code: "WORKSPACE_MISMATCH", status: 409 },
+    { code: "REPORT_CONFLICT", status: 409 },
+    { code: "JOB_FINISHED", status: 409 },
     { code: "QUEUE_UNAVAILABLE", status: 503 },
   ];
   for (const c of cases) {
@@ -447,6 +505,73 @@ describe("worker assignment HTTP error mapping", () => {
     expect(start.status).toBe(200);
     expect(startBody.replayed).toBe(true);
     expect(startBody.execution.phase).toBe("running");
+  });
+
+  it("maps report-specific errors on the report route and never echoes the token or body", async () => {
+    const SENTINEL = "HTTP_REPORT_BODY_SENTINEL";
+    const { baseUrl } = await buildServer(
+      stubService({
+        report: async () => {
+          throw new JobError("REPORT_CONFLICT", "A different execution report was already accepted.");
+        },
+      }),
+    );
+    const lines = await captureStderr(async () => {
+      const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/report`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({
+          ...reportBody(),
+          report: {
+            ...reportBody().report,
+            error: { stage: "task", code: "X", message: SENTINEL },
+          },
+        }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { code: string; message: string };
+      expect(body.code).toBe("REPORT_CONFLICT");
+      expect(JSON.stringify(body)).not.toContain(TOKEN);
+      expect(JSON.stringify(body)).not.toContain(SENTINEL);
+    });
+    const joined = lines.join("");
+    expect(joined).not.toContain(TOKEN);
+    expect(joined).not.toContain(SENTINEL);
+    expect(joined).toContain("REPORT_CONFLICT");
+  });
+
+  it("successful report returns the acceptance whitelist without tokens", async () => {
+    const { baseUrl } = await buildServer(
+      stubService({
+        report: async () => ({
+          ok: true as const,
+          job_id: JOB,
+          attempt_id: ATT,
+          state: "completed",
+          report_received: true as const,
+          received_at: "2026-09-12T23:31:28.000Z",
+          replayed: false,
+        }),
+      }),
+    );
+    const res = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/report`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(reportBody()),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      ok: true,
+      job_id: JOB,
+      attempt_id: ATT,
+      state: "completed",
+      report_received: true,
+      received_at: "2026-09-12T23:31:28.000Z",
+      replayed: false,
+    });
+    expect(JSON.stringify(body)).not.toContain(TOKEN);
   });
 
   it("heartbeat endpoint returns 404 (removed from router)", async () => {
@@ -766,6 +891,86 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
       // 9. Pending list no longer contains this job
       const pendingAfter = await pendingJobs(baseUrl);
       expect(pendingAfter.jobs.some((j) => j.job_id === jobId)).toBe(false);
+    } finally {
+      if (jobId) await client.del(jobKey(jobId));
+      await client.del(requestKey(identity.user_id, identity.workspace_id, requestId));
+      await client.del(KEY_STREAM);
+    }
+  });
+
+  it("HTTP report accepts, replays, and exposes the terminal state without leaking tokens", async () => {
+    const { baseUrl, identity } = await buildServer(service);
+    const requestId = "123e4567-e89b-12d3-a456-426614174401";
+    let jobId = "";
+    try {
+      const submitRes = await service.submit(identity, {
+        request_id: requestId,
+        workspace_ref: "tools",
+        prompt: "http report prompt",
+        acceptance: "http report acceptance",
+        timeout_seconds: 120,
+      });
+      expect(submitRes.ok).toBe(true);
+      jobId = submitRes.view!.job_id;
+
+      const claimRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/claim`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify(claimBody()),
+      });
+      expect(claimRes.status).toBe(200);
+      const startRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/start`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
+      });
+      expect(startRes.status).toBe(200);
+
+      const logs = await captureStderr(async () => {
+        const reportRes = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/report`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify(reportBody()),
+        });
+        expect(reportRes.status).toBe(200);
+        const body = (await reportRes.json()) as {
+          ok: boolean;
+          state: string;
+          replayed: boolean;
+          report_received: boolean;
+          received_at: string;
+        };
+        expect(body.ok).toBe(true);
+        expect(body.state).toBe("completed");
+        expect(body.replayed).toBe(false);
+        expect(body.report_received).toBe(true);
+        expect(JSON.stringify(body)).not.toContain(TOKEN);
+
+        const replay = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/report`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify(reportBody()),
+        });
+        expect(replay.status).toBe(200);
+        const replayBody = (await replay.json()) as { replayed: boolean; received_at: string };
+        expect(replayBody.replayed).toBe(true);
+        expect(replayBody.received_at).toBe(body.received_at);
+
+        const finished = await fetch(`${baseUrl}/api/worker/jobs/${jobId}/start`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ worker_id: WRK, attempt_id: ATT, claim_token: TOKEN }),
+        });
+        expect(finished.status).toBe(409);
+        expect(((await finished.json()) as { code: string }).code).toBe("JOB_FINISHED");
+      });
+      const joined = logs.join("");
+      expect(joined).not.toContain(TOKEN);
+      expect(joined).toContain("completed");
+
+      const got = await service.get(identity, { job_id: jobId });
+      expect(got.view?.state).toBe("completed");
+      expect(got.view?.report?.execution_status).toBe("COMPLETED");
     } finally {
       if (jobId) await client.del(jobKey(jobId));
       await client.del(requestKey(identity.user_id, identity.workspace_id, requestId));

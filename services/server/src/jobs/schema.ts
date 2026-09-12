@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import type { JobAssignment, AssignmentState } from "./assignment-schema.js";
+import type { PersistedExecutionReport } from "./report-schema.js";
 export type { JobAssignment, AssignmentState };
 
 export const JOBS_SCHEMA_VERSION = 2 as const;
@@ -82,6 +83,8 @@ export interface PersistedJobRecord {
   claim_deadline_ms: number;
   /** An absent execution field means unclaimed. An explicit null or malformed execution is invalid. */
   execution?: JobAssignment;
+  /** Absent means no report received. Explicit null or a malformed report is invalid. */
+  report?: PersistedExecutionReport;
 }
 
 export interface RequestPlaceholder {

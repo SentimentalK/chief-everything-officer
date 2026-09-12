@@ -1,10 +1,10 @@
 // services/server/src/jobs/assignment-script.ts
 //
-// Persistent, single-key Lua implementing inspect/claim/start for job assignments.
+// Persistent, single-key Lua implementing inspect/claim/start/report for job assignments.
 // Operates on KEYS[1] = ceo:job:<job_id>.
 //
 // ARGV layout (1-indexed in Lua):
-//   [1] operation               'inspect' | 'claim' | 'start'
+//   [1] operation               'inspect' | 'claim' | 'start' | 'report'
 //   [2] expected_job_id
 //   [3] trusted_user_id
 //   [4] trusted_workspace_id
@@ -12,6 +12,7 @@
 //   [6] attempt_id
 //   [7] workspace_ref
 //   [8] claim_token_sha256
+//   [9] report_json             report operation only; empty otherwise
 
 export const ASSIGNMENT_SCRIPT = `
 local operation         = ARGV[1]
@@ -22,6 +23,7 @@ local worker_id         = ARGV[5]
 local attempt_id        = ARGV[6]
 local workspace_ref     = ARGV[7]
 local token_sha         = ARGV[8]
+local report_json       = ARGV[9]
 
 local function err(code, reason)
   return cjson.encode({ ok = false, code = code, reason = reason or cjson.null })
@@ -160,6 +162,114 @@ if ex ~= nil then
   end
 end
 
+local function validStage(s)
+  return type(s) == 'string' and #s >= 1 and #s <= 64 and not s:find('[^A-Za-z0-9_-]')
+end
+
+local function validErrCode(s)
+  return type(s) == 'string' and #s >= 1 and #s <= 64 and not s:find('[^A-Z0-9_]')
+end
+
+local function validErrMessage(s)
+  if type(s) ~= 'string' or #s == 0 or #s > 2048 then
+    return false
+  end
+  if s:match('^%s*$') then
+    return false
+  end
+  return true
+end
+
+local function countKeys(t)
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+local function validReportError(e)
+  if e == cjson.null then return true end
+  if type(e) ~= 'table' then return false end
+  if countKeys(e) ~= 3 then return false end
+  return validStage(e.stage) and validErrCode(e.code) and validErrMessage(e.message)
+end
+
+local REPORT_STATUSES = {
+  COMPLETED = true,
+  FAILED = true,
+  TIMED_OUT = true,
+  CANCELLED = true,
+  BLOCKED = true,
+  INTERRUPTED = true,
+}
+
+local REPORT_OUTCOMES = {
+  UNVERIFIED = true,
+  FAILED = true,
+  NOT_STARTED = true,
+}
+
+local function validIncomingReport(r)
+  if type(r) ~= 'table' then return false end
+  if countKeys(r) ~= 6 then return false end
+  if r.schema_version ~= 1 then return false end
+  if not REPORT_STATUSES[r.execution_status] then return false end
+  if not REPORT_OUTCOMES[r.business_outcome] then return false end
+  if not validTimestamp(r.finished_at_ms) then return false end
+  if not validSha(r.receipt_sha256) then return false end
+  if not validReportError(r.error) then return false end
+  return true
+end
+
+local function validStoredReport(r)
+  if type(r) ~= 'table' then return false end
+  if countKeys(r) ~= 7 then return false end
+  if not validIncomingReport({
+    schema_version = r.schema_version,
+    execution_status = r.execution_status,
+    business_outcome = r.business_outcome,
+    finished_at_ms = r.finished_at_ms,
+    receipt_sha256 = r.receipt_sha256,
+    error = r.error,
+  }) then
+    return false
+  end
+  return validTimestamp(r.received_at_ms)
+end
+
+local function reportsMatch(a, b)
+  if a.schema_version ~= b.schema_version then return false end
+  if a.execution_status ~= b.execution_status then return false end
+  if a.business_outcome ~= b.business_outcome then return false end
+  if a.finished_at_ms ~= b.finished_at_ms then return false end
+  if a.receipt_sha256 ~= b.receipt_sha256 then return false end
+  local ae, be = a.error, b.error
+  if ae == cjson.null and be == cjson.null then return true end
+  if type(ae) ~= 'table' or type(be) ~= 'table' then return false end
+  return ae.stage == be.stage and ae.code == be.code and ae.message == be.message
+end
+
+local function reportPublicState(status)
+  if status == 'COMPLETED' then return 'completed' end
+  if status == 'FAILED' then return 'failed' end
+  if status == 'TIMED_OUT' then return 'timed_out' end
+  if status == 'CANCELLED' then return 'cancelled' end
+  if status == 'BLOCKED' then return 'blocked' end
+  if status == 'INTERRUPTED' then return 'interrupted' end
+  return nil
+end
+
+-- Validate stored report if present. Absent is allowed; explicit null/malformed is corrupt.
+-- A report without a valid execution assignment is also corrupt.
+local stored_report = job.report
+if stored_report ~= nil then
+  if stored_report == cjson.null or not validStoredReport(stored_report) then
+    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+  end
+  if ex == nil or ex == cjson.null then
+    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+  end
+end
+
 -- 5. Full-commit requirement (status 'queued' and non-empty stream_entry_id)
 local committed = job.status == 'queued'
   and type(job.stream_entry_id) == 'string'
@@ -178,6 +288,11 @@ elseif operation == 'start' then
   if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha) then
     return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
   end
+elseif operation == 'report' then
+  if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha)
+     or type(report_json) ~= 'string' or report_json == '' then
+    return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
+  end
 elseif operation ~= 'inspect' then
   return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_OPERATION')
 end
@@ -187,6 +302,10 @@ local ttime = redis.call('TIME')
 local now = tonumber(ttime[1]) * 1000 + math.floor(tonumber(ttime[2]) / 1000)
 
 local function deriveState(j, n)
+  local r = j.report
+  if r ~= nil and r ~= cjson.null then
+    return reportPublicState(r.execution_status)
+  end
   local e = j.execution
   if e == nil or e == cjson.null then
     if n >= j.claim_deadline_ms then return 'expired' end
@@ -224,6 +343,7 @@ if operation == 'claim' then
      or job.workspace_ref ~= workspace_ref then
     return err('IDEMPOTENCY_CONFLICT', cjson.null)
   end
+  if stored_report ~= nil then return err('JOB_FINISHED', cjson.null) end
   -- Identical match replay: keep current phase ('claimed' or 'running')
   return okRes(job, e.phase, true, now)
 end
@@ -234,6 +354,7 @@ if operation == 'start' then
   if e.worker_id ~= worker_id or e.attempt_id ~= attempt_id or e.claim_token_sha256 ~= token_sha then
     return err('ASSIGNMENT_MISMATCH', cjson.null)
   end
+  if stored_report ~= nil then return err('JOB_FINISHED', cjson.null) end
   if now < e.claimed_at_ms then
     return err('QUEUE_UNAVAILABLE', 'CLOCK_REGRESSION')
   end
@@ -246,6 +367,37 @@ if operation == 'start' then
   end
   -- Already running: replay
   return okRes(job, 'running', true, now)
+end
+
+if operation == 'report' then
+  local e = job.execution
+  if e == nil or e == cjson.null then return err('JOB_NOT_CLAIMED', cjson.null) end
+  if e.worker_id ~= worker_id or e.attempt_id ~= attempt_id or e.claim_token_sha256 ~= token_sha then
+    return err('ASSIGNMENT_MISMATCH', cjson.null)
+  end
+  local okp, incoming = pcall(cjson.decode, report_json)
+  if not okp or not validIncomingReport(incoming) then
+    return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
+  end
+  if stored_report ~= nil then
+    if reportsMatch(stored_report, incoming) then
+      return okRes(job, reportPublicState(stored_report.execution_status), true, stored_report.received_at_ms)
+    end
+    return err('REPORT_CONFLICT', cjson.null)
+  end
+  job.report = {
+    schema_version = incoming.schema_version,
+    execution_status = incoming.execution_status,
+    business_outcome = incoming.business_outcome,
+    finished_at_ms = incoming.finished_at_ms,
+    receipt_sha256 = incoming.receipt_sha256,
+    error = incoming.error,
+    received_at_ms = now,
+  }
+  local encoded_job = cjson.encode(job)
+  local encoded_res = okRes(job, reportPublicState(incoming.execution_status), false, now)
+  redis.call('SET', KEYS[1], encoded_job)
+  return encoded_res
 end
 
 return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_OPERATION')
