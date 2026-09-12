@@ -162,14 +162,18 @@ if [ "$exited" != "1" ]; then
   kill -KILL "$WORKER_PID" 2>/dev/null || true
   echo "execution acceptance: worker did not exit on SIGTERM"; exit 1
 fi
-wait "$WORKER_PID" || true
+wait "$WORKER_PID"
 echo "PASS worker exited cleanly on SIGTERM"
 
 # 7) Confirm a real claim/start occurred server-side, matches Redis store, and active state cleared.
 cd "$SRV"
-REDIS="$REDIS" SRV="$SRV" RECEIPT="$RECEIPT" JOB="$E/job.json" WLOG="$E/worker.stdout.log" SLOG="$E/logs/server.log" STATE="$E/workspace/tools/.ceo/bridge_state.json" ART="$E/workspace/tools/output_artifact.txt" \
+REDIS="$REDIS" SRV="$SRV" RECEIPT="$RECEIPT" JOB="$E/job.json" WLOG="$E/worker.stdout.log" SLOG="$E/logs/server.log" \
+  STATE="$E/workspace/tools/.ceo/bridge/state.json" \
+  HIST_DIR="$E/workspace/tools/.ceo/bridge/history" \
+  ART="$E/workspace/tools/output_artifact.txt" \
 node --input-type=module -e '
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { createClient } from "redis";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
@@ -200,20 +204,55 @@ if (!srvlog.includes("claim") || !srvlog.includes("start")) { console.error("ser
 
 // Verify artifact exists and matches receipt
 if (!existsSync(process.env.ART)) { console.error("output artifact missing on disk"); process.exit(1); }
-if (!r.artifacts || r.artifacts.length === 0) { console.error("receipt missing artifacts"); process.exit(1); }
+const artBytes = readFileSync(process.env.ART);
+const artStat = statSync(process.env.ART);
+const artSha = createHash("sha256").update(artBytes).digest("hex");
 
-// Verify bridge state: active attempt must be cleared, history recorded
-if (existsSync(process.env.STATE)) {
-  const state = JSON.parse(readFileSync(process.env.STATE, "utf8"));
-  if (state.active !== null && state.active !== undefined) {
-    console.error("bridge active state not cleared: " + JSON.stringify(state.active));
-    process.exit(1);
-  }
-  const hist = state.history?.[job.job_id];
-  if (!hist || hist.attempt_id !== attempt) {
-    console.error("bridge history missing or attempt mismatch: " + JSON.stringify(hist));
-    process.exit(1);
-  }
+if (!Array.isArray(r.artifacts) || r.artifacts.length === 0) { console.error("receipt missing artifacts"); process.exit(1); }
+const artClaim = r.artifacts.find(a => a.path === "output_artifact.txt");
+if (!artClaim) { console.error("receipt missing output_artifact.txt claim: " + JSON.stringify(r.artifacts)); process.exit(1); }
+if (artClaim.size_bytes !== artStat.size) {
+  console.error(`artifact size mismatch: claim=${artClaim.size_bytes} disk=${artStat.size}`);
+  process.exit(1);
+}
+if (artClaim.sha256 !== artSha) {
+  console.error(`artifact sha256 mismatch: claim=${artClaim.sha256} disk=${artSha}`);
+  process.exit(1);
+}
+
+// Verify bridge state: active attempt must be cleared
+if (!existsSync(process.env.STATE)) {
+  console.error("bridge state.json missing on disk: " + process.env.STATE);
+  process.exit(1);
+}
+const state = JSON.parse(readFileSync(process.env.STATE, "utf8"));
+if (state.active !== null && state.active !== undefined) {
+  console.error("bridge active state not cleared: " + JSON.stringify(state.active));
+  process.exit(1);
+}
+if (state.worker_id !== worker) {
+  console.error(`bridge state worker_id mismatch: state=${state.worker_id} receipt=${worker}`);
+  process.exit(1);
+}
+
+// Verify history record: must exist and match job/attempt
+const histFile = path.join(process.env.HIST_DIR, `${job.job_id}.${attempt}.json`);
+if (!existsSync(histFile)) {
+  console.error("bridge history file missing on disk: " + histFile);
+  process.exit(1);
+}
+const hist = JSON.parse(readFileSync(histFile, "utf8"));
+if (hist.job_id !== job.job_id || hist.attempt_id !== attempt) {
+  console.error("bridge history job/attempt mismatch: " + JSON.stringify(hist));
+  process.exit(1);
+}
+if (hist.worker_id !== worker) {
+  console.error("bridge history worker_id mismatch: " + JSON.stringify(hist));
+  process.exit(1);
+}
+if (typeof hist.receipt_sha256 !== "string" || hist.receipt_sha256.length !== 64) {
+  console.error("bridge history receipt_sha256 invalid: " + JSON.stringify(hist));
+  process.exit(1);
 }
 
 // Connect to Redis and inspect the actual server JobRecord
