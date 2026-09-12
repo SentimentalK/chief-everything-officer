@@ -714,8 +714,8 @@ fn verify_terminal_evidence(
         return Err("receipt dispatch intent disagrees with active state".to_string());
     }
     // 7. The history control credential must correspond to the active attempt's
-    // lease token (so a history for a different attempt/identity cannot clear it).
-    if history.claim_token != active.lease_token {
+    // claim token (so a history for a different attempt/identity cannot clear it).
+    if history.claim_token != active.claim_token {
         return Err("history control token does not match active attempt".to_string());
     }
     // 8. Only a terminal state that is safe to finalize may be cleared; an
@@ -749,11 +749,11 @@ impl Worker {
         }
 
         let attempt_id = state::new_attempt_id();
-        let token = state::generate_lease_token().map_err(|_| 1)?;
+        let token = state::generate_claim_token().map_err(|_| 1)?;
         state.active = Some(ActiveAttempt {
             job_id: job.job_id.clone(),
             attempt_id: attempt_id.clone(),
-            lease_token: token.clone(),
+            claim_token: token.clone(),
             phase: LocalPhase::ClaimIntent,
             claim: None,
             runner_boot_id: None,
@@ -1007,7 +1007,7 @@ impl Worker {
             &envelope_sha,
             &rec_sha,
             dispatch_happened,
-            &active.lease_token,
+            &active.claim_token,
         );
         // A durable history must be recorded before the active attempt is
         // cleared; neither step may be swallowed.
@@ -1183,7 +1183,7 @@ impl Worker {
         let mut watchdog = tokio::time::interval(WATCHDOG_PERIOD);
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let token = active.lease_token.clone();
+        let token = active.claim_token.clone();
         let mut lease = initial_lease;
         let mut pending: Option<PendingOp> = None;
         let mut due: Option<(OpKind, tokio::time::Instant)>;
@@ -2025,7 +2025,7 @@ mod tests {
         let active = ActiveAttempt {
             job_id: "job-a".to_string(),
             attempt_id: "attempt-a".to_string(),
-            lease_token: token.clone(),
+            claim_token: token.clone(),
             phase: LocalPhase::Running,
             claim: None,
             runner_boot_id: None,
@@ -2109,7 +2109,7 @@ mod tests {
                 .as_ref()
                 .map(|b| b.task_dispatch_intent)
                 .unwrap_or(false),
-            &ev.active.lease_token,
+            &ev.active.claim_token,
         );
         ev.rec_sha = rec_sha;
     }

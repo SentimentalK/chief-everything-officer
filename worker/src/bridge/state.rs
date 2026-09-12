@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::config::{ceo_dir, validate_id};
 use crate::local_state::atomic_write_json;
 
-pub const STATE_SCHEMA_VERSION: u32 = 1;
+pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Failure codes surfaced (redacted-safe) by local-state handling.
 pub const LOCAL_STATE_INVALID: &str = "LOCAL_STATE_INVALID";
@@ -290,7 +290,7 @@ pub struct ActiveAttempt {
     pub job_id: String,
     pub attempt_id: String,
     /// 0600-only secret for same-attempt retry. Never Debug-printed.
-    pub lease_token: String,
+    pub claim_token: String,
     pub phase: LocalPhase,
     /// Confirmed claim payload; absent before the first claim success.
     pub claim: Option<ClaimPayload>,
@@ -309,7 +309,7 @@ impl fmt::Debug for ActiveAttempt {
         f.debug_struct("ActiveAttempt")
             .field("job_id", &self.job_id)
             .field("attempt_id", &self.attempt_id)
-            .field("lease_token", &"[redacted]")
+            .field("claim_token", &"[redacted]")
             .field("phase", &self.phase)
             .field("claim", &self.claim)
             .field("runner_boot_id", &self.runner_boot_id)
@@ -321,30 +321,60 @@ impl fmt::Debug for ActiveAttempt {
 }
 
 impl ActiveAttempt {
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, binding: &BridgeBinding) -> Result<(), String> {
         validate_id("job_id", &self.job_id).map_err(|e| e.to_string())?;
         validate_id("attempt_id", &self.attempt_id).map_err(|e| e.to_string())?;
-        if self.lease_token.trim().is_empty() {
-            return Err("active attempt is missing lease_token".to_string());
+        if !claim_token_ok(&self.claim_token) {
+            return Err(
+                "active attempt claim_token must be 64 lowercase hex characters".to_string(),
+            );
         }
-        if matches!(self.phase, LocalPhase::DispatchIntent | LocalPhase::Running)
-            && !self.task_dispatch_intent
-        {
-            return Err(format!(
-                "phase {:?} requires task_dispatch_intent",
-                self.phase
-            ));
-        }
-        if self.task_dispatch_intent
-            && matches!(
-                self.phase,
-                LocalPhase::ClaimIntent | LocalPhase::Claimed | LocalPhase::RunnerIntent
-            )
-        {
-            return Err(format!(
-                "task_dispatch_intent set before phase {:?}",
-                self.phase
-            ));
+        match self.phase {
+            LocalPhase::ClaimIntent => {
+                if self.claim.is_some() {
+                    return Err("claim payload set in ClaimIntent phase".to_string());
+                }
+                if self.process.is_some() {
+                    return Err("process identity set in ClaimIntent phase".to_string());
+                }
+                if self.task_dispatch_intent {
+                    return Err("task_dispatch_intent set in ClaimIntent phase".to_string());
+                }
+            }
+            LocalPhase::Claimed => {
+                let Some(c) = &self.claim else {
+                    return Err("claim payload missing in Claimed phase".to_string());
+                };
+                if !c.verify_integrity() {
+                    return Err("claim payload hash mismatch".to_string());
+                }
+                if c.workspace_ref != binding.workspace_ref {
+                    return Err(format!(
+                        "claim payload workspace_ref {} does not match binding {}",
+                        c.workspace_ref, binding.workspace_ref
+                    ));
+                }
+                if self.process.is_some() {
+                    return Err("process identity set in Claimed phase".to_string());
+                }
+                if self.task_dispatch_intent {
+                    return Err("task_dispatch_intent set in Claimed phase".to_string());
+                }
+            }
+            LocalPhase::DispatchIntent | LocalPhase::Running => {
+                if !self.task_dispatch_intent {
+                    return Err(format!(
+                        "phase {:?} requires task_dispatch_intent",
+                        self.phase
+                    ));
+                }
+            }
+            LocalPhase::RunnerIntent => {
+                if self.task_dispatch_intent {
+                    return Err("task_dispatch_intent set before phase RunnerIntent".to_string());
+                }
+            }
+            LocalPhase::StartIntent | LocalPhase::RecoveryRequired => {}
         }
         if let Some(p) = &self.process {
             if p.boot_id.trim().is_empty() {
@@ -354,6 +384,12 @@ impl ActiveAttempt {
         if let Some(c) = &self.claim {
             if !c.verify_integrity() {
                 return Err("claim payload hash mismatch".to_string());
+            }
+            if c.workspace_ref != binding.workspace_ref {
+                return Err(format!(
+                    "claim payload workspace_ref {} does not match binding {}",
+                    c.workspace_ref, binding.workspace_ref
+                ));
             }
         }
         Ok(())
@@ -422,12 +458,15 @@ impl BridgeState {
             ));
         }
         if let Some(active) = &self.active {
-            active.validate().map_err(StateError::Invalid)?;
+            active
+                .validate(&self.binding)
+                .map_err(StateError::Invalid)?;
         }
         Ok(())
     }
 
     pub fn persist(&self, workspace: &Path) -> Result<(), StateError> {
+        self.validate(&self.binding)?;
         ensure_control_dirs(workspace).map_err(|e| StateError::io(&state_path(workspace), &e))?;
         let p = state_path(workspace);
         reject_symlink_target(&p).map_err(|e| StateError::io(&p, &e))?;
@@ -470,10 +509,14 @@ pub fn current_boot_id() -> Option<String> {
     }
 }
 
-/// Generates a 32-byte random lease token as 64 lowercase hex characters,
+pub fn claim_token_ok(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Generates a 32-byte random claim token as 64 lowercase hex characters,
 /// reading `/dev/urandom` with `read_exact`. Fails (rather than falling back to
 /// timestamps or a PRNG) if randomness is unavailable.
-pub fn generate_lease_token() -> Result<String, std::io::Error> {
+pub fn generate_claim_token() -> Result<String, std::io::Error> {
     use std::io::Read;
     let mut buf = [0u8; 32];
     let mut f = std::fs::File::open("/dev/urandom")?;
@@ -483,6 +526,29 @@ pub fn generate_lease_token() -> Result<String, std::io::Error> {
         out.push_str(&format!("{:02x}", b));
     }
     Ok(out)
+}
+
+/// Whether a job already has attempt directories on disk.
+pub fn job_dir_has_attempts(workspace: &Path, job_id: &str) -> bool {
+    let dir = crate::config::job_dir(workspace, job_id).join("attempts");
+    match std::fs::read_dir(dir) {
+        Ok(mut rd) => rd.next().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Whether the history directory contains a record starting with `{job_id}.`.
+pub fn history_dir_has_job(workspace: &Path, job_id: &str) -> bool {
+    let dir = history_dir(workspace);
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let prefix = format!("{job_id}.");
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +752,7 @@ mod tests {
     fn worker_id_stable_and_versioned() {
         let t = tempfile::tempdir().unwrap();
         let st = sample_state(t.path());
-        assert_eq!(st.schema_version, 1);
+        assert_eq!(st.schema_version, 2);
         assert!(st.worker_id.starts_with("wrk-"));
         // round-trip preserves worker_id
         let p = state_path(t.path());
@@ -719,10 +785,11 @@ mod tests {
 
     #[test]
     fn running_requires_dispatch_intent() {
+        let b = binding(Path::new("/tmp"));
         let st = ActiveAttempt {
             job_id: "job1".to_string(),
             attempt_id: new_attempt_id(),
-            lease_token: "ab".repeat(32),
+            claim_token: "ab".repeat(32),
             phase: LocalPhase::Running,
             claim: None,
             runner_boot_id: None,
@@ -730,7 +797,7 @@ mod tests {
             task_dispatch_intent: false,
             stop_error: None,
         };
-        assert!(st.validate().is_err());
+        assert!(st.validate(&b).is_err());
     }
 
     #[test]
@@ -756,8 +823,8 @@ mod tests {
         let a = ActiveAttempt {
             job_id: "j".to_string(),
             attempt_id: new_attempt_id(),
-            lease_token: "secret-token-value".to_string(),
-            phase: LocalPhase::Claimed,
+            claim_token: "ab".repeat(32),
+            phase: LocalPhase::ClaimIntent,
             claim: None,
             runner_boot_id: None,
             process: None,
@@ -765,7 +832,109 @@ mod tests {
             stop_error: None,
         };
         let dbg = format!("{a:?}");
-        assert!(!dbg.contains("secret-token-value"));
+        assert!(!dbg.contains(&"ab".repeat(32)));
+        assert!(dbg.contains("[redacted]"));
+    }
+
+    #[test]
+    fn state_contract_version_2_roundtrip_and_version_1_rejected() {
+        let t = tempfile::tempdir().unwrap();
+        let p = state_path(t.path());
+        ensure_control_dirs(t.path()).unwrap();
+        let b = binding(t.path());
+
+        // Version 1 json is rejected and never rewritten
+        let v1_json = serde_json::json!({
+            "schema_version": 1,
+            "binding": b,
+            "worker_id": "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "active": null
+        });
+        std::fs::write(&p, serde_json::to_string(&v1_json).unwrap()).unwrap();
+        let err = BridgeState::load(&p, &b).unwrap_err();
+        assert!(
+            matches!(err, StateError::Invalid(msg) if msg.contains("unsupported schema_version 1"))
+        );
+        // File content unchanged
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        assert!(on_disk.contains("\"schema_version\":1"));
+
+        // lease_token alias is not accepted
+        let lease_token_json = serde_json::json!({
+            "schema_version": 2,
+            "binding": b,
+            "worker_id": "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "active": {
+                "job_id": "job-1",
+                "attempt_id": new_attempt_id(),
+                "lease_token": "ab".repeat(32),
+                "phase": "claim_intent",
+                "claim": null,
+                "runner_boot_id": null,
+                "process": null,
+                "task_dispatch_intent": false,
+                "stop_error": null
+            }
+        });
+        std::fs::write(&p, serde_json::to_string(&lease_token_json).unwrap()).unwrap();
+        let err = BridgeState::load(&p, &b).unwrap_err();
+        assert!(matches!(err, StateError::Invalid(_)));
+
+        // Invalid claim_token (not 64 lowercase hex) is rejected
+        let bad_token_json = serde_json::json!({
+            "schema_version": 2,
+            "binding": b,
+            "worker_id": "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "active": {
+                "job_id": "job-1",
+                "attempt_id": new_attempt_id(),
+                "claim_token": "not-a-64-hex-token",
+                "phase": "claim_intent",
+                "claim": null,
+                "runner_boot_id": null,
+                "process": null,
+                "task_dispatch_intent": false,
+                "stop_error": null
+            }
+        });
+        std::fs::write(&p, serde_json::to_string(&bad_token_json).unwrap()).unwrap();
+        let err = BridgeState::load(&p, &b).unwrap_err();
+        assert!(matches!(err, StateError::Invalid(_)));
+
+        // Claimed without payload is rejected
+        let claimed_no_payload = serde_json::json!({
+            "schema_version": 2,
+            "binding": b,
+            "worker_id": "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "active": {
+                "job_id": "job-1",
+                "attempt_id": new_attempt_id(),
+                "claim_token": "ab".repeat(32),
+                "phase": "claimed",
+                "claim": null,
+                "runner_boot_id": null,
+                "process": null,
+                "task_dispatch_intent": false,
+                "stop_error": null
+            }
+        });
+        std::fs::write(&p, serde_json::to_string(&claimed_no_payload).unwrap()).unwrap();
+        let err = BridgeState::load(&p, &b).unwrap_err();
+        assert!(matches!(err, StateError::Invalid(_)));
+
+        // ClaimPayload debug redacts prompt and acceptance
+        let payload = ClaimPayload {
+            workspace_ref: "tools".to_string(),
+            resource_id: None,
+            prompt: "super secret task prompt".to_string(),
+            acceptance: "super secret acceptance criteria".to_string(),
+            timeout_seconds: 60,
+            payload_sha256: "ab".repeat(32),
+        };
+        let p_dbg = format!("{payload:?}");
+        assert!(!p_dbg.contains("super secret task prompt"));
+        assert!(!p_dbg.contains("super secret acceptance criteria"));
+        assert!(p_dbg.contains("[redacted]"));
     }
 
     #[test]
