@@ -306,6 +306,128 @@ pub struct AssignmentStartOk {
     pub execution: AssignmentExecution,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReportError {
+    pub stage: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReportBody {
+    pub schema_version: u32,
+    pub execution_status: String,
+    pub business_outcome: String,
+    pub finished_at_ms: i64,
+    pub receipt_sha256: String,
+    pub error: Option<ExecutionReportError>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReportRequest {
+    pub worker_id: String,
+    pub attempt_id: String,
+    pub claim_token: String,
+    pub report: ExecutionReportBody,
+}
+
+impl fmt::Debug for ExecutionReportRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionReportRequest")
+            .field("worker_id", &self.worker_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("claim_token", &"[redacted]")
+            .field("report", &self.report)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ExecutionReportBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionReportBody")
+            .field("schema_version", &self.schema_version)
+            .field("execution_status", &self.execution_status)
+            .field("business_outcome", &self.business_outcome)
+            .field("finished_at_ms", &self.finished_at_ms)
+            .field("receipt_sha256", &self.receipt_sha256)
+            .field("error", &self.report_error_debug())
+            .finish()
+    }
+}
+
+impl ExecutionReportBody {
+    fn report_error_debug(&self) -> Option<(&str, &str)> {
+        self.error
+            .as_ref()
+            .map(|e| (e.stage.as_str(), e.code.as_str()))
+    }
+}
+
+/// Successful execution-report acceptance. All listed keys are required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutionReportOk {
+    pub ok: bool,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub report_received: bool,
+    pub received_at: String,
+    pub replayed: bool,
+}
+
+impl<'de> Deserialize<'de> for ExecutionReportOk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ExecutionReportOk;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an execution report acceptance object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<ExecutionReportOk, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut ok: Option<bool> = None;
+                let mut job_id: Option<String> = None;
+                let mut attempt_id: Option<String> = None;
+                let mut state: Option<String> = None;
+                let mut report_received: Option<bool> = None;
+                let mut received_at: Option<String> = None;
+                let mut replayed: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "ok" => ok = Some(map.next_value()?),
+                        "job_id" => job_id = Some(map.next_value()?),
+                        "attempt_id" => attempt_id = Some(map.next_value()?),
+                        "state" => state = Some(map.next_value()?),
+                        "report_received" => report_received = Some(map.next_value()?),
+                        "received_at" => received_at = Some(map.next_value()?),
+                        "replayed" => replayed = Some(map.next_value()?),
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(ExecutionReportOk {
+                    ok: ok.ok_or_else(|| A::Error::missing_field("ok"))?,
+                    job_id: job_id.ok_or_else(|| A::Error::missing_field("job_id"))?,
+                    attempt_id: attempt_id.ok_or_else(|| A::Error::missing_field("attempt_id"))?,
+                    state: state.ok_or_else(|| A::Error::missing_field("state"))?,
+                    report_received: report_received
+                        .ok_or_else(|| A::Error::missing_field("report_received"))?,
+                    received_at: received_at
+                        .ok_or_else(|| A::Error::missing_field("received_at"))?,
+                    replayed: replayed.ok_or_else(|| A::Error::missing_field("replayed"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 /// Server business-error envelope (also tolerates the auth middleware's
 /// jsonrpc error shape, which carries a numeric code and a message). Used only
 /// for classification; `message` is never surfaced to the client.

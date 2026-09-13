@@ -16,7 +16,8 @@
 use crate::bridge::config::ApiKey;
 use crate::bridge::protocol::{
     AssignmentClaimOk, AssignmentClaimRequest, AssignmentExecution, AssignmentStartOk,
-    AssignmentStartRequest, ClaimedJob, IdentityInfo, Pending, Phase,
+    AssignmentStartRequest, ClaimedJob, ExecutionReportOk, ExecutionReportRequest, IdentityInfo,
+    Pending, Phase,
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -44,6 +45,7 @@ const MAX_TIMEOUT_SECONDS: i64 = 7200;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_ACCEPTANCE_BYTES: usize = 8 * 1024;
 const MAX_JOBS_PER_PAGE: usize = 25;
+const MAX_REPORT_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Known server business codes (from jobs/service.ts JobErrorCode). A code that
 /// is not in this set is never echoed back to the caller verbatim.
@@ -60,6 +62,8 @@ const KNOWN_CODES: &[&str] = &[
     "JOB_NOT_CLAIMED",
     "ASSIGNMENT_MISMATCH",
     "WORKSPACE_MISMATCH",
+    "REPORT_CONFLICT",
+    "JOB_FINISHED",
 ];
 
 /// Known diagnostic `details.reason` values preserved verbatim; anything else is
@@ -389,6 +393,35 @@ impl BridgeClient {
         validate_assignment_start_ok(&ok, job_id, req).map_err(ClientError::write_protocol)?;
         Ok(ok)
     }
+
+    /// POST /api/worker/jobs/{job}/report. Sends once; never auto-retries.
+    pub async fn report_execution(
+        &self,
+        job_id: &str,
+        request: &ExecutionReportRequest,
+    ) -> CResult<ExecutionReportOk> {
+        if !job_id_ok(job_id) {
+            return Err(ClientError::protocol("invalid job id"));
+        }
+        if !worker_id_ok(&request.worker_id) {
+            return Err(ClientError::protocol("invalid worker id"));
+        }
+        if !uuid_ok(&request.attempt_id) {
+            return Err(ClientError::protocol("invalid attempt id"));
+        }
+        if !claim_token_ok(&request.claim_token) {
+            return Err(ClientError::protocol("invalid claim token"));
+        }
+        let body = serde_json::to_string(request)
+            .map_err(|_| ClientError::protocol("encode report request"))?;
+        if body.len() > MAX_REPORT_REQUEST_BYTES {
+            return Err(ClientError::protocol("report request exceeds 8 KiB"));
+        }
+        let path = format!("/api/worker/jobs/{job_id}/report");
+        let ok: ExecutionReportOk = self.post_json(&path, body, true).await?;
+        validate_execution_report_ok(&ok, job_id, request).map_err(ClientError::write_protocol)?;
+        Ok(ok)
+    }
 }
 
 /// Reads the body with a hard streaming cap (never trusts Content-Length alone).
@@ -551,6 +584,8 @@ fn is_confirmed_rejection(status: u16, code: Option<&str>, explicitly_failed: bo
                         | "JOB_NOT_CLAIMED"
                         | "ASSIGNMENT_MISMATCH"
                         | "WORKSPACE_MISMATCH"
+                        | "REPORT_CONFLICT"
+                        | "JOB_FINISHED"
                 )
             )
             | (503, Some("BRIDGE_DISABLED"))
@@ -561,7 +596,7 @@ fn is_confirmed_rejection(status: u16, code: Option<&str>, explicitly_failed: bo
 // Semantic validation of successful responses.
 // ---------------------------------------------------------------------------
 
-fn job_id_ok(s: &str) -> bool {
+pub(crate) fn job_id_ok(s: &str) -> bool {
     regex_ok(JOB_ID_RE, s)
 }
 fn resource_id_ok(s: &str) -> bool {
@@ -570,14 +605,26 @@ fn resource_id_ok(s: &str) -> bool {
 fn workspace_alias_ok(s: &str) -> bool {
     regex_ok(WORKSPACE_ALIAS_RE, s)
 }
-fn uuid_ok(s: &str) -> bool {
+pub(crate) fn uuid_ok(s: &str) -> bool {
     regex_ok(UUID_RE, s)
 }
-fn worker_id_ok(s: &str) -> bool {
+pub(crate) fn worker_id_ok(s: &str) -> bool {
     regex_ok(WORKER_ID_RE, s)
 }
-fn claim_token_ok(s: &str) -> bool {
+pub(crate) fn claim_token_ok(s: &str) -> bool {
     regex_ok(CLAIM_TOKEN_RE, s)
+}
+
+pub(crate) fn public_state_for_execution_status(status: &str) -> Option<&'static str> {
+    match status {
+        "COMPLETED" => Some("completed"),
+        "FAILED" => Some("failed"),
+        "TIMED_OUT" => Some("timed_out"),
+        "CANCELLED" => Some("cancelled"),
+        "BLOCKED" => Some("blocked"),
+        "INTERRUPTED" => Some("interrupted"),
+        _ => None,
+    }
 }
 
 fn regex_ok(re: &str, s: &str) -> bool {
@@ -735,6 +782,34 @@ fn validate_assignment_execution(
                 return Err("started_at earlier than claimed_at".to_string());
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_execution_report_ok(
+    ok: &ExecutionReportOk,
+    job_id: &str,
+    req: &ExecutionReportRequest,
+) -> Result<(), String> {
+    if !ok.ok {
+        return Err("report response marked ok=false".to_string());
+    }
+    if !ok.report_received {
+        return Err("report response marked report_received=false".to_string());
+    }
+    if ok.job_id != job_id {
+        return Err("response job id does not match request".to_string());
+    }
+    if ok.attempt_id != req.attempt_id {
+        return Err("response attempt id does not match request".to_string());
+    }
+    let expected = public_state_for_execution_status(&req.report.execution_status)
+        .ok_or_else(|| "invalid execution status".to_string())?;
+    if ok.state != expected {
+        return Err("response state does not match reported execution status".to_string());
+    }
+    if rfc3339(&ok.received_at).is_none() {
+        return Err("invalid received_at".to_string());
     }
     Ok(())
 }

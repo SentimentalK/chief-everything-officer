@@ -321,4 +321,142 @@ await runner.dispose();
 console.log("PASS redis store verified: phase=running, started_at_ms=" + rec.execution.started_at_ms + ", matching worker=" + worker + ", attempt=" + attempt);
 '
 
+# 8) Report the saved local result with the compiled command (worker already stopped).
+STATE="$WS/.ceo/bridge/state.json"
+HIST="$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json"
+node --input-type=module -e '
+import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+const files = {
+  receipt: process.argv[1],
+  history: process.argv[2],
+  state: process.argv[3],
+};
+const out = {};
+for (const [k, p] of Object.entries(files)) {
+  out[k] = createHash("sha256").update(readFileSync(p)).digest("hex");
+}
+writeFileSync(process.argv[4], JSON.stringify(out));
+' "$RECEIPT" "$HIST" "$STATE" "$E/local-hashes.json"
+CLAIM_BEFORE="$(grep -c '"event":"claim"' "$E/logs/server.log" || true)"
+START_BEFORE="$(grep -c '"event":"start"' "$E/logs/server.log" || true)"
+
+set +e
+"$WRK" bridge report --config "$E/bridge.json" --workspace-ref tools --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
+  > "$E/report1.stdout" 2> "$E/report1.stderr"
+rep_ec=$?
+set -e
+if [ "$rep_ec" != "0" ]; then
+  echo "execution acceptance: first bridge report exited $rep_ec"
+  cat "$E/report1.stderr"
+  cat "$E/report1.stdout"
+  exit 1
+fi
+if grep -qiE 'api[_-]?key|authorization|claim_token|test-secret|acceptance-nonce' "$E/report1.stdout" "$E/report1.stderr"; then
+  echo "execution acceptance: report output leaked a secret"
+  exit 1
+fi
+
+cd "$SRV"
+REDIS="$REDIS" SRV="$SRV" RECEIPT="$RECEIPT" JOB="$E/job.json" \
+  REPORT_OUT="$E/report1.stdout" ATTEMPT="$ATTEMPT" \
+node --input-type=module -e '
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createClient } from "redis";
+import { pathToFileURL } from "node:url";
+import path from "node:path";
+
+const first = JSON.parse(readFileSync(process.env.REPORT_OUT, "utf8"));
+if (first.ok !== true || first.report_received !== true || first.replayed !== false) {
+  console.error("first report confirmation invalid: " + JSON.stringify(first));
+  process.exit(1);
+}
+const job = JSON.parse(readFileSync(process.env.JOB, "utf8"));
+const receiptBytes = readFileSync(process.env.RECEIPT);
+const receipt = JSON.parse(receiptBytes);
+if (first.job_id !== job.job_id || first.attempt_id !== process.env.ATTEMPT) {
+  console.error("report confirmation identity mismatch");
+  process.exit(1);
+}
+if (first.state !== "completed") {
+  console.error("expected completed, got " + first.state);
+  process.exit(1);
+}
+
+const storeMod = await import(pathToFileURL(path.join(process.env.SRV, "dist/jobs/redis-store.js")).href);
+const runner = storeMod.createRedisRunnerFromClient(
+  () => createClient({ url: process.env.REDIS, socket: { reconnectStrategy: false }, disableOfflineQueue: true }),
+  { opTimeoutMs: 2500 }
+);
+const store = new storeMod.RedisJobStore(runner);
+const wait = (ms=8000) => new Promise((res, rej) => {
+  const s = Date.now();
+  (function t(){ if (runner.ready()) return res(); if (Date.now()-s>ms) return rej(new Error("redis not ready")); setTimeout(t,20); })();
+});
+await wait();
+const rec = await store.getJob(job.job_id);
+if (!rec || !rec.report) { console.error("redis report missing after first report"); process.exit(1); }
+const receiptSha = createHash("sha256").update(receiptBytes).digest("hex");
+const finishedMs = Date.parse(receipt.timestamps.finished_at);
+if (rec.report.execution_status !== "COMPLETED") { console.error("redis execution_status mismatch"); process.exit(1); }
+if (rec.report.receipt_sha256 !== receiptSha) { console.error("redis receipt hash mismatch"); process.exit(1); }
+if (rec.report.finished_at_ms !== finishedMs) { console.error("redis finished_at_ms mismatch: " + rec.report.finished_at_ms + " vs " + finishedMs); process.exit(1); }
+if (first.received_at !== new Date(rec.report.received_at_ms).toISOString()) {
+  console.error("received_at mismatch");
+  process.exit(1);
+}
+await runner.dispose();
+console.log("PASS first report persisted in redis received_at=" + first.received_at);
+'
+
+set +e
+"$WRK" bridge report --config "$E/bridge.json" --workspace-ref tools --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
+  > "$E/report2.stdout" 2> "$E/report2.stderr"
+rep2_ec=$?
+set -e
+if [ "$rep2_ec" != "0" ]; then
+  echo "execution acceptance: replay bridge report exited $rep2_ec"
+  cat "$E/report2.stderr"
+  exit 1
+fi
+
+node --input-type=module -e '
+import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+const first = JSON.parse(readFileSync(process.argv[1], "utf8"));
+const second = JSON.parse(readFileSync(process.argv[2], "utf8"));
+if (second.ok !== true || second.report_received !== true || second.replayed !== true) {
+  console.error("replay confirmation invalid: " + JSON.stringify(second));
+  process.exit(1);
+}
+if (second.received_at !== first.received_at) {
+  console.error("replay changed received_at");
+  process.exit(1);
+}
+const expected = JSON.parse(readFileSync(process.argv[3], "utf8"));
+const files = { receipt: process.argv[4], history: process.argv[5], state: process.argv[6] };
+for (const [k, p] of Object.entries(files)) {
+  const now = createHash("sha256").update(readFileSync(p)).digest("hex");
+  if (now !== expected[k]) {
+    console.error("local " + k + " hash changed after report");
+    process.exit(1);
+  }
+}
+const histDir = process.argv[7];
+const histFiles = readdirSync(histDir).filter((n) => n.endsWith(".json"));
+if (histFiles.length !== 1) {
+  console.error("unexpected extra history files: " + histFiles.join(","));
+  process.exit(1);
+}
+' "$E/report1.stdout" "$E/report2.stdout" "$E/local-hashes.json" "$RECEIPT" "$HIST" "$STATE" "$WS/.ceo/bridge/history"
+
+CLAIM_AFTER="$(grep -c '"event":"claim"' "$E/logs/server.log" || true)"
+START_AFTER="$(grep -c '"event":"start"' "$E/logs/server.log" || true)"
+if [ "$CLAIM_AFTER" != "$CLAIM_BEFORE" ] || [ "$START_AFTER" != "$START_BEFORE" ]; then
+  echo "execution acceptance: report issued extra claim/start"
+  exit 1
+fi
+echo "PASS report replayed without rewriting local files or re-claiming"
+
 echo "ALL_EXECUTION_ACCEPTANCE_PASS"

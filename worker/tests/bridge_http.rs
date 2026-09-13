@@ -4,7 +4,9 @@
 
 use ceo_worker::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use ceo_worker::bridge::config::load_api_key;
-use ceo_worker::bridge::protocol::{AssignmentClaimRequest, AssignmentStartRequest};
+use ceo_worker::bridge::protocol::{
+    AssignmentClaimRequest, AssignmentStartRequest, ExecutionReportBody, ExecutionReportRequest,
+};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -1463,4 +1465,134 @@ async fn assignment_pre_send_validation_rejections() {
     let err = c.start_assignment(JOB, &bad_start).await.unwrap_err();
     assert!(!err.outcome_unknown);
     assert_eq!(server.recorded.lock().len(), 0);
+}
+
+fn report_request() -> ExecutionReportRequest {
+    ExecutionReportRequest {
+        worker_id: WRK.into(),
+        attempt_id: ATT.into(),
+        claim_token: TOKEN.into(),
+        report: ExecutionReportBody {
+            schema_version: 1,
+            execution_status: "COMPLETED".into(),
+            business_outcome: "UNVERIFIED".into(),
+            finished_at_ms: 1_780_000_000_000,
+            receipt_sha256: "b".repeat(64),
+            error: None,
+        },
+    }
+}
+
+fn report_ok_json(replayed: bool) -> String {
+    format!(
+        r#"{{"ok":true,"job_id":"{JOB}","attempt_id":"{ATT}","state":"completed","report_received":true,"received_at":"2026-09-13T00:00:00.000Z","replayed":{replayed}}}"#
+    )
+}
+
+#[tokio::test]
+async fn report_accepts_first_confirmation_and_replay() {
+    let server = spawn_server(Box::new(|_| json_response(&report_ok_json(false)))).await;
+    let ok = client(&server.url)
+        .report_execution(JOB, &report_request())
+        .await
+        .unwrap();
+    assert!(ok.ok);
+    assert!(ok.report_received);
+    assert!(!ok.replayed);
+    assert_eq!(ok.job_id, JOB);
+    assert_eq!(ok.attempt_id, ATT);
+    assert_eq!(ok.state, "completed");
+    assert_eq!(count_hits(&server, "/report"), 1);
+    assert!(sent_claim_token(&server, "/report"));
+
+    let replay_server = spawn_server(Box::new(|_| json_response(&report_ok_json(true)))).await;
+    let replay = client(&replay_server.url)
+        .report_execution(JOB, &report_request())
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(replay.report_received);
+}
+
+#[tokio::test]
+async fn report_drop_after_accept_is_outcome_unknown_and_sends_once() {
+    let server = spawn_server(Box::new(|_| Action::DropConnection)).await;
+    let e = client(&server.url)
+        .report_execution(JOB, &report_request())
+        .await
+        .unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::Transport(_)));
+    assert!(e.outcome_unknown);
+    assert_eq!(count_hits(&server, "/report"), 1);
+}
+
+#[tokio::test]
+async fn report_conflict_is_confirmed_and_not_retried() {
+    let server = spawn_server(Box::new(|_| {
+        status_json(
+            409,
+            r#"{"ok":false,"code":"REPORT_CONFLICT","message":"A different execution report was already accepted."}"#,
+        )
+    }))
+    .await;
+    let e = client(&server.url)
+        .report_execution(JOB, &report_request())
+        .await
+        .unwrap_err();
+    match e.kind {
+        ErrorKind::Server { status, code, .. } => {
+            assert_eq!(status, 409);
+            assert_eq!(code, "REPORT_CONFLICT");
+        }
+        other => panic!("expected REPORT_CONFLICT, got {other:?}"),
+    }
+    assert!(!e.outcome_unknown);
+    assert_eq!(count_hits(&server, "/report"), 1);
+}
+
+#[tokio::test]
+async fn report_http_200_with_invalid_confirmation_is_not_success() {
+    let cases = vec![
+        r#"{"ok":true}"#.to_string(),
+        format!(
+            r#"{{"ok":true,"job_id":"{JOB}","attempt_id":"123e4567-e89b-12d3-a456-426614174099","state":"completed","report_received":true,"received_at":"2026-09-13T00:00:00.000Z","replayed":false}}"#
+        ),
+        format!(
+            r#"{{"ok":true,"job_id":"{JOB}","attempt_id":"{ATT}","state":"failed","report_received":true,"received_at":"2026-09-13T00:00:00.000Z","replayed":false}}"#
+        ),
+        format!(
+            r#"{{"ok":true,"job_id":"{JOB}","attempt_id":"{ATT}","state":"completed","report_received":false,"received_at":"2026-09-13T00:00:00.000Z","replayed":false}}"#
+        ),
+    ];
+    for body in cases {
+        let payload = body.to_string();
+        let server = spawn_server(Box::new(move |_| json_response(&payload))).await;
+        let e = client(&server.url)
+            .report_execution(JOB, &report_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(e.kind, ErrorKind::Protocol(_)), "{body}");
+        assert!(e.outcome_unknown, "{body}");
+        assert_eq!(count_hits(&server, "/report"), 1);
+    }
+}
+
+#[tokio::test]
+async fn report_redirect_is_not_followed() {
+    let target = spawn_server(Box::new(|_| json_response(&report_ok_json(false)))).await;
+    let target_url = target.url.clone();
+    let first = spawn_server(Box::new(move |_| Action::Respond {
+        status: 302,
+        headers: vec![("location".into(), target_url.clone())],
+        body: vec![],
+    }))
+    .await;
+    let e = client(&first.url)
+        .report_execution(JOB, &report_request())
+        .await
+        .unwrap_err();
+    assert!(matches!(e.kind, ErrorKind::Redirect(302)));
+    assert!(e.outcome_unknown);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(target.recorded.lock().len(), 0);
 }

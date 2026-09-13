@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod controller;
 pub mod protocol;
+pub mod report;
 pub mod state;
 
 pub use acquisition::{acquire_one, AcquireError, AcquireOutcome};

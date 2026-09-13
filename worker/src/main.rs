@@ -1,6 +1,7 @@
 use ceo_worker::bridge::client::BridgeClient;
 use ceo_worker::bridge::config::{load_api_key, BridgeConfig};
 use ceo_worker::bridge::controller::Worker;
+use ceo_worker::bridge::report::{print_error as print_report_error, report_saved_attempt};
 use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
 use ceo_worker::local_state::ExecutionLock;
 use ceo_worker::observability::status::{JobStage, StatusTracker};
@@ -97,6 +98,21 @@ enum BridgeCmd {
         /// Workspace alias to serve (must exist in the config)
         #[arg(long)]
         workspace_ref: String,
+    },
+    /// Report a locally saved execution result to the server
+    Report {
+        /// Path to the bridge config JSON file
+        #[arg(long)]
+        config: PathBuf,
+        /// Workspace alias that produced the saved result
+        #[arg(long)]
+        workspace_ref: String,
+        /// Job id of the saved attempt (`job-<uuid>`)
+        #[arg(long)]
+        job_id: String,
+        /// Attempt id of the saved attempt
+        #[arg(long)]
+        attempt_id: String,
     },
 }
 
@@ -357,6 +373,20 @@ async fn main() {
                 let code = bridge_run(&config, &workspace_ref).await;
                 std::process::exit(code);
             }
+            BridgeCmd::Report {
+                config,
+                workspace_ref,
+                job_id,
+                attempt_id,
+            } => match report_saved_attempt(&config, &workspace_ref, &job_id, &attempt_id).await {
+                Ok(ok) => {
+                    println!("{}", serde_json::to_string_pretty(&ok).unwrap());
+                }
+                Err(e) => {
+                    print_report_error(&e);
+                    std::process::exit(1);
+                }
+            },
         },
     }
 }
