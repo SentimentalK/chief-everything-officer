@@ -970,23 +970,24 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     await putJob(job as any);
 
     // Claim first
-    const claimRes = await store.claimAssignment(scopeA, {
-      worker_id: "worker-1",
-      attempt_id: "attempt-1",
-      ttl_seconds: 60,
+    const claimRes = await store.claimAssignment(scopeA, job.job_id, {
+      worker_id: WRK,
+      attempt_id: ATT1,
+      workspace_ref: "tools",
+      claim_token_sha256: TOKEN_SHA,
     });
     expect(claimRes.ok).toBe(true);
 
     // Call resultAssignment with valid result
     const resultInput = {
-      worker_id: "worker-1",
-      attempt_id: "attempt-1",
+      worker_id: WRK,
+      attempt_id: ATT1,
+      claim_token_sha256: TOKEN_SHA,
       result: {
         target: "resource" as const,
+        payload_sha256: "payload-sha-256",
         resource_id: "res-test-123",
         commit: "git-commit-abc123",
-        payload_sha256: "payload-sha-256",
-        received_at: "2026-09-13T12:00:00.000Z",
       },
     };
 
@@ -997,12 +998,16 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const inspectRes = await store.inspectAssignment(scopeA, job.job_id);
     expect(inspectRes.ok).toBe(true);
     if (inspectRes.ok) {
-      expect(inspectRes.assignment.result).toEqual(resultInput.result);
+      expect(inspectRes.record.result?.payload_sha256).toBe(resultInput.result.payload_sha256);
+      expect(inspectRes.record.result?.commit).toBe(resultInput.result.commit);
     }
 
     // Replay with exact same payload_sha256 should succeed
     const res2 = await store.resultAssignment(scopeA, job.job_id, resultInput);
     expect(res2.ok).toBe(true);
+    if (res2.ok) {
+      expect(res2.replayed).toBe(true);
+    }
 
     // Mismatched payload_sha256 should fail with RESULT_CONFLICT
     const conflictInput = {
@@ -1020,18 +1025,28 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
 
     // Report can still be submitted after result
     const reportRes = await store.reportAssignment(scopeA, job.job_id, {
-      worker_id: "worker-1",
-      attempt_id: "attempt-1",
-      terminal_phase: "completed",
-      report_digest: "sha256-report-digest",
-      reported_at: "2026-09-13T12:01:00.000Z",
-      outcome: { status: "completed" },
-      executor: { type: "test", version: "1.0" },
+      worker_id: WRK,
+      attempt_id: ATT1,
+      claim_token_sha256: TOKEN_SHA,
+      report: {
+        schema_version: 2 as const,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 1000,
+        executor: { type: "test", version: "1.0" },
+        receipt_sha256: "a".repeat(64),
+        error: null,
+      },
     });
     expect(reportRes.ok).toBe(true);
 
     // Result replay is allowed even after terminal report
     const resAfterReport = await store.resultAssignment(scopeA, job.job_id, resultInput);
     expect(resAfterReport.ok).toBe(true);
+    if (resAfterReport.ok) {
+      expect(resAfterReport.replayed).toBe(true);
+    }
   });
 });
