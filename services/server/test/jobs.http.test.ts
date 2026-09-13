@@ -35,9 +35,15 @@ const reportBody = () => ({
   attempt_id: ATT,
   claim_token: TOKEN,
   report: {
-    schema_version: 1,
+    schema_version: 2,
     execution_status: "COMPLETED",
     business_outcome: "UNVERIFIED",
+    task_dispatched: true,
+    duration_ms: 1200,
+    executor: {
+      type: "test_stub",
+      version: "1.0.0",
+    },
     finished_at_ms: 1_789_255_887_000,
     receipt_sha256: "b".repeat(64),
     error: null,
@@ -271,9 +277,15 @@ describe("worker assignment HTTP strict input validation (real schema, not a thr
         attempt_id: ATT,
         claim_token: TOKEN,
         report: {
-          schema_version: 1,
+          schema_version: 2,
           execution_status: "COMPLETED",
           business_outcome: "UNVERIFIED",
+          task_dispatched: true,
+          duration_ms: 1200,
+          executor: {
+            type: "test_stub",
+            version: "1.0.0",
+          },
           finished_at_ms: 1,
           receipt_sha256: "b".repeat(64),
         },
@@ -524,6 +536,8 @@ describe("worker assignment HTTP error mapping", () => {
           ...reportBody(),
           report: {
             ...reportBody().report,
+            execution_status: "FAILED",
+            business_outcome: "FAILED",
             error: { stage: "task", code: "X", message: SENTINEL },
           },
         }),
