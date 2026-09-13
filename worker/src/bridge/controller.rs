@@ -133,13 +133,13 @@ fn build_envelope(
 ) -> String {
     let result_section = match payload.result_target {
         crate::bridge::protocol::ResultTarget::None => {
-            "No managed result target is required.".to_string()
+            "No CEO-managed result is required.\nDo not inspect .ceo for a result or delivery mechanism.\nComplete the task goal using normal workspace capabilities.".to_string()
         }
         crate::bridge::protocol::ResultTarget::Resource => {
             let result_path =
                 attempt_dir_for(canonical, job_id, attempt_id).join("managed-result.json");
             format!(
-                "This task requires a managed resource result.\nUpon completing extraction, you MUST write the result JSON to:\n{}\n\nFormat:\n{{\n  \"content\": \"...\",\n  \"metadata\": {{ ... }},\n  \"extraction\": {{ ... }}\n}}",
+                "CEO requires a managed Resource result.\n\nWrite the final managed result to:\n{}\n\nDo not inspect .ceo to discover delivery or protocol state.\nDo not modify canonical CEO Git.\nUse the appropriate workspace capability to produce this file.\n\nExpected JSON:\n{{\n  \"content\": \"...\",\n  \"metadata\": {{ ... }},\n  \"extraction\": {{ ... }}\n}}",
                 result_path.display()
             )
         }
@@ -157,7 +157,7 @@ You are operating on the managed workspace {:?}; keep outputs there. Follow the 
 
 {}
 
-## Result Target
+## Managed Result
 
 {}",
         canonical.display(),
@@ -1374,7 +1374,7 @@ accept b";
         assert!(env.contains(p), "prompt truncated: {env:?}");
         assert!(env.contains(a), "acceptance truncated: {env:?}");
         assert!(
-            env.contains("## Result Target\n\nNo managed result target is required."),
+            env.contains("## Managed Result\n\nNo CEO-managed result is required."),
             "result target none missing: {env:?}"
         );
         assert_eq!(sha256_of(p), sha256_of_bytes(p.as_bytes()));
@@ -1387,7 +1387,7 @@ accept b";
         p.resource_id = Some("res-123".to_string());
         let env = build_envelope(Path::new("/ws"), "job-1", "attempt-1", &p);
         assert!(
-            env.contains("## Result Target\n\nThis task requires a managed resource result.\nUpon completing extraction, you MUST write the result JSON to:\n/ws/.ceo/jobs/job-1/attempts/attempt-1/managed-result.json"),
+            env.contains("## Managed Result\n\nCEO requires a managed Resource result.\n\nWrite the final managed result to:\n/ws/.ceo/jobs/job-1/attempts/attempt-1/managed-result.json"),
             "resource target instructions mismatch: {env:?}"
         );
     }
