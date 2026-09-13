@@ -7,6 +7,8 @@ use crate::bridge::client::{
     BridgeClient, ClientError,
 };
 use crate::bridge::config::{load_api_key, BridgeConfig};
+use crate::bridge::delivery;
+use crate::bridge::outbox::PendingReportRecord;
 use crate::bridge::protocol::{
     ExecutionReportBody, ExecutionReportError, ExecutionReportOk, ExecutionReportRequest,
 };
@@ -514,7 +516,7 @@ pub async fn report_saved_attempt(
     state::reject_control_ancestor_symlinks(&workspace)
         .map_err(|e| local("PATH_INVALID", e.to_string()))?;
     let _lock = ExecutionLock::acquire(&workspace).map_err(|e| ReportError::Busy(e.to_string()))?;
-    let request = load_saved_report(&cfg, workspace_ref, job_id, attempt_id)?;
+    let binding = expected_binding(&cfg, workspace_ref, &workspace);
     let api_key =
         load_api_key(&cfg.api_key_file).map_err(|e| ReportError::Config(e.to_string()))?;
     let client =
@@ -526,10 +528,28 @@ pub async fn report_saved_attempt(
         )
         .await
         .map_err(ReportError::Client)?;
-    client
-        .report_execution(job_id, &request)
-        .await
-        .map_err(ReportError::Client)
+    match PendingReportRecord::try_load(&workspace, job_id, attempt_id, &binding) {
+        Ok(Some(pending)) => {
+            let state_path = state::state_path(&workspace);
+            let st = BridgeState::load(&state_path, &binding)
+                .map_err(|e| local(LOCAL_STATE_INVALID, e.to_string()))?;
+            validate_pending_against_evidence(&workspace, &binding, &st.worker_id, &pending)?;
+            let ok = delivery::send_pending_once(&client, &pending)
+                .await
+                .map_err(ReportError::Client)?;
+            delivery::ack_cleanup(&workspace, &pending)
+                .map_err(|e| local("CLEANUP_UNKNOWN", e.to_string()))?;
+            Ok(ok)
+        }
+        Ok(None) => {
+            let request = load_saved_report(&cfg, workspace_ref, job_id, attempt_id)?;
+            client
+                .report_execution(job_id, &request)
+                .await
+                .map_err(ReportError::Client)
+        }
+        Err(e) => Err(local("OUTBOX_INVALID", e.to_string())),
+    }
 }
 
 fn validate_history_for_report(history: &AttemptHistoryRecord) -> Result<(), String> {

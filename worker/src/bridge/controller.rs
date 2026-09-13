@@ -14,6 +14,7 @@
 use crate::bridge::acquisition::{acquire_one, AcquireError, AcquireOutcome};
 use crate::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use crate::bridge::config::{BridgeConfig, ExpectedIdentity};
+use crate::bridge::delivery;
 use crate::bridge::outbox::PendingReportRecord;
 use crate::bridge::protocol::{AssignmentStartOk, AssignmentStartRequest};
 use crate::bridge::report;
@@ -46,7 +47,7 @@ pub fn claim_backoff(attempt_index: usize) -> Duration {
     CLAIM_BACKOFF[attempt_index.min(CLAIM_BACKOFF.len() - 1)]
 }
 
-fn is_integrity_reason(reason: Option<&str>) -> bool {
+pub(crate) fn is_integrity_reason(reason: Option<&str>) -> bool {
     let Some(r) = reason else { return false };
     matches!(
         r,
@@ -203,20 +204,16 @@ impl Worker {
     /// the process exit code.
     pub async fn run(&mut self, mut stop_rx: watch::Receiver<Option<StopReason>>) -> i32 {
         let binding = self.binding();
-        if let Err(e) = self
-            .client
-            .verify_identity(&binding.user_id, &binding.workspace_id)
-            .await
+        if let Err(code) = delivery::verify_identity_until_ready(
+            &self.client,
+            &binding.user_id,
+            &binding.workspace_id,
+            &self.workspace_ref,
+            &mut stop_rx,
+        )
+        .await
         {
-            eprintln!("bridge: identity check failed: {e}");
-            emit(
-                "bridge_stopped",
-                "",
-                "",
-                &self.workspace_ref,
-                "identity_failed",
-            );
-            return 1;
+            return code;
         }
 
         let mut state = match state::try_load_or_fresh(&self.workspace, &binding) {
@@ -236,6 +233,17 @@ impl Worker {
         self.worker_id = state.worker_id.clone();
 
         if let Err(code) = self.recover_startup(&mut state, &mut stop_rx).await {
+            return code;
+        }
+        if let Err(code) = delivery::drain_pending(
+            &self.client,
+            &self.workspace,
+            &binding,
+            &self.worker_id,
+            &mut stop_rx,
+        )
+        .await
+        {
             return code;
         }
 
@@ -396,6 +404,33 @@ impl Worker {
         loop {
             if let Some(reason) = current_stop_or_closed(stop_rx) {
                 return stop_exit(&reason);
+            }
+            match delivery::has_pending(&self.workspace, &self.binding()) {
+                Ok(true) => {
+                    if let Err(code) = delivery::drain_pending(
+                        &self.client,
+                        &self.workspace,
+                        &self.binding(),
+                        &self.worker_id,
+                        stop_rx,
+                    )
+                    .await
+                    {
+                        return code;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("bridge: pending outbox is invalid: {e}");
+                    emit(
+                        "bridge_stopped",
+                        "",
+                        "",
+                        &self.workspace_ref,
+                        "outbox_invalid",
+                    );
+                    return 1;
+                }
             }
             let page = match self.client.pending(&self.workspace_ref, &cursor).await {
                 Ok(p) => {
@@ -692,6 +727,18 @@ impl Worker {
             &self.workspace_ref,
             "result_delivery_pending",
         );
+        let pending =
+            PendingReportRecord::load(&self.workspace, &job_id, &attempt_id, &self.binding())
+                .map_err(|_| 1)?;
+        delivery::deliver_one(
+            &self.client,
+            &self.workspace,
+            &self.binding(),
+            &self.worker_id,
+            &pending,
+            stop_rx,
+        )
+        .await?;
         if disposition == AttemptDisposition::StopDaemon {
             return Err(1);
         }

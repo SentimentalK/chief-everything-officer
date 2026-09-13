@@ -143,7 +143,7 @@ env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
 WORKER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
-# Wait up to 60s for local completion: receipt, history, and cleared active.
+# Wait up to 60s for local completion plus automatic report ACK.
 RECEIPT=""
 JOB_ID="$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).job_id)' "$E/job.json")"
 for i in $(seq 1 200); do
@@ -152,15 +152,17 @@ for i in $(seq 1 200); do
     ATTEMPT="$(node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const a=r.bridge_context&&r.bridge_context.attempt_id; if(!a){process.exit(2)} process.stdout.write(a)' "$RECEIPT" || true)"
     if [ -n "${ATTEMPT:-}" ] && [ -f "$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json" ]; then
       ACTIVE="$(node -e 'const fs=require("fs"); const p=process.argv[1]; if(!fs.existsSync(p)){process.exit(2)} const s=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(s.active===null||s.active===undefined?"null":"set")' "$WS/.ceo/bridge/state.json" || true)"
-      if [ "$ACTIVE" = "null" ]; then
+      if [ "$ACTIVE" = "null" ] \
+        && [ ! -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ] \
+        && grep -q 'server_result_reported' "$E/worker.stdout.log"; then
         break
       fi
     fi
   fi
   sleep 0.3
 done
-if [ -z "$RECEIPT" ] || [ -z "${ATTEMPT:-}" ] || [ ! -f "$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json" ] || [ "${ACTIVE:-}" != "null" ]; then
-  echo "execution acceptance: receipt/history/cleared-active not ready within timeout"
+if [ -z "$RECEIPT" ] || [ -z "${ATTEMPT:-}" ] || [ ! -f "$WS/.ceo/bridge/history/${JOB_ID}.${ATTEMPT}.json" ] || [ "${ACTIVE:-}" != "null" ] || [ -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ]; then
+  echo "execution acceptance: receipt/history/cleared-active/report-ack not ready within timeout"
   cat "$E/worker.stderr.log"
   cat "$E/worker.stdout.log"
   exit 1
@@ -222,8 +224,8 @@ if (r.business_outcome !== "UNVERIFIED") { console.error("expected UNVERIFIED, g
 if (!attempt) { console.error("receipt missing attempt_id"); process.exit(1); }
 if (!worker) { console.error("receipt missing worker_id"); process.exit(1); }
 
-if (!log.includes("local_result_saved") || !log.includes("result_delivery_pending")) {
-  console.error("worker stdout missing local_result_saved or result_delivery_pending");
+if (!log.includes("local_result_saved") || !log.includes("result_delivery_pending") || !log.includes("server_result_reported")) {
+  console.error("worker stdout missing local_result_saved, result_delivery_pending, or server_result_reported");
   process.exit(1);
 }
 if (!srvlog.includes(attempt)) { console.error("server log missing attempt " + attempt); process.exit(1); }
@@ -279,8 +281,8 @@ if (hist.worker_id !== worker) {
   process.exit(1);
 }
 const outboxFile = path.join(ws, ".ceo", "bridge", "outbox", `${job.job_id}.${attempt}.json`);
-if (!existsSync(outboxFile)) {
-  console.error("bridge outbox file missing on disk");
+if (existsSync(outboxFile)) {
+  console.error("bridge outbox file still present after ACK");
   process.exit(1);
 }
 const receiptSha = createHash("sha256").update(receiptBytes).digest("hex");
@@ -305,8 +307,20 @@ const rec = await store.getJob(job.job_id);
 if (!rec) { console.error("job not found in redis: " + job.job_id); process.exit(1); }
 if (!rec.execution) { console.error("job execution record missing in redis"); process.exit(1); }
 
-if (rec.execution.phase !== "running") {
-  console.error("expected redis execution phase to be running, got: " + rec.execution.phase);
+if (!rec.report) {
+  console.error("expected redis report after automatic delivery");
+  process.exit(1);
+}
+if (rec.report.execution_status !== "COMPLETED") {
+  console.error("expected COMPLETED report, got: " + rec.report.execution_status);
+  process.exit(1);
+}
+if (rec.report.business_outcome !== "UNVERIFIED") {
+  console.error("expected UNVERIFIED, got: " + rec.report.business_outcome);
+  process.exit(1);
+}
+if (rec.report.receipt_sha256 !== receiptSha) {
+  console.error("redis receipt hash mismatch");
   process.exit(1);
 }
 if (rec.execution.worker_id !== worker) {
@@ -323,7 +337,7 @@ if (typeof rec.execution.started_at_ms !== "number" || rec.execution.started_at_
 }
 
 await runner.dispose();
-console.log("PASS redis store verified: phase=running, started_at_ms=" + rec.execution.started_at_ms + ", matching worker=" + worker + ", attempt=" + attempt);
+console.log("PASS redis store verified: report COMPLETED/UNVERIFIED, matching worker=" + worker + ", attempt=" + attempt);
 '
 
 # 8) Report the saved local result with the compiled command (worker already stopped).
@@ -373,8 +387,8 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 const first = JSON.parse(readFileSync(process.env.REPORT_OUT, "utf8"));
-if (first.ok !== true || first.report_received !== true || first.replayed !== false) {
-  console.error("first report confirmation invalid: " + JSON.stringify(first));
+if (first.ok !== true || first.report_received !== true || first.replayed !== true) {
+  console.error("operator replay confirmation invalid: " + JSON.stringify(first));
   process.exit(1);
 }
 const job = JSON.parse(readFileSync(process.env.JOB, "utf8"));

@@ -2,6 +2,7 @@ pub mod acquisition;
 pub mod client;
 pub mod config;
 pub mod controller;
+pub mod delivery;
 pub mod outbox;
 pub mod protocol;
 pub mod report;

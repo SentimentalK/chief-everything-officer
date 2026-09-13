@@ -68,6 +68,8 @@ struct MockInner {
     isolate: AtomicBool,
     token_mismatch: AtomicBool,
     second_claim_first_done: Mutex<Option<bool>>,
+    report_drop: AtomicBool,
+    reported: Mutex<Vec<String>>,
     workspace: PathBuf,
 }
 
@@ -167,7 +169,10 @@ fn start_ok_json(worker_id: &str, attempt_id: &str) -> String {
 }
 
 fn decide(inner: &MockInner, req: &RecordedRequest) -> Action {
-    if inner.isolate.load(Ordering::SeqCst) {
+    if inner.isolate.load(Ordering::SeqCst)
+        && !req.target.contains("/report")
+        && !req.target.starts_with("/api/identity")
+    {
         return Action::DropConnection;
     }
     if req.target.starts_with("/api/identity") {
@@ -188,8 +193,51 @@ fn decide(inner: &MockInner, req: &RecordedRequest) -> Action {
     if req.target.contains("/start") {
         return handle_start(inner, req);
     }
+    if req.target.contains("/report") {
+        return handle_report(inner, req);
+    }
     Action::Respond {
         body: r#"{"ok":false,"code":"INVALID_INPUT"}"#.to_string(),
+    }
+}
+
+fn public_state(status: &str) -> &'static str {
+    match status {
+        "COMPLETED" => "completed",
+        "FAILED" => "failed",
+        "TIMED_OUT" => "timed_out",
+        "CANCELLED" => "cancelled",
+        "BLOCKED" => "blocked",
+        "INTERRUPTED" => "interrupted",
+        _ => "completed",
+    }
+}
+
+fn handle_report(inner: &MockInner, req: &RecordedRequest) -> Action {
+    if inner.report_drop.load(Ordering::SeqCst) {
+        return Action::DropConnection;
+    }
+    let Some(job_id) = job_id_from_target(&req.target) else {
+        return Action::Respond {
+            body: r#"{"ok":false,"code":"INVALID_INPUT"}"#.to_string(),
+        };
+    };
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+    let attempt_id = body
+        .get("attempt_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let status = body
+        .pointer("/report/execution_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("COMPLETED");
+    inner.reported.lock().push(job_id.clone());
+    Action::Respond {
+        body: format!(
+            r#"{{"ok":true,"job_id":"{job_id}","attempt_id":"{attempt_id}","state":"{}","report_received":true,"received_at":"2026-09-13T00:00:00.000Z","replayed":false}}"#,
+            public_state(status)
+        ),
     }
 }
 
@@ -467,7 +515,7 @@ fn job_terminal(workspace: &Path, job_id: &str, attempt_id: &str) -> bool {
     matches!(
         AttemptHistoryRecord::load(workspace, job_id, attempt_id),
         Ok(Some(_))
-    )
+    ) && !state::outbox_record_path(workspace, job_id, attempt_id).is_file()
 }
 
 fn job_completed(workspace: &Path, job_id: &str) -> bool {
@@ -479,7 +527,7 @@ fn job_completed(workspace: &Path, job_id: &str) -> bool {
             AttemptHistoryRecord::load(workspace, job_id, &receipt.attempt_id),
             Ok(Some(_))
         )
-        && state::outbox_record_path(workspace, job_id, &receipt.attempt_id).is_file()
+        && !state::outbox_record_path(workspace, job_id, &receipt.attempt_id).is_file()
 }
 
 fn attempt_count(workspace: &Path, job_id: &str) -> usize {
@@ -542,6 +590,8 @@ async fn start_harness_with(
         isolate: AtomicBool::new(false),
         token_mismatch: AtomicBool::new(false),
         second_claim_first_done: Mutex::new(None),
+        report_drop: AtomicBool::new(false),
+        reported: Mutex::new(Vec::new()),
         workspace: workspace.clone(),
     });
     let server = spawn_server(inner).await;
@@ -612,9 +662,11 @@ async fn start_drop_still_completes_locally() {
     assert_eq!(receipt.execution_status, "COMPLETED");
     assert!(count_hits(&run.server, "/start") >= 1);
     assert!(
-        state::outbox_record_path(&run.workspace, JOB1, &receipt.attempt_id).is_file(),
-        "outbox missing after local completion"
+        !state::outbox_record_path(&run.workspace, JOB1, &receipt.attempt_id).is_file(),
+        "outbox should be ACK-cleared after automatic delivery"
     );
+    assert!(count_hits(&run.server, "/report") >= 1);
+    assert!(run.server.inner.reported.lock().iter().any(|j| j == JOB1));
 }
 
 #[tokio::test]
@@ -764,8 +816,7 @@ async fn startup_reconstructs_missing_outbox_without_rerun() {
     let starts_before = count_hits(&run.server, "/start");
     let attempts_before = attempt_count(&run.workspace, JOB1);
     let outbox = state::outbox_record_path(&run.workspace, JOB1, &attempt);
-    assert!(outbox.is_file());
-    std::fs::remove_file(&outbox).unwrap();
+    let _ = std::fs::remove_file(&outbox);
 
     let hist = AttemptHistoryRecord::load(&run.workspace, JOB1, &attempt)
         .unwrap()
@@ -821,16 +872,76 @@ async fn startup_reconstructs_missing_outbox_without_rerun() {
     let outbox_check = outbox.clone();
     assert!(
         wait_until(Duration::from_secs(20), || {
-            outbox_check.is_file() && state_active_cleared(&ws)
+            state_active_cleared(&ws) && !outbox_check.is_file()
         })
         .await,
-        "startup did not reconstruct outbox and clear active"
+        "startup did not reconstruct, deliver, and clear active"
     );
     let _ = stop_tx.send(Some(StopReason::UserRequested));
     assert_eq!(handle.await.unwrap(), 0);
     assert_eq!(attempt_count(&run.workspace, JOB1), attempts_before);
     assert_eq!(count_hits(&run.server, "/start"), starts_before);
-    let loaded = PendingReportRecord::load(&run.workspace, JOB1, &attempt, &bind).unwrap();
-    assert_eq!(loaded.job_id, JOB1);
-    assert_eq!(loaded.attempt_id, attempt);
+    let loaded = PendingReportRecord::try_load(&run.workspace, JOB1, &attempt, &bind).unwrap();
+    assert!(loaded.is_none(), "delivered pending should be removed");
+}
+
+#[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
+async fn restart_delivers_pending_without_rerunning_agent() {
+    let mut run = start_harness(vec![JOB1.to_string()], StartMode::Ok, false, "normal").await;
+    run.server.inner.report_drop.store(true, Ordering::SeqCst);
+    let ws = run.workspace.clone();
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            load_receipt(&ws, JOB1).is_some()
+                && state_active_cleared(&ws)
+                && count_hits(&run.server, "/report") >= 1
+        })
+        .await,
+        "local completion with failed report not observed"
+    );
+    let receipt = load_receipt(&run.workspace, JOB1).expect("receipt");
+    let attempt = receipt.attempt_id.clone();
+    let outbox = state::outbox_record_path(&run.workspace, JOB1, &attempt);
+    assert!(outbox.is_file(), "pending must remain after report drop");
+    let starts_before = count_hits(&run.server, "/start");
+    let attempts_before = attempt_count(&run.workspace, JOB1);
+    let _ = run.stop_tx.send(Some(StopReason::UserRequested));
+    assert_eq!(run.handle.take().unwrap().await.unwrap(), 0);
+    assert!(outbox.is_file());
+
+    run.server.inner.report_drop.store(false, Ordering::SeqCst);
+    let cfg = BridgeConfig::load(&run.workspace.parent().unwrap().join("bridge.json")).unwrap();
+    let key = load_api_key(&cfg.api_key_file).unwrap();
+    let client = BridgeClient::new(cfg.server_base.clone(), key).unwrap();
+    let mut wcfg = WorkerConfig::default();
+    wcfg.workspace_dir = run.workspace.clone();
+    wcfg.executor_type = ExecutorType::TestStub;
+    wcfg.agent_executable = stub_bin();
+    wcfg.doctor_timeout_secs = 30;
+    let runner = Runner::new(wcfg, None);
+    let mut worker = Worker::new(
+        &cfg,
+        ExpectedIdentity {
+            user_id: USER.to_string(),
+            workspace_id: WS_ID.to_string(),
+        },
+        "tools",
+        run.workspace.clone(),
+        client,
+        runner,
+        String::new(),
+    );
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let handle = tokio::spawn(async move { worker.run(stop_rx).await });
+    let outbox_check = outbox.clone();
+    assert!(
+        wait_until(Duration::from_secs(20), || !outbox_check.is_file()).await,
+        "restart did not deliver pending report"
+    );
+    let _ = stop_tx.send(Some(StopReason::UserRequested));
+    assert_eq!(handle.await.unwrap(), 0);
+    assert_eq!(attempt_count(&run.workspace, JOB1), attempts_before);
+    assert_eq!(count_hits(&run.server, "/start"), starts_before);
+    assert!(run.server.inner.reported.lock().iter().any(|j| j == JOB1));
 }

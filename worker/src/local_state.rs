@@ -70,9 +70,30 @@ impl ExecutionLock {
 /// durable across a power loss. A plain `flush()` + `rename` is *not* a power
 /// failure guarantee by itself; only the parent-directory sync makes the
 /// directory-entry change persistent.
-fn sync_directory(dir: &Path) -> std::io::Result<()> {
+pub fn sync_directory(dir: &Path) -> std::io::Result<()> {
     let d = File::open(dir)?;
     d.sync_all()
+}
+
+/// Unlink `path` and fsync the parent directory. `NotFound` on unlink is
+/// success (the entry is already gone). If unlink succeeded but the directory
+/// fsync fails, the caller must treat cleanup durability as unknown.
+pub fn remove_durable(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no parent dir",
+            ))
+        }
+    };
+    sync_directory(parent)
 }
 
 /// Uniquely named temporary sibling for atomic replacement.
