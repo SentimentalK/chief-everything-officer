@@ -611,6 +611,13 @@ impl Worker {
             {
                 Ok(AcquireOutcome::Claimed) => {
                     let active = state.active.clone().ok_or(1)?;
+                    emit(
+                        "job_claimed",
+                        &active.job_id,
+                        &active.attempt_id,
+                        &self.workspace_ref,
+                        "claimed",
+                    );
                     return self.finish_claimed(state, active, stop_rx).await;
                 }
                 Ok(AcquireOutcome::NoLongerPending) => {
@@ -713,9 +720,25 @@ impl Worker {
             }
         };
 
+        emit(
+            "attempt_started",
+            &job_id,
+            &attempt_id,
+            &self.workspace_ref,
+            "running",
+        );
+
         let (receipt, local_write_failed) = self
             .run_managed_attempt(state, &job_id, &attempt_id, &active, &prompt_path, stop_rx)
             .await?;
+
+        emit(
+            "execution_finished",
+            &job_id,
+            &attempt_id,
+            &self.workspace_ref,
+            &receipt.execution_status,
+        );
 
         // Decide, from the local execution result + teardown evidence, what the
         // daemon does next. An unconfirmed stop means the process may still be
