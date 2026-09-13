@@ -460,8 +460,13 @@ impl BridgeState {
     /// binding mismatch, returns `Err` — never silently re-initializes.
     pub fn load(path: &Path, expected_binding: &BridgeBinding) -> Result<BridgeState, StateError> {
         let text = std::fs::read_to_string(path).map_err(|e| StateError::io(path, &e))?;
-        let st: BridgeState = serde_json::from_str(&text)
+        let mut st: BridgeState = serde_json::from_str(&text)
             .map_err(|e| StateError::Invalid(format!("parse error: {e}")))?;
+        // Seamless migration: an idle state (active == None) written under schema_version 2
+        // carries no ActiveAttempt payload and is identical in shape to schema_version 3.
+        if st.schema_version == 2 && st.active.is_none() {
+            st.schema_version = STATE_SCHEMA_VERSION;
+        }
         st.validate(expected_binding)?;
         Ok(st)
     }
@@ -883,6 +888,17 @@ mod tests {
         // File content unchanged
         let on_disk = std::fs::read_to_string(&p).unwrap();
         assert!(on_disk.contains("\"schema_version\":1"));
+
+        // Version 2 idle state cleanly migrates to Version 3
+        let v2_idle_json = serde_json::json!({
+            "schema_version": 2,
+            "binding": b,
+            "worker_id": "wrk-123e4567-e89b-12d3-a456-426614174000",
+            "active": null
+        });
+        std::fs::write(&p, serde_json::to_string(&v2_idle_json).unwrap()).unwrap();
+        let st = BridgeState::load(&p, &b).unwrap();
+        assert_eq!(st.schema_version, STATE_SCHEMA_VERSION);
 
         // lease_token alias is not accepted
         let lease_token_json = serde_json::json!({
