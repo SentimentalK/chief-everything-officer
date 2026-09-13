@@ -160,7 +160,7 @@ describe("POST /api/worker/jobs/:job_id/result route", () => {
           job_id: JOB,
           workspace_id: "ws-test",
           user_id: "usr-test",
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           resource_id: currentResourceId,
           result_target: "resource" as const,
           prompt: "test",

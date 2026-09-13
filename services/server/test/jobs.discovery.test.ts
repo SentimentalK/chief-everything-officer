@@ -35,7 +35,7 @@ function nextReq(): string {
   return `123e4567-e89b-12d3-a456-${hex}`;
 }
 
-const submitBody = (workspaceRef = "tools") => ({
+const submitBody = (workspaceRef = "ceo-agent-runtime") => ({
   request_id: nextReq(),
   workspace_ref: workspaceRef,
   prompt: "discovery prompt",
@@ -120,11 +120,11 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     expect(entry).toBeDefined();
     expect(entry!.fields.schema_version).toBe("1");
 
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     expect(res.ok).toBe(true);
     expect(res.jobs.length).toBe(1);
     expect(res.jobs[0]!.job_id).toBe(jobId);
-    expect(res.jobs[0]!.workspace_ref).toBe("tools");
+    expect(res.jobs[0]!.workspace_ref).toBe("ceo-agent-runtime");
     expect(res.has_more).toBe(false);
   });
 
@@ -137,7 +137,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const otherWs = await serviceA.pending(scopeA, { workspace_ref: "development", after: "0-0" });
     expect(otherWs.jobs).toEqual([]);
     // A (tools) only sees A's own tools job, never B's.
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
     expect(ids).toContain(aJob.view!.job_id);
     expect(ids).not.toContain(bJob.view!.job_id);
@@ -147,9 +147,9 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     await store.resetForTest();
     const q = await serviceA.submit(scopeA, submitBody()); // queued
     const claimed = await serviceA.submit(scopeA, submitBody());
-    await serviceA.claim(scopeA, claimed.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN });
+    await serviceA.claim(scopeA, claimed.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "ceo-agent-runtime", claim_token: TOKEN });
     const running = await serviceA.submit(scopeA, submitBody());
-    await serviceA.claim(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN });
+    await serviceA.claim(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "ceo-agent-runtime", claim_token: TOKEN });
     await serviceA.start(scopeA, running.view!.job_id, { worker_id: WRK, attempt_id: ATT1, claim_token: TOKEN });
 
     // Expired (no execution, past 7-day claim window)
@@ -164,7 +164,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     expect(gotExpired.ok).toBe(true);
     expect(gotExpired.view?.state).toBe("expired");
 
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
     expect(ids).toEqual([q.view!.job_id]);
     expect(ids).not.toContain(claimed.view!.job_id);
@@ -179,7 +179,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const rec = await getRawJob(bad.view!.job_id);
     rec.execution = null as unknown as JobAssignment;
     await setJob(rec);
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
     expect(ids).toEqual([good.view!.job_id]);
     expect(ids).not.toContain(bad.view!.job_id);
@@ -198,7 +198,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const collected: string[] = [];
     let after = "0-0";
     for (let page = 0; page < 10; page++) {
-      const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after });
+      const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after });
       collected.push(...res.jobs.map((j) => j.job_id));
       after = res.next_cursor;
       expect(res.jobs.length).toBeLessThanOrEqual(DISCOVERY_PAGE_SIZE);
@@ -215,11 +215,11 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
       const r = await serviceB.submit(scopeB, submitBody());
       expect(r.ok).toBe(true);
     }
-    const first = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const first = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     expect(first.jobs).toEqual([]);
     expect(first.has_more).toBe(true);
     // Cursor moved past the B-only window; a second page finds nothing.
-    const second = await serviceA.pending(scopeA, { workspace_ref: "tools", after: first.next_cursor });
+    const second = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: first.next_cursor });
     expect(second.jobs).toEqual([]);
     expect(second.has_more).toBe(false);
   });
@@ -238,7 +238,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
       request_id: "123e4567-e89b-12d3-a456-4266bad0000000",
       user_id: scopeA.user_id,
       workspace_id: scopeA.workspace_id,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       resource_id: null,
       prompt: "x",
       acceptance: "x",
@@ -251,7 +251,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
       claim_deadline_ms: Date.now() + 604_800_000,
     });
     const good = await serviceA.submit(scopeA, submitBody());
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     const ids = res.jobs.map((j) => j.job_id);
     expect(ids).toEqual([good.view!.job_id]);
   });
@@ -269,7 +269,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     );
     const deadService = new JobService({ store: new RedisJobStore(deadRunner) }, () => true);
     try {
-      await expect(deadService.pending(scopeA, { workspace_ref: "tools", after: "0-0" })).rejects.toMatchObject({
+      await expect(deadService.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" })).rejects.toMatchObject({
         code: "QUEUE_UNAVAILABLE",
       });
     } finally {
@@ -280,14 +280,14 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
   it("two clients discovering the same job: claim still allows exactly one", async () => {
     await store.resetForTest();
     const sub = await serviceA.submit(scopeA, submitBody());
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     expect(res.jobs.map((j) => j.job_id)).toEqual([sub.view!.job_id]);
     const results = await Promise.allSettled([
-      serviceA.claim(scopeA, sub.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "tools", claim_token: TOKEN }),
+      serviceA.claim(scopeA, sub.view!.job_id, { worker_id: WRK, attempt_id: ATT1, workspace_ref: "ceo-agent-runtime", claim_token: TOKEN }),
       serviceA.claim(scopeA, sub.view!.job_id, {
         worker_id: WRK,
         attempt_id: "123e4567-e89b-12d3-a456-4266141740bb",
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         claim_token: "b".repeat(64),
       }),
     ]);
@@ -304,7 +304,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     const beforeJob = await getRawJob(sub.view!.job_id);
     const beforeLen = await store.streamLength();
     const beforePh = await store.getPlaceholder(scopeA, beforeJob.request_id);
-    const res = await serviceA.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const res = await serviceA.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     expect(res.jobs.map((j) => j.job_id)).toEqual([sub.view!.job_id]);
     const afterJob = await getRawJob(sub.view!.job_id);
     const afterLen = await store.streamLength();

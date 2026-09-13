@@ -39,13 +39,13 @@ REMOTE="$CEO_ACCEPTANCE_REMOTE"
 SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 
-rm -rf "$E"; mkdir -p "$E"/workspace/tools "$E"/data/identity "$E"/logs
+rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/logs
 
-# A local "tools" worktree for the alias (content does not matter for read-only
+# A local "ceo-agent-runtime" worktree for the alias (content does not matter for read-only
 # discovery; it must simply exist and be a directory).
-cd "$E/workspace/tools"
+cd "$E/workspace/ceo-agent-runtime"
 git init -q -b "$BRANCH" 2>/dev/null || git init -q
-echo "local tools" > README.md
+echo "local ceo-agent-runtime" > README.md
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm init 2>/dev/null || true
 
@@ -91,7 +91,7 @@ const wait = (ms=8000) => new Promise((res, rej) => { const s=Date.now();
 await wait();
 const request_id = "123e4567-e89b-12d3-a456-4266141740ff";
 const res = await svc.submit(scope, { request_id,
-  workspace_ref: "tools", prompt: "connectivity acceptance", acceptance: "done", timeout_seconds: 120 });
+  workspace_ref: "ceo-agent-runtime", prompt: "connectivity acceptance", acceptance: "done", timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
 const jobId = res.view.job_id;
 const rec = await store.getJob(jobId);
@@ -167,9 +167,9 @@ node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.arg
   const cfg={schema_version:1,server_url:"http://127.0.0.1:"+process.argv[3],
     api_key_file:process.argv[1].replace(/ids\.json$/,"key"),
     expected_identity:{user_id:id.user_id,workspace_id:id.workspace_id},
-    workspaces:{tools:process.argv[2]}};
+    workspaces:{"ceo-agent-runtime":process.argv[2]}};
   fs.writeFileSync(process.argv[1].replace(/ids\.json$/,"bridge.json"), JSON.stringify(cfg,null,2));' \
-  "$E/ids.json" "$E/workspace/tools" "$PORT"
+  "$E/ids.json" "$E/workspace/ceo-agent-runtime" "$PORT"
 
 # 5) Snapshot the pre-execution Redis state and confirm the JobRecord is a
 #    clean "queued" record with no execution attached.
@@ -181,7 +181,7 @@ node -e 'const fs=require("fs");
   console.log("PASS pre-execution snapshot (queued, no execution)");' "$E/before.json"
 
 echo "--- bridge check (expected PASS) ---"
-OUT="$("$WRK" bridge check --config "$E/bridge.json" --workspace-ref tools --after 0-0)"
+OUT="$("$WRK" bridge check --config "$E/bridge.json" --workspace-ref ceo-agent-runtime --after 0-0)"
 echo "$OUT"
 node -e 'const fs=require("fs");
   const o=JSON.parse(process.argv[1]);
@@ -189,17 +189,17 @@ node -e 'const fs=require("fs");
   const id=JSON.parse(fs.readFileSync(process.argv[3],"utf8"));
   if(!o.ok||!o.identity_verified){console.error("expected ok/identity_verified");process.exit(1)}
   if(o.user_id!==id.user_id||o.workspace_id!==id.workspace_id){console.error("identity mismatch vs temp DB");process.exit(1)}
-  if(o.workspace_ref!=="tools"){console.error("workspace_ref not tools");process.exit(1)}
+  if(o.workspace_ref!=="ceo-agent-runtime"){console.error("workspace_ref not ceo-agent-runtime");process.exit(1)}
   if(o.workspace!==process.argv[4]){console.error("canonical workspace dir mismatch");process.exit(1)}
   if(o.jobs.length!==1){console.error("expected exactly one discovered job, got "+o.jobs.length);process.exit(1)}
   if(o.jobs[0].job_id!==job.job_id){console.error("discovered job != submitted job");process.exit(1)}
   if(o.next_cursor!==job.stream_entry_id){console.error("next_cursor != stream entry id");process.exit(1)}
   if(o.has_more!==false){console.error("single-task page must have has_more=false");process.exit(1)}
   console.log("PASS discovered", o.jobs[0].job_id, "cursor", o.next_cursor);' \
-  "$OUT" "$E/job.json" "$E/ids.json" "$E/workspace/tools"
+  "$OUT" "$E/job.json" "$E/ids.json" "$E/workspace/ceo-agent-runtime"
 
 # 5b) Re-run discovery from the returned cursor: an empty, non-advancing page.
-OUT2="$("$WRK" bridge check --config "$E/bridge.json" --workspace-ref tools --after "$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).stream_entry_id)' "$E/job.json")")"
+OUT2="$("$WRK" bridge check --config "$E/bridge.json" --workspace-ref ceo-agent-runtime --after "$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).stream_entry_id)' "$E/job.json")")"
 echo "$OUT2"
 node -e 'const fs=require("fs");
   const o=JSON.parse(process.argv[1]);

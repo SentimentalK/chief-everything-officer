@@ -46,7 +46,7 @@ function baseRecord(
     request_id: "123e4567-e89b-12d3-a456-4266141740cc",
     user_id: scope.user_id,
     workspace_id: scope.workspace_id,
-    workspace_ref: "tools",
+    workspace_ref: "ceo-agent-runtime",
     resource_id: null,
     prompt: "assignment test prompt",
     acceptance: "assignment test acceptance",
@@ -177,7 +177,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const res = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
 
@@ -228,13 +228,13 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       store.claimAssignment(scopeA, job.job_id, {
         worker_id: WRK,
         attempt_id: ATT1,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         claim_token_sha256: TOKEN_SHA,
       }),
       store.claimAssignment(scopeA, job.job_id, {
         worker_id: WRK2,
         attempt_id: ATT2,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         claim_token_sha256: TOKEN_SHA2,
       }),
     ];
@@ -261,7 +261,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const initial = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(initial.ok).toBe(true);
@@ -274,7 +274,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const seqReplay = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(seqReplay.ok).toBe(true);
@@ -290,7 +290,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
         store.claimAssignment(scopeA, job.job_id, {
           worker_id: WRK,
           attempt_id: ATT1,
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           claim_token_sha256: TOKEN_SHA,
         }),
       ),
@@ -316,7 +316,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const first = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(first.ok).toBe(true);
@@ -327,7 +327,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const diffWorker = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK2,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(diffWorker.ok).toBe(false);
@@ -337,7 +337,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const diffToken = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA2,
     });
     expect(diffToken.ok).toBe(false);
@@ -370,7 +370,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimB = await store.claimAssignment(scopeB, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimB.ok).toBe(false);
@@ -392,7 +392,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimWs = await store.claimAssignment(scopeA_otherWs, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimWs.ok).toBe(false);
@@ -438,7 +438,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const rep = await store.claimAssignment(scopeA, historicalJob.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(rep.ok).toBe(true);
@@ -456,7 +456,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimRes = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimRes.ok).toBe(true);
@@ -498,7 +498,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimReplay = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimReplay.ok).toBe(true);
@@ -531,7 +531,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const v1Claim = await store.claimAssignment(scopeA, v1Job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(v1Claim.ok).toBe(false);
@@ -549,7 +549,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const prepClaim = await store.claimAssignment(scopeA, prepJob.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(prepClaim.ok).toBe(false);
@@ -600,7 +600,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     await store.claimAssignment(scopeA, claimedJob.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     const startMismatch = await store.startAssignment(scopeA, claimedJob.job_id, {
@@ -652,7 +652,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimRes = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimRes.ok).toBe(true);
@@ -670,7 +670,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const firstClaim = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(firstClaim.ok).toBe(true);
@@ -680,7 +680,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const retryClaim = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(retryClaim.ok).toBe(true);
@@ -717,7 +717,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimRes = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimRes.ok).toBe(true);
@@ -769,7 +769,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       const claimRes = await store.claimAssignment(scopeA, job.job_id, {
         worker_id: tc.worker,
         attempt_id: tc.attempt,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         claim_token_sha256: TOKEN_SHA,
       });
       expect(claimRes.ok, `claim with ${tc.name} must fail`).toBe(false);
@@ -838,7 +838,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       const claimRes = await store.claimAssignment(scopeA, corruptJob.job_id, {
         worker_id: WRK,
         attempt_id: ATT1,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         claim_token_sha256: TOKEN_SHA,
       });
       expect(claimRes.ok).toBe(false);
@@ -973,7 +973,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const claimRes = await store.claimAssignment(scopeA, job.job_id, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token_sha256: TOKEN_SHA,
     });
     expect(claimRes.ok).toBe(true);

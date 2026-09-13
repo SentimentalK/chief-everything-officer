@@ -24,9 +24,9 @@ SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 STUB="$CEO_ACCEPTANCE_STUB"
 
-rm -rf "$E"; mkdir -p "$E"/workspace/tools "$E"/data/identity "$E"/logs
+rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/logs
 
-cd "$E/workspace/tools"
+cd "$E/workspace/ceo-agent-runtime"
 git init -q -b "$BRANCH" 2>/dev/null || git init -q
 cat > AGENTS.md <<EOF
 # Guidelines
@@ -44,12 +44,14 @@ node --input-type=module -e '
 import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-const store = await import(pathToFileURL(path.join(process.env.SRV, "dist/identity/store.js")).href);
+const base = process.env.SRV;
+const store = await import(pathToFileURL(path.join(base, "dist/identity/store.js")).href);
 const id = store.provisionEmptyIdentityDatabase(process.env.DB, {
   remoteUrl: process.env.REMOTE, branch: process.env.BRANCH,
   apiKeyDigest: store.sha256Hex(process.env.KEY),
 });
 writeFileSync(process.env.IDS, JSON.stringify(id));
+console.log("provisioned", id.user_id, id.workspace_id);
 '
 
 cd "$SRV"
@@ -59,8 +61,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createClient } from "redis";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-const storeMod = await import(pathToFileURL(path.join(process.env.SRV, "dist/jobs/redis-store.js")).href);
-const serviceMod = await import(pathToFileURL(path.join(process.env.SRV, "dist/jobs/service.js")).href);
+const base = process.env.SRV;
+const storeMod = await import(pathToFileURL(path.join(base, "dist/jobs/redis-store.js")).href);
+const serviceMod = await import(pathToFileURL(path.join(base, "dist/jobs/service.js")).href);
 const id = JSON.parse(readFileSync(process.env.IDS,"utf8"));
 const scope = { user_id: id.user_id, workspace_id: id.workspace_id };
 const runner = storeMod.createRedisRunnerFromClient(
@@ -72,7 +75,7 @@ const wait = (ms=8000) => new Promise((res, rej) => { const s=Date.now();
   (function t(){ if (runner.ready()) return res(); if (Date.now()-s>ms) return rej(new Error("redis not ready")); setTimeout(t,20); })(); });
 await wait();
 const res = await svc.submit(scope, { request_id: "123e4567-e89b-12d3-a456-4266141740aa",
-  workspace_ref: "tools",
+  workspace_ref: "ceo-agent-runtime",
   prompt: "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: delivery-nonce-4242",
   acceptance: "output_artifact.txt must contain delivery-nonce-4242", timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
@@ -133,15 +136,15 @@ node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.arg
   const cfg={schema_version:1,server_url:"http://127.0.0.1:"+process.argv[3],
     api_key_file:process.argv[1].replace(/ids\.json$/,"key"),
     expected_identity:{user_id:id.user_id,workspace_id:id.workspace_id},
-    workspaces:{tools:process.argv[2]}};
+    workspaces:{"ceo-agent-runtime":process.argv[2]}};
   fs.writeFileSync(process.argv[1].replace(/ids\.json$/,"bridge.json"), JSON.stringify(cfg,null,2));' \
-  "$E/ids.json" "$E/workspace/tools" "$PORT"
-WS="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(c.workspaces.tools)' "$E/bridge.json")"
+  "$E/ids.json" "$E/workspace/ceo-agent-runtime" "$PORT"
+WS="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(c.workspaces["ceo-agent-runtime"])' "$E/bridge.json")"
 JOB_ID="$(node -e 'const fs=require("fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).job_id)' "$E/job.json")"
 
 cd "$WS"
 env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
-  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref tools \
+  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref ceo-agent-runtime \
   > "$E/worker.stdout.log" 2> "$E/worker.stderr.log" &
 WORKER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
@@ -239,7 +242,7 @@ if [ ! -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ]; then
 fi
 
 env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
-  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref tools \
+  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref ceo-agent-runtime \
   > "$E/worker2.stdout.log" 2> "$E/worker2.stderr.log" &
 WORKER_PID=$!
 for i in $(seq 1 80); do

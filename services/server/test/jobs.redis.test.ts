@@ -36,7 +36,7 @@ function makePrepared(scope: typeof userA, reqId: string, note = "x"): { prepare
   const job_id = makeJobId();
   const now = Date.now();
   const request_digest = businessDigest({
-    workspace_ref: "tools",
+    workspace_ref: "ceo-agent-runtime",
     prompt,
     acceptance: "accept",
     resource_id: null,
@@ -50,7 +50,7 @@ function makePrepared(scope: typeof userA, reqId: string, note = "x"): { prepare
       request_id: reqId,
       user_id: scope.user_id,
       workspace_id: scope.workspace_id,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       resource_id: null,
       prompt,
       acceptance: "accept",
@@ -67,7 +67,7 @@ function makePrepared(scope: typeof userA, reqId: string, note = "x"): { prepare
 
 const submitPayload = (req: string, prompt = "p-x") => ({
   request_id: req,
-  workspace_ref: "tools",
+  workspace_ref: "ceo-agent-runtime",
   prompt,
   acceptance: "accept",
   timeout_seconds: 120,
@@ -312,7 +312,7 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     const claimRes = await serviceA.claim(userA, jobId, {
       worker_id: "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
       attempt_id: "123e4567-e89b-12d3-a456-4266141740aa",
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token: "a".repeat(64),
     });
     expect(claimRes.ok).toBe(true);

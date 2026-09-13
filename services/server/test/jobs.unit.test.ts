@@ -25,7 +25,7 @@ import type { JobService } from "../src/jobs/service.js";
 import type { AuditStore, TraceRecordInput } from "../src/audit.js";
 
 const uuid = "123e4567-e89b-12d3-a456-426614174000";
-const wsRef = "tools";
+const wsRef = "ceo-agent-runtime";
 
 function valid(patch: Record<string, unknown> = {}) {
   return {
@@ -266,7 +266,7 @@ describe("worker execution report schema", () => {
 
 describe("business digest", () => {
   const base = {
-    workspace_ref: "tools",
+    workspace_ref: "ceo-agent-runtime",
     prompt: "translate next",
     acceptance: "> 0 lines",
     resource_id: null as string | null,
@@ -475,7 +475,7 @@ describe("MCP protocol layer enforcement and audit tracing", () => {
           state: "failed",
           created_at: "2026-09-12T23:20:00.000Z",
           expires_at: "2026-09-19T23:20:00.000Z",
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           resource_id: null,
           replayed: false,
           execution: {

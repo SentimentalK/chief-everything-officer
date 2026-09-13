@@ -29,7 +29,7 @@ const WRK = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
 const ATT = "123e4567-e89b-12d3-a456-4266141740ab";
 const TOKEN = "c".repeat(64);
 
-const claimBody = () => ({ worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", claim_token: TOKEN });
+const claimBody = () => ({ worker_id: WRK, attempt_id: ATT, workspace_ref: "ceo-agent-runtime", claim_token: TOKEN });
 const reportBody = () => ({
   worker_id: WRK,
   attempt_id: ATT,
@@ -93,7 +93,7 @@ function okAssignment(patch: Record<string, unknown> = {}): AssignmentResult {
     },
     job: {
       job_id: JOB,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       resource_id: null,
       prompt: "http prompt",
       acceptance: "http acceptance",
@@ -219,10 +219,10 @@ describe("worker assignment HTTP strict input validation (real schema, not a thr
   const cases: Array<{ name: string; body: Record<string, unknown> }> = [
     { name: "forged user_id (unknown field)", body: { ...claimBody(), user_id: "usr_evil" } },
     { name: "forged workspace_id (unknown field)", body: { ...claimBody(), workspace_id: "ws_evil" } },
-    { name: "missing attempt_id", body: { worker_id: WRK, workspace_ref: "tools", claim_token: TOKEN } },
+    { name: "missing attempt_id", body: { worker_id: WRK, workspace_ref: "ceo-agent-runtime", claim_token: TOKEN } },
     { name: "malformed worker_id", body: { ...claimBody(), worker_id: "wrk-NOTHEX" } },
     { name: "malformed claim_token", body: { ...claimBody(), claim_token: "not-hex" } },
-    { name: "legacy lease_token rejected", body: { worker_id: WRK, attempt_id: ATT, workspace_ref: "tools", lease_token: TOKEN } },
+    { name: "legacy lease_token rejected", body: { worker_id: WRK, attempt_id: ATT, workspace_ref: "ceo-agent-runtime", lease_token: TOKEN } },
     { name: "malformed workspace_ref", body: { ...claimBody(), workspace_ref: "tools/../evil" } },
   ];
   for (const c of cases) {
@@ -366,7 +366,7 @@ describe("worker discovery HTTP (GET /pending)", () => {
         jobs: [
           {
             job_id: JOB2,
-            workspace_ref: "tools",
+            workspace_ref: "ceo-agent-runtime",
             resource_id: null,
             created_at: "2026-09-07T00:00:00.000Z",
             expires_at: "2026-09-14T00:00:00.000Z",
@@ -682,7 +682,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
       // 1. Submit job
       const submitRes = await service.submit(identity, {
         request_id: requestId,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         prompt: promptText,
         acceptance: acceptanceText,
         timeout_seconds: 120,
@@ -712,7 +712,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
           body: JSON.stringify({
             worker_id: WRK,
             attempt_id: ATT,
-            workspace_ref: "tools",
+            workspace_ref: "ceo-agent-runtime",
             claim_token: TOKEN,
           }),
         });
@@ -745,7 +745,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
         const jobKeys = Object.keys(claimBody.job).sort();
         expect(jobKeys).toEqual(["acceptance", "job_id", "prompt", "resource_id", "result_target", "timeout_seconds", "workspace_ref"]);
         expect(claimBody.job.job_id).toBe(jobId);
-        expect(claimBody.job.workspace_ref).toBe("tools");
+        expect(claimBody.job.workspace_ref).toBe("ceo-agent-runtime");
         expect(claimBody.job.prompt).toBe(promptText);
         expect(claimBody.job.acceptance).toBe(acceptanceText);
         expect(claimBody.job.timeout_seconds).toBe(120);
@@ -775,7 +775,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
           body: JSON.stringify({
             worker_id: WRK,
             attempt_id: ATT,
-            workspace_ref: "tools",
+            workspace_ref: "ceo-agent-runtime",
             claim_token: TOKEN,
           }),
         });
@@ -866,7 +866,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
           body: JSON.stringify({
             worker_id: WRK,
             attempt_id: ATT,
-            workspace_ref: "tools",
+            workspace_ref: "ceo-agent-runtime",
             claim_token: TOKEN,
           }),
         });
@@ -921,7 +921,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
     try {
       const submitRes = await service.submit(identity, {
         request_id: requestId,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         prompt: "http report prompt",
         acceptance: "http report acceptance",
         timeout_seconds: 120,
@@ -1005,7 +1005,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
       // Scenario A: Unclaimed task past claim_deadline
       const submitA = await service.submit(identity, {
         request_id: reqA,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         prompt: "task A prompt",
         acceptance: "task A acceptance",
         timeout_seconds: 60,
@@ -1030,7 +1030,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
         body: JSON.stringify({
           worker_id: WRK,
           attempt_id: ATT,
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           claim_token: TOKEN,
         }),
       });
@@ -1041,7 +1041,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
       // Scenario B: Claimed task execution with historical claim_deadline
       const submitB = await service.submit(identity, {
         request_id: reqB,
-        workspace_ref: "tools",
+        workspace_ref: "ceo-agent-runtime",
         prompt: "task B prompt",
         acceptance: "task B acceptance",
         timeout_seconds: 60,
@@ -1055,7 +1055,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
         body: JSON.stringify({
           worker_id: WRK,
           attempt_id: ATT,
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           claim_token: TOKEN,
         }),
       });
@@ -1112,7 +1112,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
     const reqV1 = "123e4567-e89b-12d3-a456-426614174301";
     const payloadV1 = {
       request_id: reqV1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       prompt: "v1 test prompt",
       acceptance: "v1 test acceptance",
       timeout_seconds: 60,
@@ -1160,7 +1160,7 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
         body: JSON.stringify({
           worker_id: WRK,
           attempt_id: ATT,
-          workspace_ref: "tools",
+          workspace_ref: "ceo-agent-runtime",
           claim_token: TOKEN,
         }),
       });

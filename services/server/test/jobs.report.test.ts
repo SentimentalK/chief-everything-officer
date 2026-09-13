@@ -79,7 +79,7 @@ function executionReport(patch: Partial<ExecutionReport> = {}): ExecutionReport 
 function submitBody(requestId: string, prompt = "report test prompt") {
   return {
     request_id: requestId,
-    workspace_ref: "tools",
+    workspace_ref: "ceo-agent-runtime",
     prompt,
     acceptance: "report test acceptance",
     timeout_seconds: 120,
@@ -115,7 +115,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
     const claim = await service.claim(scope, jobId, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token: TOKEN,
     });
     expect(claim.ok).toBe(true);
@@ -366,7 +366,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
     const reported = await service.report(scopeA, jobId, reportBody());
     expect(reported.ok).toBe(true);
 
-    const pending = await service.pending(scopeA, { workspace_ref: "tools", after: "0-0" });
+    const pending = await service.pending(scopeA, { workspace_ref: "ceo-agent-runtime", after: "0-0" });
     expect(pending.jobs.some((j) => j.job_id === jobId)).toBe(false);
 
     const replaySubmit = await service.submit(scopeA, submitBody(requestId));
@@ -378,7 +378,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
     await expect(service.claim(scopeA, jobId, {
       worker_id: WRK,
       attempt_id: ATT1,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token: TOKEN,
     })).rejects.toMatchObject({ code: "JOB_FINISHED" });
 
@@ -391,7 +391,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
     await expect(service.claim(scopeA, jobId, {
       worker_id: WRK,
       attempt_id: ATT2,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       claim_token: TOKEN,
     })).rejects.toMatchObject({ code: "JOB_ALREADY_CLAIMED" });
 
@@ -437,7 +437,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
       request_id: "123e4567-e89b-12d3-a456-426614170017",
       user_id: scopeA.user_id,
       workspace_id: scopeA.workspace_id,
-      workspace_ref: "tools",
+      workspace_ref: "ceo-agent-runtime",
       resource_id: null,
       prompt: "corrupt report without assignment",
       acceptance: "n/a",

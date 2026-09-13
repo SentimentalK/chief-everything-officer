@@ -126,7 +126,7 @@ jobs:
               await waitAvailable(bridge.service);
               const sub = await bridge.service.submit(scope, {
                 request_id: reqId,
-                workspace_ref: "tools",
+                workspace_ref: "ceo-agent-runtime",
                 prompt: "acceptance prompt",
                 acceptance: "acceptance done",
                 timeout_seconds: 120,
@@ -134,7 +134,7 @@ jobs:
               if (!sub.ok) throw new Error("submit failed: " + JSON.stringify(sub));
               if (sub.view.result_target !== "none") throw new Error("expected default result_target none");
               const jobId = sub.view.job_id;
-              const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", claim_token: tok });
+              const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "ceo-agent-runtime", claim_token: tok });
               if (!c.ok) throw new Error("claim failed: " + JSON.stringify(c));
               if (c.job.result_target !== "none") throw new Error("expected claim result_target none");
               const s = await bridge.service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
@@ -189,7 +189,7 @@ jobs:
             const tok = "e".repeat(64);
             const res = await service.submit(scope, {
               request_id: reqId,
-              workspace_ref: "tools",
+              workspace_ref: "ceo-agent-runtime",
               prompt: "restart test persistence job",
               acceptance: "survives force-kill and replay",
               result_target: "none",
@@ -198,7 +198,7 @@ jobs:
             if (!res.ok) throw new Error("Failed pre-restart submit: " + JSON.stringify(res));
 
             const jobId = res.view.job_id;
-            const claim = await service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", claim_token: tok });
+            const claim = await service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "ceo-agent-runtime", claim_token: tok });
             if (!claim.ok) throw new Error("pre-restart claim failed: " + JSON.stringify(claim));
             const start = await service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
             if (!start.ok) throw new Error("pre-restart start failed: " + JSON.stringify(start));
@@ -409,7 +409,7 @@ jobs:
             if (ph.job_id !== expected.job_id) throw new Error("placeholder job_id mismatch");
             const replayRes = await service.submit(scope, {
               request_id: expected.request_id,
-              workspace_ref: "tools",
+              workspace_ref: "ceo-agent-runtime",
               prompt: expected.prompt,
               acceptance: expected.acceptance,
               result_target: expected.result_target,

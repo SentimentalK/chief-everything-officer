@@ -13,7 +13,7 @@ import type { AssignmentScriptResult } from "../src/jobs/assignment-schema.js";
 // budget logic is exercised without a wall-clock race. No Redis is used.
 
 const scope: JobAuthScope = { user_id: "usr_a", workspace_id: "ws_a" };
-const wsRef = "tools";
+const wsRef = "ceo-agent-runtime";
 
 /** Fake monotonic clock in ms. */
 interface FakeClock {

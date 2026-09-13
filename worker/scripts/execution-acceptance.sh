@@ -39,11 +39,11 @@ SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 STUB="$CEO_ACCEPTANCE_STUB"
 
-rm -rf "$E"; mkdir -p "$E"/workspace/tools "$E"/data/identity "$E"/logs
+rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/logs
 
 # A doctor-passing workspace for the test_stub executor (AGENTS.md marker +
 # stub mode file), matching what the generic/doctor-caching tests use.
-cd "$E/workspace/tools"
+cd "$E/workspace/ceo-agent-runtime"
 git init -q -b "$BRANCH" 2>/dev/null || git init -q
 cat > AGENTS.md <<EOF
 # Guidelines
@@ -96,7 +96,7 @@ await wait();
 const request_id = "123e4567-e89b-12d3-a456-4266141740ff";
 const prompt_text = "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: acceptance-nonce-98765\nAfter producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
 const res = await svc.submit(scope, { request_id,
-  workspace_ref: "tools",
+  workspace_ref: "ceo-agent-runtime",
   prompt: prompt_text,
   acceptance: "output_artifact.txt must contain acceptance-nonce-98765",
   result_target: "none",
@@ -106,7 +106,7 @@ if (res.view.result_target !== "none") throw new Error("expected view.result_tar
 const rec = await store.getJob(res.view.job_id);
 writeFileSync(process.env.JOB, JSON.stringify({
   job_id: res.view.job_id, request_id, user_id: scope.user_id,
-  workspace_id: scope.workspace_id, workspace_ref: "tools",
+  workspace_id: scope.workspace_id, workspace_ref: "ceo-agent-runtime",
   stream_entry_id: rec.stream_entry_id,
 }));
 console.log("submitted", res.view.job_id, "entry", rec.stream_entry_id);
@@ -132,17 +132,17 @@ node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.arg
   const cfg={schema_version:1,server_url:"http://127.0.0.1:"+process.argv[3],
     api_key_file:process.argv[1].replace(/ids\.json$/,"key"),
     expected_identity:{user_id:id.user_id,workspace_id:id.workspace_id},
-    workspaces:{tools:process.argv[2]}};
+    workspaces:{"ceo-agent-runtime":process.argv[2]}};
   fs.writeFileSync(process.argv[1].replace(/ids\.json$/,"bridge.json"), JSON.stringify(cfg,null,2));' \
-  "$E/ids.json" "$E/workspace/tools" "$PORT"
+  "$E/ids.json" "$E/workspace/ceo-agent-runtime" "$PORT"
 
 # Workspace path comes from the same bridge.json the worker loaded.
-WS="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(!c.workspaces||!c.workspaces.tools){process.stderr.write("bridge.json missing workspaces.tools\n"); process.exit(1)} process.stdout.write(c.workspaces.tools)' "$E/bridge.json")"
+WS="$(node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(!c.workspaces||!c.workspaces["ceo-agent-runtime"]){process.stderr.write("bridge.json missing workspaces[\"ceo-agent-runtime\"]\n"); process.exit(1)} process.stdout.write(c.workspaces["ceo-agent-runtime"])' "$E/bridge.json")"
 
 # 5) Run the resident worker against the real server using the hermetic agent.
 cd "$WS"
 env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
-  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref tools \
+  "$WRK" bridge run --config "$E/bridge.json" --workspace-ref ceo-agent-runtime \
   > "$E/worker.stdout.log" 2> "$E/worker.stderr.log" &
 WORKER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
@@ -208,8 +208,8 @@ import path from "node:path";
 const base = process.env.SRV;
 const storeMod = await import(pathToFileURL(path.join(base, "dist/jobs/redis-store.js")).href);
 const bridge = JSON.parse(readFileSync(process.env.BRIDGE, "utf8"));
-const ws = bridge.workspaces && bridge.workspaces.tools;
-if (!ws) { console.error("bridge.json missing workspaces.tools"); process.exit(1); }
+const ws = bridge.workspaces && bridge.workspaces["ceo-agent-runtime"];
+if (!ws) { console.error("bridge.json missing workspaces[\"ceo-agent-runtime\"]"); process.exit(1); }
 const statePath = path.join(ws, ".ceo", "bridge", "state.json");
 const histDir = path.join(ws, ".ceo", "bridge", "history");
 const artPath = path.join(ws, "output_artifact.txt");
@@ -414,7 +414,7 @@ CLAIM_BEFORE="$(grep -c '"event":"claim"' "$E/logs/server.log" || true)"
 START_BEFORE="$(grep -c '"event":"start"' "$E/logs/server.log" || true)"
 
 set +e
-"$WRK" bridge report --config "$E/bridge.json" --workspace-ref tools --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
+"$WRK" bridge report --config "$E/bridge.json" --workspace-ref ceo-agent-runtime --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
   > "$E/report1.stdout" 2> "$E/report1.stderr"
 rep_ec=$?
 set -e
@@ -489,7 +489,7 @@ console.log("PASS first report persisted in redis received_at=" + first.received
 '
 
 set +e
-"$WRK" bridge report --config "$E/bridge.json" --workspace-ref tools --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
+"$WRK" bridge report --config "$E/bridge.json" --workspace-ref ceo-agent-runtime --job-id "$JOB_ID" --attempt-id "$ATTEMPT" \
   > "$E/report2.stdout" 2> "$E/report2.stderr"
 rep2_ec=$?
 set -e
