@@ -270,9 +270,9 @@ if (Buffer.compare(deliveredBytes, artBytes) !== 0) {
 }
 
 // Verify prompt envelope contains ## Delivery and instructions
-const promptPath = path.join(path.dirname(process.env.RECEIPT), "prompt.md");
+const promptPath = path.join(ws, ".ceo", "bridge", "requests", job.job_id, attempt, "prompt.md");
 if (!existsSync(promptPath)) {
-  console.error("prompt.md missing in attempt dir");
+  console.error("prompt.md missing at: " + promptPath);
   process.exit(1);
 }
 const promptContent = readFileSync(promptPath, "utf8");
