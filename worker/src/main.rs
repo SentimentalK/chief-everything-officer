@@ -1,5 +1,5 @@
 use ceo_worker::bridge::client::BridgeClient;
-use ceo_worker::bridge::config::{load_api_key, BridgeConfig};
+use ceo_worker::bridge::config::{load_api_key, resolve_config_path_from_env, BridgeConfig};
 use ceo_worker::bridge::controller::Worker;
 use ceo_worker::bridge::report::{print_error as print_report_error, report_saved_attempt};
 use ceo_worker::config::{safe_attempt_dir, safe_job_dir, validate_id, WorkerConfig};
@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
 #[command(name = "ceo-worker")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CEO_WORKER_GIT_SHA"), ")"))]
 #[command(about = "CEO Worker Plane lightweight capability runner", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -82,7 +83,7 @@ enum BridgeCmd {
     Check {
         /// Path to the bridge config JSON file
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Workspace alias to check (must exist in the config)
         #[arg(long)]
         workspace_ref: String,
@@ -94,7 +95,7 @@ enum BridgeCmd {
     Run {
         /// Path to the bridge config JSON file
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Workspace alias to serve (must exist in the config)
         #[arg(long)]
         workspace_ref: String,
@@ -103,7 +104,7 @@ enum BridgeCmd {
     Report {
         /// Path to the bridge config JSON file
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         /// Workspace alias that produced the saved result
         #[arg(long)]
         workspace_ref: String,
@@ -354,6 +355,7 @@ async fn main() {
                 workspace_ref,
                 after,
             } => {
+                let config = require_bridge_config(config);
                 // bridge check is READ-ONLY: it never claims, starts, or beats
                 // a job, and never creates attempt/cursor/receipt files.
                 match bridge_check(&config, &workspace_ref, &after).await {
@@ -370,6 +372,7 @@ async fn main() {
                 config,
                 workspace_ref,
             } => {
+                let config = require_bridge_config(config);
                 let code = bridge_run(&config, &workspace_ref).await;
                 std::process::exit(code);
             }
@@ -378,16 +381,29 @@ async fn main() {
                 workspace_ref,
                 job_id,
                 attempt_id,
-            } => match report_saved_attempt(&config, &workspace_ref, &job_id, &attempt_id).await {
-                Ok(ok) => {
-                    println!("{}", serde_json::to_string_pretty(&ok).unwrap());
+            } => {
+                let config = require_bridge_config(config);
+                match report_saved_attempt(&config, &workspace_ref, &job_id, &attempt_id).await {
+                    Ok(ok) => {
+                        println!("{}", serde_json::to_string_pretty(&ok).unwrap());
+                    }
+                    Err(e) => {
+                        print_report_error(&e);
+                        std::process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    print_report_error(&e);
-                    std::process::exit(1);
-                }
-            },
+            }
         },
+    }
+}
+
+fn require_bridge_config(config: Option<PathBuf>) -> PathBuf {
+    match resolve_config_path_from_env(config.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bridge: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

@@ -1,0 +1,86 @@
+name: CEO Worker — Release
+
+on:
+  push:
+    tags:
+      - "worker-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: ceo-worker-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: ceo-worker-linux-arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          cd worker
+          cargo build --locked --release
+          strip target/release/ceo-worker
+          cp target/release/ceo-worker "${{ matrix.artifact }}"
+          ./target/release/ceo-worker --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: worker/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="worker-v0.3.5"
+          fi
+          test -f dist/ceo-worker-linux-x86_64
+          test -f dist/ceo-worker-linux-arm64
+          chmod +x dist/ceo-worker-linux-x86_64 dist/ceo-worker-linux-arm64
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              dist/ceo-worker-linux-x86_64 \
+              dist/ceo-worker-linux-arm64 \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              dist/ceo-worker-linux-x86_64 \
+              dist/ceo-worker-linux-arm64 \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$TAG" \
+              --notes "CEO Worker Plane ${TAG} host binaries (linux x86_64 and arm64)."
+          fi

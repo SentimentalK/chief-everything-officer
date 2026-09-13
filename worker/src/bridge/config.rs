@@ -44,6 +44,65 @@ pub enum ConfigError {
     InvalidExpectedIdentity,
     #[error("api key error: {0}")]
     ApiKey(String),
+    #[error("bridge config not found; pass --config or set CEO_BRIDGE_CONFIG, or place bridge.json at {0}")]
+    ConfigNotFound(String),
+}
+
+/// System-wide production config path used by systemd packaging.
+pub const ETC_BRIDGE_CONFIG: &str = "/etc/ceo/worker/bridge.json";
+
+const USER_CONFIG_REL: &str = "ceo/worker/bridge.json";
+
+/// Resolve the bridge config path without reading process environment.
+///
+/// Precedence: `explicit`, then `env_config`, then `etc_path` if the file
+/// exists, then `$xdg_home/ceo/worker/bridge.json`, then
+/// `$home/.config/ceo/worker/bridge.json`.
+pub fn resolve_config_path(
+    explicit: Option<&Path>,
+    env_config: Option<&Path>,
+    etc_path: &Path,
+    xdg_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, ConfigError> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(p) = env_config {
+        return Ok(p.to_path_buf());
+    }
+    if etc_path.is_file() {
+        return Ok(etc_path.to_path_buf());
+    }
+    if let Some(xdg) = xdg_home {
+        let p = xdg.join(USER_CONFIG_REL);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    if let Some(h) = home {
+        let p = h.join(".config").join(USER_CONFIG_REL);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(ConfigError::ConfigNotFound(format!(
+        "{ETC_BRIDGE_CONFIG}, $XDG_CONFIG_HOME/{USER_CONFIG_REL}, or ~/.config/{USER_CONFIG_REL}"
+    )))
+}
+
+/// Production wrapper: read real env vars and call [`resolve_config_path`].
+pub fn resolve_config_path_from_env(explicit: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let env_config = std::env::var_os("CEO_BRIDGE_CONFIG").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_config_path(
+        explicit,
+        env_config.as_deref(),
+        Path::new(ETC_BRIDGE_CONFIG),
+        xdg.as_deref(),
+        home.as_deref(),
+    )
 }
 
 /// Identity binding the client expects the server to confirm via /api/identity.
@@ -391,5 +450,73 @@ mod unit_tests {
         fs::set_permissions(&ok, fs::Permissions::from_mode(0o600)).unwrap();
         let key = load_api_key(&ok).unwrap();
         assert_eq!(key.as_str(), "sekret");
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_then_env_then_existing_files() {
+        let t = tempfile::tempdir().unwrap();
+        let explicit = t.path().join("explicit.json");
+        let env_cfg = t.path().join("env.json");
+        let etc = t.path().join("etc.json");
+        let xdg = t.path().join("xdg");
+        let home = t.path().join("home");
+        fs::create_dir_all(xdg.join("ceo/worker")).unwrap();
+        fs::create_dir_all(home.join(".config/ceo/worker")).unwrap();
+        let xdg_file = xdg.join("ceo/worker/bridge.json");
+        let home_file = home.join(".config/ceo/worker/bridge.json");
+        fs::write(&etc, "{}").unwrap();
+        fs::write(&xdg_file, "{}").unwrap();
+        fs::write(&home_file, "{}").unwrap();
+
+        assert_eq!(
+            resolve_config_path(
+                Some(&explicit),
+                Some(&env_cfg),
+                &etc,
+                Some(&xdg),
+                Some(&home)
+            )
+            .unwrap(),
+            explicit
+        );
+        assert_eq!(
+            resolve_config_path(None, Some(&env_cfg), &etc, Some(&xdg), Some(&home)).unwrap(),
+            env_cfg
+        );
+        assert_eq!(
+            resolve_config_path(None, None, &etc, Some(&xdg), Some(&home)).unwrap(),
+            etc
+        );
+        assert_eq!(
+            resolve_config_path(
+                None,
+                None,
+                &t.path().join("missing-etc.json"),
+                Some(&xdg),
+                Some(&home)
+            )
+            .unwrap(),
+            xdg_file
+        );
+        assert_eq!(
+            resolve_config_path(
+                None,
+                None,
+                &t.path().join("missing-etc.json"),
+                Some(&t.path().join("empty-xdg")),
+                Some(&home)
+            )
+            .unwrap(),
+            home_file
+        );
+        let err = resolve_config_path(
+            None,
+            None,
+            &t.path().join("missing-etc.json"),
+            Some(&t.path().join("empty-xdg")),
+            Some(&t.path().join("empty-home")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigNotFound(_)));
     }
 }
