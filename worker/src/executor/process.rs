@@ -137,6 +137,16 @@ impl ManagedProcess for GroupManagedProcess {
 /// stopped". An entry whose directory listing raced away is skipped only
 /// because we could never read it; it is not evidence of absence.
 pub fn pgid_has_live_members(pgid: i32) -> Result<bool, std::io::Error> {
+    pgid_has_live_members_except(pgid, None)
+}
+
+/// Same scan as [`pgid_has_live_members`], but ignores `except_pid` (typically
+/// the still-idle executor leader). After a Resource turn ends, leftover
+/// capability work is the descendants — not the leader itself.
+pub fn pgid_has_live_members_except(
+    pgid: i32,
+    except_pid: Option<i32>,
+) -> Result<bool, std::io::Error> {
     let entries = std::fs::read_dir("/proc")?;
     for entry in entries {
         let entry = match entry {
@@ -152,6 +162,9 @@ pub fn pgid_has_live_members(pgid: i32) -> Result<bool, std::io::Error> {
             Ok(p) => p,
             Err(_) => continue,
         };
+        if except_pid == Some(pid) {
+            continue;
+        }
         let stat_path = format!("/proc/{pid}/stat");
         let stat = match std::fs::read_to_string(&stat_path) {
             Ok(s) => s,
@@ -211,5 +224,36 @@ mod tests {
         let my_pgrp = unsafe { libc::getpgrp() };
         let has = pgid_has_live_members(my_pgrp).unwrap();
         assert!(has, "scanner should observe our own live process group");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn survivor_scan_except_leader_ignores_idle_leader() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let mut child = unsafe {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn sleep")
+        };
+        let pid = child.id() as i32;
+        let has_leader = pgid_has_live_members(pid).unwrap();
+        let has_work = pgid_has_live_members_except(pid, Some(pid)).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(has_leader, "new group should include the sleep leader");
+        assert!(
+            !has_work,
+            "excluding the leader should report no remaining work"
+        );
     }
 }

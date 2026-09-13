@@ -13,7 +13,7 @@ use crate::doctor::{
     SessionDoctorReport,
 };
 use crate::executor::adapter_trait::ManagedProcess;
-use crate::executor::process::pgid_has_live_members;
+use crate::executor::process::{pgid_has_live_members, pgid_has_live_members_except};
 use crate::executor::{create_executor, ExecutionRequest, ExecutorError};
 use crate::observability::{
     EventLogger, JobStage, LogSource, ProcessLogger, StatusTracker, StreamEventDispatcher,
@@ -237,17 +237,23 @@ fn should_wait_for_resource_result(
         && !managed_result_file_ready(result_path)
 }
 
-fn process_group_still_live(child: &mut dyn ManagedProcess) -> bool {
+/// True while capability work (descendants) is still running in the executor
+/// group. The idle leader alone does not keep a Resource wait open — otherwise
+/// an ended turn with no `managed-result.json` waits until the task deadline.
+fn process_group_has_remaining_work(child: &mut dyn ManagedProcess) -> bool {
     let _ = child.try_wait();
-    match child.pgid() {
-        Some(pg) => pgid_has_live_members(pg).unwrap_or(true),
-        None => child.try_wait().ok().flatten().is_none(),
+    match (child.pgid(), child.pid()) {
+        (Some(pg), Some(leader)) => {
+            pgid_has_live_members_except(pg, Some(leader as i32)).unwrap_or(true)
+        }
+        (Some(pg), None) => pgid_has_live_members(pg).unwrap_or(true),
+        (None, _) => child.try_wait().ok().flatten().is_none(),
     }
 }
 
 /// After the agent ends its turn, a Resource capability may still be running
-/// in the executor process group. Poll until the managed result is valid, the
-/// group is gone, the caller stops, or the task deadline is reached.
+/// in the executor process group. Poll until the managed result is valid, no
+/// descendant work remains, the caller stops, or the task deadline is reached.
 #[cfg(test)]
 async fn wait_for_resource_result<FStop, FLive>(
     result_path: &Path,
@@ -1490,6 +1496,15 @@ impl Runner {
         let result_path = current_attempt_dir.join(crate::managed_result::MANAGED_RESULT_FILENAME);
 
         loop {
+            // Once the file exists, `should_wait_for_resource_result` is false,
+            // which disables the poll branch. Break here so a later event or
+            // stop-tick cannot leave a ready result stranded until deadline.
+            if task_turn_finished
+                && task_result_status.eq_ignore_ascii_case("success")
+                && managed_result_file_ready(&result_path)
+            {
+                break;
+            }
             let waiting_for_resource = should_wait_for_resource_result(
                 &managed_result,
                 task_turn_finished,
@@ -1607,7 +1622,7 @@ impl Runner {
                     if managed_result_file_ready(&result_path) {
                         break;
                     }
-                    if !process_group_still_live(child.as_mut()) {
+                    if !process_group_has_remaining_work(child.as_mut()) {
                         break;
                     }
                 }
@@ -2057,6 +2072,10 @@ mod tests {
         assert!(!should_wait_for_resource_result(
             &req, true, "SUCCESS", &path
         ));
+        assert!(
+            managed_result_file_ready(&path),
+            "a ready file must be visible so the task loop can exit without the wait branch"
+        );
     }
 
     #[tokio::test]
