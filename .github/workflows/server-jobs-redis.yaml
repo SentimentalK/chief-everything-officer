@@ -204,9 +204,15 @@ jobs:
               attempt_id: att,
               claim_token: tok,
               report: {
-                schema_version: 1,
+                schema_version: 2,
                 execution_status: "COMPLETED",
                 business_outcome: "UNVERIFIED",
+                task_dispatched: true,
+                duration_ms: 1200,
+                executor: {
+                  type: "test_stub",
+                  version: "1.0.0",
+                },
                 finished_at_ms: 1789255887000,
                 receipt_sha256: "f".repeat(64),
                 error: null,
@@ -237,8 +243,13 @@ jobs:
               execution_phase: job.execution && job.execution.phase,
               execution_claimed_at_ms: job.execution && job.execution.claimed_at_ms,
               execution_started_at_ms: job.execution && job.execution.started_at_ms,
+              report_schema_version: job.report && job.report.schema_version,
               report_execution_status: job.report && job.report.execution_status,
               report_business_outcome: job.report && job.report.business_outcome,
+              report_task_dispatched: job.report && job.report.task_dispatched,
+              report_duration_ms: job.report && job.report.duration_ms,
+              report_executor_type: job.report && job.report.executor && job.report.executor.type,
+              report_executor_version: job.report && job.report.executor && job.report.executor.version,
               report_finished_at_ms: job.report && job.report.finished_at_ms,
               report_receipt_sha256: job.report && job.report.receipt_sha256,
               report_error: job.report && job.report.error,
@@ -329,8 +340,13 @@ jobs:
             if (job.execution.claimed_at_ms !== expected.execution_claimed_at_ms) throw new Error("execution.claimed_at_ms mismatch");
             if (job.execution.started_at_ms !== expected.execution_started_at_ms) throw new Error("execution.started_at_ms mismatch");
             if (!job.report) throw new Error("execution report missing after restart");
+            if (job.report.schema_version !== expected.report_schema_version) throw new Error("report.schema_version mismatch");
             if (job.report.execution_status !== expected.report_execution_status) throw new Error("report.execution_status mismatch");
             if (job.report.business_outcome !== expected.report_business_outcome) throw new Error("report.business_outcome mismatch");
+            if (job.report.task_dispatched !== expected.report_task_dispatched) throw new Error("report.task_dispatched mismatch");
+            if (job.report.duration_ms !== expected.report_duration_ms) throw new Error("report.duration_ms mismatch");
+            if (job.report.executor.type !== expected.report_executor_type) throw new Error("report.executor.type mismatch");
+            if (job.report.executor.version !== expected.report_executor_version) throw new Error("report.executor.version mismatch");
             if (job.report.finished_at_ms !== expected.report_finished_at_ms) throw new Error("report.finished_at_ms mismatch");
             if (job.report.receipt_sha256 !== expected.report_receipt_sha256) throw new Error("report.receipt_sha256 mismatch");
             if (JSON.stringify(job.report.error) !== JSON.stringify(expected.report_error)) throw new Error("report.error mismatch");
@@ -352,9 +368,15 @@ jobs:
               attempt_id: att,
               claim_token: tok,
               report: {
-                schema_version: 1,
+                schema_version: 2,
                 execution_status: "COMPLETED",
                 business_outcome: "UNVERIFIED",
+                task_dispatched: true,
+                duration_ms: 1200,
+                executor: {
+                  type: "test_stub",
+                  version: "1.0.0",
+                },
                 finished_at_ms: 1789255887000,
                 receipt_sha256: "f".repeat(64),
                 error: null,
