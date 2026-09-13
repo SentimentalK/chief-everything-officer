@@ -5,10 +5,34 @@ import re
 import json
 import time
 
+def write_marker(path):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def wait_for_delivery_release(workspace):
+    write_marker(os.path.join(workspace, ".delivery-entered"))
+    release = os.path.join(workspace, ".delivery-release")
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if os.path.exists(release):
+            return
+        time.sleep(0.1)
+    sys.stderr.write("test stub: timed out waiting for .delivery-release\n")
+    sys.exit(1)
+
+
 def handle_task_turn(mode, workspace, attempt_dir):
     if mode == "hang_task":
         time.sleep(30)
         sys.exit(0)
+
+    if mode == "hold_for_delivery":
+        if not workspace:
+            sys.exit(1)
+        wait_for_delivery_release(workspace)
 
     if mode == "permission_error_in_task":
         err_msg = f"permission check failed: access to {workspace}/output_artifact.txt denied"

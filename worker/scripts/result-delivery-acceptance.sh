@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Real Server + Redis proof that upload failure does not rerun execution:
-# start → Server down → local receipt/history/outbox → Worker restart while
-# Server is still offline → Server returns → pending report delivered → one attempt.
+# stub holds the task → Server down and identity unreachable → release stub →
+# local receipt/history/outbox → Worker restart while Server is still offline →
+# Server returns → pending report delivered → one attempt.
 set -euo pipefail
 
 : "${CEO_ACCEPTANCE_REDIS:?missing}"
@@ -34,7 +35,7 @@ cat > AGENTS.md <<EOF
 
 1. Respect boundaries.
 EOF
-echo -n "normal" > .stub_mode
+echo -n "hold_for_delivery" > .stub_mode
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm init 2>/dev/null || true
 
@@ -107,6 +108,25 @@ stop_server() {
   fi
 }
 
+identity_reachable() {
+  curl -s -m 1 -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/api/identity" >/dev/null 2>&1
+}
+
+wait_identity_down() {
+  for i in $(seq 1 40); do
+    if ! identity_reachable; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "result delivery acceptance: identity still reachable after stop_server"
+  return 1
+}
+
+attempt_count() {
+  find "$WS/.ceo/jobs/$JOB_ID/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
 start_server
 echo -n "$KEY" > "$E/key"; chmod 600 "$E/key"
 node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
@@ -126,17 +146,23 @@ env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
 WORKER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
-for i in $(seq 1 80); do
-  if grep -q start "$E/logs/server.log"; then break; fi
-  sleep 0.25
+for i in $(seq 1 200); do
+  if [ -f "$WS/.delivery-entered" ]; then
+    break
+  fi
+  sleep 0.1
 done
-if ! grep -q start "$E/logs/server.log"; then
-  echo "result delivery acceptance: start never appeared"
+if [ ! -f "$WS/.delivery-entered" ]; then
+  echo "result delivery acceptance: stub never entered the task"
   cat "$E/worker.stderr.log"
+  cat "$E/worker.stdout.log"
   exit 1
 fi
 
 stop_server
+wait_identity_down
+
+: > "$WS/.delivery-release"
 
 RECEIPT=""
 ATTEMPT=""
@@ -161,6 +187,17 @@ if [ -z "$RECEIPT" ] || [ -z "${ATTEMPT:-}" ] || [ ! -f "$WS/.ceo/bridge/outbox/
   cat "$E/worker.stdout.log"
   exit 1
 fi
+for i in $(seq 1 40); do
+  if grep -q 'result_delivery_retry' "$E/worker.stdout.log"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! grep -q 'result_delivery_retry' "$E/worker.stdout.log"; then
+  echo "result delivery acceptance: first worker never retried delivery"
+  cat "$E/worker.stdout.log"
+  exit 1
+fi
 
 REDIS="$REDIS" SRV="$SRV" JOB="$E/job.json" node --input-type=module -e '
 import { readFileSync } from "node:fs";
@@ -180,6 +217,11 @@ if (rec && rec.report) { console.error("report reached redis while server was su
 await runner.dispose();
 '
 
+if [ "$(attempt_count)" != "1" ]; then
+  echo "result delivery acceptance: expected one attempt before restart, got $(attempt_count)"
+  exit 1
+fi
+
 kill -TERM "$WORKER_PID" 2>/dev/null || true
 for i in $(seq 1 60); do
   if ! kill -0 "$WORKER_PID" 2>/dev/null; then break; fi
@@ -190,15 +232,35 @@ if kill -0 "$WORKER_PID" 2>/dev/null; then
   exit 1
 fi
 wait "$WORKER_PID" || true
+if [ ! -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ]; then
+  echo "result delivery acceptance: outbox disappeared after first worker exit"
+  exit 1
+fi
 
 env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
   "$WRK" bridge run --config "$E/bridge.json" --workspace-ref tools \
   > "$E/worker2.stdout.log" 2> "$E/worker2.stderr.log" &
 WORKER_PID=$!
-sleep 2
-if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-  echo "result delivery acceptance: worker exited while Server was still offline"
+for i in $(seq 1 80); do
+  if grep -q 'identity_retry' "$E/worker2.stdout.log" 2>/dev/null && kill -0 "$WORKER_PID" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    echo "result delivery acceptance: worker exited while Server was still offline"
+    cat "$E/worker2.stderr.log"
+    cat "$E/worker2.stdout.log"
+    exit 1
+  fi
+  sleep 0.25
+done
+if ! kill -0 "$WORKER_PID" 2>/dev/null || ! grep -q 'identity_retry' "$E/worker2.stdout.log"; then
+  echo "result delivery acceptance: worker did not stay alive retrying identity"
   cat "$E/worker2.stderr.log"
+  cat "$E/worker2.stdout.log"
+  exit 1
+fi
+if [ "$(attempt_count)" != "1" ]; then
+  echo "result delivery acceptance: expected one attempt while Server stayed offline, got $(attempt_count)"
   exit 1
 fi
 
@@ -219,9 +281,8 @@ if [ -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ]; then
   exit 1
 fi
 
-ATTEMPTS="$(find "$WS/.ceo/jobs/$JOB_ID/attempts" -mindepth 1 -maxdepth 1 -type d | wc -l)"
-if [ "$ATTEMPTS" != "1" ]; then
-  echo "result delivery acceptance: expected one attempt, got $ATTEMPTS"
+if [ "$(attempt_count)" != "1" ]; then
+  echo "result delivery acceptance: expected one attempt, got $(attempt_count)"
   exit 1
 fi
 
