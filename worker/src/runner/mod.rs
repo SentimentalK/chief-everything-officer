@@ -208,6 +208,90 @@ async fn teardown_managed(
 /// to `PROCESS_STOP_UNCONFIRMED` so the attempt is kept for recovery.
 /// `dispatched` is the effective dispatch intent (true once the business prompt
 /// may have been sent).
+const RESOURCE_RESULT_POLL: Duration = Duration::from_millis(200);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceResultWait {
+    Ready,
+    Deadline,
+    Stopped,
+    GroupGone,
+}
+
+fn managed_result_file_ready(path: &Path) -> bool {
+    crate::managed_result::validate_managed_result_file(path).is_ok()
+}
+
+fn should_wait_for_resource_result(
+    requirement: &crate::managed_result::ManagedResultRequirement,
+    turn_finished: bool,
+    result_status: &str,
+    result_path: &Path,
+) -> bool {
+    matches!(
+        requirement,
+        crate::managed_result::ManagedResultRequirement::Resource { .. }
+    ) && turn_finished
+        && result_status.eq_ignore_ascii_case("success")
+        && !managed_result_file_ready(result_path)
+}
+
+fn process_group_still_live(child: &mut dyn ManagedProcess) -> bool {
+    let _ = child.try_wait();
+    match child.pgid() {
+        Some(pg) => pgid_has_live_members(pg).unwrap_or(true),
+        None => child.try_wait().ok().flatten().is_none(),
+    }
+}
+
+/// After the agent ends its turn, a Resource capability may still be running
+/// in the executor process group. Poll until the managed result is valid, the
+/// group is gone, the caller stops, or the task deadline is reached.
+#[cfg(test)]
+async fn wait_for_resource_result<FStop, FLive>(
+    result_path: &Path,
+    deadline: tokio::time::Instant,
+    mut stop_check: FStop,
+    mut group_live: FLive,
+) -> ResourceResultWait
+where
+    FStop: FnMut() -> bool,
+    FLive: FnMut() -> bool,
+{
+    if managed_result_file_ready(result_path) {
+        return ResourceResultWait::Ready;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return ResourceResultWait::Deadline;
+    }
+    let mut tick = tokio::time::interval(RESOURCE_RESULT_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                return if managed_result_file_ready(result_path) {
+                    ResourceResultWait::Ready
+                } else {
+                    ResourceResultWait::Deadline
+                };
+            }
+            _ = tick.tick() => {
+                if managed_result_file_ready(result_path) {
+                    return ResourceResultWait::Ready;
+                }
+                if stop_check() {
+                    return ResourceResultWait::Stopped;
+                }
+                if !group_live() {
+                    return ResourceResultWait::GroupGone;
+                }
+            }
+        }
+    }
+}
+
 fn apply_teardown_evidence(
     outcome: AttemptOutcome,
     report: &TeardownReport,
@@ -1397,12 +1481,23 @@ impl Runner {
         let mut task_turn_finished = false;
         let mut task_authorized_permission_failure = false;
         let mut task_stopped: Option<StopReason> = None;
+        let mut resource_wait_logged = false;
+        let mut events_open = true;
         let mut task_stop_tick = tokio::time::interval(std::time::Duration::from_millis(100));
         task_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut resource_result_tick = tokio::time::interval(RESOURCE_RESULT_POLL);
+        resource_result_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let result_path = current_attempt_dir.join(crate::managed_result::MANAGED_RESULT_FILENAME);
 
         loop {
+            let waiting_for_resource = should_wait_for_resource_result(
+                &managed_result,
+                task_turn_finished,
+                &task_result_status,
+                &result_path,
+            );
             tokio::select! {
-                maybe_event = event_rx.recv() => {
+                maybe_event = event_rx.recv(), if events_open => {
                     match maybe_event {
                         Some(val) => {
                             if let Some(cid) = val.get("conversation_id").and_then(|c| c.as_str()) {
@@ -1442,12 +1537,50 @@ impl Runner {
                                         }
                                     }
                                     task_turn_finished = true;
-                                    break;
+                                    if should_wait_for_resource_result(
+                                        &managed_result,
+                                        task_turn_finished,
+                                        &task_result_status,
+                                        &result_path,
+                                    ) {
+                                        if !resource_wait_logged {
+                                            resource_wait_logged = true;
+                                            event_logger.log_event(
+                                                "task",
+                                                "resource_result_wait",
+                                                LogSource::System,
+                                                serde_json::json!({
+                                                    "reason": "turn_ended_before_managed_result"
+                                                }),
+                                            );
+                                        }
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                         }
                         None => {
-                            break;
+                            events_open = false;
+                            if !should_wait_for_resource_result(
+                                &managed_result,
+                                task_turn_finished,
+                                &task_result_status,
+                                &result_path,
+                            ) {
+                                break;
+                            }
+                            if !resource_wait_logged {
+                                resource_wait_logged = true;
+                                event_logger.log_event(
+                                    "task",
+                                    "resource_result_wait",
+                                    LogSource::System,
+                                    serde_json::json!({
+                                        "reason": "turn_ended_before_managed_result"
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
@@ -1467,6 +1600,14 @@ impl Runner {
                 _ = task_stop_tick.tick(), if gate.is_bridge() => {
                     if let Some(stop) = gate.current_stop() {
                         task_stopped = Some(stop);
+                        break;
+                    }
+                }
+                _ = resource_result_tick.tick(), if waiting_for_resource => {
+                    if managed_result_file_ready(&result_path) {
+                        break;
+                    }
+                    if !process_group_still_live(child.as_mut()) {
                         break;
                     }
                 }
@@ -1889,6 +2030,66 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_wait_for_resource_result_only_after_success_without_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-result.json");
+        let req = crate::managed_result::ManagedResultRequirement::Resource {
+            resource_id: "res-1".to_string(),
+        };
+        assert!(should_wait_for_resource_result(
+            &req, true, "SUCCESS", &path
+        ));
+        assert!(!should_wait_for_resource_result(
+            &req, false, "SUCCESS", &path
+        ));
+        assert!(!should_wait_for_resource_result(
+            &req, true, "FAILED", &path
+        ));
+        assert!(!should_wait_for_resource_result(
+            &crate::managed_result::ManagedResultRequirement::None,
+            true,
+            "SUCCESS",
+            &path
+        ));
+        std::fs::write(&path, r#"{"content":"hello"}"#).unwrap();
+        assert!(!should_wait_for_resource_result(
+            &req, true, "SUCCESS", &path
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_resource_result_ready_when_file_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-result.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let writer = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            std::fs::write(&writer, r#"{"content":"hello"}"#).unwrap();
+        });
+        let got = wait_for_resource_result(&path, deadline, || false, || true).await;
+        assert_eq!(got, ResourceResultWait::Ready);
+    }
+
+    #[tokio::test]
+    async fn wait_for_resource_result_group_gone_without_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-result.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let got = wait_for_resource_result(&path, deadline, || false, || false).await;
+        assert_eq!(got, ResourceResultWait::GroupGone);
+    }
+
+    #[tokio::test]
+    async fn wait_for_resource_result_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-result.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let got = wait_for_resource_result(&path, deadline, || false, || true).await;
+        assert_eq!(got, ResourceResultWait::Deadline);
+    }
 
     #[test]
     fn teardown_report_fully_stopped_requires_all_confirmed() {
