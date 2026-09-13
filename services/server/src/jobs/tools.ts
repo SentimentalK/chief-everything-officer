@@ -93,6 +93,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
         "Enqueue a task for the configured worker bridge. Submission queues work; it does not require an online Worker, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (which may already be claimed/running) rather than queuing again. " +
         "prompt describes the task goal and necessary inputs only. Do not include CEO/Worker transport mechanics, managed-result paths, Git persistence instructions, or generic runtime safety rules; those are injected by the Worker/runtime. " +
         "For external Resource ingestion, use this semantic pattern: 1) resource_capture(URL) -> resource_id, 2) worker_submit(workspace_ref=\"ceo-agent-runtime\", resource_id=<captured id>, result_target=\"resource\", prompt=\"Extract the complete usable source content from <URL>.\", acceptance=\"A non-empty faithful source transcript/content is extracted.\"), 3) worker_get until completed -> resource_get(content). " +
+        "timeout_seconds is optional and defaults to 3600 (1 hour); omit it or keep it at 3600 for media ingestion or long tasks. " +
         "worker_get reflects queue and assignment state; do not poll intensely. Retry with the original request_id when the submit outcome is unknown.",
       inputSchema: workerSubmitSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },

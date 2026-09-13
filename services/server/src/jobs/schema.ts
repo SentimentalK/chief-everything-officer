@@ -5,7 +5,7 @@ export type { JobAssignment, AssignmentState };
 
 export const JOBS_SCHEMA_VERSION = 5 as const;
 export const JOB_STREAM_SCHEMA_VERSION = 1 as const;
-export const DEFAULT_TIMEOUT_SECONDS = 1800;
+export const DEFAULT_TIMEOUT_SECONDS = 3600;
 export const MIN_TIMEOUT_SECONDS = 60;
 export const MAX_TIMEOUT_SECONDS = 7200;
 export const MAX_PROMPT_BYTES = 64 * 1024;
@@ -150,7 +150,7 @@ export const workerSubmitSchema = z.object({
   prompt: z.string().min(1, "prompt must be non-empty").refine((s) => !isWhitespaceOnly(s), "prompt must not be whitespace-only").refine((s) => utf8ByteLength(s) <= MAX_PROMPT_BYTES, "prompt exceeds 64 KiB (UTF-8)").describe("Task goal and necessary inputs only (non-empty, UTF-8 <= 64 KiB). Do not include CEO/Worker transport mechanics, managed-result paths, Git persistence instructions, or generic runtime safety rules."),
   acceptance: z.string().min(1, "acceptance must be non-empty").refine((s) => !isWhitespaceOnly(s), "acceptance must not be whitespace-only").refine((s) => utf8ByteLength(s) <= MAX_ACCEPTANCE_BYTES, "acceptance exceeds 8 KiB (UTF-8)").describe("Pure business completion criterion (non-empty, UTF-8 <= 8 KiB). Do not specify internal file paths like managed-result.json."),
   resource_id: z.string().regex(RESOURCE_ID_RE, "resource_id must be a res-<uuid>").optional().describe("Optional res-<uuid> that must already exist in your workspace."),
-  timeout_seconds: z.number().int("timeout_seconds must be an integer").min(MIN_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).max(MAX_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).optional().describe("Execution timeout; 1800 default, 60-7200."),
+  timeout_seconds: z.number().int("timeout_seconds must be an integer").min(MIN_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).max(MAX_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).optional().describe("Execution timeout in seconds; optional, default 3600 (1 hour), range 60-7200. Omit or leave default for media ingestion or long tasks."),
   result_target: z.enum(RESULT_TARGET_VALUES).optional().default("none").describe("Target destination for managed result; 'none' default, 'resource' writes to canonical Git Resource."),
 }).strict().superRefine((val, ctx) => {
   if (val.result_target === "resource" && !val.resource_id) {

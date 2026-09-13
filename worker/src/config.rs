@@ -152,7 +152,7 @@ impl Default for WorkerConfig {
             agent_executable: default_agent,
             agent_model: Some("gemini-3.8-flash-medium".to_string()),
             doctor_timeout_secs: 90,
-            task_timeout_secs: 300,
+            task_timeout_secs: 3600,
             teardown_wait_secs: 5,
             guide_files: Vec::new(),
         }
