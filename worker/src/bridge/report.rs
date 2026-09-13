@@ -10,7 +10,8 @@ use crate::bridge::config::{load_api_key, BridgeConfig};
 use crate::bridge::delivery;
 use crate::bridge::outbox::PendingReportRecord;
 use crate::bridge::protocol::{
-    ExecutionReportBody, ExecutionReportError, ExecutionReportOk, ExecutionReportRequest,
+    ExecutionReportBody, ExecutionReportError, ExecutionReportExecutor, ExecutionReportOk,
+    ExecutionReportRequest,
 };
 use crate::bridge::state::{
     self, AttemptHistoryRecord, BridgeBinding, BridgeState, LOCAL_BINDING_MISMATCH,
@@ -26,6 +27,7 @@ use std::path::Path;
 
 const MAX_REPORT_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 2 * 1024;
+const MAX_EXECUTOR_VERSION_BYTES: usize = 256;
 const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 const ALLOWED_EXECUTION: &[&str] = &[
@@ -139,6 +141,16 @@ fn error_code_ok(s: &str) -> bool {
             .all(|b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
 }
 
+fn executor_type_ok(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-'))
+}
+
+fn executor_version_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_EXECUTOR_VERSION_BYTES && !s.trim().is_empty()
+}
+
 pub(crate) fn validate_report_contract(req: &ExecutionReportRequest) -> Result<(), ReportError> {
     if !worker_id_ok(&req.worker_id) {
         return Err(local("INVALID_REPORT", "worker_id is not a wrk-<uuid>"));
@@ -152,8 +164,8 @@ pub(crate) fn validate_report_contract(req: &ExecutionReportRequest) -> Result<(
             "claim token is not 64 lowercase hex",
         ));
     }
-    if req.report.schema_version != 1 {
-        return Err(local("INVALID_REPORT", "schema_version must be 1"));
+    if req.report.schema_version != 2 {
+        return Err(local("INVALID_REPORT", "schema_version must be 2"));
     }
     if !ALLOWED_EXECUTION.contains(&req.report.execution_status.as_str()) {
         return Err(local(
@@ -181,6 +193,42 @@ pub(crate) fn validate_report_contract(req: &ExecutionReportRequest) -> Result<(
         return Err(local(
             "INVALID_REPORT",
             "finished_at_ms is not a nonnegative safe integer",
+        ));
+    }
+    if req.report.duration_ms > JS_MAX_SAFE_INTEGER as u64 {
+        return Err(local(
+            "INVALID_REPORT",
+            "duration_ms is not a nonnegative safe integer",
+        ));
+    }
+    if !executor_type_ok(&req.report.executor.r#type) {
+        return Err(local("INVALID_REPORT", "executor.type is invalid"));
+    }
+    if !executor_version_ok(&req.report.executor.version) {
+        return Err(local("INVALID_REPORT", "executor.version is invalid"));
+    }
+    if req.report.execution_status == "COMPLETED" && req.report.error.is_some() {
+        return Err(local(
+            "INVALID_REPORT",
+            "completed report must not have error",
+        ));
+    }
+    if req.report.execution_status != "COMPLETED" && req.report.error.is_none() {
+        return Err(local(
+            "INVALID_REPORT",
+            "non-completed report must include error",
+        ));
+    }
+    if !req.report.task_dispatched && req.report.business_outcome != "NOT_STARTED" {
+        return Err(local(
+            "INVALID_REPORT",
+            "undispatched task must have business_outcome NOT_STARTED",
+        ));
+    }
+    if req.report.business_outcome == "UNVERIFIED" && !req.report.task_dispatched {
+        return Err(local(
+            "INVALID_REPORT",
+            "unverified business outcome requires task_dispatched true",
         ));
     }
     if req.report.receipt_sha256.len() != 64
@@ -376,10 +424,16 @@ pub fn build_report_request_from_evidence(
         attempt_id: history.attempt_id.clone(),
         claim_token: history.claim_token.clone(),
         report: ExecutionReportBody {
-            schema_version: 1,
+            schema_version: 2,
             execution_status: receipt.execution_status.clone(),
             business_outcome: business_outcome.to_string(),
+            task_dispatched: bc.task_dispatch_intent,
             finished_at_ms,
+            duration_ms: receipt.timestamps.duration_ms,
+            executor: ExecutionReportExecutor {
+                r#type: receipt.executor.executor_type.clone(),
+                version: receipt.executor.version.clone(),
+            },
             receipt_sha256: receipt_sha,
             error,
         },

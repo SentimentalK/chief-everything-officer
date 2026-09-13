@@ -132,6 +132,11 @@ fn persist_valid_fixture(workspace: &Path, receipt: &TaskReceipt) -> (BridgeConf
     let receipt_bytes = std::fs::read(&receipt_path).unwrap();
     let rec_sha = sha256_hex(&receipt_bytes);
 
+    let task_dispatch_intent = receipt
+        .bridge_context
+        .as_ref()
+        .map(|b| b.task_dispatch_intent)
+        .unwrap_or(true);
     let hist = new_history_record(
         &bind,
         WRK,
@@ -141,7 +146,7 @@ fn persist_valid_fixture(workspace: &Path, receipt: &TaskReceipt) -> (BridgeConf
         &hex64(),
         &hex64(),
         &rec_sha,
-        true,
+        task_dispatch_intent,
         TOKEN,
     );
     hist.persist(&canon).unwrap();
@@ -163,10 +168,14 @@ fn valid_bridge_receipt_projects_exact_request_fields() {
     assert_eq!(req.worker_id, WRK);
     assert_eq!(req.attempt_id, ATT);
     assert_eq!(req.claim_token, TOKEN);
-    assert_eq!(req.report.schema_version, 1);
+    assert_eq!(req.report.schema_version, 2);
     assert_eq!(req.report.execution_status, "COMPLETED");
     assert_eq!(req.report.business_outcome, "UNVERIFIED");
+    assert!(req.report.task_dispatched);
     assert_eq!(req.report.finished_at_ms, FINISHED_MS);
+    assert_eq!(req.report.duration_ms, 0);
+    assert_eq!(req.report.executor.r#type, "test_stub");
+    assert_eq!(req.report.executor.version, "test");
     assert_eq!(req.report.receipt_sha256, sha256_hex(&bytes));
     assert_eq!(req.report.error, None);
     let again = load_ok(&cfg);
@@ -328,4 +337,134 @@ fn recovery_receipts_cannot_be_reported() {
 #[test]
 fn history_schema_constant_is_current() {
     assert_eq!(HISTORY_SCHEMA_VERSION, 2);
+}
+
+#[test]
+fn terminal_status_matrix_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = root.path().join("tools");
+    std::fs::create_dir(&ws).unwrap();
+
+    let non_success_statuses = [
+        ("FAILED", BusinessOutcome::Failed),
+        ("TIMED_OUT", BusinessOutcome::Failed),
+        ("BLOCKED", BusinessOutcome::Failed),
+        ("CANCELLED", BusinessOutcome::Failed),
+        ("INTERRUPTED", BusinessOutcome::Failed),
+    ];
+
+    for (status, outcome) in non_success_statuses {
+        let mut rec = receipt(&ws, status, outcome);
+        rec.timestamps.duration_ms = 4321;
+        rec.error = Some(ReceiptError {
+            stage: "task".to_string(),
+            code: "TASK_FAILED".to_string(),
+            message: format!("{status} occurred"),
+        });
+        rec.executor.executor_type = "agy".to_string();
+        rec.executor.version = "Antigravity CLI 1.2.3 (build abc-123)".to_string();
+
+        let (cfg, _) = persist_valid_fixture(&ws, &rec);
+        let req = load_ok(&cfg);
+        assert_eq!(req.report.schema_version, 2);
+        assert_eq!(req.report.execution_status, status);
+        assert_eq!(req.report.business_outcome, "FAILED");
+        assert!(req.report.task_dispatched);
+        assert_eq!(req.report.duration_ms, 4321);
+        assert_eq!(req.report.executor.r#type, "agy");
+        assert_eq!(
+            req.report.executor.version,
+            "Antigravity CLI 1.2.3 (build abc-123)"
+        );
+        assert!(req.report.error.is_some());
+        assert_eq!(req.report.error.as_ref().unwrap().code, "TASK_FAILED");
+    }
+}
+
+#[test]
+fn report_v2_invariants_and_executor_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = root.path().join("tools");
+    std::fs::create_dir(&ws).unwrap();
+
+    // 1. COMPLETED + error must be rejected
+    let mut rec = receipt(&ws, "COMPLETED", BusinessOutcome::Unverified);
+    rec.error = Some(ReceiptError {
+        stage: "task".to_string(),
+        code: "UNEXPECTED".to_string(),
+        message: "unexpected".to_string(),
+    });
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, message }) => {
+            assert_eq!(code, "INVALID_REPORT");
+            assert!(message.contains("completed report must not have error"));
+        }
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
+
+    // 2. FAILED + null error must be rejected
+    let mut rec = receipt(&ws, "FAILED", BusinessOutcome::Failed);
+    rec.error = None;
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, message }) => {
+            assert_eq!(code, "INVALID_REPORT");
+            assert!(message.contains("non-completed report must include error"));
+        }
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
+
+    // 3. task_dispatched=false + UNVERIFIED must be rejected
+    let mut rec = receipt(&ws, "COMPLETED", BusinessOutcome::Unverified);
+    if let Some(bc) = rec.bridge_context.as_mut() {
+        bc.task_dispatch_intent = false;
+    }
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, .. }) => assert_eq!(code, "INVALID_REPORT"),
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
+
+    // 4. task_dispatched=false + NOT_STARTED is accepted
+    let mut rec = receipt(&ws, "FAILED", BusinessOutcome::NotStarted);
+    if let Some(bc) = rec.bridge_context.as_mut() {
+        bc.task_dispatch_intent = false;
+    }
+    rec.error = Some(ReceiptError {
+        stage: "preflight".to_string(),
+        code: "DOCTOR_PREFLIGHT_FAILED".to_string(),
+        message: "doctor failed".to_string(),
+    });
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    let req = load_ok(&cfg);
+    assert!(!req.report.task_dispatched);
+    assert_eq!(req.report.business_outcome, "NOT_STARTED");
+
+    // 5. executor bounds: invalid type rejected
+    let mut rec = receipt(&ws, "COMPLETED", BusinessOutcome::Unverified);
+    rec.executor.executor_type = "bad@type".to_string();
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, .. }) => assert_eq!(code, "INVALID_REPORT"),
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
+
+    // 6. executor bounds: version > 256 bytes rejected
+    let mut rec = receipt(&ws, "COMPLETED", BusinessOutcome::Unverified);
+    rec.executor.version = "v".repeat(257);
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, .. }) => assert_eq!(code, "INVALID_REPORT"),
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
+
+    // 7. executor bounds: whitespace-only version rejected
+    let mut rec = receipt(&ws, "COMPLETED", BusinessOutcome::Unverified);
+    rec.executor.version = "   ".to_string();
+    let (cfg, _) = persist_valid_fixture(&ws, &rec);
+    match load_saved_report(&cfg, "tools", JOB, ATT) {
+        Err(ReportError::Local { code, .. }) => assert_eq!(code, "INVALID_REPORT"),
+        other => panic!("expected INVALID_REPORT, got {other:?}"),
+    }
 }

@@ -96,8 +96,8 @@ if job.job_id ~= expected_job_id
   return err('JOB_NOT_FOUND', cjson.null)
 end
 
--- 3. Schema version must be 2
-if job.schema_version ~= 2 then
+-- 3. Schema version must be 3
+if job.schema_version ~= 3 then
   return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_SCHEMA_VERSION')
 end
 
@@ -186,6 +186,30 @@ local function countKeys(t)
   return n
 end
 
+local function validExecutorType(s)
+  return type(s) == 'string' and #s >= 1 and #s <= 64 and not s:find('[^A-Za-z0-9_.-]')
+end
+
+local function validExecutorVersion(s)
+  if type(s) ~= 'string' or #s == 0 or #s > 256 then
+    return false
+  end
+  if s:match('^%s*$') then
+    return false
+  end
+  return true
+end
+
+local function validExecutor(ex)
+  if type(ex) ~= 'table' then return false end
+  if countKeys(ex) ~= 2 then return false end
+  return validExecutorType(ex.type) and validExecutorVersion(ex.version)
+end
+
+local function validDuration(d)
+  return type(d) == 'number' and d >= 0 and d <= 9007199254740991 and math.floor(d) == d
+end
+
 local function validReportError(e)
   if e == cjson.null then return true end
   if type(e) ~= 'table' then return false end
@@ -210,24 +234,34 @@ local REPORT_OUTCOMES = {
 
 local function validIncomingReport(r)
   if type(r) ~= 'table' then return false end
-  if countKeys(r) ~= 6 then return false end
-  if r.schema_version ~= 1 then return false end
+  if countKeys(r) ~= 9 then return false end
+  if r.schema_version ~= 2 then return false end
   if not REPORT_STATUSES[r.execution_status] then return false end
   if not REPORT_OUTCOMES[r.business_outcome] then return false end
+  if type(r.task_dispatched) ~= 'boolean' then return false end
   if not validTimestamp(r.finished_at_ms) then return false end
+  if not validDuration(r.duration_ms) then return false end
+  if not validExecutor(r.executor) then return false end
   if not validSha(r.receipt_sha256) then return false end
   if not validReportError(r.error) then return false end
+  if r.execution_status == 'COMPLETED' and r.error ~= cjson.null then return false end
+  if r.execution_status ~= 'COMPLETED' and r.error == cjson.null then return false end
+  if not r.task_dispatched and r.business_outcome ~= 'NOT_STARTED' then return false end
+  if r.business_outcome == 'UNVERIFIED' and not r.task_dispatched then return false end
   return true
 end
 
 local function validStoredReport(r)
   if type(r) ~= 'table' then return false end
-  if countKeys(r) ~= 7 then return false end
+  if countKeys(r) ~= 10 then return false end
   if not validIncomingReport({
     schema_version = r.schema_version,
     execution_status = r.execution_status,
     business_outcome = r.business_outcome,
+    task_dispatched = r.task_dispatched,
     finished_at_ms = r.finished_at_ms,
+    duration_ms = r.duration_ms,
+    executor = r.executor,
     receipt_sha256 = r.receipt_sha256,
     error = r.error,
   }) then
@@ -240,7 +274,11 @@ local function reportsMatch(a, b)
   if a.schema_version ~= b.schema_version then return false end
   if a.execution_status ~= b.execution_status then return false end
   if a.business_outcome ~= b.business_outcome then return false end
+  if a.task_dispatched ~= b.task_dispatched then return false end
   if a.finished_at_ms ~= b.finished_at_ms then return false end
+  if a.duration_ms ~= b.duration_ms then return false end
+  if type(a.executor) ~= 'table' or type(b.executor) ~= 'table' then return false end
+  if a.executor.type ~= b.executor.type or a.executor.version ~= b.executor.version then return false end
   if a.receipt_sha256 ~= b.receipt_sha256 then return false end
   local ae, be = a.error, b.error
   if ae == cjson.null and be == cjson.null then return true end
@@ -389,7 +427,13 @@ if operation == 'report' then
     schema_version = incoming.schema_version,
     execution_status = incoming.execution_status,
     business_outcome = incoming.business_outcome,
+    task_dispatched = incoming.task_dispatched,
     finished_at_ms = incoming.finished_at_ms,
+    duration_ms = incoming.duration_ms,
+    executor = {
+      type = incoming.executor.type,
+      version = incoming.executor.version,
+    },
     receipt_sha256 = incoming.receipt_sha256,
     error = incoming.error,
     received_at_ms = now,

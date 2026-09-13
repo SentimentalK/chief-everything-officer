@@ -1473,10 +1473,16 @@ fn report_request() -> ExecutionReportRequest {
         attempt_id: ATT.into(),
         claim_token: TOKEN.into(),
         report: ExecutionReportBody {
-            schema_version: 1,
+            schema_version: 2,
             execution_status: "COMPLETED".into(),
             business_outcome: "UNVERIFIED".into(),
+            task_dispatched: true,
             finished_at_ms: 1_780_000_000_000,
+            duration_ms: 1234,
+            executor: ceo_worker::bridge::protocol::ExecutionReportExecutor {
+                r#type: "test_stub".into(),
+                version: "1.0.0".into(),
+            },
             receipt_sha256: "b".repeat(64),
             error: None,
         },

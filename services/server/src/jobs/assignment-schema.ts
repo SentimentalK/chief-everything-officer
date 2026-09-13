@@ -66,10 +66,16 @@ export interface ReportAssignmentInput {
   attempt_id: string;
   claim_token_sha256: string;
   report: {
-    schema_version: 1;
+    schema_version: 2;
     execution_status: string;
     business_outcome: string;
+    task_dispatched: boolean;
     finished_at_ms: number;
+    duration_ms: number;
+    executor: {
+      type: string;
+      version: string;
+    };
     receipt_sha256: string;
     error: { stage: string; code: string; message: string } | null;
   };

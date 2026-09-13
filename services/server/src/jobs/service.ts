@@ -142,7 +142,13 @@ function reportView(r: PersistedExecutionReport | undefined): ExecutionReportVie
     schema_version: r.schema_version,
     execution_status: r.execution_status,
     business_outcome: r.business_outcome,
+    task_dispatched: r.task_dispatched,
     finished_at_ms: r.finished_at_ms,
+    duration_ms: r.duration_ms,
+    executor: {
+      type: r.executor.type,
+      version: r.executor.version,
+    },
     receipt_sha256: r.receipt_sha256,
     error: r.error,
     received_at: iso(r.received_at_ms),

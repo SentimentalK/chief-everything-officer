@@ -323,6 +323,27 @@ if (rec.report.receipt_sha256 !== receiptSha) {
   console.error("redis receipt hash mismatch");
   process.exit(1);
 }
+if (rec.report.schema_version !== 2) {
+  console.error("schema_version mismatch: expected 2, got " + rec.report.schema_version);
+  process.exit(1);
+}
+if (rec.report.task_dispatched !== r.bridge_context.task_dispatch_intent) {
+  console.error("task_dispatched mismatch: " + rec.report.task_dispatched + " vs " + r.bridge_context.task_dispatch_intent);
+  process.exit(1);
+}
+if (rec.report.duration_ms !== r.timestamps.duration_ms) {
+  console.error("duration_ms mismatch: " + rec.report.duration_ms + " vs " + r.timestamps.duration_ms);
+  process.exit(1);
+}
+const execType = r.executor.type || r.executor.executor_type;
+if (rec.report.executor?.type !== execType) {
+  console.error("executor.type mismatch: " + rec.report.executor?.type + " vs " + execType);
+  process.exit(1);
+}
+if (rec.report.executor?.version !== r.executor.version) {
+  console.error("executor.version mismatch: " + rec.report.executor?.version + " vs " + r.executor.version);
+  process.exit(1);
+}
 if (rec.execution.worker_id !== worker) {
   console.error(`worker_id mismatch: redis=${rec.execution.worker_id} receipt=${worker}`);
   process.exit(1);
@@ -421,6 +442,12 @@ const finishedMs = Date.parse(receipt.timestamps.finished_at);
 if (rec.report.execution_status !== "COMPLETED") { console.error("redis execution_status mismatch"); process.exit(1); }
 if (rec.report.receipt_sha256 !== receiptSha) { console.error("redis receipt hash mismatch"); process.exit(1); }
 if (rec.report.finished_at_ms !== finishedMs) { console.error("redis finished_at_ms mismatch: " + rec.report.finished_at_ms + " vs " + finishedMs); process.exit(1); }
+if (rec.report.schema_version !== 2) { console.error("schema_version mismatch"); process.exit(1); }
+if (rec.report.task_dispatched !== receipt.bridge_context.task_dispatch_intent) { console.error("task_dispatched mismatch"); process.exit(1); }
+if (rec.report.duration_ms !== receipt.timestamps.duration_ms) { console.error("duration_ms mismatch"); process.exit(1); }
+const repExecType = receipt.executor.type || receipt.executor.executor_type;
+if (rec.report.executor?.type !== repExecType) { console.error("executor.type mismatch"); process.exit(1); }
+if (rec.report.executor?.version !== receipt.executor.version) { console.error("executor.version mismatch"); process.exit(1); }
 if (first.received_at !== new Date(rec.report.received_at_ms).toISOString()) {
   console.error("received_at mismatch");
   process.exit(1);

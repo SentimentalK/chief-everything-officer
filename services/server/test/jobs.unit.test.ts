@@ -105,10 +105,16 @@ describe("worker execution report schema", () => {
       attempt_id: attempt,
       claim_token: token,
       report: {
-        schema_version: 1,
+        schema_version: 2,
         execution_status: "COMPLETED",
         business_outcome: "UNVERIFIED",
+        task_dispatched: true,
         finished_at_ms: 1_789_255_887_000,
+        duration_ms: 3172,
+        executor: {
+          type: "agy",
+          version: "1.0.0",
+        },
         receipt_sha256: receipt,
         error: null,
         ...reportPatch,
@@ -119,59 +125,110 @@ describe("worker execution report schema", () => {
 
   for (const status of EXECUTION_STATUSES) {
     it(`accepts execution_status ${status}`, () => {
-      const r = parseReport(body({}, { execution_status: status }));
+      const reportPatch: Record<string, unknown> = { execution_status: status };
+      if (status !== "COMPLETED") {
+        reportPatch.business_outcome = "FAILED";
+        reportPatch.error = { stage: "task", code: "FAILED", message: "execution failed" };
+      }
+      const r = parseReport(body({}, reportPatch));
       expect(r.ok).toBe(true);
       if (r.ok) expect(r.value.report.execution_status).toBe(status);
     });
   }
 
-  it("rejects unknown fields at top, report, and error levels", () => {
+  it("rejects unknown fields at top, report, executor, and error levels", () => {
     expect(parseReport(body({ user_id: "usr_x" })).ok).toBe(false);
     expect(parseReport(body({ workspace_id: "ws_x" })).ok).toBe(false);
     expect(parseReport(body({ resource_id: "res-x" })).ok).toBe(false);
     expect(parseReport(body({}, { local_path: "/tmp/out" })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "agy", version: "1", extra: 1 } })).ok).toBe(false);
     expect(parseReport(body({}, {
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
       error: { stage: "task", code: "X", message: "m", extra: true },
     })).ok).toBe(false);
   });
 
-  it("rejects invalid ids, token, hash, version, and unsafe timestamps", () => {
+  it("rejects invalid ids, token, hash, version, duration, executor, and unsafe timestamps", () => {
     expect(parseReport(body({ worker_id: "wrk-NOT" })).ok).toBe(false);
     expect(parseReport(body({ attempt_id: "not-a-uuid" })).ok).toBe(false);
     expect(parseReport(body({ claim_token: "ZZ" })).ok).toBe(false);
     expect(parseReport(body({}, { receipt_sha256: "ABC" })).ok).toBe(false);
-    expect(parseReport(body({}, { schema_version: 2 })).ok).toBe(false);
+    expect(parseReport(body({}, { schema_version: 1 })).ok).toBe(false);
+    expect(parseReport(body({}, { schema_version: 3 })).ok).toBe(false);
     expect(parseReport(body({}, { finished_at_ms: -1 })).ok).toBe(false);
     expect(parseReport(body({}, { finished_at_ms: 1.5 })).ok).toBe(false);
     expect(parseReport(body({}, { finished_at_ms: Number.MAX_SAFE_INTEGER + 1 })).ok).toBe(false);
+    expect(parseReport(body({}, { duration_ms: -1 })).ok).toBe(false);
+    expect(parseReport(body({}, { duration_ms: 1.5 })).ok).toBe(false);
+    expect(parseReport(body({}, { duration_ms: Number.MAX_SAFE_INTEGER + 1 })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "", version: "1" } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "bad@char", version: "1" } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "a".repeat(65), version: "1" } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "agy", version: "" } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "agy", version: "   " } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "agy", version: "x".repeat(257) } })).ok).toBe(false);
+    expect(parseReport(body({}, { executor: { type: "agy_headless.1-beta", version: "x".repeat(256) } })).ok).toBe(true);
   });
 
-  it("rejects VERIFIED and accepts explicit null error", () => {
+  it("enforces invariants between execution_status, error, task_dispatched, and business_outcome", () => {
     expect(parseReport(body({}, { business_outcome: "VERIFIED" })).ok).toBe(false);
-    const okNull = parseReport(body({}, { error: null }));
-    expect(okNull.ok).toBe(true);
-    const missingError = {
-      worker_id: wrk,
-      attempt_id: attempt,
-      claim_token: token,
-      report: {
-        schema_version: 1,
-        execution_status: "COMPLETED",
-        business_outcome: "UNVERIFIED",
-        finished_at_ms: 1,
-        receipt_sha256: receipt,
-      },
-    };
-    expect(parseReport(missingError).ok).toBe(false);
+    // COMPLETED cannot have error
+    expect(parseReport(body({}, {
+      execution_status: "COMPLETED",
+      error: { stage: "task", code: "ERR", message: "fail" },
+    })).ok).toBe(false);
+    // Non-COMPLETED must have error
+    expect(parseReport(body({}, {
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
+      error: null,
+    })).ok).toBe(false);
+    // !task_dispatched requires NOT_STARTED
+    expect(parseReport(body({}, {
+      task_dispatched: false,
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
+      error: { stage: "task", code: "ERR", message: "fail" },
+    })).ok).toBe(false);
+    expect(parseReport(body({}, {
+      task_dispatched: false,
+      execution_status: "FAILED",
+      business_outcome: "UNVERIFIED",
+      error: { stage: "task", code: "ERR", message: "fail" },
+    })).ok).toBe(false);
+    expect(parseReport(body({}, {
+      task_dispatched: false,
+      execution_status: "FAILED",
+      business_outcome: "NOT_STARTED",
+      error: { stage: "preflight", code: "ERR", message: "fail" },
+    })).ok).toBe(true);
+    // UNVERIFIED requires task_dispatched = true
+    expect(parseReport(body({}, {
+      task_dispatched: true,
+      execution_status: "COMPLETED",
+      business_outcome: "UNVERIFIED",
+      error: null,
+    })).ok).toBe(true);
   });
 
   it("enforces the UTF-8 error-message limit and rejects whitespace-only messages", () => {
     const atLimit = "x".repeat(MAX_REPORT_ERROR_MESSAGE_BYTES);
-    expect(parseReport(body({}, { error: { stage: "task", code: "CODE", message: atLimit } })).ok).toBe(true);
     expect(parseReport(body({}, {
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
+      error: { stage: "task", code: "CODE", message: atLimit },
+    })).ok).toBe(true);
+    expect(parseReport(body({}, {
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
       error: { stage: "task", code: "CODE", message: atLimit + "y" },
     })).ok).toBe(false);
-    expect(parseReport(body({}, { error: { stage: "task", code: "CODE", message: "   " } })).ok).toBe(false);
+    expect(parseReport(body({}, {
+      execution_status: "FAILED",
+      business_outcome: "FAILED",
+      error: { stage: "task", code: "CODE", message: "   " },
+    })).ok).toBe(false);
   });
 });
 

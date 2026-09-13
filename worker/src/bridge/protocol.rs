@@ -313,12 +313,22 @@ pub struct ExecutionReportError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReportExecutor {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub version: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionReportBody {
     pub schema_version: u32,
     pub execution_status: String,
     pub business_outcome: String,
+    pub task_dispatched: bool,
     pub finished_at_ms: i64,
+    pub duration_ms: u64,
+    pub executor: ExecutionReportExecutor,
     pub receipt_sha256: String,
     pub error: Option<ExecutionReportError>,
 }
@@ -348,7 +358,10 @@ impl fmt::Debug for ExecutionReportBody {
             .field("schema_version", &self.schema_version)
             .field("execution_status", &self.execution_status)
             .field("business_outcome", &self.business_outcome)
+            .field("task_dispatched", &self.task_dispatched)
             .field("finished_at_ms", &self.finished_at_ms)
+            .field("duration_ms", &self.duration_ms)
+            .field("executor", &self.executor)
             .field("receipt_sha256", &self.receipt_sha256)
             .field("error", &self.report_error_debug())
             .finish()

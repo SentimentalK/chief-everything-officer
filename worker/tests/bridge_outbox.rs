@@ -269,6 +269,11 @@ fn evidence_mismatch_rejects_tampered_status() {
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     v["request"]["report"]["execution_status"] = serde_json::json!("FAILED");
     v["request"]["report"]["business_outcome"] = serde_json::json!("FAILED");
+    v["request"]["report"]["error"] = serde_json::json!({
+        "stage": "AGENT_RUN",
+        "code": "TASK_FAILED",
+        "message": "tampered"
+    });
     std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     let loaded = PendingReportRecord::load(&canon, JOB, ATT, &bind).unwrap();
     let err = validate_pending_against_evidence(&canon, &bind, WRK, &loaded).unwrap_err();

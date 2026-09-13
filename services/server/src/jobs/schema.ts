@@ -3,7 +3,7 @@ import type { JobAssignment, AssignmentState } from "./assignment-schema.js";
 import type { PersistedExecutionReport } from "./report-schema.js";
 export type { JobAssignment, AssignmentState };
 
-export const JOBS_SCHEMA_VERSION = 2 as const;
+export const JOBS_SCHEMA_VERSION = 3 as const;
 export const JOB_STREAM_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
 export const MIN_TIMEOUT_SECONDS = 60;

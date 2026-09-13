@@ -34,18 +34,25 @@ function sha(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
-function reportBody(patch: Record<string, unknown> = {}): Record<string, unknown> {
+function reportBody(patch: Record<string, unknown> = {}, reportPatch: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     worker_id: WRK,
     attempt_id: ATT1,
     claim_token: TOKEN,
     report: {
-      schema_version: 1,
+      schema_version: 2,
       execution_status: "COMPLETED",
       business_outcome: "UNVERIFIED",
+      task_dispatched: true,
       finished_at_ms: 1_789_255_887_000,
+      duration_ms: 3172,
+      executor: {
+        type: "agy",
+        version: "1.0.0",
+      },
       receipt_sha256: RECEIPT,
       error: null,
+      ...reportPatch,
     },
     ...patch,
   };
@@ -53,10 +60,16 @@ function reportBody(patch: Record<string, unknown> = {}): Record<string, unknown
 
 function executionReport(patch: Partial<ExecutionReport> = {}): ExecutionReport {
   return {
-    schema_version: 1,
+    schema_version: 2,
     execution_status: "COMPLETED",
     business_outcome: "UNVERIFIED",
+    task_dispatched: true,
     finished_at_ms: 1_789_255_887_000,
+    duration_ms: 3172,
+    executor: {
+      type: "agy",
+      version: "1.0.0",
+    },
     receipt_sha256: RECEIPT,
     error: null,
     ...patch,
@@ -176,10 +189,16 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
     expect(got.view?.execution?.attempt_id).toBe(ATT1);
     expect(got.view?.execution?.started_at).toBeTruthy();
     expect(got.view?.report).toEqual({
-      schema_version: 1,
+      schema_version: 2,
       execution_status: "COMPLETED",
       business_outcome: "UNVERIFIED",
+      task_dispatched: true,
       finished_at_ms: 1_789_255_887_000,
+      duration_ms: 3172,
+      executor: {
+        type: "agy",
+        version: "1.0.0",
+      },
       receipt_sha256: RECEIPT,
       error: null,
       received_at: reported.received_at,
@@ -194,10 +213,16 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
       started_at_ms: rawBefore.execution!.started_at_ms,
     });
     expect(raw.report).toEqual({
-      schema_version: 1,
+      schema_version: 2,
       execution_status: "COMPLETED",
       business_outcome: "UNVERIFIED",
+      task_dispatched: true,
       finished_at_ms: 1_789_255_887_000,
+      duration_ms: 3172,
+      executor: {
+        type: "agy",
+        version: "1.0.0",
+      },
       receipt_sha256: RECEIPT,
       error: null,
       received_at_ms: raw.report!.received_at_ms,
@@ -246,11 +271,24 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
 
     const snapshot = await client.get(jobKey(jobId));
     await expect(service.report(scopeA, jobId, reportBody({
-      report: executionReport({ execution_status: "FAILED", business_outcome: "FAILED" }),
+      report: executionReport({
+        execution_status: "FAILED",
+        business_outcome: "FAILED",
+        error: { stage: "task", code: "FAILED", message: "fail" },
+      }),
     }))).rejects.toMatchObject({
       code: "REPORT_CONFLICT",
       message: "A different execution report was already accepted.",
     });
+
+    await expect(service.report(scopeA, jobId, reportBody({
+      report: executionReport({ duration_ms: 9999 }),
+    }))).rejects.toMatchObject({ code: "REPORT_CONFLICT" });
+
+    await expect(service.report(scopeA, jobId, reportBody({
+      report: executionReport({ executor: { type: "agy", version: "2.0.0" } }),
+    }))).rejects.toMatchObject({ code: "REPORT_CONFLICT" });
+
     expect(await client.get(jobKey(jobId))).toBe(snapshot);
 
     const got = await service.get(scopeA, { job_id: jobId });
