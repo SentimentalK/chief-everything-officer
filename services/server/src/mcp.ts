@@ -235,14 +235,17 @@ export function createMcpServer(
     resolverClient?: UrlMetadataResolver;
     identity?: WorkspaceIdentity;
     jobs?: { service: JobService | null };
+    resourceService?: ResourceService;
   } = {},
 ): McpServer {
   const { auditStore, resolverClient, identity, jobs } = options;
-  const resourceService = new ResourceService(
-    workspace,
-    workspace.config,
-    resolverClient ?? createContentResolverClient(workspace.config),
-  );
+  const resourceService =
+    options.resourceService ??
+    new ResourceService(
+      workspace,
+      workspace.config,
+      resolverClient ?? createContentResolverClient(workspace.config),
+    );
   const resourceRetrieval = new ResourceRetrievalService(workspace, workspace.config);
 
   const server = new McpServer(

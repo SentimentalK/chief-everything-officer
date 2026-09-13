@@ -81,5 +81,17 @@ export interface ReportAssignmentInput {
   };
 }
 
-export type AssignmentOperation = "inspect" | "claim" | "start" | "report";
-export const ASSIGNMENT_OPERATIONS = ["inspect", "claim", "start", "report"] as const;
+export interface ResultAssignmentInput {
+  worker_id: string;
+  attempt_id: string;
+  claim_token_sha256: string;
+  result: {
+    target: "resource";
+    payload_sha256: string;
+    resource_id: string;
+    commit: string;
+  };
+}
+
+export type AssignmentOperation = "inspect" | "claim" | "start" | "report" | "result";
+export const ASSIGNMENT_OPERATIONS = ["inspect", "claim", "start", "report", "result"] as const;

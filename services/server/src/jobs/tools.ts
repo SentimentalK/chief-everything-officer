@@ -38,8 +38,7 @@ interface SafeLog {
   request_digest?: string | null;
   prompt_bytes?: number | null;
   acceptance_bytes?: number | null;
-  delivery_type?: "none" | "agent" | null;
-  delivery_bytes?: number | null;
+  result_target?: "none" | "resource" | null;
   error_code?: string | null;
 }
 
@@ -71,8 +70,7 @@ function logTrace(ctx: ToolContext, toolName: string, status: "success" | "error
       request_digest: safe.request_digest ?? null,
       prompt_bytes: safe.prompt_bytes ?? null,
       acceptance_bytes: safe.acceptance_bytes ?? null,
-      delivery_type: safe.delivery_type ?? null,
-      delivery_bytes: safe.delivery_bytes ?? null,
+      result_target: safe.result_target ?? null,
       error_code: safe.error_code ?? null,
     }),
     semantic_output_json: JSON.stringify({
@@ -92,7 +90,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Submit a worker task (queue only)",
       description:
-        "Enqueue a task for the configured worker bridge. Submission queues work; it does not require an online Worker, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (which may already be claimed/running) rather than queuing again. An optional delivery contract can be supplied: omitted or { type: 'none' } means no external delivery; { type: 'agent', instructions: '...' } passes instructions to the Worker Agent runtime upon task completion. CEO does not provide/proxy delivery channels or verify delivery. worker_get reflects queue and assignment state; do not poll intensely. Retry with the original request_id when the submit outcome is unknown.",
+        "Enqueue a task for the configured worker bridge. Submission queues work; it does not require an online Worker, and 'queued' is not 'done'. Retrying the same request_id returns the original task with its CURRENT state (which may already be claimed/running) rather than queuing again. Set result_target to 'resource' (with resource_id) to have the worker extract and write back structured source content to the canonical CEO Resource, or 'none' (default) for ordinary autonomous tasks. worker_get reflects queue and assignment state; do not poll intensely. Retry with the original request_id when the submit outcome is unknown.",
       inputSchema: workerSubmitSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -103,11 +101,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
       const promptBytes = typeof body.prompt === "string" ? utf8ByteLength(body.prompt) : null;
       const accBytes = typeof body.acceptance === "string" ? utf8ByteLength(body.acceptance) : null;
       const parsed = parseSubmit(raw);
-      const deliveryType = parsed.ok ? parsed.value.delivery.type : null;
-      const deliveryBytes =
-        parsed.ok && parsed.value.delivery.type === "agent"
-          ? utf8ByteLength(parsed.value.delivery.instructions)
-          : null;
+      const resultTarget = parsed.ok ? parsed.value.result_target : null;
       const digest = parsed.ok ? businessDigest(parsed.value) : null;
 
       if (!ctx.service) {
@@ -115,8 +109,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           request_id: reqId,
           prompt_bytes: promptBytes,
           acceptance_bytes: accBytes,
-          delivery_type: deliveryType,
-          delivery_bytes: deliveryBytes,
+          result_target: resultTarget,
           error_code: "BRIDGE_DISABLED",
         });
         return result({ ok: false, code: "BRIDGE_DISABLED", message: "Job submission is disabled on this deployment." }, true);
@@ -129,8 +122,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           request_digest: digest,
           prompt_bytes: promptBytes,
           acceptance_bytes: accBytes,
-          delivery_type: deliveryType,
-          delivery_bytes: deliveryBytes,
+          result_target: resultTarget,
           error_code: res.ok ? null : res.code ?? null,
         });
         return toSubmitResult(res);
@@ -141,8 +133,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           request_digest: digest,
           prompt_bytes: promptBytes,
           acceptance_bytes: accBytes,
-          delivery_type: deliveryType,
-          delivery_bytes: deliveryBytes,
+          result_target: resultTarget,
           error_code: info.code,
         });
         return result({ ok: false, code: info.code, message: info.message, ...(info.reason ? { reason: info.reason } : {}) }, true);
@@ -180,7 +171,8 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           expires_at: v.expires_at,
           workspace_ref: v.workspace_ref,
           resource_id: v.resource_id,
-          delivery: v.delivery,
+          result_target: v.result_target,
+          result: v.result ?? null,
           execution: v.execution,
           report: v.report ?? null,
         });
@@ -212,24 +204,16 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
           const jobId = sanitizeJobId(args.job_id);
           const promptBytes = typeof args.prompt === "string" ? utf8ByteLength(args.prompt) : null;
           const accBytes = typeof args.acceptance === "string" ? utf8ByteLength(args.acceptance) : null;
-          let deliveryType: "none" | "agent" | null = null;
-          let deliveryBytes: number | null = null;
-          if (args.delivery && typeof args.delivery === "object") {
-            const d = args.delivery as Record<string, unknown>;
-            if (d.type === "none" || d.type === "agent") {
-              deliveryType = d.type;
-              if (d.type === "agent" && typeof d.instructions === "string") {
-                deliveryBytes = utf8ByteLength(d.instructions);
-              }
-            }
-          }
+          const resultTarget =
+            args.result_target === "none" || args.result_target === "resource"
+              ? args.result_target
+              : null;
           logTrace(ctx, request.params.name, "error", Date.now() - started, {
             request_id: reqId,
             job_id: jobId,
             prompt_bytes: promptBytes,
             acceptance_bytes: accBytes,
-            delivery_type: deliveryType,
-            delivery_bytes: deliveryBytes,
+            result_target: resultTarget,
             error_code: "INVALID_INPUT",
           });
         }

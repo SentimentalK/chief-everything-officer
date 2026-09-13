@@ -124,16 +124,25 @@ fn sha256_of(data: &str) -> String {
 }
 
 /// Versioned plain-text prompt envelope: task goal + acceptance kept verbatim,
-/// plus the managed-workspace constraint and delivery instructions. Never injects tokens/keys/credentials.
-fn build_envelope(canonical: &Path, payload: &ClaimPayload) -> String {
-    let delivery_section = match &payload.delivery {
-        crate::bridge::protocol::TaskDeliverySpec::None => {
-            "No external delivery is requested.".to_string()
+/// plus the managed-workspace constraint and result target instructions. Never injects tokens/keys/credentials.
+fn build_envelope(
+    canonical: &Path,
+    job_id: &str,
+    attempt_id: &str,
+    payload: &ClaimPayload,
+) -> String {
+    let result_section = match payload.result_target {
+        crate::bridge::protocol::ResultTarget::None => {
+            "No managed result target is required.".to_string()
         }
-        crate::bridge::protocol::TaskDeliverySpec::Agent { instructions } => format!(
-            "The following delivery instruction is part of task completion.\nUse only capabilities already available/configured in this runtime.\nIf the delivery cannot be completed, do not claim successful completion.\n\n{}",
-            instructions
-        ),
+        crate::bridge::protocol::ResultTarget::Resource => {
+            let result_path =
+                attempt_dir_for(canonical, job_id, attempt_id).join("managed-result.json");
+            format!(
+                "This task requires a managed resource result.\nUpon completing extraction, you MUST write the result JSON to:\n{}\n\nFormat:\n{{\n  \"content\": \"...\",\n  \"metadata\": {{ ... }},\n  \"extraction\": {{ ... }}\n}}",
+                result_path.display()
+            )
+        }
     };
     format!(
         "# CEO task
@@ -148,13 +157,13 @@ You are operating on the managed workspace {:?}; keep outputs there. Follow the 
 
 {}
 
-## Delivery
+## Result Target
 
 {}",
         canonical.display(),
         payload.prompt,
         payload.acceptance,
-        delivery_section,
+        result_section,
     )
 }
 
@@ -247,6 +256,17 @@ impl Worker {
         self.worker_id = state.worker_id.clone();
 
         if let Err(code) = self.recover_startup(&mut state, &mut stop_rx).await {
+            return code;
+        }
+        if let Err(code) = crate::bridge::result_delivery::drain_pending_results(
+            &self.client,
+            &self.workspace,
+            &binding,
+            &self.worker_id,
+            &mut stop_rx,
+        )
+        .await
+        {
             return code;
         }
         if let Err(code) = delivery::drain_pending(
@@ -418,6 +438,35 @@ impl Worker {
         loop {
             if let Some(reason) = current_stop_or_closed(stop_rx) {
                 return stop_exit(&reason);
+            }
+            match crate::bridge::result_delivery::has_pending_results(
+                &self.workspace,
+                &self.binding(),
+            ) {
+                Ok(true) => {
+                    if let Err(code) = crate::bridge::result_delivery::drain_pending_results(
+                        &self.client,
+                        &self.workspace,
+                        &self.binding(),
+                        &self.worker_id,
+                        stop_rx,
+                    )
+                    .await
+                    {
+                        return code;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    emit(
+                        "bridge_stopped",
+                        "",
+                        "",
+                        &self.workspace_ref,
+                        "result_outbox_unreadable",
+                    );
+                    return 1;
+                }
             }
             match delivery::has_pending(&self.workspace, &self.binding()) {
                 Ok(true) => {
@@ -646,7 +695,7 @@ impl Worker {
         }
         atomic_write_durable(
             &prompt_path,
-            build_envelope(&self.workspace, &payload).as_bytes(),
+            build_envelope(&self.workspace, &job_id, &attempt_id, &payload).as_bytes(),
         )
         .map_err(|_| 1)?;
 
@@ -691,6 +740,56 @@ impl Worker {
         }
 
         let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
+
+        // If execution succeeded and result_target is Resource: deliver result FIRST
+        if receipt.execution_status == "COMPLETED"
+            && payload.result_target == crate::bridge::protocol::ResultTarget::Resource
+        {
+            let result_file = attempt_dir.join("managed-result.json");
+            let res_sha = match sha256_file(&result_file) {
+                Ok(s) => s,
+                Err(_) => {
+                    emit(
+                        "bridge_stopped",
+                        &job_id,
+                        &attempt_id,
+                        &self.workspace_ref,
+                        "result_unreadable",
+                    );
+                    return Err(1);
+                }
+            };
+            let resource_id = payload.resource_id.clone().unwrap_or_default();
+            let pending_result = crate::bridge::result_outbox::PendingResultRecord::new(
+                &self.binding(),
+                &self.worker_id,
+                &job_id,
+                &attempt_id,
+                &resource_id,
+                &active.claim_token,
+                &result_file.to_string_lossy(),
+                &res_sha,
+            )
+            .map_err(|_| 1)?;
+            pending_result.persist(&self.workspace).map_err(|_| 1)?;
+            emit(
+                "local_result_saved",
+                &job_id,
+                &attempt_id,
+                &self.workspace_ref,
+                "result_delivery_pending",
+            );
+            crate::bridge::result_delivery::deliver_result_one(
+                &self.client,
+                &self.workspace,
+                &self.binding(),
+                &self.worker_id,
+                &pending_result,
+                stop_rx,
+            )
+            .await?;
+        }
+
         let receipt_path = attempt_dir.join("receipt.json");
         let receipt_bytes = match std::fs::read(&receipt_path) {
             Ok(b) => b,
@@ -739,7 +838,7 @@ impl Worker {
             &job_id,
             &attempt_id,
             &self.workspace_ref,
-            "result_delivery_pending",
+            "report_delivery_pending",
         );
         let pending =
             PendingReportRecord::load(&self.workspace, &job_id, &attempt_id, &self.binding())
@@ -807,6 +906,22 @@ impl Worker {
         let aid = attempt_id.to_string();
         let pfile = prompt_path.to_path_buf();
         let timeout = active.claim.as_ref().unwrap().timeout_seconds.max(1) as u64;
+        let managed_result = match active.claim.as_ref().unwrap().result_target {
+            crate::bridge::protocol::ResultTarget::Resource => {
+                crate::managed_result::ManagedResultRequirement::Resource {
+                    resource_id: active
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .resource_id
+                        .clone()
+                        .unwrap_or_default(),
+                }
+            }
+            crate::bridge::protocol::ResultTarget::None => {
+                crate::managed_result::ManagedResultRequirement::None
+            }
+        };
         let mut handle: JoinHandle<Result<TaskReceipt, RunnerError>> = tokio::spawn(async move {
             runner
                 .run_managed(
@@ -818,6 +933,7 @@ impl Worker {
                     false,
                     runner_controls,
                     context,
+                    managed_result,
                 )
                 .await
         });
@@ -1241,7 +1357,7 @@ mod tests {
             prompt: prompt.to_string(),
             acceptance: acceptance.to_string(),
             timeout_seconds: 300,
-            delivery: crate::bridge::protocol::TaskDeliverySpec::None,
+            result_target: crate::bridge::protocol::ResultTarget::None,
             payload_sha256: String::new(),
         }
     }
@@ -1254,26 +1370,25 @@ step two
 ";
         let a = "accept a	
 accept b";
-        let env = build_envelope(Path::new("/ws"), &payload(p, a));
+        let env = build_envelope(Path::new("/ws"), "job-1", "attempt-1", &payload(p, a));
         assert!(env.contains(p), "prompt truncated: {env:?}");
         assert!(env.contains(a), "acceptance truncated: {env:?}");
         assert!(
-            env.contains("## Delivery\n\nNo external delivery is requested."),
-            "delivery none missing: {env:?}"
+            env.contains("## Result Target\n\nNo managed result target is required."),
+            "result target none missing: {env:?}"
         );
         assert_eq!(sha256_of(p), sha256_of_bytes(p.as_bytes()));
     }
 
     #[test]
-    fn envelope_renders_agent_delivery_instructions() {
+    fn envelope_renders_resource_target_instructions() {
         let mut p = payload("do task", "done");
-        p.delivery = crate::bridge::protocol::TaskDeliverySpec::Agent {
-            instructions: "Upload output.png to Discord channel #art".to_string(),
-        };
-        let env = build_envelope(Path::new("/ws"), &p);
+        p.result_target = crate::bridge::protocol::ResultTarget::Resource;
+        p.resource_id = Some("res-123".to_string());
+        let env = build_envelope(Path::new("/ws"), "job-1", "attempt-1", &p);
         assert!(
-            env.contains("## Delivery\n\nThe following delivery instruction is part of task completion.\nUse only capabilities already available/configured in this runtime.\nIf the delivery cannot be completed, do not claim successful completion.\n\nUpload output.png to Discord channel #art"),
-            "agent delivery instructions mismatch: {env:?}"
+            env.contains("## Result Target\n\nThis task requires a managed resource result.\nUpon completing extraction, you MUST write the result JSON to:\n/ws/.ceo/jobs/job-1/attempts/attempt-1/managed-result.json"),
+            "resource target instructions mismatch: {env:?}"
         );
     }
 

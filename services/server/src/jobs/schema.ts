@@ -3,14 +3,13 @@ import type { JobAssignment, AssignmentState } from "./assignment-schema.js";
 import type { PersistedExecutionReport } from "./report-schema.js";
 export type { JobAssignment, AssignmentState };
 
-export const JOBS_SCHEMA_VERSION = 4 as const;
+export const JOBS_SCHEMA_VERSION = 5 as const;
 export const JOB_STREAM_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
 export const MIN_TIMEOUT_SECONDS = 60;
 export const MAX_TIMEOUT_SECONDS = 7200;
 export const MAX_PROMPT_BYTES = 64 * 1024;
 export const MAX_ACCEPTANCE_BYTES = 8 * 1024;
-export const MAX_DELIVERY_INSTRUCTIONS_BYTES = 8192;
 export const WORKSPACE_REF_MAX = 64;
 export const CLAIM_TTL_DAYS = 7;
 export const CLAIM_TTL_MS = CLAIM_TTL_DAYS * 24 * 60 * 60 * 1000;
@@ -43,18 +42,8 @@ export function utf8ByteLength(s: string): number {
 
 import * as z from "zod/v4";
 
-export const deliverySpecSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("none") }).strict(),
-  z.object({
-    type: z.literal("agent"),
-    instructions: z
-      .string()
-      .min(1, "instructions must be non-empty")
-      .refine((s) => !isWhitespaceOnly(s), "instructions must not be whitespace-only")
-      .refine((s) => utf8ByteLength(s) <= MAX_DELIVERY_INSTRUCTIONS_BYTES, "instructions exceeds 8 KiB (UTF-8)"),
-  }).strict(),
-]);
-export type DeliverySpec = z.infer<typeof deliverySpecSchema>;
+export const RESULT_TARGET_VALUES = ["none", "resource"] as const;
+export type ResultTarget = (typeof RESULT_TARGET_VALUES)[number];
 
 /** Public submit payload after strict parse + policy checks. */
 export interface NormalizedSubmit {
@@ -64,7 +53,7 @@ export interface NormalizedSubmit {
   acceptance: string;
   resource_id: string | null;
   execution_timeout_seconds: number;
-  delivery: DeliverySpec;
+  result_target: ResultTarget;
 }
 
 export interface JobRequest {
@@ -78,6 +67,15 @@ export type JobRecordStatus = "queued";
  */
 export type JobState = AssignmentState;
 
+export interface PersistedJobResult {
+  target: "resource";
+  attempt_id: string;
+  payload_sha256: string;
+  resource_id: string;
+  commit: string;
+  received_at_ms: number;
+}
+
 export interface PersistedJobRecord {
   schema_version: typeof JOBS_SCHEMA_VERSION;
   job_id: string;
@@ -89,7 +87,7 @@ export interface PersistedJobRecord {
   prompt: string;
   acceptance: string;
   execution_timeout_seconds: number;
-  delivery: DeliverySpec;
+  result_target: ResultTarget;
   request_digest: string;
   // Authoritative commit marker, written last and atomically as one JSON value:
   // status === 'queued' AND stream_entry_id is set. A 'preparing' record (no
@@ -103,6 +101,8 @@ export interface PersistedJobRecord {
   execution?: JobAssignment;
   /** Absent means no report received. Explicit null or a malformed report is invalid. */
   report?: PersistedExecutionReport;
+  /** Optional durable managed result receipt. */
+  result?: PersistedJobResult;
 }
 
 export interface RequestPlaceholder {
@@ -125,16 +125,14 @@ export function businessDigest(p: {
   acceptance: string;
   resource_id: string | null;
   execution_timeout_seconds: number;
-  delivery: DeliverySpec;
+  result_target: ResultTarget;
 }): string {
   const canonical = JSON.stringify({
     acceptance: p.acceptance,
-    delivery: p.delivery.type === "none"
-      ? { type: "none" }
-      : { type: "agent", instructions: p.delivery.instructions },
     execution_timeout_seconds: p.execution_timeout_seconds,
     prompt: p.prompt,
     resource_id: p.resource_id,
+    result_target: p.result_target,
     workspace_ref: p.workspace_ref,
   });
   return createHash("sha256").update(canonical, "utf8").digest("hex");
@@ -153,8 +151,16 @@ export const workerSubmitSchema = z.object({
   acceptance: z.string().min(1, "acceptance must be non-empty").refine((s) => !isWhitespaceOnly(s), "acceptance must not be whitespace-only").refine((s) => utf8ByteLength(s) <= MAX_ACCEPTANCE_BYTES, "acceptance exceeds 8 KiB (UTF-8)").describe("Completion criterion (non-empty, UTF-8 <= 8 KiB)."),
   resource_id: z.string().regex(RESOURCE_ID_RE, "resource_id must be a res-<uuid>").optional().describe("Optional res-<uuid> that must already exist in your workspace."),
   timeout_seconds: z.number().int("timeout_seconds must be an integer").min(MIN_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).max(MAX_TIMEOUT_SECONDS, `timeout_seconds must be ${MIN_TIMEOUT_SECONDS}..${MAX_TIMEOUT_SECONDS}`).optional().describe("Execution timeout; 1800 default, 60-7200."),
-  delivery: deliverySpecSchema.optional().describe("Optional delivery contract for the agent upon task completion. Defaults to { type: 'none' }."),
-}).strict();
+  result_target: z.enum(RESULT_TARGET_VALUES).optional().default("none").describe("Target destination for managed result; 'none' default, 'resource' writes to canonical Git Resource."),
+}).strict().superRefine((val, ctx) => {
+  if (val.result_target === "resource" && !val.resource_id) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "resource_id is required when result_target is 'resource'",
+      path: ["resource_id"],
+    });
+  }
+});
 
 export const workerGetSchema = z.object({
   job_id: z.string().regex(JOB_ID_RE, "job_id must be a job-<uuid>").describe("Canonical job identifier (job-<uuid>)."),
@@ -195,7 +201,7 @@ export function parseSubmit(raw: unknown): ParseOutcome<NormalizedSubmit> {
       acceptance: val.acceptance,
       resource_id: val.resource_id ?? null,
       execution_timeout_seconds: val.timeout_seconds ?? DEFAULT_TIMEOUT_SECONDS,
-      delivery: val.delivery ?? { type: "none" },
+      result_target: val.result_target ?? "none",
     },
   };
 }

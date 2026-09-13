@@ -15,6 +15,7 @@ import {
   type ClaimAssignmentInput,
   type StartAssignmentInput,
   type ReportAssignmentInput,
+  type ResultAssignmentInput,
 } from "./assignment-schema.js";
 import { ASSIGNMENT_SCRIPT } from "./assignment-script.js";
 import {
@@ -328,6 +329,19 @@ export class RedisJobStore {
       attemptId: input.attempt_id,
       tokenSha: input.claim_token_sha256,
       reportJson: JSON.stringify(input.report),
+    });
+  }
+
+  async resultAssignment(
+    scope: AuthScope,
+    jobId: string,
+    input: ResultAssignmentInput,
+  ): Promise<AssignmentScriptResult> {
+    return this.runAssignment(scope, "result", jobId, {
+      workerId: input.worker_id,
+      attemptId: input.attempt_id,
+      tokenSha: input.claim_token_sha256,
+      reportJson: JSON.stringify(input.result),
     });
   }
 

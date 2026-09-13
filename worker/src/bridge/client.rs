@@ -17,7 +17,7 @@ use crate::bridge::config::ApiKey;
 use crate::bridge::protocol::{
     AssignmentClaimOk, AssignmentClaimRequest, AssignmentExecution, AssignmentStartOk,
     AssignmentStartRequest, ClaimedJob, ExecutionReportOk, ExecutionReportRequest, IdentityInfo,
-    Pending, Phase,
+    Pending, Phase, WorkerResultRequest, WorkerResultResponse, MAX_RESULT_REQUEST_BYTES,
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -150,7 +150,7 @@ impl ClientError {
     }
     /// A local (pre-send) or read-side protocol error: outcome is definitely
     /// known (nothing was sent, or no state change was possible).
-    fn protocol(msg: impl Into<String>) -> Self {
+    pub(crate) fn protocol(msg: impl Into<String>) -> Self {
         ClientError {
             kind: ErrorKind::Protocol(msg.into()),
             outcome_unknown: false,
@@ -420,6 +420,41 @@ impl BridgeClient {
         let path = format!("/api/worker/jobs/{job_id}/report");
         let ok: ExecutionReportOk = self.post_json(&path, body, true).await?;
         validate_execution_report_ok(&ok, job_id, request).map_err(ClientError::write_protocol)?;
+        Ok(ok)
+    }
+
+    pub async fn post_job_result(
+        &self,
+        job_id: &str,
+        request: &WorkerResultRequest,
+    ) -> CResult<WorkerResultResponse> {
+        if !job_id_ok(job_id) {
+            return Err(ClientError::protocol("invalid job id"));
+        }
+        if !worker_id_ok(&request.worker_id) {
+            return Err(ClientError::protocol("invalid worker id"));
+        }
+        if !uuid_ok(&request.attempt_id) {
+            return Err(ClientError::protocol("invalid attempt id"));
+        }
+        if !claim_token_ok(&request.claim_token) {
+            return Err(ClientError::protocol("invalid claim token"));
+        }
+        let body = serde_json::to_string(request)
+            .map_err(|_| ClientError::protocol("encode result request"))?;
+        if body.len() > MAX_RESULT_REQUEST_BYTES {
+            return Err(ClientError::protocol("result request exceeds 9 MiB"));
+        }
+        let path = format!("/api/worker/jobs/{job_id}/result");
+        let ok: WorkerResultResponse = self.post_json(&path, body, true).await?;
+        if !ok.ok {
+            return Err(ClientError::write_protocol("result response ok is false"));
+        }
+        if ok.commit.is_empty() {
+            return Err(ClientError::write_protocol(
+                "result response missing commit",
+            ));
+        }
         Ok(ok)
     }
 }
@@ -842,8 +877,10 @@ fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     if job.timeout_seconds < MIN_TIMEOUT_SECONDS || job.timeout_seconds > MAX_TIMEOUT_SECONDS {
         return Err("timeout_seconds out of range".to_string());
     }
-    if let Err(e) = job.delivery.validate() {
-        return Err(format!("invalid delivery: {}", e));
+    if job.result_target == crate::bridge::protocol::ResultTarget::Resource
+        && job.resource_id.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err("resource_id required when result_target is resource".to_string());
     }
     Ok(())
 }

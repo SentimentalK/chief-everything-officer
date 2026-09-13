@@ -78,6 +78,22 @@ def handle_task_turn(mode, workspace, attempt_dir, task_content=""):
             deliv_path = os.path.join(workspace, "delivered_artifact.txt")
             with open(deliv_path, "w", encoding="utf-8") as f:
                 f.write("Task completed: artifact data 12345")
+        if attempt_dir and "managed-result.json" in task_content:
+            res_path = os.path.join(attempt_dir, "managed-result.json")
+            with open(res_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "content": "Test stub extracted resource content",
+                    "metadata": {
+                        "title": "Extracted Resource Title",
+                        "author": "Test Author",
+                        "published_at": "2026-09-13T12:00:00Z",
+                        "language": "en"
+                    },
+                    "extraction": {
+                        "method": "test_stub",
+                        "extracted_at": "2026-09-13T12:00:00Z"
+                    }
+                }, f)
 
     resp = "Task completed successfully. Created output_artifact.txt"
     update = {"event": "step_update", "step_update": {"text_delta": resp + "\n"}}

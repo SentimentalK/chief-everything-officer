@@ -634,6 +634,7 @@ impl Runner {
             force_doctor,
             ExecGate::Local,
             None,
+            crate::managed_result::ManagedResultRequirement::None,
         )
         .await
     }
@@ -653,6 +654,7 @@ impl Runner {
         force_doctor: bool,
         mut gate: ExecGate,
         bridge_ctx: Option<BridgeReceiptContext>,
+        managed_result: crate::managed_result::ManagedResultRequirement,
     ) -> Result<TaskReceipt, RunnerError> {
         let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
 
@@ -1531,10 +1533,32 @@ impl Runner {
                 } else {
                     verification.outcome
                 };
-            AttemptOutcome::Success {
-                executor: executor_info.clone(),
-                artifacts: verification.verified_artifacts,
-                business_outcome,
+
+            // Managed result verification before claiming clean completion
+            match managed_result {
+                crate::managed_result::ManagedResultRequirement::Resource { .. } => {
+                    let result_path = current_attempt_dir.join("managed-result.json");
+                    match crate::managed_result::validate_managed_result_file(&result_path) {
+                        Ok(_) => AttemptOutcome::Success {
+                            executor: executor_info.clone(),
+                            artifacts: verification.verified_artifacts,
+                            business_outcome,
+                        },
+                        Err(err) => AttemptOutcome::Failed {
+                            stage: "managed_result".to_string(),
+                            code: err.code().to_string(),
+                            message: err.to_string(),
+                            business_outcome: BusinessOutcome::Failed,
+                            executor: executor_info.clone(),
+                            artifacts: verification.verified_artifacts,
+                        },
+                    }
+                }
+                crate::managed_result::ManagedResultRequirement::None => AttemptOutcome::Success {
+                    executor: executor_info.clone(),
+                    artifacts: verification.verified_artifacts,
+                    business_outcome,
+                },
             }
         };
 
@@ -1558,6 +1582,7 @@ impl Runner {
         force_doctor: bool,
         controls: RunnerControls,
         context: BridgeReceiptContext,
+        managed_result: crate::managed_result::ManagedResultRequirement,
     ) -> Result<TaskReceipt, RunnerError> {
         let canonical_workspace = workspace.canonicalize().map_err(RunnerError::IoError)?;
         validate_id("job_id", job_id)?;
@@ -1575,6 +1600,7 @@ impl Runner {
             force_doctor,
             ExecGate::Bridge(controls),
             Some(context),
+            managed_result,
         )
         .await
     }
@@ -2167,6 +2193,7 @@ mod tests {
                     false,
                     runner_controls,
                     context,
+                    crate::managed_result::ManagedResultRequirement::None,
                 )
                 .await
         });
@@ -2602,6 +2629,7 @@ time.sleep(300)
                     false,
                     runner_controls,
                     context,
+                    crate::managed_result::ManagedResultRequirement::None,
                 )
                 .await
         });
@@ -2700,6 +2728,7 @@ time.sleep(300)
                     false,
                     runner_controls,
                     context,
+                    crate::managed_result::ManagedResultRequirement::None,
                 )
                 .await
         });
@@ -2783,6 +2812,7 @@ time.sleep(300)
                     false,
                     runner_controls,
                     context,
+                    crate::managed_result::ManagedResultRequirement::None,
                 )
                 .await
         });

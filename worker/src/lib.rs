@@ -3,10 +3,16 @@ pub mod config;
 pub mod doctor;
 pub mod executor;
 pub mod local_state;
+pub mod managed_result;
 pub mod observability;
 pub mod receipt;
 pub mod runner;
 pub mod verifier;
+
+pub use managed_result::{
+    validate_managed_result_file, ManagedResourceResult, ManagedResultError,
+    ManagedResultExtraction, ManagedResultMetadata, ManagedResultRequirement,
+};
 
 pub use config::WorkerConfig;
 pub use doctor::{

@@ -46,9 +46,42 @@ const workspace = new CeoWorkspace(config);
 const productPolicy = await loadProductPolicy();
 await workspace.initialize();
 
+import { ResourceService } from "./resource/service.js";
+import { createJobResultHandler } from "./jobs/result-service.js";
+
 const auditStore = new AuditStore(config.auditDbPath);
 
+// Shared single ResourceService instance for both MCP tools and Worker result ingress
+const resourceService = new ResourceService(workspace, config);
+
+// Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
+// enforced at the /mcp boundary by the identity middleware per request.
+const workspaceIdentity = identityService.workspaceIdentityValue;
+
+// Optional worker-bridge job layer (disabled unless configured). Resource
+// existence for new tasks is checked against the single-user repo contents.
+const jobBridge = openJobBridge({
+  bridgeEnabled: config.bridgeEnabled,
+  redisUrl: config.redisUrl,
+}, async (_scope, resourceId) => {
+  const loc = await resolveResourceLocation(workspace.config.repoDir, resourceId);
+  return loc !== null;
+});
+
 const app = createMcpExpressApp({ host: config.bindHost });
+
+// Managed result route FIRST with dedicated 9 MiB body limit:
+// Host -> Origin -> Identity -> 9mb parser -> resultHandler
+app.post(
+  "/api/worker/jobs/:job_id/result",
+  createHostGuard(config.allowedHosts),
+  createOriginGuard(config.allowedOrigins),
+  createIdentityAuthMiddleware(identityService),
+  express.json({ limit: "9mb" }),
+  createJobResultHandler(jobBridge.service, resourceService),
+);
+
+// Ordinary JSON body parser for subsequent routes (default 100 KiB)
 app.use(express.json());
 
 // Probes
@@ -88,20 +121,6 @@ app.use(
   }),
 );
 
-// Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
-// enforced at the /mcp boundary by the identity middleware per request.
-const workspaceIdentity = identityService.workspaceIdentityValue;
-
-// Optional worker-bridge job layer (disabled unless configured). Resource
-// existence for new tasks is checked against the single-user repo contents.
-const jobBridge = openJobBridge({
-  bridgeEnabled: config.bridgeEnabled,
-  redisUrl: config.redisUrl,
-}, async (_scope, resourceId) => {
-  const loc = await resolveResourceLocation(workspace.config.repoDir, resourceId);
-  return loc !== null;
-});
-
 // Worker assignment endpoints: Host -> Origin -> Identity -> router ->
 // JobService. Identity scope is taken from the authenticated locals only.
 app.use(
@@ -118,6 +137,7 @@ const mcpHandler = createMcpHandler(
     auditStore,
     identity: workspaceIdentity,
     jobs: { service: jobBridge.service },
+    resourceService,
   }),
   { legacy: "reject" },
 );

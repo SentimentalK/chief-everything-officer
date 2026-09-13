@@ -4,7 +4,7 @@
 // Operates on KEYS[1] = ceo:job:<job_id>.
 //
 // ARGV layout (1-indexed in Lua):
-//   [1] operation               'inspect' | 'claim' | 'start' | 'report'
+//   [1] operation               'inspect' | 'claim' | 'start' | 'report' | 'result'
 //   [2] expected_job_id
 //   [3] trusted_user_id
 //   [4] trusted_workspace_id
@@ -12,7 +12,7 @@
 //   [6] attempt_id
 //   [7] workspace_ref
 //   [8] claim_token_sha256
-//   [9] report_json             report operation only; empty otherwise
+//   [9] report_json             report/result operation only; empty otherwise
 
 export const ASSIGNMENT_SCRIPT = `
 local operation         = ARGV[1]
@@ -74,21 +74,25 @@ local function validSha(s)
   return type(s) == 'string' and #s == 64 and not s:find('[^0-9a-f]')
 end
 
-local function validDelivery(d)
-  if type(d) ~= 'table' then return false end
-  local count = 0
-  for _ in pairs(d) do count = count + 1 end
-  if d.type == 'none' then
-    return count == 1
-  elseif d.type == 'agent' then
-    if count ~= 2 then return false end
-    if type(d.instructions) ~= 'string' then return false end
-    if #d.instructions < 1 or #d.instructions > 8192 then return false end
-    if d.instructions:match('^%s*$') then return false end
-    return true
+local function validResultTarget(target, res_id)
+  if target == 'none' then
+    return res_id == nil or res_id == cjson.null or type(res_id) == 'string'
+  elseif target == 'resource' then
+    return type(res_id) == 'string' and #res_id > 0
   else
     return false
   end
+end
+
+local function validStoredResult(r)
+  if type(r) ~= 'table' then return false end
+  if r.target ~= 'resource' then return false end
+  if not validUuid(r.attempt_id) then return false end
+  if not validSha(r.payload_sha256) then return false end
+  if type(r.resource_id) ~= 'string' or #r.resource_id == 0 then return false end
+  if type(r.commit) ~= 'string' or #r.commit == 0 then return false end
+  if not validTimestamp(r.received_at_ms) then return false end
+  return true
 end
 
 -- 1. Key type check
@@ -113,13 +117,13 @@ if job.job_id ~= expected_job_id
   return err('JOB_NOT_FOUND', cjson.null)
 end
 
--- 3. Schema version must be 4
-if job.schema_version ~= 4 then
+-- 3. Schema version must be 5
+if job.schema_version ~= 5 then
   return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_SCHEMA_VERSION')
 end
 
 -- 4. Structural validation of base job record
-if not validDelivery(job.delivery) then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
+if not validResultTarget(job.result_target, job.resource_id) then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.request_id) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.request_digest) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.status) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
@@ -326,6 +330,17 @@ if stored_report ~= nil then
   end
 end
 
+-- Validate stored result if present. Absent is allowed; explicit null/malformed is corrupt.
+local stored_result = job.result
+if stored_result ~= nil then
+  if stored_result == cjson.null or not validStoredResult(stored_result) then
+    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+  end
+  if ex == nil or ex == cjson.null then
+    return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD')
+  end
+end
+
 -- 5. Full-commit requirement (status 'queued' and non-empty stream_entry_id)
 local committed = job.status == 'queued'
   and type(job.stream_entry_id) == 'string'
@@ -345,6 +360,11 @@ elseif operation == 'start' then
     return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
   end
 elseif operation == 'report' then
+  if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha)
+     or type(report_json) ~= 'string' or report_json == '' then
+    return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
+  end
+elseif operation == 'result' then
   if not validWorkerId(worker_id) or not validUuid(attempt_id) or not validSha(token_sha)
      or type(report_json) ~= 'string' or report_json == '' then
     return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
@@ -460,6 +480,49 @@ if operation == 'report' then
   local encoded_res = okRes(job, reportPublicState(incoming.execution_status), false, now)
   redis.call('SET', KEYS[1], encoded_job)
   return encoded_res
+end
+
+if operation == 'result' then
+  local e = job.execution
+  if e == nil or e == cjson.null then return err('JOB_NOT_CLAIMED', cjson.null) end
+  if e.worker_id ~= worker_id or e.attempt_id ~= attempt_id or e.claim_token_sha256 ~= token_sha then
+    return err('ASSIGNMENT_MISMATCH', cjson.null)
+  end
+  if job.result_target ~= 'resource' then
+    return err('REPORT_CONFLICT', 'RESULT_NOT_EXPECTED')
+  end
+  local okr, incoming = pcall(cjson.decode, report_json)
+  if not okr or type(incoming) ~= 'table' then
+    return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
+  end
+  if not validSha(incoming.payload_sha256)
+     or type(incoming.resource_id) ~= 'string' or #incoming.resource_id == 0
+     or type(incoming.commit) ~= 'string' or #incoming.commit == 0 then
+    return err('QUEUE_UNAVAILABLE', 'INVALID_ARGUMENT')
+  end
+  if incoming.resource_id ~= job.resource_id then
+    return err('REPORT_CONFLICT', 'RESOURCE_MISMATCH')
+  end
+
+  if stored_result ~= nil then
+    if stored_result.attempt_id == attempt_id and stored_result.payload_sha256 == incoming.payload_sha256 then
+      local st = deriveState(job, now)
+      return okRes(job, st, true, stored_result.received_at_ms)
+    end
+    return err('REPORT_CONFLICT', 'RESULT_CONFLICT')
+  end
+
+  job.result = {
+    target = 'resource',
+    attempt_id = attempt_id,
+    payload_sha256 = incoming.payload_sha256,
+    resource_id = incoming.resource_id,
+    commit = incoming.commit,
+    received_at_ms = now,
+  }
+  local st = deriveState(job, now)
+  redis.call('SET', KEYS[1], cjson.encode(job))
+  return okRes(job, st, false, now)
 end
 
 return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_OPERATION')

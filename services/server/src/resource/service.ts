@@ -65,6 +65,21 @@ import {
 } from "./resolver-mapping.js";
 import { formatSummaryDocument } from "./summary.js";
 import type { ContentMetadataV1 } from "./resolver-contract.js";
+import type { WorkerResultPayload } from "../jobs/result-schema.js";
+
+export function assertWorkerResultReceipt(
+  result: Record<string, unknown>,
+  expectedDigest: string,
+): { payload_sha256: string; resource_id: string } {
+  const wr = result.worker_result as { payload_sha256?: string; resource_id?: string } | undefined;
+  if (!wr || wr.payload_sha256 !== expectedDigest) {
+    throw new CeoError(
+      "RESULT_CONFLICT",
+      "Result payload does not match previously completed attempt.",
+    );
+  }
+  return { payload_sha256: wr.payload_sha256, resource_id: wr.resource_id ?? "" };
+}
 
 export interface ResourceExecutionContext {
   location: ResourceLocation;
@@ -852,5 +867,114 @@ export class ResourceService {
         }
       }
     }
+  }
+
+  async applyWorkerResult(input: {
+    requestId: string;
+    resourceId: string;
+    jobId: string;
+    payload: WorkerResultPayload;
+    payloadDigest: string;
+  }): Promise<{ resource_id: string; commit: string; replayed: boolean }> {
+    const cached = await this.workspace.isRequestCompleted(input.requestId);
+    if (cached) {
+      assertWorkerResultReceipt(cached, input.payloadDigest);
+      return {
+        resource_id: input.resourceId,
+        commit: cached.commit as string,
+        replayed: true,
+      };
+    }
+
+    const baseCommit = await this.workspace.withReadyWorkspace(async (base) => base);
+
+    const tx = await this.workspace.withAtomicWorkspaceTransaction({
+      requestId: input.requestId,
+      baseCommit,
+      commitMessage: `CEO: ingest worker result for resource ${input.resourceId} (job: ${input.jobId})`,
+      allowResourceSourceFiles: true,
+      operationResultProducer: () => ({
+        worker_result: {
+          payload_sha256: input.payloadDigest,
+          resource_id: input.resourceId,
+        },
+      }),
+      mutator: async (worktree) => {
+        const location = await resolveResourceLocation(worktree, input.resourceId);
+        if (!location) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resourceId}' does not exist.`, {
+            resource_id: input.resourceId,
+          });
+        }
+
+        const resDir = path.join(worktree, location.relative_path);
+        const metaPath = path.join(resDir, "meta.md");
+        const metaContent = await readFile(metaPath, "utf8").catch(() => null);
+        if (!metaContent) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resourceId}' meta.md not found.`, {
+            resource_id: input.resourceId,
+          });
+        }
+
+        const doc = parseMetaMarkdown(metaContent);
+        const meta = doc.meta;
+
+        let metadataPatched = false;
+        if (input.payload.metadata) {
+          const m = input.payload.metadata;
+          if (m.title !== undefined) {
+            meta.title = m.title;
+            metadataPatched = true;
+          }
+          if (m.author !== undefined) {
+            meta.author = m.author;
+            metadataPatched = true;
+          }
+          if (m.published_at !== undefined) {
+            meta.published_at = m.published_at;
+            metadataPatched = true;
+          }
+          if (m.language !== undefined) {
+            meta.language = m.language;
+            metadataPatched = true;
+          }
+        }
+
+        if (metadataPatched) {
+          if (meta.metadata_method === "user_provided" || meta.metadata_method === "mixed") {
+            meta.metadata_method = "mixed";
+          } else {
+            meta.metadata_method = "deterministic_adapter";
+          }
+        }
+
+        await writeFile(path.join(resDir, "content.md"), input.payload.content, "utf8");
+
+        if (input.payload.extraction) {
+          const ext = input.payload.extraction;
+          const evidenceContent = [
+            "# Worker extraction evidence",
+            "",
+            `- job_id: ${input.jobId}`,
+            `- attempt_id: ${input.requestId}`,
+            `- method: ${ext.method}`,
+            `- extracted_at: ${ext.extracted_at}`,
+            "",
+          ].join("\n");
+          await writeFile(path.join(resDir, "evidence.md"), evidenceContent, "utf8");
+        }
+
+        const updatedMetaMarkdown = formatMetaMarkdown(meta, doc.capture_note, doc.capture_history);
+        await writeFile(metaPath, updatedMetaMarkdown, "utf8");
+      },
+    });
+
+    assertWorkerResultReceipt(tx, input.payloadDigest);
+    const replayed = tx.pushed === false || Boolean(cached);
+    return {
+      resource_id: input.resourceId,
+      commit: tx.commit as string,
+      replayed,
+    };
   }
 }

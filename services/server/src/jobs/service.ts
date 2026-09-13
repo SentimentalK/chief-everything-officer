@@ -21,7 +21,7 @@ import {
   type JobState,
   type PendingJobsResult,
   type PendingJob,
-  type DeliverySpec,
+  type ResultTarget,
 } from "./schema.js";
 import {
   type ExecutionAssignmentView,
@@ -79,7 +79,8 @@ export interface JobView {
   workspace_ref: string;
   resource_id: string | null;
   replayed: boolean;
-  delivery: { type: "none" | "agent" };
+  result_target: ResultTarget;
+  result?: { target: "resource"; resource_id: string; commit: string; received_at: string };
   execution: ExecutionAssignmentView | null;
   report: ExecutionReportView | null;
 }
@@ -99,7 +100,7 @@ export interface ClaimJobInfo {
   prompt: string;
   acceptance: string;
   timeout_seconds: number;
-  delivery: DeliverySpec;
+  result_target: ResultTarget;
 }
 
 export type AssignmentResult =
@@ -169,7 +170,15 @@ function viewFromAssignment(res: Extract<AssignmentScriptResult, { ok: true }>, 
     workspace_ref: rec.workspace_ref,
     resource_id: rec.resource_id,
     replayed,
-    delivery: { type: rec.delivery.type },
+    result_target: rec.result_target,
+    result: rec.result
+      ? {
+          target: rec.result.target,
+          resource_id: rec.result.resource_id,
+          commit: rec.result.commit,
+          received_at: iso(rec.result.received_at_ms),
+        }
+      : undefined,
     execution: executionAssignmentView(rec.execution),
     report: reportView(rec.report),
   };
@@ -275,6 +284,10 @@ export class JobService {
     return this.enabled() && this.deps.store.isReady();
   }
 
+  get store(): RedisJobStore {
+    return this.deps.store;
+  }
+
   private assertAvailable(): void {
     if (!this.enabled()) throw new JobError("BRIDGE_DISABLED", "Job submission is disabled on this deployment.");
     if (!this.deps.store.isReady()) throw new JobError("QUEUE_UNAVAILABLE", "Queue backend is not available.");
@@ -339,7 +352,7 @@ export class JobService {
       acceptance: input.acceptance,
       resource_id: input.resource_id,
       execution_timeout_seconds: input.execution_timeout_seconds,
-      delivery: input.delivery,
+      result_target: input.result_target,
     });
     const jobId = makeJobId();
     const prepared: PersistedJobRecord = {
@@ -353,7 +366,7 @@ export class JobService {
       prompt: input.prompt,
       acceptance: input.acceptance,
       execution_timeout_seconds: input.execution_timeout_seconds,
-      delivery: input.delivery,
+      result_target: input.result_target,
       request_digest: digest,
       status: "preparing",
       stream_entry_id: null,
@@ -450,7 +463,7 @@ export class JobService {
       acceptance: input.acceptance,
       resource_id: input.resource_id,
       execution_timeout_seconds: input.execution_timeout_seconds,
-      delivery: input.delivery,
+      result_target: input.result_target,
     });
     if (rec && rec.request_digest !== digest) return { kind: "conflict" };
     if (!rec || rec.status !== "queued" || !rec.stream_entry_id) {
@@ -501,7 +514,7 @@ export class JobService {
         prompt: rec.prompt,
         acceptance: rec.acceptance,
         timeout_seconds: rec.execution_timeout_seconds,
-        delivery: rec.delivery,
+        result_target: rec.result_target,
       },
     };
   }

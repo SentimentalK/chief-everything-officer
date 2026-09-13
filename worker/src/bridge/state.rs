@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::config::{ceo_dir, validate_id};
 use crate::local_state::atomic_write_json;
 
-pub const STATE_SCHEMA_VERSION: u32 = 3;
+pub const STATE_SCHEMA_VERSION: u32 = 4;
 
 /// Failure codes surfaced (redacted-safe) by local-state handling.
 pub const LOCAL_STATE_INVALID: &str = "LOCAL_STATE_INVALID";
@@ -65,6 +65,15 @@ pub fn outbox_record_path(workspace: &Path, job_id: &str, attempt_id: &str) -> P
     outbox_dir(workspace).join(format!("{job_id}.{attempt_id}.json"))
 }
 
+/// Directory holding immutable pending execution-result payloads.
+pub fn result_outbox_dir(workspace: &Path) -> PathBuf {
+    bridge_dir(workspace).join("result-outbox")
+}
+
+pub fn result_outbox_record_path(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf {
+    result_outbox_dir(workspace).join(format!("{job_id}.{attempt_id}.json"))
+}
+
 /// Directory holding the versioned prompt envelope for a request.
 pub fn request_dir(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf {
     bridge_dir(workspace)
@@ -88,6 +97,7 @@ pub fn ensure_control_dirs(workspace: &Path) -> std::io::Result<()> {
         bridge_dir(workspace).join("requests"),
         history_dir(workspace),
         outbox_dir(workspace),
+        result_outbox_dir(workspace),
     ] {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -107,6 +117,7 @@ fn control_tree_dirs(workspace: &Path) -> Vec<PathBuf> {
         bridge_dir(workspace).join("requests"),
         history_dir(workspace),
         outbox_dir(workspace),
+        result_outbox_dir(workspace),
         crate::config::jobs_dir(workspace),
     ]
 }
@@ -217,26 +228,20 @@ pub struct ClaimPayload {
     pub prompt: String,
     pub acceptance: String,
     pub timeout_seconds: i64,
-    pub delivery: crate::bridge::protocol::TaskDeliverySpec,
+    pub result_target: crate::bridge::protocol::ResultTarget,
     /// sha256 over the canonical JSON of the six fields above.
     pub payload_sha256: String,
 }
 
 impl fmt::Debug for ClaimPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let delivery_desc = match &self.delivery {
-            crate::bridge::protocol::TaskDeliverySpec::None => "none",
-            crate::bridge::protocol::TaskDeliverySpec::Agent { .. } => {
-                "agent [instructions redacted]"
-            }
-        };
         f.debug_struct("ClaimPayload")
             .field("workspace_ref", &self.workspace_ref)
             .field("resource_id", &self.resource_id)
             .field("prompt", &"[redacted]")
             .field("acceptance", &"[redacted]")
             .field("timeout_seconds", &self.timeout_seconds)
-            .field("delivery", &delivery_desc)
+            .field("result_target", &self.result_target)
             .field("payload_sha256", &self.payload_sha256)
             .finish()
     }
@@ -250,7 +255,7 @@ impl ClaimPayload {
             "prompt": self.prompt,
             "acceptance": self.acceptance,
             "timeout_seconds": self.timeout_seconds,
-            "delivery": self.delivery,
+            "result_target": self.result_target,
         }))
         .expect("claim payload canonical json serializes")
     }
@@ -270,7 +275,7 @@ impl ClaimPayload {
             prompt: job.prompt.clone(),
             acceptance: job.acceptance.clone(),
             timeout_seconds: job.timeout_seconds,
-            delivery: job.delivery.clone(),
+            result_target: job.result_target,
             payload_sha256: String::new(),
         };
         p.payload_sha256 = p.sha256_of();
@@ -412,8 +417,12 @@ impl ActiveAttempt {
                     c.workspace_ref, binding.workspace_ref
                 ));
             }
-            if let Err(e) = c.delivery.validate() {
-                return Err(format!("claim payload delivery invalid: {}", e));
+            if c.result_target == crate::bridge::protocol::ResultTarget::Resource
+                && c.resource_id.as_deref().unwrap_or("").trim().is_empty()
+            {
+                return Err(
+                    "claim payload resource_id required when result_target is resource".to_string(),
+                );
             }
         }
         Ok(())
@@ -837,7 +846,7 @@ mod tests {
             prompt: "do x".to_string(),
             acceptance: "x done".to_string(),
             timeout_seconds: 300,
-            delivery: crate::bridge::protocol::TaskDeliverySpec::None,
+            result_target: crate::bridge::protocol::ResultTarget::None,
             payload_sha256: String::new(),
         };
         let mut p = payload.clone();
@@ -963,50 +972,38 @@ mod tests {
         let err = BridgeState::load(&p, &b).unwrap_err();
         assert!(matches!(err, StateError::Invalid(_)));
 
-        // ClaimPayload debug redacts prompt, acceptance, and delivery instructions
+        // ClaimPayload debug redacts prompt and acceptance
         let payload = ClaimPayload {
             workspace_ref: "tools".to_string(),
             resource_id: None,
             prompt: "super secret task prompt".to_string(),
             acceptance: "super secret acceptance criteria".to_string(),
             timeout_seconds: 60,
-            delivery: crate::bridge::protocol::TaskDeliverySpec::Agent {
-                instructions: "super secret delivery instructions".to_string(),
-            },
+            result_target: crate::bridge::protocol::ResultTarget::None,
             payload_sha256: "ab".repeat(32),
         };
         let p_dbg = format!("{payload:?}");
         assert!(!p_dbg.contains("super secret task prompt"));
         assert!(!p_dbg.contains("super secret acceptance criteria"));
-        assert!(!p_dbg.contains("super secret delivery instructions"));
         assert!(p_dbg.contains("[redacted]"));
-        assert!(p_dbg.contains("[instructions redacted]"));
     }
 
     #[test]
-    fn claim_payload_integrity_covers_delivery() {
+    fn claim_payload_integrity_covers_result_target() {
         let job = crate::bridge::protocol::ClaimedJob {
             job_id: "job-123e4567-e89b-12d3-a456-426614174000".to_string(),
             workspace_ref: "tools".to_string(),
-            resource_id: None,
+            resource_id: Some("res-123".to_string()),
             prompt: "task prompt".to_string(),
             acceptance: "task acceptance".to_string(),
             timeout_seconds: 300,
-            delivery: crate::bridge::protocol::TaskDeliverySpec::Agent {
-                instructions: "deliver to discord".to_string(),
-            },
+            result_target: crate::bridge::protocol::ResultTarget::Resource,
         };
         let mut p = ClaimPayload::from_wire(&job);
         assert!(p.verify_integrity());
 
-        // Tamper with delivery instructions without updating sha256
-        p.delivery = crate::bridge::protocol::TaskDeliverySpec::Agent {
-            instructions: "deliver to evil webhook".to_string(),
-        };
-        assert!(!p.verify_integrity());
-
-        // Switch to None without updating sha256
-        p.delivery = crate::bridge::protocol::TaskDeliverySpec::None;
+        // Tamper with result_target without updating sha256
+        p.result_target = crate::bridge::protocol::ResultTarget::None;
         assert!(!p.verify_integrity());
     }
 

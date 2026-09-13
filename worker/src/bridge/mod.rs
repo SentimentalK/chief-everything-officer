@@ -6,6 +6,8 @@ pub mod delivery;
 pub mod outbox;
 pub mod protocol;
 pub mod report;
+pub mod result_delivery;
+pub mod result_outbox;
 pub mod state;
 
 pub use acquisition::{acquire_one, AcquireError, AcquireOutcome};

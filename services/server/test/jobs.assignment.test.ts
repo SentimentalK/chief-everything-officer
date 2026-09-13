@@ -51,7 +51,7 @@ function baseRecord(
     prompt: "assignment test prompt",
     acceptance: "assignment test acceptance",
     execution_timeout_seconds: 120,
-    delivery: { type: "none" },
+    result_target: "none",
     request_digest: "digest-12345",
     status: "queued",
     stream_entry_id: "999-0",
@@ -935,23 +935,21 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     }
   });
 
-  it("15. rejects malformed or corrupt delivery specification as CORRUPT_RECORD", async () => {
-    const malformedDeliveries = [
-      null,
-      {},
-      { type: "none", extra: 1 },
-      { type: "agent" },
-      { type: "agent", instructions: "" },
-      { type: "agent", instructions: "   " },
-      { type: "agent", instructions: "x".repeat(8193) },
-      { type: "agent", instructions: "valid", extra: 1 },
-      { type: "unknown" },
+  it("15. rejects malformed or corrupt result_target specification as CORRUPT_RECORD", async () => {
+    const malformedRecords = [
+      { result_target: null },
+      { result_target: 123 },
+      { result_target: "unknown" },
+      { result_target: "agent" },
+      { result_target: "resource", resource_id: undefined },
+      { result_target: "resource", resource_id: "" },
+      { result_target: "resource", resource_id: null },
     ];
 
-    for (const badDelivery of malformedDeliveries) {
+    for (const bad of malformedRecords) {
       const corruptJob = {
         ...baseRecord(scopeA),
-        delivery: badDelivery as any,
+        ...bad,
       };
       await putJob(corruptJob as any);
       const res = await store.inspectAssignment(scopeA, corruptJob.job_id);
@@ -961,5 +959,79 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
         expect(res.reason).toBe("CORRUPT_RECORD");
       }
     }
+  });
+
+  it("16. records worker result via resultAssignment and supports idempotent replay", async () => {
+    const job = {
+      ...baseRecord(scopeA),
+      resource_id: "res-test-123",
+      result_target: "resource" as const,
+    };
+    await putJob(job as any);
+
+    // Claim first
+    const claimRes = await store.claimAssignment(scopeA, {
+      worker_id: "worker-1",
+      attempt_id: "attempt-1",
+      ttl_seconds: 60,
+    });
+    expect(claimRes.ok).toBe(true);
+
+    // Call resultAssignment with valid result
+    const resultInput = {
+      worker_id: "worker-1",
+      attempt_id: "attempt-1",
+      result: {
+        target: "resource" as const,
+        resource_id: "res-test-123",
+        commit: "git-commit-abc123",
+        payload_sha256: "payload-sha-256",
+        received_at: "2026-09-13T12:00:00.000Z",
+      },
+    };
+
+    const res1 = await store.resultAssignment(scopeA, job.job_id, resultInput);
+    expect(res1.ok).toBe(true);
+
+    // Inspect assignment should show result persisted
+    const inspectRes = await store.inspectAssignment(scopeA, job.job_id);
+    expect(inspectRes.ok).toBe(true);
+    if (inspectRes.ok) {
+      expect(inspectRes.assignment.result).toEqual(resultInput.result);
+    }
+
+    // Replay with exact same payload_sha256 should succeed
+    const res2 = await store.resultAssignment(scopeA, job.job_id, resultInput);
+    expect(res2.ok).toBe(true);
+
+    // Mismatched payload_sha256 should fail with RESULT_CONFLICT
+    const conflictInput = {
+      ...resultInput,
+      result: {
+        ...resultInput.result,
+        payload_sha256: "different-sha",
+      },
+    };
+    const resConflict = await store.resultAssignment(scopeA, job.job_id, conflictInput);
+    expect(resConflict.ok).toBe(false);
+    if (!resConflict.ok) {
+      expect(resConflict.code).toBe("RESULT_CONFLICT");
+    }
+
+    // Report can still be submitted after result
+    const reportRes = await store.reportAssignment(scopeA, job.job_id, {
+      worker_id: "worker-1",
+      attempt_id: "attempt-1",
+      terminal_phase: "completed",
+      report_digest: "sha256-report-digest",
+      reported_at: "2026-09-13T12:01:00.000Z",
+      outcome: { status: "completed" },
+      executor: { type: "test", version: "1.0" },
+    });
+    expect(reportRes.ok).toBe(true);
+
+    // Result replay is allowed even after terminal report
+    const resAfterReport = await store.resultAssignment(scopeA, job.job_id, resultInput);
+    expect(resAfterReport.ok).toBe(true);
   });
 });
