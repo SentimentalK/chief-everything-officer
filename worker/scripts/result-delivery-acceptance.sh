@@ -199,6 +199,7 @@ if ! grep -q 'result_delivery_retry' "$E/worker.stdout.log"; then
   exit 1
 fi
 
+cd "$SRV"
 REDIS="$REDIS" SRV="$SRV" JOB="$E/job.json" node --input-type=module -e '
 import { readFileSync } from "node:fs";
 import { createClient } from "redis";
@@ -286,6 +287,7 @@ if [ "$(attempt_count)" != "1" ]; then
   exit 1
 fi
 
+cd "$SRV"
 REDIS="$REDIS" SRV="$SRV" JOB="$E/job.json" RECEIPT="$RECEIPT" node --input-type=module -e '
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
