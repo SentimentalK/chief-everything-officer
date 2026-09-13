@@ -266,15 +266,15 @@ if (Buffer.compare(deliveredBytes, artBytes) !== 0) {
   process.exit(1);
 }
 
-// Verify prompt envelope contains ## Result Target
+// Verify prompt envelope contains ## Managed Result
 const promptPath = path.join(ws, ".ceo", "bridge", "requests", job.job_id, attempt, "prompt.md");
 if (!existsSync(promptPath)) {
   console.error("prompt.md missing at: " + promptPath);
   process.exit(1);
 }
 const promptContent = readFileSync(promptPath, "utf8");
-if (!promptContent.includes("## Result Target")) {
-  console.error("prompt envelope missing ## Result Target section");
+if (!promptContent.includes("## Managed Result")) {
+  console.error("prompt envelope missing ## Managed Result section");
   process.exit(1);
 }
 
