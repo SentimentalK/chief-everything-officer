@@ -7,6 +7,7 @@
 use ceo_worker::bridge::client::BridgeClient;
 use ceo_worker::bridge::config::{load_api_key, BridgeConfig, ExpectedIdentity};
 use ceo_worker::bridge::controller::Worker;
+use ceo_worker::bridge::outbox::PendingReportRecord;
 use ceo_worker::bridge::protocol::ClaimedJob;
 use ceo_worker::bridge::state::{
     self, ActiveAttempt, AttemptHistoryRecord, BridgeBinding, BridgeState, ClaimPayload, LocalPhase,
@@ -478,6 +479,19 @@ fn job_completed(workspace: &Path, job_id: &str) -> bool {
             AttemptHistoryRecord::load(workspace, job_id, &receipt.attempt_id),
             Ok(Some(_))
         )
+        && state::outbox_record_path(workspace, job_id, &receipt.attempt_id).is_file()
+}
+
+fn attempt_count(workspace: &Path, job_id: &str) -> usize {
+    let attempts = workspace
+        .join(".ceo")
+        .join("jobs")
+        .join(job_id)
+        .join("attempts");
+    match std::fs::read_dir(attempts) {
+        Ok(rd) => rd.flatten().count(),
+        Err(_) => 0,
+    }
 }
 
 async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
@@ -597,6 +611,10 @@ async fn start_drop_still_completes_locally() {
     let receipt = load_receipt(&run.workspace, JOB1).expect("receipt");
     assert_eq!(receipt.execution_status, "COMPLETED");
     assert!(count_hits(&run.server, "/start") >= 1);
+    assert!(
+        state::outbox_record_path(&run.workspace, JOB1, &receipt.attempt_id).is_file(),
+        "outbox missing after local completion"
+    );
 }
 
 #[tokio::test]
@@ -733,4 +751,86 @@ async fn startup_recovers_claimed_without_reclaim() {
     let receipt = load_receipt(&run.workspace, JOB1).expect("receipt");
     assert_eq!(receipt.execution_status, "COMPLETED");
     assert_eq!(receipt.attempt_id, seeded_attempt);
+}
+
+#[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
+async fn startup_reconstructs_missing_outbox_without_rerun() {
+    let mut run = start_harness(vec![JOB1.to_string()], StartMode::Ok, false, "normal").await;
+    let code = stop_after_success(&mut run, &[JOB1]).await;
+    assert_eq!(code, 0);
+    let receipt = load_receipt(&run.workspace, JOB1).expect("receipt");
+    let attempt = receipt.attempt_id.clone();
+    let starts_before = count_hits(&run.server, "/start");
+    let attempts_before = attempt_count(&run.workspace, JOB1);
+    let outbox = state::outbox_record_path(&run.workspace, JOB1, &attempt);
+    assert!(outbox.is_file());
+    std::fs::remove_file(&outbox).unwrap();
+
+    let hist = AttemptHistoryRecord::load(&run.workspace, JOB1, &attempt)
+        .unwrap()
+        .expect("history");
+    let cfg_path = run.workspace.parent().unwrap().join("bridge.json");
+    let cfg = BridgeConfig::load(&cfg_path).unwrap();
+    let bind = BridgeBinding {
+        server_origin: cfg.server_base.as_str().trim_end_matches('/').to_string(),
+        user_id: USER.to_string(),
+        workspace_id: WS_ID.to_string(),
+        workspace_ref: "tools".to_string(),
+        canonical_workspace: run.workspace.clone(),
+    };
+    let mut st = BridgeState::load(&state::state_path(&run.workspace), &bind).unwrap();
+    st.active = Some(ActiveAttempt {
+        job_id: JOB1.to_string(),
+        attempt_id: attempt.clone(),
+        claim_token: hist.claim_token.clone(),
+        phase: LocalPhase::DispatchIntent,
+        claim: None,
+        runner_boot_id: None,
+        process: None,
+        task_dispatch_intent: hist.task_dispatch_intent,
+        stop_error: None,
+    });
+    st.persist(&run.workspace).unwrap();
+
+    let key = load_api_key(&cfg.api_key_file).unwrap();
+    let client = BridgeClient::new(cfg.server_base.clone(), key).unwrap();
+    #[allow(clippy::field_reassign_with_default)]
+    let mut wcfg = WorkerConfig::default();
+    wcfg.workspace_dir = run.workspace.clone();
+    wcfg.executor_type = ExecutorType::TestStub;
+    wcfg.agent_executable = stub_bin();
+    wcfg.doctor_timeout_secs = 30;
+    let runner = Runner::new(wcfg, None);
+    let expected = ExpectedIdentity {
+        user_id: USER.to_string(),
+        workspace_id: WS_ID.to_string(),
+    };
+    let mut worker = Worker::new(
+        &cfg,
+        expected,
+        "tools",
+        run.workspace.clone(),
+        client,
+        runner,
+        String::new(),
+    );
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let handle = tokio::spawn(async move { worker.run(stop_rx).await });
+    let ws = run.workspace.clone();
+    let outbox_check = outbox.clone();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            outbox_check.is_file() && state_active_cleared(&ws)
+        })
+        .await,
+        "startup did not reconstruct outbox and clear active"
+    );
+    let _ = stop_tx.send(Some(StopReason::UserRequested));
+    assert_eq!(handle.await.unwrap(), 0);
+    assert_eq!(attempt_count(&run.workspace, JOB1), attempts_before);
+    assert_eq!(count_hits(&run.server, "/start"), starts_before);
+    let loaded = PendingReportRecord::load(&run.workspace, JOB1, &attempt, &bind).unwrap();
+    assert_eq!(loaded.job_id, JOB1);
+    assert_eq!(loaded.attempt_id, attempt);
 }

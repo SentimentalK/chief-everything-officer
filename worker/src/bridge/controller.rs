@@ -7,13 +7,16 @@
 //! deadline, automatic reassignment, or synthetic infinite lease. Execution
 //! authority is established by a confirmed, locally persisted assignment.
 //!
-//! Local completion saves receipt + history and clears active; it never
-//! invents a server-side succeeded.
+//! Local completion saves receipt + history + a pending report, then clears
+//! active. Delivery to the Server is a later step; this module never invents a
+//! server-side succeeded.
 
 use crate::bridge::acquisition::{acquire_one, AcquireError, AcquireOutcome};
 use crate::bridge::client::{BridgeClient, ClientError, ErrorKind};
 use crate::bridge::config::{BridgeConfig, ExpectedIdentity};
+use crate::bridge::outbox::PendingReportRecord;
 use crate::bridge::protocol::{AssignmentStartOk, AssignmentStartRequest};
+use crate::bridge::report;
 use crate::bridge::state::{
     self, ActiveAttempt, AttemptHistoryRecord, BridgeBinding, BridgeState, ClaimPayload, LocalPhase,
 };
@@ -360,14 +363,22 @@ impl Worker {
                     );
                     return Err(1);
                 }
-                state.active = None;
-                state.persist(&self.workspace).map_err(|_| 1)?;
+                ensure_pending_and_clear_active(
+                    &self.workspace,
+                    &binding,
+                    &self.worker_id,
+                    state,
+                    &job_id,
+                    &attempt_id,
+                    &history,
+                    &receipt_bytes,
+                )?;
                 emit(
-                    "bridge_ready",
+                    "local_result_saved",
                     &job_id,
                     &attempt_id,
                     &self.workspace_ref,
-                    "finalized",
+                    "result_delivery_pending",
                 );
                 Ok(())
             }
@@ -631,8 +642,9 @@ impl Worker {
         }
 
         let attempt_dir = attempt_dir_for(&self.workspace, &job_id, &attempt_id);
-        let rec_sha = match sha256_file(&attempt_dir.join("receipt.json")) {
-            Ok(s) => s,
+        let receipt_path = attempt_dir.join("receipt.json");
+        let receipt_bytes = match std::fs::read(&receipt_path) {
+            Ok(b) => b,
             Err(_) => {
                 emit(
                     "bridge_stopped",
@@ -644,6 +656,7 @@ impl Worker {
                 return Err(1);
             }
         };
+        let rec_sha = sha256_of_bytes(&receipt_bytes);
         let dispatch_happened = receipt
             .bridge_context
             .as_ref()
@@ -662,14 +675,22 @@ impl Worker {
             &active.claim_token,
         );
         history.persist(&self.workspace).map_err(|_| 1)?;
-        state.active = None;
-        state.persist(&self.workspace).map_err(|_| 1)?;
+        ensure_pending_and_clear_active(
+            &self.workspace,
+            &self.binding(),
+            &self.worker_id,
+            state,
+            &job_id,
+            &attempt_id,
+            &history,
+            &receipt_bytes,
+        )?;
         emit(
             "local_result_saved",
             &job_id,
             &attempt_id,
             &self.workspace_ref,
-            "server_result_reported:false",
+            "result_delivery_pending",
         );
         if disposition == AttemptDisposition::StopDaemon {
             return Err(1);
@@ -1009,6 +1030,49 @@ fn classify_disposition(receipt: &TaskReceipt) -> AttemptDisposition {
         "INTERRUPTED" => AttemptDisposition::StopDaemon,
         _ => AttemptDisposition::StopDaemon,
     }
+}
+
+/// Persist the exact pending report (or accept a matching existing one), then
+/// clear `active` only after that write is durable. Memory is updated only
+/// after persist succeeds.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_pending_and_clear_active(
+    workspace: &Path,
+    binding: &BridgeBinding,
+    worker_id: &str,
+    state: &mut BridgeState,
+    job_id: &str,
+    attempt_id: &str,
+    history: &AttemptHistoryRecord,
+    receipt_bytes: &[u8],
+) -> Result<(), i32> {
+    let request = report::build_report_request_from_evidence(
+        binding,
+        worker_id,
+        job_id,
+        attempt_id,
+        history,
+        receipt_bytes,
+    )
+    .map_err(|_| 1)?;
+    match PendingReportRecord::try_load(workspace, job_id, attempt_id, binding) {
+        Ok(Some(existing)) => {
+            if existing.request != request {
+                return Err(1);
+            }
+        }
+        Ok(None) => {
+            let pending =
+                PendingReportRecord::from_request(binding, job_id, request).map_err(|_| 1)?;
+            pending.persist(workspace).map_err(|_| 1)?;
+        }
+        Err(_) => return Err(1),
+    }
+    let mut candidate = state.clone();
+    candidate.active = None;
+    candidate.persist(workspace).map_err(|_| 1)?;
+    *state = candidate;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

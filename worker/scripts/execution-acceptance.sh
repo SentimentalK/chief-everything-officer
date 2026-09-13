@@ -222,8 +222,8 @@ if (r.business_outcome !== "UNVERIFIED") { console.error("expected UNVERIFIED, g
 if (!attempt) { console.error("receipt missing attempt_id"); process.exit(1); }
 if (!worker) { console.error("receipt missing worker_id"); process.exit(1); }
 
-if (!log.includes("local_result_saved") || !log.includes("server_result_reported:false")) {
-  console.error("worker stdout missing local_result_saved or server_result_reported:false");
+if (!log.includes("local_result_saved") || !log.includes("result_delivery_pending")) {
+  console.error("worker stdout missing local_result_saved or result_delivery_pending");
   process.exit(1);
 }
 if (!srvlog.includes(attempt)) { console.error("server log missing attempt " + attempt); process.exit(1); }
@@ -276,6 +276,11 @@ if (hist.job_id !== job.job_id || hist.attempt_id !== attempt) {
 }
 if (hist.worker_id !== worker) {
   console.error("bridge history worker_id mismatch");
+  process.exit(1);
+}
+const outboxFile = path.join(ws, ".ceo", "bridge", "outbox", `${job.job_id}.${attempt}.json`);
+if (!existsSync(outboxFile)) {
+  console.error("bridge outbox file missing on disk");
   process.exit(1);
 }
 const receiptSha = createHash("sha256").update(receiptBytes).digest("hex");

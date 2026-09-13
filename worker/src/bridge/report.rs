@@ -137,7 +137,7 @@ fn error_code_ok(s: &str) -> bool {
             .all(|b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
 }
 
-fn validate_report_contract(req: &ExecutionReportRequest) -> Result<(), ReportError> {
+pub(crate) fn validate_report_contract(req: &ExecutionReportRequest) -> Result<(), ReportError> {
     if !worker_id_ok(&req.worker_id) {
         return Err(local("INVALID_REPORT", "worker_id is not a wrk-<uuid>"));
     }
@@ -256,56 +256,20 @@ fn map_business_outcome(outcome: BusinessOutcome) -> Result<&'static str, Report
     }
 }
 
-/// Read and validate the persisted local result, then build the exact report request.
-pub fn load_saved_report(
-    config: &BridgeConfig,
-    workspace_ref: &str,
+/// Build the exact report from already-loaded receipt bytes and history.
+///
+/// Allowed while `active` is still set. Callers that need the CLI gate must
+/// use [`load_saved_report`] instead.
+pub fn build_report_request_from_evidence(
+    binding: &BridgeBinding,
+    worker_id: &str,
     job_id: &str,
     attempt_id: &str,
+    history: &AttemptHistoryRecord,
+    receipt_bytes: &[u8],
 ) -> Result<ExecutionReportRequest, ReportError> {
     validate_ids(job_id, attempt_id)?;
-    let workspace = config
-        .resolve_workspace(workspace_ref)
-        .cloned()
-        .ok_or_else(|| {
-            ReportError::Config(format!("workspace_ref {workspace_ref:?} is not configured"))
-        })?;
-    state::reject_control_ancestor_symlinks(&workspace)
-        .map_err(|e| local("PATH_INVALID", e.to_string()))?;
-
-    let binding = expected_binding(config, workspace_ref, &workspace);
-    let state_path = state::state_path(&workspace);
-    let state = match BridgeState::load(&state_path, &binding) {
-        Ok(s) => s,
-        Err(state::StateError::Io(_, msg)) if msg.contains("No such file") => {
-            return Err(local("LOCAL_STATE_MISSING", "bridge state is missing"));
-        }
-        Err(state::StateError::BindingMismatch(m)) => {
-            return Err(local(LOCAL_BINDING_MISMATCH, m));
-        }
-        Err(state::StateError::Invalid(m)) => return Err(local(LOCAL_STATE_INVALID, m)),
-        Err(e) => return Err(local(LOCAL_STATE_INVALID, e.to_string())),
-    };
-    if state.active.is_some() {
-        return Err(local(
-            "ACTIVE_ATTEMPT",
-            "an active attempt is still recorded; stop bridge run first",
-        ));
-    }
-
-    let history_path = state::history_record_path(&workspace, job_id, attempt_id);
-    match std::fs::symlink_metadata(&history_path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(local("HISTORY_MISSING", "history record is missing"));
-        }
-        Err(e) => return Err(local("HISTORY_INVALID", e.to_string())),
-    }
-    let history_bytes = read_workspace_file(&workspace, &history_path)?;
-    let history: AttemptHistoryRecord = serde_json::from_slice(&history_bytes)
-        .map_err(|_| local("HISTORY_INVALID", "history record is not valid JSON"))?;
-    validate_history_for_report(&history).map_err(|e| local("HISTORY_INVALID", e))?;
-
+    validate_history_for_report(history).map_err(|e| local("HISTORY_INVALID", e))?;
     if history.server_origin != binding.server_origin
         || history.user_id != binding.user_id
         || history.workspace_id != binding.workspace_id
@@ -316,7 +280,7 @@ pub fn load_saved_report(
             "history identity does not match the configured binding",
         ));
     }
-    if history.worker_id != state.worker_id {
+    if history.worker_id != worker_id {
         return Err(local(
             LOCAL_BINDING_MISMATCH,
             "history worker_id does not match local state",
@@ -332,25 +296,14 @@ pub fn load_saved_report(
         return Err(local("INVALID_REPORT", "history claim token is invalid"));
     }
 
-    let attempt_dir = safe_attempt_dir(&workspace, job_id, attempt_id)
-        .map_err(|e| local("PATH_INVALID", e.to_string()))?;
-    let receipt_path = attempt_dir.join("receipt.json");
-    match std::fs::symlink_metadata(&receipt_path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(local("RECEIPT_MISSING", "receipt is missing"));
-        }
-        Err(e) => return Err(local("RECEIPT_INVALID", e.to_string())),
-    }
-    let receipt_bytes = read_workspace_file(&workspace, &receipt_path)?;
-    let receipt_sha = sha256_hex(&receipt_bytes);
+    let receipt_sha = sha256_hex(receipt_bytes);
     if receipt_sha != history.receipt_sha256 {
         return Err(local(
             "RECEIPT_HASH_MISMATCH",
             "receipt bytes do not match history.receipt_sha256",
         ));
     }
-    let receipt: TaskReceipt = serde_json::from_slice(&receipt_bytes)
+    let receipt: TaskReceipt = serde_json::from_slice(receipt_bytes)
         .map_err(|_| local("RECEIPT_INVALID", "receipt is not valid JSON"))?;
     if receipt.job_id != job_id || receipt.attempt_id != attempt_id {
         return Err(local(
@@ -358,7 +311,7 @@ pub fn load_saved_report(
             "receipt job/attempt does not match the command",
         ));
     }
-    if !workspace_matches(&receipt.workspace, &workspace) {
+    if !workspace_matches(&receipt.workspace, &binding.canonical_workspace) {
         return Err(local(
             LOCAL_BINDING_MISMATCH,
             "receipt workspace does not match the canonical workspace",
@@ -431,6 +384,116 @@ pub fn load_saved_report(
     };
     validate_report_contract(&request)?;
     Ok(request)
+}
+
+/// Load history + receipt bytes for a finalized attempt. Does not require
+/// `active == null`; that gate belongs to the manual CLI path.
+pub fn load_history_and_receipt_bytes(
+    workspace: &Path,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<(AttemptHistoryRecord, Vec<u8>), ReportError> {
+    validate_ids(job_id, attempt_id)?;
+    state::reject_control_ancestor_symlinks(workspace)
+        .map_err(|e| local("PATH_INVALID", e.to_string()))?;
+    let history_path = state::history_record_path(workspace, job_id, attempt_id);
+    match std::fs::symlink_metadata(&history_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(local("HISTORY_MISSING", "history record is missing"));
+        }
+        Err(e) => return Err(local("HISTORY_INVALID", e.to_string())),
+    }
+    let history_bytes = read_workspace_file(workspace, &history_path)?;
+    let history: AttemptHistoryRecord = serde_json::from_slice(&history_bytes)
+        .map_err(|_| local("HISTORY_INVALID", "history record is not valid JSON"))?;
+
+    let attempt_dir = safe_attempt_dir(workspace, job_id, attempt_id)
+        .map_err(|e| local("PATH_INVALID", e.to_string()))?;
+    let receipt_path = attempt_dir.join("receipt.json");
+    match std::fs::symlink_metadata(&receipt_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(local("RECEIPT_MISSING", "receipt is missing"));
+        }
+        Err(e) => return Err(local("RECEIPT_INVALID", e.to_string())),
+    }
+    let receipt_bytes = read_workspace_file(workspace, &receipt_path)?;
+    Ok((history, receipt_bytes))
+}
+
+/// Rebuild the authoritative request from receipt/history and require it to
+/// match the stored outbox payload exactly.
+pub fn validate_pending_against_evidence(
+    workspace: &Path,
+    binding: &BridgeBinding,
+    worker_id: &str,
+    pending: &crate::bridge::outbox::PendingReportRecord,
+) -> Result<ExecutionReportRequest, ReportError> {
+    let (history, receipt_bytes) =
+        load_history_and_receipt_bytes(workspace, &pending.job_id, &pending.attempt_id)?;
+    let rebuilt = build_report_request_from_evidence(
+        binding,
+        worker_id,
+        &pending.job_id,
+        &pending.attempt_id,
+        &history,
+        &receipt_bytes,
+    )?;
+    if rebuilt != pending.request {
+        return Err(local(
+            "OUTBOX_EVIDENCE_MISMATCH",
+            "pending report does not match receipt/history",
+        ));
+    }
+    Ok(rebuilt)
+}
+
+/// Read and validate the persisted local result, then build the exact report request.
+pub fn load_saved_report(
+    config: &BridgeConfig,
+    workspace_ref: &str,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<ExecutionReportRequest, ReportError> {
+    validate_ids(job_id, attempt_id)?;
+    let workspace = config
+        .resolve_workspace(workspace_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ReportError::Config(format!("workspace_ref {workspace_ref:?} is not configured"))
+        })?;
+    state::reject_control_ancestor_symlinks(&workspace)
+        .map_err(|e| local("PATH_INVALID", e.to_string()))?;
+
+    let binding = expected_binding(config, workspace_ref, &workspace);
+    let state_path = state::state_path(&workspace);
+    let state = match BridgeState::load(&state_path, &binding) {
+        Ok(s) => s,
+        Err(state::StateError::Io(_, msg)) if msg.contains("No such file") => {
+            return Err(local("LOCAL_STATE_MISSING", "bridge state is missing"));
+        }
+        Err(state::StateError::BindingMismatch(m)) => {
+            return Err(local(LOCAL_BINDING_MISMATCH, m));
+        }
+        Err(state::StateError::Invalid(m)) => return Err(local(LOCAL_STATE_INVALID, m)),
+        Err(e) => return Err(local(LOCAL_STATE_INVALID, e.to_string())),
+    };
+    if state.active.is_some() {
+        return Err(local(
+            "ACTIVE_ATTEMPT",
+            "an active attempt is still recorded; stop bridge run first",
+        ));
+    }
+    let (history, receipt_bytes) = load_history_and_receipt_bytes(&workspace, job_id, attempt_id)?;
+    build_report_request_from_evidence(
+        &binding,
+        &state.worker_id,
+        job_id,
+        attempt_id,
+        &history,
+        &receipt_bytes,
+    )
 }
 
 /// Verify remote identity, then send the locally constructed report exactly once.

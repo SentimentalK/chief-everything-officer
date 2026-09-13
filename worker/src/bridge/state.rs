@@ -56,6 +56,15 @@ pub fn history_record_path(workspace: &Path, job_id: &str, attempt_id: &str) -> 
     history_dir(workspace).join(format!("{job_id}.{attempt_id}.json"))
 }
 
+/// Directory holding immutable pending execution-report payloads.
+pub fn outbox_dir(workspace: &Path) -> PathBuf {
+    bridge_dir(workspace).join("outbox")
+}
+
+pub fn outbox_record_path(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf {
+    outbox_dir(workspace).join(format!("{job_id}.{attempt_id}.json"))
+}
+
 /// Directory holding the versioned prompt envelope for a request.
 pub fn request_dir(workspace: &Path, job_id: &str, attempt_id: &str) -> PathBuf {
     bridge_dir(workspace)
@@ -78,6 +87,7 @@ pub fn ensure_control_dirs(workspace: &Path) -> std::io::Result<()> {
         bridge_dir(workspace),
         bridge_dir(workspace).join("requests"),
         history_dir(workspace),
+        outbox_dir(workspace),
     ] {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -96,6 +106,7 @@ fn control_tree_dirs(workspace: &Path) -> Vec<PathBuf> {
         bridge_dir(workspace),
         bridge_dir(workspace).join("requests"),
         history_dir(workspace),
+        outbox_dir(workspace),
         crate::config::jobs_dir(workspace),
     ]
 }
