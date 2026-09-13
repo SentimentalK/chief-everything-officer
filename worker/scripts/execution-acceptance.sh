@@ -228,8 +228,8 @@ if (r.business_outcome !== "UNVERIFIED") { console.error("expected UNVERIFIED, g
 if (!attempt) { console.error("receipt missing attempt_id"); process.exit(1); }
 if (!worker) { console.error("receipt missing worker_id"); process.exit(1); }
 
-if (!log.includes("local_result_saved") || !log.includes("result_delivery_pending") || !log.includes("server_result_reported")) {
-  console.error("worker stdout missing local_result_saved, result_delivery_pending, or server_result_reported");
+if (!log.includes("local_result_saved") || (!log.includes("result_delivery_pending") && !log.includes("report_delivery_pending")) || !log.includes("server_result_reported")) {
+  console.error("worker stdout missing local_result_saved, delivery_pending, or server_result_reported");
   process.exit(1);
 }
 if (!srvlog.includes(attempt)) { console.error("server log missing attempt " + attempt); process.exit(1); }

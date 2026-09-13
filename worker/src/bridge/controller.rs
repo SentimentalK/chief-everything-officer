@@ -838,7 +838,7 @@ impl Worker {
             &job_id,
             &attempt_id,
             &self.workspace_ref,
-            "report_delivery_pending",
+            "result_delivery_pending",
         );
         let pending =
             PendingReportRecord::load(&self.workspace, &job_id, &attempt_id, &self.binding())
