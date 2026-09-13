@@ -13,7 +13,7 @@ use crate::doctor::{
     SessionDoctorReport,
 };
 use crate::executor::adapter_trait::ManagedProcess;
-use crate::executor::process::{pgid_has_live_members, pgid_has_live_members_except};
+use crate::executor::process::pgid_has_live_members;
 use crate::executor::{create_executor, ExecutionRequest, ExecutorError};
 use crate::observability::{
     EventLogger, JobStage, LogSource, ProcessLogger, StatusTracker, StreamEventDispatcher,
@@ -216,7 +216,6 @@ enum ResourceResultWait {
     Ready,
     Deadline,
     Stopped,
-    GroupGone,
 }
 
 fn managed_result_file_ready(path: &Path) -> bool {
@@ -237,33 +236,18 @@ fn should_wait_for_resource_result(
         && !managed_result_file_ready(result_path)
 }
 
-/// True while capability work (descendants) is still running in the executor
-/// group. The idle leader alone does not keep a Resource wait open — otherwise
-/// an ended turn with no `managed-result.json` waits until the task deadline.
-fn process_group_has_remaining_work(child: &mut dyn ManagedProcess) -> bool {
-    let _ = child.try_wait();
-    match (child.pgid(), child.pid()) {
-        (Some(pg), Some(leader)) => {
-            pgid_has_live_members_except(pg, Some(leader as i32)).unwrap_or(true)
-        }
-        (Some(pg), None) => pgid_has_live_members(pg).unwrap_or(true),
-        (None, _) => child.try_wait().ok().flatten().is_none(),
-    }
-}
-
-/// After the agent ends its turn, a Resource capability may still be running
-/// in the executor process group. Poll until the managed result is valid, no
-/// descendant work remains, the caller stops, or the task deadline is reached.
+/// After the agent ends its turn, a Resource result may still be written by a
+/// detached extractor. Poll until the managed result is valid, the caller
+/// stops, or the task deadline is reached. Process-group membership is not a
+/// completion signal.
 #[cfg(test)]
-async fn wait_for_resource_result<FStop, FLive>(
+async fn wait_for_resource_result<FStop>(
     result_path: &Path,
     deadline: tokio::time::Instant,
     mut stop_check: FStop,
-    mut group_live: FLive,
 ) -> ResourceResultWait
 where
     FStop: FnMut() -> bool,
-    FLive: FnMut() -> bool,
 {
     if managed_result_file_ready(result_path) {
         return ResourceResultWait::Ready;
@@ -289,9 +273,6 @@ where
                 }
                 if stop_check() {
                     return ResourceResultWait::Stopped;
-                }
-                if !group_live() {
-                    return ResourceResultWait::GroupGone;
                 }
             }
         }
@@ -1600,6 +1581,16 @@ impl Runner {
                     }
                 }
                 _ = tokio::time::sleep_until(task_deadline) => {
+                    if task_turn_finished
+                        && task_result_status.eq_ignore_ascii_case("success")
+                        && matches!(
+                            managed_result,
+                            crate::managed_result::ManagedResultRequirement::Resource { .. }
+                        )
+                        && managed_result_file_ready(&result_path)
+                    {
+                        break;
+                    }
                     return self
                         .finalize_after_teardown(
                             finalize_params,
@@ -1620,9 +1611,6 @@ impl Runner {
                 }
                 _ = resource_result_tick.tick(), if waiting_for_resource => {
                     if managed_result_file_ready(&result_path) {
-                        break;
-                    }
-                    if !process_group_has_remaining_work(child.as_mut()) {
                         break;
                     }
                 }
@@ -2079,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_resource_result_ready_when_file_appears() {
+    async fn wait_for_resource_result_keeps_waiting_until_delayed_file_appears() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("managed-result.json");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -2088,17 +2076,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
             std::fs::write(&writer, r#"{"content":"hello"}"#).unwrap();
         });
-        let got = wait_for_resource_result(&path, deadline, || false, || true).await;
+        let got = wait_for_resource_result(&path, deadline, || false).await;
         assert_eq!(got, ResourceResultWait::Ready);
-    }
-
-    #[tokio::test]
-    async fn wait_for_resource_result_group_gone_without_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("managed-result.json");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let got = wait_for_resource_result(&path, deadline, || false, || false).await;
-        assert_eq!(got, ResourceResultWait::GroupGone);
     }
 
     #[tokio::test]
@@ -2106,8 +2085,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("managed-result.json");
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-        let got = wait_for_resource_result(&path, deadline, || false, || true).await;
+        let got = wait_for_resource_result(&path, deadline, || false).await;
         assert_eq!(got, ResourceResultWait::Deadline);
+    }
+
+    #[tokio::test]
+    async fn wait_for_resource_result_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed-result.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let got = wait_for_resource_result(&path, deadline, || true).await;
+        assert_eq!(got, ResourceResultWait::Stopped);
     }
 
     #[test]

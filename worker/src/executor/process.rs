@@ -140,9 +140,9 @@ pub fn pgid_has_live_members(pgid: i32) -> Result<bool, std::io::Error> {
     pgid_has_live_members_except(pgid, None)
 }
 
-/// Same scan as [`pgid_has_live_members`], but ignores `except_pid` (typically
-/// the still-idle executor leader). After a Resource turn ends, leftover
-/// capability work is the descendants — not the leader itself.
+/// Same scan as [`pgid_has_live_members`], optionally excluding one PID.
+/// This reports membership of one Linux process group only; it does not
+/// establish whether detached/background work exists elsewhere.
 pub fn pgid_has_live_members_except(
     pgid: i32,
     except_pid: Option<i32>,
@@ -228,7 +228,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn survivor_scan_except_leader_ignores_idle_leader() {
+    fn survivor_scan_except_pid_ignores_excluded_member() {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
 
@@ -247,13 +247,13 @@ mod tests {
         };
         let pid = child.id() as i32;
         let has_leader = pgid_has_live_members(pid).unwrap();
-        let has_work = pgid_has_live_members_except(pid, Some(pid)).unwrap();
+        let has_except = pgid_has_live_members_except(pid, Some(pid)).unwrap();
         let _ = child.kill();
         let _ = child.wait();
         assert!(has_leader, "new group should include the sleep leader");
         assert!(
-            !has_work,
-            "excluding the leader should report no remaining work"
+            !has_except,
+            "excluding that pid should report no remaining member"
         );
     }
 }
