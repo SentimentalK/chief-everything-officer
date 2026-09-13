@@ -333,15 +333,15 @@ describe("worker discovery HTTP (GET /pending)", () => {
 
   it("requires authentication (401)", async () => {
     const { baseUrl } = await buildServer(stubService({}));
-    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`);
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=ceo-agent-runtime`);
     expect(res.status).toBe(401);
   });
 
   it("validates query parameters through the real schema (never QUEUE_UNAVAILABLE)", async () => {
     const { baseUrl } = await buildServer(deadStoreService());
     const bad: Array<[string, number]> = [
-      [`?workspace_ref=tools&after=not-a-cursor`, 400],
-      [`?workspace_ref=tools&extra=1`, 400], // unknown param
+      [`?workspace_ref=ceo-agent-runtime&after=not-a-cursor`, 400],
+      [`?workspace_ref=ceo-agent-runtime&extra=1`, 400], // unknown param
       [`?workspace_ref=`, 400], // missing/empty required alias
       [`?after=0-0`, 400], // missing workspace_ref
     ];
@@ -354,7 +354,7 @@ describe("worker discovery HTTP (GET /pending)", () => {
 
   it("a schema-valid pending query on an unreachable backend is QUEUE_UNAVAILABLE", async () => {
     const { baseUrl } = await buildServer(deadStoreService());
-    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`, { headers: authHeaders() });
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=ceo-agent-runtime`, { headers: authHeaders() });
     expect(res.status).toBe(503);
     expect(((await res.json()) as { code: string }).code).toBe("QUEUE_UNAVAILABLE");
   });
@@ -377,7 +377,7 @@ describe("worker discovery HTTP (GET /pending)", () => {
       }),
     } as unknown as JobService;
     const { baseUrl } = await buildServer(service);
-    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=tools`, { headers: authHeaders() });
+    const res = await fetch(`${baseUrl}/api/worker/jobs/pending?workspace_ref=ceo-agent-runtime`, { headers: authHeaders() });
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = (await res.json()) as Record<string, unknown>;
@@ -602,7 +602,7 @@ describe("worker assignment HTTP error mapping", () => {
 
 async function pendingJobs(baseUrl: string) {
   const response = await fetch(
-    `${baseUrl}/api/worker/jobs/pending?workspace_ref=tools&after=0-0`,
+    `${baseUrl}/api/worker/jobs/pending?workspace_ref=ceo-agent-runtime&after=0-0`,
     { headers: authHeaders() },
   );
 
