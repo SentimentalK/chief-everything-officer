@@ -185,7 +185,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
 
     expect(res.replayed).toBe(false);
     expect(res.state).toBe("claimed");
-    expect(res.record.schema_version).toBe(2);
+    expect(res.record.schema_version).toBe(ASSIGNMENT_SCHEMA_VERSION);
     expect(res.record.execution).toBeDefined();
 
     const ex = res.record.execution!;

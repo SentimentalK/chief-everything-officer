@@ -110,9 +110,9 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
     expect(sub.ok).toBe(true);
     const jobId = sub.view!.job_id;
 
-    // Assert JobRecord version is 2
+    // Assert JobRecord version is JOBS_SCHEMA_VERSION
     const rec = await getRawJob(jobId);
-    expect(rec.schema_version).toBe(2);
+    expect(rec.schema_version).toBe(JOBS_SCHEMA_VERSION);
 
     // Assert Stream envelope version is "1"
     const streamEntries = await store.readStreamEntries("0-0", 10);
