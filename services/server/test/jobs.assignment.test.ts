@@ -985,7 +985,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       claim_token_sha256: TOKEN_SHA,
       result: {
         target: "resource" as const,
-        payload_sha256: "payload-sha-256",
+        payload_sha256: "a".repeat(64),
         resource_id: "res-test-123",
         commit: "git-commit-abc123",
       },
@@ -1014,13 +1014,14 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       ...resultInput,
       result: {
         ...resultInput.result,
-        payload_sha256: "different-sha",
+        payload_sha256: "b".repeat(64),
       },
     };
     const resConflict = await store.resultAssignment(scopeA, job.job_id, conflictInput);
     expect(resConflict.ok).toBe(false);
     if (!resConflict.ok) {
-      expect(resConflict.code).toBe("RESULT_CONFLICT");
+      expect(resConflict.code).toBe("REPORT_CONFLICT");
+      expect(resConflict.reason).toBe("RESULT_CONFLICT");
     }
 
     // Report can still be submitted after result
