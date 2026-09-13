@@ -94,18 +94,15 @@ const wait = (ms=8000) => new Promise((res, rej) => { const s=Date.now();
   (function t(){ if (runner.ready()) return res(); if (Date.now()-s>ms) return rej(new Error("redis not ready")); setTimeout(t,20); })(); });
 await wait();
 const request_id = "123e4567-e89b-12d3-a456-4266141740ff";
-const delivery_instructions = "After producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
+const prompt_text = "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: acceptance-nonce-98765\nAfter producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
 const res = await svc.submit(scope, { request_id,
   workspace_ref: "tools",
-  prompt: "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: acceptance-nonce-98765",
+  prompt: prompt_text,
   acceptance: "output_artifact.txt must contain acceptance-nonce-98765",
-  delivery: {
-    type: "agent",
-    instructions: delivery_instructions,
-  },
+  result_target: "none",
   timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
-if (res.view.delivery?.type !== "agent") throw new Error("expected view.delivery.type agent, got " + JSON.stringify(res.view.delivery));
+if (res.view.result_target !== "none") throw new Error("expected view.result_target none, got " + JSON.stringify(res.view.result_target));
 const rec = await store.getJob(res.view.job_id);
 writeFileSync(process.env.JOB, JSON.stringify({
   job_id: res.view.job_id, request_id, user_id: scope.user_id,
@@ -269,16 +266,15 @@ if (Buffer.compare(deliveredBytes, artBytes) !== 0) {
   process.exit(1);
 }
 
-// Verify prompt envelope contains ## Delivery and instructions
+// Verify prompt envelope contains ## Result Target
 const promptPath = path.join(ws, ".ceo", "bridge", "requests", job.job_id, attempt, "prompt.md");
 if (!existsSync(promptPath)) {
   console.error("prompt.md missing at: " + promptPath);
   process.exit(1);
 }
 const promptContent = readFileSync(promptPath, "utf8");
-const deliveryInstructions = "After producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
-if (!promptContent.includes("## Delivery") || !promptContent.includes(deliveryInstructions)) {
-  console.error("prompt envelope missing delivery section or instructions");
+if (!promptContent.includes("## Result Target")) {
+  console.error("prompt envelope missing ## Result Target section");
   process.exit(1);
 }
 
@@ -338,8 +334,8 @@ await wait();
 const rec = await store.getJob(job.job_id);
 if (!rec) { console.error("job not found in redis: " + job.job_id); process.exit(1); }
 if (!rec.execution) { console.error("job execution record missing in redis"); process.exit(1); }
-if (!rec.delivery || rec.delivery.type !== "agent" || rec.delivery.instructions !== deliveryInstructions) {
-  console.error("redis delivery spec mismatch: " + JSON.stringify(rec.delivery));
+if (rec.result_target !== "none") {
+  console.error("redis result_target mismatch: " + JSON.stringify(rec.result_target));
   process.exit(1);
 }
 

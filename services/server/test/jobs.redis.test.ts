@@ -301,7 +301,7 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     const req = "123e4567-e89b-12d3-a456-426614174050";
     const res = await serviceA.submit(userA, {
       ...submitPayload(req),
-      resource_id: "res-redis-target-1",
+      resource_id: "res-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
       result_target: "resource",
     });
     expect(res.ok).toBe(true);
@@ -318,6 +318,6 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     expect(claimRes.ok).toBe(true);
     if (!claimRes.ok) return;
     expect(claimRes.job?.result_target).toBe("resource");
-    expect(claimRes.job?.resource_id).toBe("res-redis-target-1");
+    expect(claimRes.job?.resource_id).toBe("res-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d");
   });
 });
