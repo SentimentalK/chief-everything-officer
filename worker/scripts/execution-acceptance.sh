@@ -94,11 +94,18 @@ const wait = (ms=8000) => new Promise((res, rej) => { const s=Date.now();
   (function t(){ if (runner.ready()) return res(); if (Date.now()-s>ms) return rej(new Error("redis not ready")); setTimeout(t,20); })(); });
 await wait();
 const request_id = "123e4567-e89b-12d3-a456-4266141740ff";
+const delivery_instructions = "After producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
 const res = await svc.submit(scope, { request_id,
   workspace_ref: "tools",
   prompt: "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: acceptance-nonce-98765",
-  acceptance: "output_artifact.txt must contain acceptance-nonce-98765", timeout_seconds: 120 });
+  acceptance: "output_artifact.txt must contain acceptance-nonce-98765",
+  delivery: {
+    type: "agent",
+    instructions: delivery_instructions,
+  },
+  timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
+if (res.view.delivery?.type !== "agent") throw new Error("expected view.delivery.type agent, got " + JSON.stringify(res.view.delivery));
 const rec = await store.getJob(res.view.job_id);
 writeFileSync(process.env.JOB, JSON.stringify({
   job_id: res.view.job_id, request_id, user_id: scope.user_id,
@@ -250,6 +257,31 @@ if (artClaim.sha256 !== artSha) {
   process.exit(1);
 }
 
+// Verify delivered artifact exists and matches output_artifact.txt
+const deliveredPath = path.join(ws, "delivered_artifact.txt");
+if (!existsSync(deliveredPath)) {
+  console.error("delivered_artifact.txt missing on disk");
+  process.exit(1);
+}
+const deliveredBytes = readFileSync(deliveredPath);
+if (Buffer.compare(deliveredBytes, artBytes) !== 0) {
+  console.error("delivered_artifact.txt content mismatch with output_artifact.txt");
+  process.exit(1);
+}
+
+// Verify prompt envelope contains ## Delivery and instructions
+const promptPath = path.join(path.dirname(process.env.RECEIPT), "prompt.md");
+if (!existsSync(promptPath)) {
+  console.error("prompt.md missing in attempt dir");
+  process.exit(1);
+}
+const promptContent = readFileSync(promptPath, "utf8");
+const deliveryInstructions = "After producing output_artifact.txt, copy the exact same bytes to delivered_artifact.txt in the managed workspace.";
+if (!promptContent.includes("## Delivery") || !promptContent.includes(deliveryInstructions)) {
+  console.error("prompt envelope missing delivery section or instructions");
+  process.exit(1);
+}
+
 // Verify bridge state: active attempt must be cleared
 if (!existsSync(statePath)) {
   console.error("bridge state.json missing on disk");
@@ -306,6 +338,10 @@ await wait();
 const rec = await store.getJob(job.job_id);
 if (!rec) { console.error("job not found in redis: " + job.job_id); process.exit(1); }
 if (!rec.execution) { console.error("job execution record missing in redis"); process.exit(1); }
+if (!rec.delivery || rec.delivery.type !== "agent" || rec.delivery.instructions !== deliveryInstructions) {
+  console.error("redis delivery spec mismatch: " + JSON.stringify(rec.delivery));
+  process.exit(1);
+}
 
 if (!rec.report) {
   console.error("expected redis report after automatic delivery");

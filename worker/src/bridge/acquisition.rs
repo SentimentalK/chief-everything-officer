@@ -431,7 +431,8 @@ mod tests {
                 "resource_id": null,
                 "prompt": "Create output artifact",
                 "acceptance": "Artifact must exist",
-                "timeout_seconds": 120
+                "timeout_seconds": 120,
+                "delivery": { "type": "none" }
             },
             "execution": {
                 "worker_id": worker_id,
@@ -687,6 +688,7 @@ mod tests {
             prompt: "P".to_string(),
             acceptance: "A".to_string(),
             timeout_seconds: 60,
+            delivery: crate::bridge::protocol::TaskDeliverySpec::None,
         });
 
         state.active = Some(ActiveAttempt {
@@ -798,7 +800,8 @@ mod tests {
                         "resource_id": null,
                         "prompt": "Create output artifact",
                         "acceptance": "Artifact must exist",
-                        "timeout_seconds": 120
+                        "timeout_seconds": 120,
+                        "delivery": { "type": "none" }
                     },
                     "execution": {
                         "worker_id": worker_id,

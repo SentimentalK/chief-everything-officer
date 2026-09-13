@@ -98,6 +98,7 @@ function okAssignment(patch: Record<string, unknown> = {}): AssignmentResult {
       prompt: "http prompt",
       acceptance: "http acceptance",
       timeout_seconds: 120,
+      delivery: { type: "none" },
     },
     ...patch,
   };
@@ -742,13 +743,14 @@ describe.skipIf(!URL)("worker assignment HTTP integration (real Redis, CI-gated)
 
         // Verify returned job fields whitelist
         const jobKeys = Object.keys(claimBody.job).sort();
-        expect(jobKeys).toEqual(["acceptance", "job_id", "prompt", "resource_id", "timeout_seconds", "workspace_ref"]);
+        expect(jobKeys).toEqual(["acceptance", "delivery", "job_id", "prompt", "resource_id", "timeout_seconds", "workspace_ref"]);
         expect(claimBody.job.job_id).toBe(jobId);
         expect(claimBody.job.workspace_ref).toBe("tools");
         expect(claimBody.job.prompt).toBe(promptText);
         expect(claimBody.job.acceptance).toBe(acceptanceText);
         expect(claimBody.job.timeout_seconds).toBe(120);
         expect(claimBody.job.resource_id).toBeNull();
+        expect(claimBody.job.delivery).toEqual({ type: "none" });
         expect(claimBody.job).not.toHaveProperty("user_id");
         expect(claimBody.job).not.toHaveProperty("workspace_id");
         expect(claimBody.job).not.toHaveProperty("claim_token");

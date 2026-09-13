@@ -38,12 +38,45 @@ function valid(patch: Record<string, unknown> = {}) {
 }
 
 describe("worker submit schema", () => {
-  it("defaults timeout to 1800 and treats absent resource_id as null", () => {
+  it("defaults timeout to 1800, resource_id to null, and delivery to none", () => {
     const r = parseSubmit(valid());
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.value.execution_timeout_seconds).toBe(DEFAULT_TIMEOUT_SECONDS);
     expect(r.value.resource_id).toBeNull();
+    expect(r.value.delivery).toEqual({ type: "none" });
+  });
+
+  it("normalizes explicit { type: 'none' } correctly", () => {
+    const r = parseSubmit(valid({ delivery: { type: "none" } }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.delivery).toEqual({ type: "none" });
+  });
+
+  it("accepts valid { type: 'agent', instructions: '...' }", () => {
+    const r = parseSubmit(valid({ delivery: { type: "agent", instructions: "send to discord" } }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.delivery).toEqual({ type: "agent", instructions: "send to discord" });
+  });
+
+  it("rejects delivery with missing or empty instructions for agent type", () => {
+    expect(parseSubmit(valid({ delivery: { type: "agent" } })).ok).toBe(false);
+    expect(parseSubmit(valid({ delivery: { type: "agent", instructions: "" } })).ok).toBe(false);
+    expect(parseSubmit(valid({ delivery: { type: "agent", instructions: "   \t\n " } })).ok).toBe(false);
+  });
+
+  it("rejects delivery with instructions exceeding 8192 bytes", () => {
+    const atLimit = "x".repeat(8192);
+    expect(parseSubmit(valid({ delivery: { type: "agent", instructions: atLimit } })).ok).toBe(true);
+    expect(parseSubmit(valid({ delivery: { type: "agent", instructions: atLimit + "a" } })).ok).toBe(false);
+  });
+
+  it("rejects unknown delivery type or extra keys", () => {
+    expect(parseSubmit(valid({ delivery: { type: "email" } })).ok).toBe(false);
+    expect(parseSubmit(valid({ delivery: { type: "none", extra: 1 } })).ok).toBe(false);
+    expect(parseSubmit(valid({ delivery: { type: "agent", instructions: "test", extra: 1 } })).ok).toBe(false);
   });
 
   it("rejects unknown fields (e.g. forged identity)", () => {
@@ -239,11 +272,13 @@ describe("business digest", () => {
     acceptance: "> 0 lines",
     resource_id: null as string | null,
     execution_timeout_seconds: 120,
+    delivery: { type: "none" as const },
   };
   it("is stable across key-authoring order and excludes request_id/server-time concepts", () => {
     const a = businessDigest({ ...base });
     const b = businessDigest({
       acceptance: base.acceptance,
+      delivery: { type: "none" },
       execution_timeout_seconds: base.execution_timeout_seconds,
       prompt: base.prompt,
       resource_id: base.resource_id,
@@ -253,6 +288,21 @@ describe("business digest", () => {
   });
   it("changes when a business field changes", () => {
     expect(businessDigest({ ...base, prompt: "different task" })).not.toBe(businessDigest(base));
+  });
+  it("treats omitted delivery and explicit none identically via parseSubmit", () => {
+    const p1 = parseSubmit(valid());
+    const p2 = parseSubmit(valid({ delivery: { type: "none" } }));
+    expect(p1.ok && p2.ok).toBe(true);
+    if (p1.ok && p2.ok) {
+      expect(businessDigest(p1.value)).toBe(businessDigest(p2.value));
+    }
+  });
+  it("differentiates delivery types and instructions", () => {
+    const dNone = businessDigest({ ...base, delivery: { type: "none" } });
+    const dAgent1 = businessDigest({ ...base, delivery: { type: "agent", instructions: "send to channel A" } });
+    const dAgent2 = businessDigest({ ...base, delivery: { type: "agent", instructions: "send to channel B" } });
+    expect(dNone).not.toBe(dAgent1);
+    expect(dAgent1).not.toBe(dAgent2);
   });
 });
 

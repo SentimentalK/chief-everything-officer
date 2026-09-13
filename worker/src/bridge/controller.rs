@@ -124,23 +124,37 @@ fn sha256_of(data: &str) -> String {
 }
 
 /// Versioned plain-text prompt envelope: task goal + acceptance kept verbatim,
-/// plus the managed-workspace constraint. Never injects tokens/keys/credentials.
+/// plus the managed-workspace constraint and delivery instructions. Never injects tokens/keys/credentials.
 fn build_envelope(canonical: &Path, payload: &ClaimPayload) -> String {
+    let delivery_section = match &payload.delivery {
+        crate::bridge::protocol::TaskDeliverySpec::None => {
+            "No external delivery is requested.".to_string()
+        }
+        crate::bridge::protocol::TaskDeliverySpec::Agent { instructions } => format!(
+            "The following delivery instruction is part of task completion.\nUse only capabilities already available/configured in this runtime.\nIf the delivery cannot be completed, do not claim successful completion.\n\n{}",
+            instructions
+        ),
+    };
     format!(
         "# CEO task
 
-You are operating on the managed workspace {:?}; keep outputs          there. Follow the workspace AGENTS.md and Doctor constraints.
+You are operating on the managed workspace {:?}; keep outputs there. Follow the workspace AGENTS.md and Doctor constraints.
 
-         ## Task goal
+## Task goal
 
 {}
 
 ## Acceptance requirements
 
+{}
+
+## Delivery
+
 {}",
         canonical.display(),
         payload.prompt,
         payload.acceptance,
+        delivery_section,
     )
 }
 
@@ -1227,6 +1241,7 @@ mod tests {
             prompt: prompt.to_string(),
             acceptance: acceptance.to_string(),
             timeout_seconds: 300,
+            delivery: crate::bridge::protocol::TaskDeliverySpec::None,
             payload_sha256: String::new(),
         }
     }
@@ -1242,7 +1257,24 @@ accept b";
         let env = build_envelope(Path::new("/ws"), &payload(p, a));
         assert!(env.contains(p), "prompt truncated: {env:?}");
         assert!(env.contains(a), "acceptance truncated: {env:?}");
+        assert!(
+            env.contains("## Delivery\n\nNo external delivery is requested."),
+            "delivery none missing: {env:?}"
+        );
         assert_eq!(sha256_of(p), sha256_of_bytes(p.as_bytes()));
+    }
+
+    #[test]
+    fn envelope_renders_agent_delivery_instructions() {
+        let mut p = payload("do task", "done");
+        p.delivery = crate::bridge::protocol::TaskDeliverySpec::Agent {
+            instructions: "Upload output.png to Discord channel #art".to_string(),
+        };
+        let env = build_envelope(Path::new("/ws"), &p);
+        assert!(
+            env.contains("## Delivery\n\nThe following delivery instruction is part of task completion.\nUse only capabilities already available/configured in this runtime.\nIf the delivery cannot be completed, do not claim successful completion.\n\nUpload output.png to Discord channel #art"),
+            "agent delivery instructions mismatch: {env:?}"
+        );
     }
 
     fn skeleton_receipt(status: &str, code: Option<&str>) -> TaskReceipt {

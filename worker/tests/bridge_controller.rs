@@ -137,7 +137,7 @@ fn pending_body(target: &str, jobs: &[String]) -> String {
 
 fn claimed_job_json(job_id: &str) -> String {
     format!(
-        r#"{{"job_id":"{job_id}","workspace_ref":"tools","resource_id":null,"prompt":"do the thing","acceptance":"thing done","timeout_seconds":120}}"#
+        r#"{{"job_id":"{job_id}","workspace_ref":"tools","resource_id":null,"prompt":"do the thing","acceptance":"thing done","timeout_seconds":120,"delivery":{{"type":"none"}}}}"#
     )
 }
 
@@ -770,6 +770,7 @@ async fn startup_recovers_claimed_without_reclaim() {
                 prompt: "do the thing".to_string(),
                 acceptance: "thing done".to_string(),
                 timeout_seconds: 120,
+                delivery: ceo_worker::bridge::protocol::TaskDeliverySpec::None,
             };
             let mut st = BridgeState::new(binding);
             st.worker_id = "wrk-123e4567-e89b-12d3-a456-426614174000".to_string();

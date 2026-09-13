@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createClient, type RedisClientType } from "redis";
 import { RedisJobStore, createRedisRunnerFromClient, type RedisRunner } from "../src/jobs/redis-store.js";
 import { JobService } from "../src/jobs/service.js";
-import { makeJobId, JOBS_SCHEMA_VERSION, businessDigest } from "../src/jobs/schema.js";
+import { makeJobId, JOBS_SCHEMA_VERSION, businessDigest, type DeliverySpec } from "../src/jobs/schema.js";
 
 // Real-Redis integration. Managed by CI only. When CEO_REDIS_URL is absent we
 // skip locally; the CI workflow asserts CEO_REDIS_URL is present before running
@@ -23,6 +23,7 @@ interface Prepared {
   prompt: string;
   acceptance: string;
   execution_timeout_seconds: number;
+  delivery: DeliverySpec;
   request_digest: string;
   status: "preparing";
   stream_entry_id: null;
@@ -40,6 +41,7 @@ function makePrepared(scope: typeof userA, reqId: string, note = "x"): { prepare
     acceptance: "accept",
     resource_id: null,
     execution_timeout_seconds: 120,
+    delivery: { type: "none" },
   });
   return {
     prepared: {
@@ -53,6 +55,7 @@ function makePrepared(scope: typeof userA, reqId: string, note = "x"): { prepare
       prompt,
       acceptance: "accept",
       execution_timeout_seconds: 120,
+      delivery: { type: "none" },
       request_digest,
       status: "preparing",
       stream_entry_id: null,
@@ -291,5 +294,35 @@ describe.skipIf(!URL)("worker queue (real Redis, CI-gated)", () => {
     } finally {
       await dead.dispose();
     }
+  });
+
+  it("persists delivery specification and returns it upon claim", async () => {
+    await store.resetForTest();
+    const req = "123e4567-e89b-12d3-a456-426614174050";
+    const agentInstructions = "Deliver report to webhook https://example.com/hook";
+    const res = await serviceA.submit(userA, {
+      ...submitPayload(req),
+      delivery: {
+        type: "agent",
+        instructions: agentInstructions,
+      },
+    });
+    expect(res.ok).toBe(true);
+    const jobId = res.view!.job_id;
+    expect(res.view!.delivery).toEqual({ type: "agent" });
+
+    // Claim the job
+    const claimRes = await serviceA.claim(userA, jobId, {
+      worker_id: "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+      attempt_id: "123e4567-e89b-12d3-a456-4266141740aa",
+      workspace_ref: "tools",
+      claim_token: "a".repeat(64),
+    });
+    expect(claimRes.ok).toBe(true);
+    if (!claimRes.ok) return;
+    expect(claimRes.job?.delivery).toEqual({
+      type: "agent",
+      instructions: agentInstructions,
+    });
   });
 });

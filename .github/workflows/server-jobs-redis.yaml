@@ -132,9 +132,11 @@ jobs:
                 timeout_seconds: 120,
               });
               if (!sub.ok) throw new Error("submit failed: " + JSON.stringify(sub));
+              if (sub.view.delivery?.type !== "none") throw new Error("expected default delivery type none");
               const jobId = sub.view.job_id;
               const c = await bridge.service.claim(scope, jobId, { worker_id: wrk, attempt_id: att, workspace_ref: "tools", claim_token: tok });
               if (!c.ok) throw new Error("claim failed: " + JSON.stringify(c));
+              if (c.job.delivery?.type !== "none") throw new Error("expected claim delivery type none");
               const s = await bridge.service.start(scope, jobId, { worker_id: wrk, attempt_id: att, claim_token: tok });
               if (!s.ok) throw new Error("start failed: " + JSON.stringify(s));
               const g = await bridge.service.get(scope, { job_id: jobId });
@@ -190,6 +192,7 @@ jobs:
               workspace_ref: "tools",
               prompt: "restart test persistence job",
               acceptance: "survives force-kill and replay",
+              delivery: { type: "agent", instructions: "send report to delivery target" },
               timeout_seconds: 300,
             });
             if (!res.ok) throw new Error("Failed pre-restart submit: " + JSON.stringify(res));
@@ -234,6 +237,8 @@ jobs:
               workspace_id: job.workspace_id,
               prompt: job.prompt,
               acceptance: job.acceptance,
+              delivery_type: job.delivery && job.delivery.type,
+              delivery_instructions: job.delivery && job.delivery.instructions,
               status: job.status,
               created_at_ms: job.created_at_ms,
               claim_deadline_ms: job.claim_deadline_ms,
@@ -333,6 +338,9 @@ jobs:
             if (job.claim_deadline_ms !== expected.claim_deadline_ms) throw new Error("claim_deadline_ms mismatch");
             if (job.stream_entry_id !== expected.stream_entry_id) throw new Error("stream_entry_id mismatch");
             if (job.status !== "queued") throw new Error("status mismatch: " + job.status);
+            if (!job.delivery) throw new Error("delivery missing after restart");
+            if (job.delivery.type !== expected.delivery_type) throw new Error("delivery.type mismatch");
+            if (job.delivery.instructions !== expected.delivery_instructions) throw new Error("delivery.instructions mismatch");
             if (!job.execution) throw new Error("execution assignment missing after restart");
             if (job.execution.worker_id !== expected.execution_worker_id) throw new Error("execution.worker_id mismatch");
             if (job.execution.attempt_id !== expected.execution_attempt_id) throw new Error("execution.attempt_id mismatch");
@@ -355,6 +363,7 @@ jobs:
             // 2. get / worker_get derive the reported terminal state.
             const got = await service.get(scope, { job_id: expected.job_id });
             if (!got.ok || got.view.state !== "completed") throw new Error("get did not derive completed: " + JSON.stringify(got));
+            if (got.view.delivery?.type !== expected.delivery_type) throw new Error("view.delivery mismatch");
             if (!got.view.report || got.view.report.execution_status !== "COMPLETED") {
               throw new Error("worker_get missing persisted report: " + JSON.stringify(got));
             }
@@ -406,11 +415,13 @@ jobs:
               workspace_ref: "tools",
               prompt: expected.prompt,
               acceptance: expected.acceptance,
+              delivery: { type: expected.delivery_type, instructions: expected.delivery_instructions },
               timeout_seconds: 300,
             });
             if (!replayRes.ok) throw new Error("Replay submission failed: " + JSON.stringify(replayRes));
             if (!replayRes.view.replayed) throw new Error("Expected replayed: true on post-restart submit");
             if (replayRes.view.job_id !== expected.job_id) throw new Error("Replay returned different job_id");
+            if (replayRes.view.delivery?.type !== expected.delivery_type) throw new Error("Replay delivery type mismatch");
             if (replayRes.view.state !== "completed") throw new Error("Replay state not completed: " + replayRes.view.state);
 
             // 5. Stream length unchanged (no duplicate XADD on replay).

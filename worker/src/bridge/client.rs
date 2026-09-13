@@ -842,5 +842,8 @@ fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     if job.timeout_seconds < MIN_TIMEOUT_SECONDS || job.timeout_seconds > MAX_TIMEOUT_SECONDS {
         return Err("timeout_seconds out of range".to_string());
     }
+    if let Err(e) = job.delivery.validate() {
+        return Err(format!("invalid delivery: {}", e));
+    }
     Ok(())
 }

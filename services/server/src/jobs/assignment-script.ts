@@ -74,6 +74,23 @@ local function validSha(s)
   return type(s) == 'string' and #s == 64 and not s:find('[^0-9a-f]')
 end
 
+local function validDelivery(d)
+  if type(d) ~= 'table' then return false end
+  local count = 0
+  for _ in pairs(d) do count = count + 1 end
+  if d.type == 'none' then
+    return count == 1
+  elseif d.type == 'agent' then
+    if count ~= 2 then return false end
+    if type(d.instructions) ~= 'string' then return false end
+    if #d.instructions < 1 or #d.instructions > 8192 then return false end
+    if d.instructions:match('^%s*$') then return false end
+    return true
+  else
+    return false
+  end
+end
+
 -- 1. Key type check
 local t = redis.call('TYPE', KEYS[1])
 local tt = type(t) == 'table' and t.ok or tostring(t)
@@ -96,12 +113,13 @@ if job.job_id ~= expected_job_id
   return err('JOB_NOT_FOUND', cjson.null)
 end
 
--- 3. Schema version must be 3
-if job.schema_version ~= 3 then
+-- 3. Schema version must be 4
+if job.schema_version ~= 4 then
   return err('QUEUE_UNAVAILABLE', 'UNSUPPORTED_SCHEMA_VERSION')
 end
 
 -- 4. Structural validation of base job record
+if not validDelivery(job.delivery) then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.request_id) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.request_digest) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end
 if type(job.status) ~= 'string' then return err('QUEUE_UNAVAILABLE', 'CORRUPT_RECORD') end

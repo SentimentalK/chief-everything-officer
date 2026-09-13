@@ -243,6 +243,7 @@ describe.skipIf(!URL)("worker task discovery (real Redis, CI-gated)", () => {
       prompt: "x",
       acceptance: "x",
       execution_timeout_seconds: 120,
+      delivery: { type: "none" },
       request_digest: "d",
       status: "preparing",
       stream_entry_id: null,

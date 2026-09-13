@@ -190,7 +190,7 @@ const IDENTITY_OK: &str =
     r#"{"user_id":"usr_alice","workspace_id":"ws_alpha","deployment_mode":"single_user"}"#;
 fn claim_job_json() -> String {
     format!(
-        r#"{{"job_id":"{JOB}","workspace_ref":"tools","resource_id":null,"prompt":"do the thing","acceptance":"thing done","timeout_seconds":120}}"#
+        r#"{{"job_id":"{JOB}","workspace_ref":"tools","resource_id":null,"prompt":"do the thing","acceptance":"thing done","timeout_seconds":120,"delivery":{{"type":"none"}}}}"#
     )
 }
 
@@ -1601,4 +1601,123 @@ async fn report_redirect_is_not_followed() {
     assert!(e.outcome_unknown);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(target.recorded.lock().len(), 0);
+}
+
+#[test]
+fn claimed_job_delivery_contract_deserialization() {
+    use ceo_worker::bridge::protocol::{ClaimedJob, TaskDeliverySpec};
+
+    // 1. Valid None delivery
+    let json_none = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "none" }
+    });
+    let job_none: ClaimedJob = serde_json::from_value(json_none).unwrap();
+    assert_eq!(job_none.delivery, TaskDeliverySpec::None);
+
+    // 2. Valid Agent delivery
+    let json_agent = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "agent", "instructions": "post to discord" }
+    });
+    let job_agent: ClaimedJob = serde_json::from_value(json_agent).unwrap();
+    assert_eq!(
+        job_agent.delivery,
+        TaskDeliverySpec::Agent {
+            instructions: "post to discord".to_string()
+        }
+    );
+
+    // 3. Outer unknown field tolerance
+    let json_outer_extra = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "none" },
+        "future_server_field": "preserved"
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_outer_extra).is_ok());
+
+    // 4. Missing delivery is rejected
+    let json_missing_delivery = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_missing_delivery).is_err());
+
+    // 5. Unknown delivery type is rejected
+    let json_bad_type = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "webhook" }
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_bad_type).is_err());
+
+    // 6. Delivery inner extra fields rejected (strict deny_unknown_fields)
+    let json_delivery_extra = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "none", "extra": true }
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_delivery_extra).is_err());
+
+    // 7. Agent delivery blank / empty instructions rejected
+    let json_agent_empty = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "agent", "instructions": "" }
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_agent_empty).is_err());
+
+    let json_agent_whitespace = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "agent", "instructions": "   \n\t " }
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_agent_whitespace).is_err());
+
+    // 8. Agent delivery oversized instructions (> 8 KiB) rejected
+    let json_agent_oversized = serde_json::json!({
+        "job_id": JOB,
+        "workspace_ref": "tools",
+        "resource_id": null,
+        "prompt": "prompt",
+        "acceptance": "acceptance",
+        "timeout_seconds": 120,
+        "delivery": { "type": "agent", "instructions": "a".repeat(8193) }
+    });
+    assert!(serde_json::from_value::<ClaimedJob>(json_agent_oversized).is_err());
 }

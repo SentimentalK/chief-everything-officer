@@ -442,6 +442,7 @@ describe.skipIf(!URL)("worker execution reports (real Redis, CI-gated)", () => {
       prompt: "corrupt report without assignment",
       acceptance: "n/a",
       execution_timeout_seconds: 120,
+      delivery: { type: "none" },
       request_digest: "digest",
       status: "queued",
       stream_entry_id: "1-0",

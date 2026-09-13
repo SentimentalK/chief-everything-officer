@@ -24,7 +24,7 @@ def wait_for_delivery_release(workspace):
     sys.exit(1)
 
 
-def handle_task_turn(mode, workspace, attempt_dir):
+def handle_task_turn(mode, workspace, attempt_dir, task_content=""):
     if mode == "hang_task":
         time.sleep(30)
         sys.exit(0)
@@ -74,6 +74,10 @@ def handle_task_turn(mode, workspace, attempt_dir):
                         "file_name": "output_artifact.txt"
                     }
                 }, f)
+        if "delivered_artifact.txt" in task_content:
+            deliv_path = os.path.join(workspace, "delivered_artifact.txt")
+            with open(deliv_path, "w", encoding="utf-8") as f:
+                f.write("Task completed: artifact data 12345")
 
     resp = "Task completed successfully. Created output_artifact.txt"
     update = {"event": "step_update", "step_update": {"text_delta": resp + "\n"}}
@@ -142,7 +146,7 @@ def main():
     m_nonce = re.search(r'Write the exact string "([^"]+)" into the file "([^"]+)"', content1)
     if not m_nonce:
         # Doctor was skipped (cache hit); line1 is the task prompt!
-        handle_task_turn(mode, workspace, attempt_dir)
+        handle_task_turn(mode, workspace, attempt_dir, content1)
         return
 
     write_nonce = m_nonce.group(1)
@@ -208,7 +212,16 @@ def main():
         # Client terminated session (e.g. doctor failed or standalone doctor)
         sys.exit(0)
 
-    handle_task_turn(mode, workspace, attempt_dir)
+    try:
+        req2 = json.loads(line2.strip())
+    except Exception:
+        req2 = {}
+
+    content2 = ""
+    if isinstance(req2, dict):
+        content2 = req2.get("message", {}).get("content", "")
+
+    handle_task_turn(mode, workspace, attempt_dir, content2)
 
 if __name__ == "__main__":
     main()

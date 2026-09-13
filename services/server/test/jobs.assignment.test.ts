@@ -35,7 +35,7 @@ function sha(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
-function baseRecordV2(
+function baseRecord(
   scope: { user_id: string; workspace_id: string },
   patch: Partial<AssignmentJobRecord> = {},
 ): AssignmentJobRecord {
@@ -51,6 +51,7 @@ function baseRecordV2(
     prompt: "assignment test prompt",
     acceptance: "assignment test acceptance",
     execution_timeout_seconds: 120,
+    delivery: { type: "none" },
     request_digest: "digest-12345",
     status: "queued",
     stream_entry_id: "999-0",
@@ -170,7 +171,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("1. initial claim: sets phase=claimed, attribution from Redis, started_at=null, no lease fields", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     const res = await store.claimAssignment(scopeA, job.job_id, {
@@ -220,7 +221,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("2. concurrent claims by different workers: exactly one succeeds, others get JOB_ALREADY_CLAIMED", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     const calls = [
@@ -254,7 +255,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("3. identical claim retry (concurrent & sequential): exactly one replayed=false, others replayed=true", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     const initial = await store.claimAssignment(scopeA, job.job_id, {
@@ -309,7 +310,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("4. same attempt with modified worker/token/alias yields IDEMPOTENCY_CONFLICT with byte-for-byte unchanged Redis key", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     const first = await store.claimAssignment(scopeA, job.job_id, {
@@ -358,7 +359,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("5. auth & scope isolation: other user or different workspace gets uniform JOB_NOT_FOUND", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     // Cross-user inspect, claim, start
@@ -411,7 +412,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     const oldClaimedAt = now - 30 * 24 * 60 * 60 * 1000; // 30 days ago
     const oldClaimDeadline = now - 23 * 24 * 60 * 60 * 1000; // deadline expired 23 days ago
 
-    const historicalJob: AssignmentJobRecord = baseRecordV2(scopeA, {
+    const historicalJob: AssignmentJobRecord = baseRecord(scopeA, {
       created_at_ms: oldClaimedAt - 1000,
       claim_deadline_ms: oldClaimDeadline,
       execution: {
@@ -449,7 +450,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("7. start and start replay: first sets running, replay preserves started_at; claim replay does not downgrade running", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     const claimRes = await store.claimAssignment(scopeA, job.job_id, {
@@ -514,7 +515,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   it("8. corrupt, unsupported schema_version, and incomplete records return expected errors without modifying key", async () => {
     // 8.1 Unsupported schema version (version 1)
     const v1Job = {
-      ...baseRecordV2(scopeA),
+      ...baseRecord(scopeA),
       schema_version: 1,
     };
     await putJob(v1Job);
@@ -541,7 +542,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     expect(await getRawJob(v1Job.job_id)).toBe(rawV1Before);
 
     // 8.2 Incomplete submission (status='preparing')
-    const prepJob = baseRecordV2(scopeA, { status: "preparing", stream_entry_id: null });
+    const prepJob = baseRecord(scopeA, { status: "preparing", stream_entry_id: null });
     await putJob(prepJob);
     const rawPrepBefore = await getRawJob(prepJob.job_id);
 
@@ -560,7 +561,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
 
     // 8.3 Corrupt record: contains legacy lease fields in execution
     const mixedJob = {
-      ...baseRecordV2(scopeA),
+      ...baseRecord(scopeA),
       execution: {
         worker_id: WRK,
         attempt_id: ATT1,
@@ -583,7 +584,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     expect(await getRawJob(mixedJob.job_id)).toBe(rawMixedBefore);
 
     // 8.4 Start on unclaimed job -> JOB_NOT_CLAIMED
-    const unclaimedJob = baseRecordV2(scopeA);
+    const unclaimedJob = baseRecord(scopeA);
     await putJob(unclaimedJob);
     const startUnclaimed = await store.startAssignment(scopeA, unclaimedJob.job_id, {
       worker_id: WRK,
@@ -594,7 +595,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     if (!startUnclaimed.ok) expect(startUnclaimed.code).toBe("JOB_NOT_CLAIMED");
 
     // 8.5 Start with mismatched credentials -> ASSIGNMENT_MISMATCH
-    const claimedJob = baseRecordV2(scopeA);
+    const claimedJob = baseRecord(scopeA);
     await putJob(claimedJob);
     await store.claimAssignment(scopeA, claimedJob.job_id, {
       worker_id: WRK,
@@ -611,7 +612,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
     if (!startMismatch.ok) expect(startMismatch.code).toBe("ASSIGNMENT_MISMATCH");
 
     // 8.6 Clock regression: claimed_at_ms in the future -> CLOCK_REGRESSION
-    const futureClaimedJob: AssignmentJobRecord = baseRecordV2(scopeA, {
+    const futureClaimedJob: AssignmentJobRecord = baseRecord(scopeA, {
       execution: {
         worker_id: WRK,
         attempt_id: ATT1,
@@ -635,7 +636,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("9. SCRIPT FLUSH triggers NOSCRIPT transparent reload and subsequent success", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     // Warm up assignment script
@@ -662,7 +663,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("10. network drop recovery: discarding first response and retrying returns replayed=true with identical record", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     // Initial claim succeeds in Redis
@@ -691,7 +692,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("11. dedupe placeholder and stream entries remain completely untouched across claims and starts", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
 
     // Plant request placeholder
@@ -739,7 +740,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
   });
 
   it("12. table-driven: rejects invalid claim/start arguments with INVALID_ARGUMENT without altering Redis", async () => {
-    const job = baseRecordV2(scopeA);
+    const job = baseRecord(scopeA);
     await putJob(job);
     const rawBefore = await getRawJob(job.job_id);
 
@@ -812,7 +813,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
 
     for (const tc of invalidExecutions) {
       const corruptJob = {
-        ...baseRecordV2(scopeA),
+        ...baseRecord(scopeA),
         execution: {
           worker_id: tc.worker,
           attempt_id: tc.attempt,
@@ -857,7 +858,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
 
     for (const bad of badValues) {
       // 1. bad created_at_ms
-      const badCreated = baseRecordV2(scopeA, {
+      const badCreated = baseRecord(scopeA, {
         created_at_ms: bad,
         claim_deadline_ms: now + 100000,
       });
@@ -872,7 +873,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       expect(await getRawJob(badCreated.job_id)).toBe(rawCreatedBefore);
 
       // 2. bad claim_deadline_ms
-      const badDeadline = baseRecordV2(scopeA, {
+      const badDeadline = baseRecord(scopeA, {
         created_at_ms: now,
         claim_deadline_ms: bad,
       });
@@ -887,7 +888,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       expect(await getRawJob(badDeadline.job_id)).toBe(rawDeadlineBefore);
 
       // 3. bad execution.claimed_at_ms
-      const badClaimed = baseRecordV2(scopeA, {
+      const badClaimed = baseRecord(scopeA, {
         created_at_ms: now,
         claim_deadline_ms: now + 100000,
         execution: {
@@ -910,7 +911,7 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
       expect(await getRawJob(badClaimed.job_id)).toBe(rawClaimedBefore);
 
       // 4. bad execution.started_at_ms (on running execution)
-      const badStarted = baseRecordV2(scopeA, {
+      const badStarted = baseRecord(scopeA, {
         created_at_ms: now,
         claim_deadline_ms: now + 100000,
         execution: {
@@ -931,6 +932,34 @@ describe.skipIf(!URL)("persistent job assignment storage (real Redis, CI-gated)"
         expect(resStarted.reason).toBe("CORRUPT_RECORD");
       }
       expect(await getRawJob(badStarted.job_id)).toBe(rawStartedBefore);
+    }
+  });
+
+  it("15. rejects malformed or corrupt delivery specification as CORRUPT_RECORD", async () => {
+    const malformedDeliveries = [
+      null,
+      {},
+      { type: "none", extra: 1 },
+      { type: "agent" },
+      { type: "agent", instructions: "" },
+      { type: "agent", instructions: "   " },
+      { type: "agent", instructions: "x".repeat(8193) },
+      { type: "agent", instructions: "valid", extra: 1 },
+      { type: "unknown" },
+    ];
+
+    for (const badDelivery of malformedDeliveries) {
+      const corruptJob = {
+        ...baseRecord(scopeA),
+        delivery: badDelivery as any,
+      };
+      await putJob(corruptJob as any);
+      const res = await store.inspectAssignment(scopeA, corruptJob.job_id);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.code).toBe("QUEUE_UNAVAILABLE");
+        expect(res.reason).toBe("CORRUPT_RECORD");
+      }
     }
   });
 });

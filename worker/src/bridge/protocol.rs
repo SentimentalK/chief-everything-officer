@@ -210,6 +210,118 @@ impl<'de> Deserialize<'de> for AssignmentExecution {
     }
 }
 
+pub const MAX_DELIVERY_INSTRUCTIONS_BYTES: usize = 8192;
+
+/// Delivery specification requested by a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskDeliverySpec {
+    None,
+    Agent { instructions: String },
+}
+
+impl<'de> Deserialize<'de> for TaskDeliverySpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TaskDeliverySpec;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a delivery spec object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<TaskDeliverySpec, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut type_val: Option<String> = None;
+                let mut instructions: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => {
+                            if type_val.is_some() {
+                                return Err(A::Error::custom("duplicate type field in delivery"));
+                            }
+                            type_val = Some(map.next_value()?);
+                        }
+                        "instructions" => {
+                            if instructions.is_some() {
+                                return Err(A::Error::custom(
+                                    "duplicate instructions field in delivery",
+                                ));
+                            }
+                            instructions = Some(map.next_value()?);
+                        }
+                        _ => {
+                            return Err(A::Error::custom("unexpected field in delivery spec"));
+                        }
+                    }
+                }
+                let type_str = type_val.ok_or_else(|| A::Error::missing_field("type"))?;
+                match type_str.as_str() {
+                    "none" => {
+                        if instructions.is_some() {
+                            return Err(A::Error::custom(
+                                "instructions not allowed when delivery type is none",
+                            ));
+                        }
+                        Ok(TaskDeliverySpec::None)
+                    }
+                    "agent" => {
+                        let inst =
+                            instructions.ok_or_else(|| A::Error::missing_field("instructions"))?;
+                        Ok(TaskDeliverySpec::Agent { instructions: inst })
+                    }
+                    _ => Err(A::Error::custom("invalid delivery type")),
+                }
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl Serialize for TaskDeliverySpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            TaskDeliverySpec::None => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", "none")?;
+                map.end()
+            }
+            TaskDeliverySpec::Agent { instructions } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "agent")?;
+                map.serialize_entry("instructions", instructions)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl TaskDeliverySpec {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            TaskDeliverySpec::None => Ok(()),
+            TaskDeliverySpec::Agent { instructions } => {
+                if instructions.is_empty() {
+                    return Err("instructions must be non-empty");
+                }
+                if instructions.trim().is_empty() {
+                    return Err("instructions must not be whitespace-only");
+                }
+                if instructions.len() > MAX_DELIVERY_INSTRUCTIONS_BYTES {
+                    return Err("instructions exceeds 8 KiB (UTF-8)");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// The task details a successful claim returns (whitelist; never the token).
 /// Debug is redacted so prompt/acceptance never print via a derived Debug.
 /// `resource_id` is present-but-nullable.
@@ -221,10 +333,15 @@ pub struct ClaimedJob {
     pub prompt: String,
     pub acceptance: String,
     pub timeout_seconds: i64,
+    pub delivery: TaskDeliverySpec,
 }
 
 impl fmt::Debug for ClaimedJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let delivery_desc = match &self.delivery {
+            TaskDeliverySpec::None => "none",
+            TaskDeliverySpec::Agent { .. } => "agent [instructions redacted]",
+        };
         f.debug_struct("ClaimedJob")
             .field("job_id", &self.job_id)
             .field("workspace_ref", &self.workspace_ref)
@@ -232,6 +349,7 @@ impl fmt::Debug for ClaimedJob {
             .field("prompt", &"[redacted]")
             .field("acceptance", &"[redacted]")
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("delivery", &delivery_desc)
             .finish()
     }
 }
@@ -257,6 +375,7 @@ impl<'de> Deserialize<'de> for ClaimedJob {
                 let mut prompt: Option<String> = None;
                 let mut acceptance: Option<String> = None;
                 let mut timeout_seconds: Option<i64> = None;
+                let mut delivery: Option<TaskDeliverySpec> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "job_id" => job_id = Some(map.next_value()?),
@@ -265,6 +384,12 @@ impl<'de> Deserialize<'de> for ClaimedJob {
                         "prompt" => prompt = Some(map.next_value()?),
                         "acceptance" => acceptance = Some(map.next_value()?),
                         "timeout_seconds" => timeout_seconds = Some(map.next_value()?),
+                        "delivery" => {
+                            use serde::de::Error as _;
+                            let d: TaskDeliverySpec = map.next_value()?;
+                            d.validate().map_err(A::Error::custom)?;
+                            delivery = Some(d);
+                        }
                         _ => {
                             let _: IgnoredAny = map.next_value()?;
                         }
@@ -280,6 +405,7 @@ impl<'de> Deserialize<'de> for ClaimedJob {
                     acceptance: acceptance.ok_or_else(|| A::Error::missing_field("acceptance"))?,
                     timeout_seconds: timeout_seconds
                         .ok_or_else(|| A::Error::missing_field("timeout_seconds"))?,
+                    delivery: delivery.ok_or_else(|| A::Error::missing_field("delivery"))?,
                 })
             }
         }

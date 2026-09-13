@@ -21,6 +21,7 @@ import {
   type JobState,
   type PendingJobsResult,
   type PendingJob,
+  type DeliverySpec,
 } from "./schema.js";
 import {
   type ExecutionAssignmentView,
@@ -78,6 +79,7 @@ export interface JobView {
   workspace_ref: string;
   resource_id: string | null;
   replayed: boolean;
+  delivery: { type: "none" | "agent" };
   execution: ExecutionAssignmentView | null;
   report: ExecutionReportView | null;
 }
@@ -97,6 +99,7 @@ export interface ClaimJobInfo {
   prompt: string;
   acceptance: string;
   timeout_seconds: number;
+  delivery: DeliverySpec;
 }
 
 export type AssignmentResult =
@@ -166,6 +169,7 @@ function viewFromAssignment(res: Extract<AssignmentScriptResult, { ok: true }>, 
     workspace_ref: rec.workspace_ref,
     resource_id: rec.resource_id,
     replayed,
+    delivery: { type: rec.delivery.type },
     execution: executionAssignmentView(rec.execution),
     report: reportView(rec.report),
   };
@@ -335,6 +339,7 @@ export class JobService {
       acceptance: input.acceptance,
       resource_id: input.resource_id,
       execution_timeout_seconds: input.execution_timeout_seconds,
+      delivery: input.delivery,
     });
     const jobId = makeJobId();
     const prepared: PersistedJobRecord = {
@@ -348,6 +353,7 @@ export class JobService {
       prompt: input.prompt,
       acceptance: input.acceptance,
       execution_timeout_seconds: input.execution_timeout_seconds,
+      delivery: input.delivery,
       request_digest: digest,
       status: "preparing",
       stream_entry_id: null,
@@ -444,6 +450,7 @@ export class JobService {
       acceptance: input.acceptance,
       resource_id: input.resource_id,
       execution_timeout_seconds: input.execution_timeout_seconds,
+      delivery: input.delivery,
     });
     if (rec && rec.request_digest !== digest) return { kind: "conflict" };
     if (!rec || rec.status !== "queued" || !rec.stream_entry_id) {
@@ -494,6 +501,7 @@ export class JobService {
         prompt: rec.prompt,
         acceptance: rec.acceptance,
         timeout_seconds: rec.execution_timeout_seconds,
+        delivery: rec.delivery,
       },
     };
   }
