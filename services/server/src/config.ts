@@ -30,6 +30,8 @@ export interface Config {
   githubClientSecret?: string;
   githubCallbackUrl?: string;
   publicOrigin?: string;
+  oauthEnabled: boolean;
+  oauthDbPath: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -124,6 +126,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(githubClientSecret ? { githubClientSecret } : {}),
     ...(githubCallbackUrl ? { githubCallbackUrl } : {}),
     ...(publicOrigin ? { publicOrigin } : {}),
+    oauthEnabled: parseBool(env.CEO_OAUTH_ENABLED, false),
+    oauthDbPath: env.CEO_OAUTH_DB_PATH ?? path.join(dataRoot, "identity", "oauth.sqlite"),
   };
 }
 

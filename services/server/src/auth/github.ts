@@ -16,6 +16,7 @@ export interface GitHubAuthRouterOptions {
 interface PendingOAuthState {
   codeVerifier: string;
   expiresAt: number;
+  oauthRequest?: string;
 }
 
 const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -39,9 +40,10 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
   }
 
   // GET /auth/github (mounted at /auth/github, so path is "/")
-  router.get("/", (_req: Request, res: Response) => {
+  router.get("/", (req: Request, res: Response) => {
     cleanupStates();
 
+    const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
     const state = crypto.randomBytes(32).toString("hex");
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto
@@ -52,6 +54,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
     pendingStates.set(state, {
       codeVerifier,
       expiresAt: Date.now() + STATE_TTL_MS,
+      oauthRequest,
     });
 
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
@@ -169,6 +172,10 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
       });
 
       sessionManager.setCookie(res, session.sessionId);
+      if (pending.oauthRequest) {
+        res.redirect(302, `/authorize/resume?request=${encodeURIComponent(pending.oauthRequest)}`);
+        return;
+      }
       res.redirect(302, "/login");
     } catch (error) {
       if (error instanceof IdentityConflictError) {

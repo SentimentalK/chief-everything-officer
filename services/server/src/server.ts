@@ -165,6 +165,30 @@ if (config.githubClientId && config.githubClientSecret) {
   );
 }
 
+// OAuth 2.1 Authorization Server (when enabled)
+import { OAuthStore } from "./oauth/store.js";
+import { OAuthService } from "./oauth/service.js";
+import { createOAuthRouter } from "./oauth/router.js";
+
+let oauthStore: OAuthStore | null = null;
+let oauthService: OAuthService | null = null;
+
+if (config.oauthEnabled) {
+  const publicOrigin = config.publicOrigin || `http://${config.bindHost}:${config.port}`;
+  oauthStore = new OAuthStore(config.oauthDbPath);
+  oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
+    publicOrigin,
+    workspaceId: workspaceIdentity.workspace_id,
+  });
+
+  app.use(
+    createOAuthRouter({
+      oauthService,
+      sessionManager: userSessionManager,
+    }),
+  );
+}
+
 // Worker assignment endpoints: Host -> Origin -> Identity -> router ->
 // JobService. Identity scope is taken from the authenticated locals only.
 app.use(
@@ -204,6 +228,7 @@ const listener = app.listen(config.port, config.bindHost, () => {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     auditStore.close();
+    oauthStore?.close();
     identityService.close();
     void jobBridge.dispose();
     listener.close(() => process.exit(0));

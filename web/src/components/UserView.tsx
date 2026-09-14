@@ -22,17 +22,26 @@ export const UserView: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const [oauthRequest, setOauthRequest] = useState<string | null>(null);
+
   useEffect(() => {
-    // Check for error in query string
+    // Check for error and oauth_request in query string
     const params = new URLSearchParams(window.location.search);
     const err = params.get("error");
     if (err) {
       setErrorMessage(err);
     }
+    const req = params.get("oauth_request");
+    if (req) {
+      setOauthRequest(req);
+    }
 
     checkUserSession().then((s) => {
       setSession(s);
       setLoading(false);
+      if (s.authenticated && req) {
+        window.location.href = `/authorize/resume?request=${encodeURIComponent(req)}`;
+      }
     });
   }, []);
 
@@ -110,7 +119,11 @@ export const UserView: React.FC = () => {
         ) : (
           <div className="space-y-4">
             <a
-              href="/auth/github"
+              href={
+                oauthRequest
+                  ? `/auth/github?oauth_request=${encodeURIComponent(oauthRequest)}`
+                  : "/auth/github"
+              }
               className="flex w-full items-center justify-center gap-2 rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 transition hover:bg-neutral-200"
             >
               <GithubIcon className="h-4 w-4" />
