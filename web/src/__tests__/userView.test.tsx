@@ -65,8 +65,9 @@ describe("UserView Component Tests", () => {
 
   it("handles logout properly when clicking Sign Out", async () => {
     let authenticated = true;
-    global.fetch = vi.fn(async (url: string) => {
-      if (url.includes("/api/user/session/logout")) {
+    global.fetch = vi.fn(async (url: any) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/api/user/session/logout")) {
         authenticated = false;
         return { ok: true, json: async () => ({ ok: true }) } as any;
       }
