@@ -516,9 +516,72 @@ impl fmt::Debug for WorkerResultRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Successful managed-result acceptance. All listed keys are required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerResultResponse {
     pub ok: bool,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub result_received: bool,
+    pub resource_id: String,
     pub commit: String,
     pub received_at: String,
+    pub replayed: bool,
+}
+
+impl<'de> Deserialize<'de> for WorkerResultResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = WorkerResultResponse;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a worker result acceptance object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<WorkerResultResponse, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut ok: Option<bool> = None;
+                let mut job_id: Option<String> = None;
+                let mut attempt_id: Option<String> = None;
+                let mut result_received: Option<bool> = None;
+                let mut resource_id: Option<String> = None;
+                let mut commit: Option<String> = None;
+                let mut received_at: Option<String> = None;
+                let mut replayed: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "ok" => ok = Some(map.next_value()?),
+                        "job_id" => job_id = Some(map.next_value()?),
+                        "attempt_id" => attempt_id = Some(map.next_value()?),
+                        "result_received" => result_received = Some(map.next_value()?),
+                        "resource_id" => resource_id = Some(map.next_value()?),
+                        "commit" => commit = Some(map.next_value()?),
+                        "received_at" => received_at = Some(map.next_value()?),
+                        "replayed" => replayed = Some(map.next_value()?),
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(WorkerResultResponse {
+                    ok: ok.ok_or_else(|| A::Error::missing_field("ok"))?,
+                    job_id: job_id.ok_or_else(|| A::Error::missing_field("job_id"))?,
+                    attempt_id: attempt_id.ok_or_else(|| A::Error::missing_field("attempt_id"))?,
+                    result_received: result_received
+                        .ok_or_else(|| A::Error::missing_field("result_received"))?,
+                    resource_id: resource_id
+                        .ok_or_else(|| A::Error::missing_field("resource_id"))?,
+                    commit: commit.ok_or_else(|| A::Error::missing_field("commit"))?,
+                    received_at: received_at
+                        .ok_or_else(|| A::Error::missing_field("received_at"))?,
+                    replayed: replayed.ok_or_else(|| A::Error::missing_field("replayed"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
 }

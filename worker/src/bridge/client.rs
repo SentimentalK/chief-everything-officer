@@ -31,6 +31,9 @@ use url::Url;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// `POST /result` waits on a Git resource commit before the Redis receipt.
+/// This is robustness only: a lost response is still `outcome_unknown`.
+const RESULT_POST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---- Server contract constants (mirrored from jobs/schema.ts) ----
 const JOB_ID_RE: &str = r"^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
@@ -201,13 +204,14 @@ pub struct BridgeClient {
 }
 
 impl BridgeClient {
-    /// Production constructor: 3 s connect / 8 s total, automatic retries off.
+    /// Production constructor: 3 s connect / 8 s total for ordinary calls.
+    /// `POST /result` overrides the total budget to [`RESULT_POST_TIMEOUT`].
     pub fn new(base: Url, api_key: ApiKey) -> CResult<BridgeClient> {
         Self::new_with_timeouts(base, api_key, CONNECT_TIMEOUT, TOTAL_TIMEOUT)
     }
 
     /// Test-support constructor that lets a test inject a short budget. The
-    /// production `new()` keeps the fixed 3 s / 8 s values.
+    /// production `new()` keeps the fixed 3 s / 8 s values for ordinary calls.
     pub fn new_with_timeouts(
         base: Url,
         api_key: ApiKey,
@@ -249,13 +253,21 @@ impl BridgeClient {
         })
     }
 
-    async fn send_post(&self, url: Url, body: String) -> CResult<reqwest::Response> {
-        let req = self
+    async fn send_post_with_timeout(
+        &self,
+        url: Url,
+        body: String,
+        total: Option<Duration>,
+    ) -> CResult<reqwest::Response> {
+        let mut req = self
             .http
             .post(url)
             .bearer_auth(self.api_key.as_str())
             .header("content-type", "application/json")
             .body(body);
+        if let Some(total) = total {
+            req = req.timeout(total);
+        }
         req.send().await.map_err(|e| {
             let msg = if e.is_timeout() {
                 "request timed out".to_string()
@@ -278,8 +290,19 @@ impl BridgeClient {
         body: String,
         is_write: bool,
     ) -> CResult<T> {
+        self.post_json_with_timeout(path, body, is_write, None)
+            .await
+    }
+
+    async fn post_json_with_timeout<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: String,
+        is_write: bool,
+        total: Option<Duration>,
+    ) -> CResult<T> {
         let url = self.endpoint(path)?;
-        let resp = match self.send_post(url, body).await {
+        let resp = match self.send_post_with_timeout(url, body, total).await {
             Ok(r) => r,
             Err(e) => return Err(if is_write { e.mark_write() } else { e }),
         };
@@ -427,6 +450,7 @@ impl BridgeClient {
         &self,
         job_id: &str,
         request: &WorkerResultRequest,
+        expected_resource_id: &str,
     ) -> CResult<WorkerResultResponse> {
         if !job_id_ok(job_id) {
             return Err(ClientError::protocol("invalid job id"));
@@ -440,21 +464,20 @@ impl BridgeClient {
         if !claim_token_ok(&request.claim_token) {
             return Err(ClientError::protocol("invalid claim token"));
         }
+        if !resource_id_ok(expected_resource_id) {
+            return Err(ClientError::protocol("invalid resource id"));
+        }
         let body = serde_json::to_string(request)
             .map_err(|_| ClientError::protocol("encode result request"))?;
         if body.len() > MAX_RESULT_REQUEST_BYTES {
             return Err(ClientError::protocol("result request exceeds 9 MiB"));
         }
         let path = format!("/api/worker/jobs/{job_id}/result");
-        let ok: WorkerResultResponse = self.post_json(&path, body, true).await?;
-        if !ok.ok {
-            return Err(ClientError::write_protocol("result response ok is false"));
-        }
-        if ok.commit.is_empty() {
-            return Err(ClientError::write_protocol(
-                "result response missing commit",
-            ));
-        }
+        let ok: WorkerResultResponse = self
+            .post_json_with_timeout(&path, body, true, Some(RESULT_POST_TIMEOUT))
+            .await?;
+        validate_worker_result_ok(&ok, job_id, request, expected_resource_id)
+            .map_err(ClientError::write_protocol)?;
         Ok(ok)
     }
 }
@@ -849,6 +872,36 @@ fn validate_execution_report_ok(
     Ok(())
 }
 
+fn validate_worker_result_ok(
+    ok: &WorkerResultResponse,
+    job_id: &str,
+    req: &WorkerResultRequest,
+    expected_resource_id: &str,
+) -> Result<(), String> {
+    if !ok.ok {
+        return Err("result response marked ok=false".to_string());
+    }
+    if !ok.result_received {
+        return Err("result response marked result_received=false".to_string());
+    }
+    if ok.job_id != job_id {
+        return Err("response job id does not match request".to_string());
+    }
+    if ok.attempt_id != req.attempt_id {
+        return Err("response attempt id does not match request".to_string());
+    }
+    if ok.resource_id != expected_resource_id {
+        return Err("response resource id does not match pending target".to_string());
+    }
+    if ok.commit.is_empty() {
+        return Err("result response missing commit".to_string());
+    }
+    if rfc3339(&ok.received_at).is_none() {
+        return Err("invalid received_at".to_string());
+    }
+    Ok(())
+}
+
 /// Validates a ClaimedJob's value fields (format/limits/range).
 fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
     if !job_id_ok(&job.job_id) {
@@ -883,4 +936,81 @@ fn validate_claimed_job(job: &ClaimedJob) -> Result<(), String> {
         return Err("resource_id required when result_target is resource".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod result_ack_tests {
+    use super::*;
+    use crate::managed_result::ManagedResourceResult;
+
+    const JOB: &str = "job-123e4567-e89b-12d3-a456-426614174001";
+    const ATT: &str = "123e4567-e89b-12d3-a456-4266141740ab";
+    const RES: &str = "res-123e4567-e89b-12d3-a456-426614174099";
+    const WRK: &str = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMIT: &str = "181abe952c1045fa2f9487aa834f5e65615c10ff";
+    const RECEIVED_AT: &str = "2026-09-13T10:00:00.000Z";
+
+    fn request() -> WorkerResultRequest {
+        WorkerResultRequest {
+            worker_id: WRK.to_string(),
+            attempt_id: ATT.to_string(),
+            claim_token: TOKEN.to_string(),
+            payload: ManagedResourceResult {
+                content: "hello".to_string(),
+                metadata: None,
+                extraction: None,
+            },
+        }
+    }
+
+    fn valid_ack() -> WorkerResultResponse {
+        WorkerResultResponse {
+            ok: true,
+            job_id: JOB.to_string(),
+            attempt_id: ATT.to_string(),
+            result_received: true,
+            resource_id: RES.to_string(),
+            commit: COMMIT.to_string(),
+            received_at: RECEIVED_AT.to_string(),
+            replayed: false,
+        }
+    }
+
+    #[test]
+    fn valid_result_ack_passes_association_checks() {
+        assert!(validate_worker_result_ok(&valid_ack(), JOB, &request(), RES).is_ok());
+    }
+
+    #[test]
+    fn result_ack_association_mismatches_are_rejected() {
+        let req = request();
+        let cases: [(&str, WorkerResultResponse); 4] = [
+            ("wrong job_id", {
+                let mut ack = valid_ack();
+                ack.job_id = "job-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
+                ack
+            }),
+            ("wrong attempt_id", {
+                let mut ack = valid_ack();
+                ack.attempt_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
+                ack
+            }),
+            ("wrong resource_id", {
+                let mut ack = valid_ack();
+                ack.resource_id = "res-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
+                ack
+            }),
+            ("bad received_at", {
+                let mut ack = valid_ack();
+                ack.received_at = "not-rfc3339".to_string();
+                ack
+            }),
+        ];
+        for (name, ack) in cases {
+            let err = validate_worker_result_ok(&ack, JOB, &req, RES)
+                .expect_err(name);
+            assert!(!err.is_empty(), "{name} should produce a protocol reason");
+        }
+    }
 }

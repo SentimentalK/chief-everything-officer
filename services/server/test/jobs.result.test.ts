@@ -22,6 +22,8 @@ const JOB = "job-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
 const WRK = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
 const ATT = "123e4567-e89b-12d3-a456-4266141740aa";
 const TOKEN = "a".repeat(64);
+const RECEIVED_AT_MS = Date.parse("2026-09-13T10:00:00.000Z");
+const RECEIVED_AT = "2026-09-13T10:00:00.000Z";
 
 const cleanupServers: HttpServer[] = [];
 const cleanupDirs: string[] = [];
@@ -136,22 +138,44 @@ describe("POST /api/worker/jobs/:job_id/result route", () => {
     const resourceService = new ResourceService(workspace, item.config);
 
     let currentResourceId = "res-test-job-1";
-    // Mock minimal JobStore
-    let storedResult: any = null;
+    // Mock Redis resultAssignment: persist the durable receipt and keep
+    // received_at_ms stable across replay (same as the Lua result operation).
+    let storedResult: {
+      target: "resource";
+      attempt_id: string;
+      payload_sha256: string;
+      resource_id: string;
+      commit: string;
+      received_at_ms: number;
+    } | null = null;
+    const receiptRecord = () => ({
+      job_id: JOB,
+      result: storedResult,
+    });
     const fakeStore = {
       resultAssignment: async (
         _scope: any,
         _jobId: string,
         input: any,
-      ): Promise<{ ok: true; replayed: boolean } | { ok: false; code: string; reason: string }> => {
+      ): Promise<
+        | { ok: true; replayed: boolean; record: { job_id: string; result: typeof storedResult } }
+        | { ok: false; code: string; reason: string }
+      > => {
         if (storedResult) {
           if (storedResult.payload_sha256 !== input.result.payload_sha256) {
             return { ok: false, code: "RESULT_CONFLICT", reason: "conflicting result" };
           }
-          return { ok: true, replayed: true };
+          return { ok: true, replayed: true, record: receiptRecord() };
         }
-        storedResult = input.result;
-        return { ok: true, replayed: false };
+        storedResult = {
+          target: "resource",
+          attempt_id: input.attempt_id,
+          payload_sha256: input.result.payload_sha256,
+          resource_id: input.result.resource_id,
+          commit: input.result.commit,
+          received_at_ms: RECEIVED_AT_MS,
+        };
+        return { ok: true, replayed: false, record: receiptRecord() };
       },
       inspectAssignment: async () => ({
         ok: true as const,
@@ -266,10 +290,20 @@ describe("POST /api/worker/jobs/:job_id/result route", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.ok).toBe(true);
-    expect(body.commit).toBeDefined();
+    expect(body).toEqual({
+      ok: true,
+      job_id: JOB,
+      attempt_id: ATT,
+      result_received: true,
+      resource_id: capturedResourceId,
+      commit: body.commit,
+      received_at: RECEIVED_AT,
+      replayed: false,
+    });
+    expect(typeof body.commit).toBe("string");
+    expect(body.commit.length).toBeGreaterThan(0);
 
-    // Verify idempotent replay
+    // Verify idempotent replay keeps the original receipt time and commit.
     const replayRes = await fetch(`${baseUrl}/api/worker/jobs/${JOB}/result`, {
       method: "POST",
       headers: {
@@ -280,8 +314,10 @@ describe("POST /api/worker/jobs/:job_id/result route", () => {
     });
     expect(replayRes.status).toBe(200);
     const replayBody = await replayRes.json();
-    expect(replayBody.ok).toBe(true);
-    expect(replayBody.commit).toBe(body.commit);
+    expect(replayBody).toEqual({
+      ...body,
+      replayed: true,
+    });
 
     // Verify conflicting payload fails with 409
     const conflictBody = {

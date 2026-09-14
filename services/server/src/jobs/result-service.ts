@@ -9,6 +9,7 @@ import {
   JOB_ID_RE,
   WORKER_ID_RE,
   ATTEMPT_ID_RE,
+  utcIsoFromMs,
 } from "./schema.js";
 import type { RedisJobStore } from "./redis-store.js";
 import type { ResourceService } from "../resource/service.js";
@@ -21,9 +22,13 @@ import {
 
 export interface ResultSuccess {
   ok: true;
-  replayed: boolean;
+  job_id: string;
+  attempt_id: string;
+  result_received: true;
   resource_id: string;
   commit: string;
+  received_at: string;
+  replayed: boolean;
 }
 
 export type ResultOutcome =
@@ -139,11 +144,22 @@ export async function handleWorkerResult(
     });
   }
 
+  const stored = redisRes.record.result;
+  if (!stored) {
+    throw new JobError("QUEUE_UNAVAILABLE", "Result receipt did not persist.", {
+      reason: "CORRUPT_RECORD",
+    });
+  }
+
   return {
     ok: true,
+    job_id: redisRes.record.job_id,
+    attempt_id: stored.attempt_id,
+    result_received: true,
+    resource_id: stored.resource_id,
+    commit: stored.commit,
+    received_at: utcIsoFromMs(stored.received_at_ms),
     replayed: gitReceipt.replayed || redisRes.replayed,
-    resource_id: job.resource_id,
-    commit: gitReceipt.commit,
   };
 }
 
@@ -235,9 +251,13 @@ export function createJobResultHandler(
 
       res.status(200).json({
         ok: true,
-        replayed: result.replayed,
+        job_id: result.job_id,
+        attempt_id: result.attempt_id,
+        result_received: true,
         resource_id: result.resource_id,
         commit: result.commit,
+        received_at: result.received_at,
+        replayed: result.replayed,
       });
     } catch (e) {
       const error = e as { code?: unknown; message?: unknown; details?: { reason?: unknown } };

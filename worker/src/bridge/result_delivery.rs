@@ -135,7 +135,9 @@ async fn send_result_once(
         payload,
     };
 
-    client.post_job_result(&pending.job_id, &req).await
+    client
+        .post_job_result(&pending.job_id, &req, &pending.resource_id)
+        .await
 }
 
 fn ack_result_cleanup(workspace: &Path, pending: &PendingResultRecord) -> std::io::Result<()> {
@@ -291,4 +293,168 @@ pub fn has_pending_results(
     binding: &BridgeBinding,
 ) -> Result<bool, result_outbox::ResultOutboxError> {
     Ok(!list_pending(workspace, binding)?.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::config::load_api_key;
+    use crate::bridge::state::{self, BridgeBinding};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const JOB: &str = "job-123e4567-e89b-12d3-a456-426614174001";
+    const ATT: &str = "123e4567-e89b-12d3-a456-4266141740ab";
+    const RES: &str = "res-123e4567-e89b-12d3-a456-426614174099";
+    const WRK: &str = "wrk-0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMIT: &str = "181abe952c1045fa2f9487aa834f5e65615c10ff";
+    const RECEIVED_AT: &str = "2026-09-13T10:00:00.000Z";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    fn binding(workspace: &std::path::Path) -> BridgeBinding {
+        BridgeBinding {
+            server_origin: "https://ceo.example.com".to_string(),
+            user_id: "usr_result".to_string(),
+            workspace_id: "ws_result".to_string(),
+            workspace_ref: "ceo-agent-runtime".to_string(),
+            canonical_workspace: workspace.to_path_buf(),
+        }
+    }
+
+    fn test_client(url: &str) -> BridgeClient {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("key");
+        std::fs::write(&key_path, "test-secret-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let key = load_api_key(&key_path).unwrap();
+        BridgeClient::new(url.parse().unwrap(), key).unwrap()
+    }
+
+    fn persist_pending(workspace: &std::path::Path) -> PendingResultRecord {
+        state::ensure_control_dirs(workspace).unwrap();
+        let attempt = crate::config::attempt_dir(workspace, JOB, ATT);
+        std::fs::create_dir_all(&attempt).unwrap();
+        let result_path = attempt.join(crate::managed_result::MANAGED_RESULT_FILENAME);
+        let bytes = br#"{"content":"hello from extractor"}"#;
+        std::fs::write(&result_path, bytes).unwrap();
+        let rec = PendingResultRecord::new(
+            &binding(workspace),
+            WRK,
+            JOB,
+            ATT,
+            RES,
+            TOKEN,
+            result_path.to_str().unwrap(),
+            &sha256_hex(bytes),
+        )
+        .unwrap();
+        rec.persist(workspace).unwrap();
+        rec
+    }
+
+    fn ack_body(replayed: bool, job_id: &str) -> String {
+        format!(
+            r#"{{"ok":true,"job_id":"{job_id}","attempt_id":"{ATT}","result_received":true,"resource_id":"{RES}","commit":"{COMMIT}","received_at":"{RECEIVED_AT}","replayed":{replayed}}}"#
+        )
+    }
+
+    async fn spawn_json_ok(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    let header_end = loop {
+                        if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let head_str = String::from_utf8_lossy(&head[..header_end]).to_string();
+                    let content_len: usize = head_str
+                        .lines()
+                        .find_map(|l| {
+                            let lower = l.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().to_string())
+                        })
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let mut rest = head[header_end..].to_vec();
+                    while rest.len() < content_len {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        rest.extend_from_slice(&buf[..n]);
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    async fn deliver_with_ack(replayed: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let pending = persist_pending(workspace);
+        let url = spawn_json_ok(ack_body(replayed, JOB)).await;
+        let client = test_client(&url);
+        let bind = binding(workspace);
+        let (_tx, mut stop_rx) = watch::channel(None);
+        deliver_result_one(&client, workspace, &bind, WRK, &pending, &mut stop_rx)
+            .await
+            .unwrap();
+        let outbox = state::result_outbox_record_path(workspace, JOB, ATT);
+        assert!(!outbox.exists(), "valid ACK must delete result-outbox");
+        assert!(!has_pending_results(workspace, &bind).unwrap());
+    }
+
+    #[tokio::test]
+    async fn first_result_ack_replayed_false_clears_outbox() {
+        deliver_with_ack(false).await;
+    }
+
+    #[tokio::test]
+    async fn replayed_result_ack_clears_outbox() {
+        deliver_with_ack(true).await;
+    }
+
+    #[tokio::test]
+    async fn mismatched_result_ack_is_outcome_unknown_and_keeps_outbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let pending = persist_pending(workspace);
+        let url = spawn_json_ok(ack_body(false, "job-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")).await;
+        let client = test_client(&url);
+        let err = send_result_once(&client, &pending).await.unwrap_err();
+        assert!(err.outcome_unknown);
+        assert!(matches!(err.kind, ErrorKind::Protocol(_)));
+        let outbox = state::result_outbox_record_path(workspace, JOB, ATT);
+        assert!(outbox.exists(), "malformed ACK must leave result-outbox");
+    }
 }
