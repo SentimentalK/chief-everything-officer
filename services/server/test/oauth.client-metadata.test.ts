@@ -294,5 +294,42 @@ describe("Client ID Metadata Document (CIMD) Resolver", () => {
         })
       ).rejects.toThrow(/Unsupported token_endpoint_auth_method/);
     });
+
+    it("accepts ChatGPT CIMD metadata with private_key_jwt and supported methods", async () => {
+      const server = http.createServer((req, res) => {
+        const port = (server.address() as any).port;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            client_id: `http://localhost:${port}/oauth/client.json`,
+            client_uri: `http://localhost:${port}/`,
+            redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+            token_endpoint_auth_method: "private_key_jwt",
+            token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            client_name: "ChatGPT",
+            jwks_uri: `http://localhost:${port}/oauth/jwks.json`,
+          })
+        );
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      cleanupServers.push(server);
+      const port = (server.address() as any).port;
+      const clientId = `http://localhost:${port}/oauth/client.json`;
+
+      const meta = await resolveClientMetadata(clientId, {
+        allowHttpForTest: true,
+        allowPrivateIpsForTest: true,
+        dnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
+      });
+
+      expect(meta.client_id).toBe(clientId);
+      expect(meta.client_name).toBe("ChatGPT");
+      expect(meta.token_endpoint_auth_method).toBe("private_key_jwt");
+      expect(meta.token_endpoint_auth_methods_supported).toEqual(["none", "private_key_jwt"]);
+      expect(meta.jwks_uri).toBe(`http://localhost:${port}/oauth/jwks.json`);
+    });
   });
 });

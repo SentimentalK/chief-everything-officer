@@ -238,10 +238,11 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       res.status(200).send(renderConsentHtml(request, nonce));
     } catch (err: any) {
       if (err instanceof OAuthServerError) {
-        // If redirect_uri is invalid, cannot redirect to it
+        process.stderr.write(`oauth: /authorize error for client '${clientId}': ${err.message}\n`);
         res.status(err.statusCode).send(renderErrorHtml("Authorization Error", err.errorDescription || err.errorCode));
         return;
       }
+      process.stderr.write(`oauth: unexpected error in /authorize for client '${clientId}': ${err?.stack || err}\n`);
       res.status(500).send(renderErrorHtml("Server Error", "An unexpected error occurred"));
     }
   });

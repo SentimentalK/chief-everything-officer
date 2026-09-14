@@ -17,6 +17,8 @@ export interface ClientMetadata {
   grant_types?: string[];
   response_types?: string[];
   token_endpoint_auth_method?: string;
+  token_endpoint_auth_methods_supported?: string[];
+  jwks_uri?: string;
   scope?: string;
   logo_uri?: string;
   client_uri?: string;
@@ -403,13 +405,22 @@ export async function resolveClientMetadata(
     }
   }
 
-  // token_endpoint_auth_method must be absent or "none" (public client)
-  if (
-    parsedJson.token_endpoint_auth_method !== undefined &&
-    parsedJson.token_endpoint_auth_method !== "none"
-  ) {
+  // token_endpoint_auth_method: CIMD prohibited methods are shared secrets (client_secret_basic, client_secret_post, client_secret_jwt)
+  // Permitted methods for CIMD are asymmetric or public: 'none' and 'private_key_jwt'
+  const allowedAuthMethods = new Set(["none", "private_key_jwt"]);
+  const clientAuthMethod = parsedJson.token_endpoint_auth_method;
+  const methodsSupported: string[] = Array.isArray(parsedJson.token_endpoint_auth_methods_supported)
+    ? parsedJson.token_endpoint_auth_methods_supported
+    : [];
+
+  const supportsAllowedMethod =
+    clientAuthMethod === undefined ||
+    allowedAuthMethods.has(clientAuthMethod) ||
+    methodsSupported.some((m) => allowedAuthMethods.has(m));
+
+  if (!supportsAllowedMethod) {
     throw new ClientMetadataError(
-      `Unsupported token_endpoint_auth_method: ${parsedJson.token_endpoint_auth_method}. Only 'none' is supported.`,
+      `Unsupported token_endpoint_auth_method: ${clientAuthMethod}. Only 'none' and 'private_key_jwt' are supported.`,
       "unsupported_auth_method"
     );
   }
@@ -425,6 +436,8 @@ export async function resolveClientMetadata(
     grant_types: parsedJson.grant_types,
     response_types: parsedJson.response_types,
     token_endpoint_auth_method: parsedJson.token_endpoint_auth_method,
+    token_endpoint_auth_methods_supported: methodsSupported.length > 0 ? methodsSupported : undefined,
+    jwks_uri: typeof parsedJson.jwks_uri === "string" ? parsedJson.jwks_uri : undefined,
     scope: typeof parsedJson.scope === "string" ? parsedJson.scope : undefined,
     logo_uri: typeof parsedJson.logo_uri === "string" ? parsedJson.logo_uri : undefined,
     client_uri: typeof parsedJson.client_uri === "string" ? parsedJson.client_uri : undefined,
