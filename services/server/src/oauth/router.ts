@@ -284,7 +284,8 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         return;
       }
 
-      const { request_id, consent_nonce, decision } = req.body;
+      const body = (req.body && typeof req.body === "object") ? req.body : {};
+      const { request_id, consent_nonce, decision } = body;
       if (!request_id || !consent_nonce || !decision) {
         res.status(400).send(renderErrorHtml("Invalid Request", "Missing decision parameters"));
         return;
@@ -327,6 +328,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Pragma", "no-cache");
 
+      const body = (req.body && typeof req.body === "object") ? req.body : {};
       const {
         grant_type,
         client_id,
@@ -336,7 +338,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         refresh_token,
         scope,
         resource,
-      } = req.body;
+      } = body;
 
       try {
         if (grant_type === "authorization_code") {

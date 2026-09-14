@@ -331,6 +331,14 @@ describe("OAuth HTTP Router Endpoints", () => {
       expect(replayRes.status).toBe(400);
       const replayData = (await replayRes.json()) as any;
       expect(replayData.error).toBe("invalid_grant");
+
+      // 4. Empty request returns 400 unsupported_grant_type
+      const emptyRes = await fetch(`${env.baseUrl}/token`, {
+        method: "POST",
+      });
+      expect(emptyRes.status).toBe(400);
+      const emptyData = (await emptyRes.json()) as any;
+      expect(emptyData.error).toBe("unsupported_grant_type");
     } finally {
       await env.close();
     }
