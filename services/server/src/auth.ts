@@ -82,6 +82,142 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
   };
 }
 
+/**
+ * Dual-bearer authentication middleware for the /mcp endpoint:
+ * Accepts either:
+ * 1. Legacy MCP_API_KEY verified against IdentityService.
+ * 2. OAuth 2.1 Bearer access token verified against OAuthService (with scope 'mcp'
+ *    and matching canonical resource `${publicOrigin}/mcp`).
+ *
+ * Includes RFC 9728 resource_metadata in WWW-Authenticate 401/403 challenge headers.
+ */
+import type { OAuthService } from "./oauth/service.js";
+import { OAuthStoreUnavailable } from "./oauth/store.js";
+
+export function createMcpAuthMiddleware(
+  identityService: IdentityService,
+  oauthService: OAuthService | null,
+): RequestHandler {
+  const resourceMetadataUrl = oauthService
+    ? `${oauthService.publicOrigin}/.well-known/oauth-protected-resource`
+    : undefined;
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const token = readBearer(req);
+    if (token === null) {
+      if (resourceMetadataUrl) {
+        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+      }
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized: Bearer token required" },
+        id: null,
+      });
+      return;
+    }
+
+    // 1. Try legacy MCP_API_KEY
+    try {
+      const apiKeyResult = identityService.authenticateApiKey(token);
+      if (apiKeyResult !== null) {
+        try {
+          identityService.assertWorkspaceAccess(apiKeyResult);
+          res.locals.identity = apiKeyResult;
+          next();
+          return;
+        } catch (error) {
+          if (error instanceof WorkspaceAccessDeniedError) {
+            res.status(403).json({
+              jsonrpc: "2.0",
+              error: { code: -32003, message: "Forbidden: workspace not owned" },
+              id: null,
+            });
+            return;
+          }
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error instanceof IdentityDbUnavailable) {
+        process.stderr.write(`auth: identity database unavailable: ${error.message}\n`);
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32050, message: "Identity service unavailable" },
+          id: null,
+        });
+        return;
+      }
+      throw error;
+    }
+
+    // 2. If OAuth is enabled, try OAuth access token
+    if (oauthService !== null) {
+      try {
+        const oauthResult = oauthService.validateAccessToken(token);
+        if (oauthResult.valid) {
+          res.locals.identity = {
+            user_id: oauthResult.user_id,
+            workspace_id: oauthResult.workspace_id,
+            api_key_id: "oauth",
+          };
+          next();
+          return;
+        }
+
+        if (oauthResult.error === "insufficient_scope") {
+          res.setHeader(
+            "WWW-Authenticate",
+            `Bearer error="insufficient_scope", scope="mcp", resource_metadata="${resourceMetadataUrl}"`,
+          );
+          res.status(403).json({
+            jsonrpc: "2.0",
+            error: { code: -32003, message: `Forbidden: ${oauthResult.description}` },
+            id: null,
+          });
+          return;
+        }
+
+        // Token invalid, expired, revoked, or wrong target resource
+        res.setHeader(
+          "WWW-Authenticate",
+          `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}"`,
+        );
+        res.status(401).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: `Unauthorized: ${oauthResult.description}` },
+          id: null,
+        });
+        return;
+      } catch (error) {
+        if (error instanceof OAuthStoreUnavailable || error instanceof IdentityDbUnavailable) {
+          res.status(503).json({
+            jsonrpc: "2.0",
+            error: { code: -32050, message: "Authentication store unavailable" },
+            id: null,
+          });
+          return;
+        }
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32050, message: "Authentication service error" },
+          id: null,
+        });
+        return;
+      }
+    }
+
+    // Neither legacy key nor OAuth
+    if (resourceMetadataUrl) {
+      res.setHeader("WWW-Authenticate", `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`);
+    }
+    res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized" },
+      id: null,
+    });
+  };
+}
+
 function readBearer(req: Request): string | null {
   const authHeader = req.headers.authorization;
   if (!authHeader) return null;

@@ -6,7 +6,12 @@ import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
-import { createHostGuard, createOriginGuard, createIdentityAuthMiddleware } from "./auth.js";
+import {
+  createHostGuard,
+  createOriginGuard,
+  createIdentityAuthMiddleware,
+  createMcpAuthMiddleware,
+} from "./auth.js";
 import { IdentityService } from "./identity/service.js";
 import { SingletonAccountProvisioner } from "./identity/provisioner.js";
 import { UserSessionManager } from "./auth/user-session.js";
@@ -215,7 +220,9 @@ app.all(
   "/mcp",
   createHostGuard(config.allowedHosts),
   createOriginGuard(config.allowedOrigins),
-  createIdentityAuthMiddleware(identityService),
+  config.oauthEnabled && oauthService
+    ? createMcpAuthMiddleware(identityService, oauthService)
+    : createIdentityAuthMiddleware(identityService),
   (req: Request, res: Response) => {
     void nodeHandler(req, res, req.body);
   },
