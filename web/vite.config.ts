@@ -18,6 +18,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api/audit": "http://127.0.0.1:3000",
+      "/api/user": "http://127.0.0.1:3000",
+      "/auth": "http://127.0.0.1:3000",
     },
   },
   test: {

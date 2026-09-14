@@ -2,9 +2,21 @@ import React, { useEffect, useState } from "react";
 import { checkSession } from "./api";
 import { LoginView } from "./components/LoginView";
 import { ConsoleView } from "./components/ConsoleView";
+import { UserView } from "./components/UserView";
 import { Loader2 } from "lucide-react";
 
 export const App: React.FC = () => {
+  const isAuditRoute =
+    typeof window !== "undefined" && window.location.pathname.startsWith("/audit");
+
+  if (!isAuditRoute) {
+    return <UserView />;
+  }
+
+  return <AuditApp />;
+};
+
+const AuditApp: React.FC = () => {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -27,3 +39,4 @@ export const App: React.FC = () => {
 };
 
 export default App;
+

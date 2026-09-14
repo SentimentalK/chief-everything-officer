@@ -25,6 +25,36 @@ export interface TraceDetail extends TraceSummary {
   output_json: string;
 }
 
+export interface UserSessionState {
+  authenticated: boolean;
+  user?: {
+    id: string;
+    provider: string;
+    provider_login?: string | null;
+  };
+}
+
+export async function checkUserSession(): Promise<UserSessionState> {
+  try {
+    const res = await fetch("/api/user/session", { credentials: "include" });
+    if (!res.ok) return { authenticated: false };
+    const data = await res.json();
+    return {
+      authenticated: Boolean(data.authenticated),
+      user: data.user,
+    };
+  } catch {
+    return { authenticated: false };
+  }
+}
+
+export async function logoutUser(): Promise<void> {
+  await fetch("/api/user/session/logout", {
+    method: "POST",
+    credentials: "include",
+  }).catch(() => {});
+}
+
 export async function checkSession(): Promise<boolean> {
   try {
     const res = await fetch("/api/audit/session", { credentials: "include" });

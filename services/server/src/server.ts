@@ -8,6 +8,10 @@ import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
 import { createHostGuard, createOriginGuard, createIdentityAuthMiddleware } from "./auth.js";
 import { IdentityService } from "./identity/service.js";
+import { SingletonAccountProvisioner } from "./identity/provisioner.js";
+import { UserSessionManager } from "./auth/user-session.js";
+import { createGitHubAuthRouter } from "./auth/github.js";
+import { createUserRouter } from "./auth/user-router.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
@@ -57,6 +61,18 @@ const resourceService = new ResourceService(workspace, config);
 // Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
 // enforced at the /mcp boundary by the identity middleware per request.
 const workspaceIdentity = identityService.workspaceIdentityValue;
+
+// CEO Product User provisioner and session manager (independent from Audit auth)
+const userProvisioner = new SingletonAccountProvisioner(
+  identityService.storeInstance,
+  workspaceIdentity,
+);
+const isSecureOrigin = config.publicOrigin
+  ? config.publicOrigin.startsWith("https://")
+  : false;
+const userSessionManager = new UserSessionManager({
+  secureCookies: isSecureOrigin,
+});
 
 // Optional worker-bridge job layer (disabled unless configured). Resource
 // existence for new tasks is checked against the single-user repo contents.
@@ -120,6 +136,34 @@ app.use(
     identityService,
   }),
 );
+
+// Product user session router (independent from Audit session)
+app.use(
+  "/api/user",
+  createUserRouter({
+    store: identityService.storeInstance,
+    sessionManager: userSessionManager,
+  }),
+);
+
+// GitHub OAuth authorization router (when configured)
+if (config.githubClientId && config.githubClientSecret) {
+  const defaultCallback = config.publicOrigin
+    ? `${config.publicOrigin.replace(/\/+$/, "")}/auth/github/callback`
+    : `http://${config.bindHost}:${config.port}/auth/github/callback`;
+  const callbackUrl = config.githubCallbackUrl || defaultCallback;
+
+  app.use(
+    "/auth/github",
+    createGitHubAuthRouter({
+      clientId: config.githubClientId,
+      clientSecret: config.githubClientSecret,
+      callbackUrl,
+      provisioner: userProvisioner,
+      sessionManager: userSessionManager,
+    }),
+  );
+}
 
 // Worker assignment endpoints: Host -> Origin -> Identity -> router ->
 // JobService. Identity scope is taken from the authenticated locals only.

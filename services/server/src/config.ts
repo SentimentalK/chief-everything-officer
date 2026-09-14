@@ -26,6 +26,10 @@ export interface Config {
   contentResolverTimeoutMs: number;
   bridgeEnabled: boolean;
   redisUrl?: string;
+  githubClientId?: string;
+  githubClientSecret?: string;
+  githubCallbackUrl?: string;
+  publicOrigin?: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -85,6 +89,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     }
   }
 
+  const githubClientId = env.GITHUB_CLIENT_ID?.trim() || env.CEO_GITHUB_CLIENT_ID?.trim() || undefined;
+  const githubClientSecret = env.GITHUB_CLIENT_SECRET?.trim() || env.CEO_GITHUB_CLIENT_SECRET?.trim() || undefined;
+  const githubCallbackUrl = env.GITHUB_CALLBACK_URL?.trim() || env.CEO_GITHUB_CALLBACK_URL?.trim() || undefined;
+  const publicOrigin = env.CEO_PUBLIC_ORIGIN?.trim() || env.PUBLIC_ORIGIN?.trim() || undefined;
+
   return {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
@@ -111,6 +120,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     contentResolverTimeoutMs,
     bridgeEnabled,
     ...(redisUrl ? { redisUrl } : {}),
+    ...(githubClientId ? { githubClientId } : {}),
+    ...(githubClientSecret ? { githubClientSecret } : {}),
+    ...(githubCallbackUrl ? { githubCallbackUrl } : {}),
+    ...(publicOrigin ? { publicOrigin } : {}),
   };
 }
 

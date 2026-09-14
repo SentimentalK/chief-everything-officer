@@ -40,7 +40,13 @@ export class IdentityStructureError extends IdentityError {}
  */
 export class IdentityDbUnavailable extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 1;
+/**
+ * Raised when an external identity binding encounters a conflict (e.g. attempting
+ * to bind an external account already associated with another CEO user, or vice versa).
+ */
+export class IdentityConflictError extends IdentityError {}
+
+export const IDENTITY_DB_USER_VERSION = 2;
 
 // Application data schema. DDL runs inside a single provisioning transaction.
 export const IDENTITY_DDL = `
@@ -68,30 +74,46 @@ CREATE TABLE api_keys (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+CREATE TABLE external_identities (
+  id TEXT PRIMARY KEY NOT NULL,
+  provider TEXT NOT NULL,
+  provider_subject TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  provider_login TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  UNIQUE(provider, provider_subject),
+  UNIQUE(provider, user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX idx_external_identities_user ON external_identities(user_id);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
-// Used only for precise structural validation of the three fixed tables.
-const EXPECTED_TABLES = ["users", "workspaces", "api_keys"] as const;
+// Used only for precise structural validation of the four fixed tables.
+const EXPECTED_TABLES = ["users", "workspaces", "api_keys", "external_identities"] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
   users: ["id", "created_at"],
   workspaces: ["id", "owner_user_id", "remote_url", "branch", "created_at"],
   api_keys: ["id", "user_id", "key_digest", "created_at"],
+  external_identities: ["id", "provider", "provider_subject", "user_id", "created_at_ms", "updated_at_ms"],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
   workspaces: [{ from: "owner_user_id", to: "id", referencedTable: "users" }],
   api_keys: [{ from: "user_id", to: "id", referencedTable: "users" }],
+  external_identities: [{ from: "user_id", to: "id", referencedTable: "users" }],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -260,6 +282,8 @@ export class IdentityStore {
       db.exec("PRAGMA foreign_keys = ON;");
       db.exec("PRAGMA busy_timeout = 100;");
       ensureJournalMode(db);
+
+      IdentityStore.migrateIfVersion1(db);
 
       const store = new IdentityStore(resolved, db);
       store.validateStructure();
@@ -599,6 +623,116 @@ export class IdentityStore {
       const row = db.prepare("SELECT id FROM api_keys WHERE key_digest = ? AND revoked_at IS NOT NULL;").get(digest) as
         | { id: string }
         | undefined;
+      return Boolean(row);
+    });
+  }
+
+  static migrateIfVersion1(db: DatabaseSync): void {
+    const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number } | undefined;
+    const version = Number(versionRow?.user_version ?? 0);
+    if (version === 1) {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS external_identities (
+            id TEXT PRIMARY KEY NOT NULL,
+            provider TEXT NOT NULL,
+            provider_subject TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            provider_login TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            UNIQUE(provider, provider_subject),
+            UNIQUE(provider, user_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
+          PRAGMA user_version = 2;
+        `);
+        db.exec("COMMIT;");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        throw new IdentityStructureError(`Failed to migrate identity database from version 1 to 2: ${error}`);
+      }
+    }
+  }
+
+  findExternalIdentity(provider: string, providerSubject: string): {
+    id: string;
+    provider: string;
+    provider_subject: string;
+    user_id: string;
+    provider_login: string | null;
+  } | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, provider, provider_subject, user_id, provider_login FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+      ).get(provider, providerSubject) as
+        | { id: string; provider: string; provider_subject: string; user_id: string; provider_login: string | null }
+        | undefined;
+      return row ?? null;
+    });
+  }
+
+  findExternalIdentityForUser(provider: string, userId: string): {
+    id: string;
+    provider: string;
+    provider_subject: string;
+    user_id: string;
+    provider_login: string | null;
+  } | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, provider, provider_subject, user_id, provider_login FROM external_identities WHERE provider = ? AND user_id = ? LIMIT 1;",
+      ).get(provider, userId) as
+        | { id: string; provider: string; provider_subject: string; user_id: string; provider_login: string | null }
+        | undefined;
+      return row ?? null;
+    });
+  }
+
+  bindExternalIdentity(record: {
+    id: string;
+    provider: string;
+    providerSubject: string;
+    userId: string;
+    providerLogin?: string;
+  }): void {
+    this.withDb((db) => {
+      const nowMs = Date.now();
+      db.prepare(
+        `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?);`,
+      ).run(
+        record.id,
+        record.provider,
+        record.providerSubject,
+        record.userId,
+        record.providerLogin ?? null,
+        nowMs,
+        nowMs,
+      );
+    });
+  }
+
+  isUserActive(userId: string): boolean {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id FROM users WHERE id = ? AND disabled_at IS NULL LIMIT 1;",
+      ).get(userId) as { id: string } | undefined;
+      return Boolean(row);
+    });
+  }
+
+  isWorkspaceOwnedByUser(workspaceId: string, userId: string): boolean {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id FROM workspaces WHERE id = ? AND owner_user_id = ? LIMIT 1;",
+      ).get(workspaceId, userId) as { id: string } | undefined;
       return Boolean(row);
     });
   }

@@ -9,8 +9,10 @@ import {
   provisionEmptyIdentityDatabase,
   sha256Hex,
   IDENTITY_DB_USER_VERSION,
+  IdentityConflictError,
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
+import { SingletonAccountProvisioner } from "../src/identity/provisioner.js";
 
 const cleanupDirs: string[] = [];
 const cleanupStores: IdentityStore[] = [];
@@ -299,4 +301,107 @@ describe("structural contract rejects bad schemas", () => {
       expect(() => IdentityStore.open(ctx.dbPath)).toThrow();
     },
   );
+});
+
+describe("v2 schema & external identities migration", () => {
+  it("provisions fresh database with user_version = 2 and external_identities table", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const raw = new DatabaseSync(ctx.dbPath);
+    const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
+    expect(Number(versionRow.user_version)).toBe(2);
+    const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
+    const names = tables.map((t) => t.name);
+    expect(names).toContain("external_identities");
+    raw.close();
+  });
+
+  it("auto-migrates an existing v1 database to v2 on open", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL, branch TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY (owner_user_id) REFERENCES users(id));
+      CREATE TABLE api_keys (id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, revoked_at INTEGER, FOREIGN KEY (user_id) REFERENCES users(id));
+      PRAGMA user_version = 1;
+      INSERT INTO users VALUES ('usr_v1', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_v1', 'usr_v1', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+      INSERT INTO api_keys VALUES ('ak_v1', 'usr_v1', '${sha256Hex("key-1")}', 1000, NULL);
+    `);
+    db.close();
+
+    // Opening with IdentityStore.open should run auto-migration
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
+    expect(Number(versionRow.user_version)).toBe(2);
+    const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
+    const names = tables.map((t) => t.name);
+    expect(names).toContain("external_identities");
+    raw.close();
+  });
+});
+
+describe("SingletonAccountProvisioner", () => {
+  it("binds new external identity to the singleton user and is idempotent", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const provisioner = new SingletonAccountProvisioner(store, ident);
+
+    // First bind: creates new external identity
+    const res1 = provisioner.resolveOrBind("github", "40360455", "SentimentalK");
+    expect(res1.isNewBinding).toBe(true);
+    expect(res1.userId).toBe(ident.user_id);
+    expect(res1.workspaceId).toBe(ident.workspace_id);
+    expect(res1.providerLogin).toBe("SentimentalK");
+
+    // Re-bind: idempotent, returns existing binding
+    const res2 = provisioner.resolveOrBind("github", "40360455", "SentimentalK");
+    expect(res2.isNewBinding).toBe(false);
+    expect(res2.userId).toBe(ident.user_id);
+    expect(res2.workspaceId).toBe(ident.workspace_id);
+  });
+
+  it("throws IdentityConflictError when user is already bound to a different github id", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const provisioner = new SingletonAccountProvisioner(store, ident);
+    provisioner.resolveOrBind("github", "40360455", "SentimentalK");
+
+    // Second github ID attempting to bind to the same user
+    expect(() =>
+      provisioner.resolveOrBind("github", "99999999", "OtherUser"),
+    ).toThrow(IdentityConflictError);
+  });
+
+  it("throws IdentityConflictError if external identity belongs to a different user", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    // Insert second user into users table first to satisfy FK
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("INSERT INTO users VALUES ('usr_other', 1000, NULL);").run();
+    raw.close();
+
+    // Bind github:40360455 to usr_other
+    store.bindExternalIdentity({
+      id: "ext_1",
+      provider: "github",
+      providerSubject: "40360455",
+      userId: "usr_other",
+    });
+
+    const provisioner = new SingletonAccountProvisioner(store, ident);
+    expect(() =>
+      provisioner.resolveOrBind("github", "40360455", "SentimentalK"),
+    ).toThrow(IdentityConflictError);
+  });
 });

@@ -47,6 +47,11 @@ export class IdentityService {
     return this.workspaceIdentity;
   }
 
+  /** The underlying IdentityStore instance. */
+  get storeInstance(): IdentityStore {
+    return this.store;
+  }
+
   /**
    * One-time initialization orchestration (drives `cli init`). Atomic on a
    * fresh path: create + validate + seed. On an existing DB: validate binding
