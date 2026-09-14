@@ -1008,8 +1008,7 @@ mod result_ack_tests {
             }),
         ];
         for (name, ack) in cases {
-            let err = validate_worker_result_ok(&ack, JOB, &req, RES)
-                .expect_err(name);
+            let err = validate_worker_result_ok(&ack, JOB, &req, RES).expect_err(name);
             assert!(!err.is_empty(), "{name} should produce a protocol reason");
         }
     }
