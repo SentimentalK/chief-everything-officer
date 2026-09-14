@@ -64,6 +64,8 @@ describe("OAuthService Core & Security Constraints", () => {
     expect(meta.response_types_supported).toEqual(["code"]);
     expect(meta.code_challenge_methods_supported).toEqual(["S256"]);
     expect(meta.token_endpoint_auth_methods_supported).toEqual(["none"]);
+    expect(meta.client_id_metadata_document_supported).toBe(true);
+    expect(meta.authorization_response_iss_parameter_supported).toBe(true);
   });
 
   it("handles complete authorize -> consent -> code exchange -> refresh flow", async () => {
@@ -138,6 +140,7 @@ describe("OAuthService Core & Security Constraints", () => {
       service.refreshTokens({
         clientId: "https://chatgpt.com/client.json",
         refreshToken: tokenRes.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
       })
     ).toThrow(OAuthServerError);
 
@@ -146,6 +149,7 @@ describe("OAuthService Core & Security Constraints", () => {
       service.refreshTokens({
         clientId: "https://chatgpt.com/client.json",
         refreshToken: refreshRes.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
       })
     ).toThrow(OAuthServerError);
   });
@@ -190,6 +194,7 @@ describe("OAuthService Core & Security Constraints", () => {
       service.refreshTokens({
         clientId: "https://chatgpt.com/client.json",
         refreshToken: tokens.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
       })
     ).toThrow(OAuthServerError);
 
@@ -240,7 +245,162 @@ describe("OAuthService Core & Security Constraints", () => {
       service.refreshTokens({
         clientId: "https://chatgpt.com/client.json",
         refreshToken: tokens.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
       })
     ).toThrow(OAuthServerError);
+  });
+
+  describe("Mandatory Explicit Resource Binding (3 Legs)", () => {
+    it("rejects initiateAuthorizationRequest when resource is missing or malformed", async () => {
+      const { service } = await setupTestEnv();
+
+      const baseReq = {
+        clientId: "https://chatgpt.com/client.json",
+        redirectUri: "https://chatgpt.com/oauth/callback",
+        responseType: "code",
+        codeChallenge: sha256Base64Url("test_verifier_123456789012345678901234"),
+        codeChallengeMethod: "S256",
+      };
+
+      // Missing resource
+      await expect(service.initiateAuthorizationRequest(baseReq as any)).rejects.toThrow(
+        /Resource parameter is required/
+      );
+
+      // Resource with query parameter
+      await expect(
+        service.initiateAuthorizationRequest({
+          ...baseReq,
+          resource: "https://ceo.sentimentalk.com/mcp?param=1",
+        })
+      ).rejects.toThrow(/Resource URL must not contain query parameters/);
+
+      // Resource with fragment
+      await expect(
+        service.initiateAuthorizationRequest({
+          ...baseReq,
+          resource: "https://ceo.sentimentalk.com/mcp#frag",
+        })
+      ).rejects.toThrow(/Resource URL must not contain fragments/);
+
+      // Resource with credentials
+      await expect(
+        service.initiateAuthorizationRequest({
+          ...baseReq,
+          resource: "https://user:pass@ceo.sentimentalk.com/mcp",
+        })
+      ).rejects.toThrow(/Resource URL must not contain credentials/);
+
+      // Resource mismatch
+      await expect(
+        service.initiateAuthorizationRequest({
+          ...baseReq,
+          resource: "https://other.domain.com/mcp",
+        })
+      ).rejects.toThrow(/does not match canonical resource/);
+
+      // Trailing slash mismatch
+      await expect(
+        service.initiateAuthorizationRequest({
+          ...baseReq,
+          resource: "https://ceo.sentimentalk.com/mcp/",
+        })
+      ).rejects.toThrow(/does not match canonical resource/);
+    });
+
+    it("rejects exchangeAuthorizationCode when resource is missing or mismatching", async () => {
+      const { service, ident, oauthStore } = await setupTestEnv();
+
+      const verifier = "verifier_res_binding_1234567890123456789";
+      const challenge = sha256Base64Url(verifier);
+      const reqId = "oar_res_binding";
+
+      oauthStore.createAuthorizationRequest({
+        id: reqId,
+        client_id: "https://chatgpt.com/client.json",
+        client_name: "ChatGPT",
+        redirect_uri: "https://chatgpt.com/oauth/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp",
+        state: null,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+
+      const nonce = service.createConsentNonce(reqId);
+      const approval = service.approveConsent(reqId, nonce, ident.user_id);
+
+      // Missing resource
+      expect(() =>
+        service.exchangeAuthorizationCode({
+          clientId: "https://chatgpt.com/client.json",
+          redirectUri: "https://chatgpt.com/oauth/callback",
+          code: approval.code,
+          codeVerifier: verifier,
+        })
+      ).toThrow(/Resource parameter is required/);
+
+      // Wrong resource
+      expect(() =>
+        service.exchangeAuthorizationCode({
+          clientId: "https://chatgpt.com/client.json",
+          redirectUri: "https://chatgpt.com/oauth/callback",
+          code: approval.code,
+          codeVerifier: verifier,
+          resource: "https://other.domain.com/mcp",
+        })
+      ).toThrow(/does not match canonical resource/);
+    });
+
+    it("rejects refreshTokens when resource is missing or mismatching", async () => {
+      const { service, ident, oauthStore } = await setupTestEnv();
+
+      const verifier = "verifier_refresh_res_1234567890123456789";
+      const challenge = sha256Base64Url(verifier);
+      const reqId = "oar_refresh_res";
+
+      oauthStore.createAuthorizationRequest({
+        id: reqId,
+        client_id: "https://chatgpt.com/client.json",
+        client_name: "ChatGPT",
+        redirect_uri: "https://chatgpt.com/oauth/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp offline_access",
+        state: null,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+
+      const nonce = service.createConsentNonce(reqId);
+      const approval = service.approveConsent(reqId, nonce, ident.user_id);
+      const tokens = service.exchangeAuthorizationCode({
+        clientId: "https://chatgpt.com/client.json",
+        redirectUri: "https://chatgpt.com/oauth/callback",
+        code: approval.code,
+        codeVerifier: verifier,
+        resource: "https://ceo.sentimentalk.com/mcp",
+      });
+
+      // Missing resource
+      expect(() =>
+        service.refreshTokens({
+          clientId: "https://chatgpt.com/client.json",
+          refreshToken: tokens.refresh_token,
+        })
+      ).toThrow(/Resource parameter is required/);
+
+      // Wrong resource
+      expect(() =>
+        service.refreshTokens({
+          clientId: "https://chatgpt.com/client.json",
+          refreshToken: tokens.refresh_token,
+          resource: "https://other.domain.com/mcp",
+        })
+      ).toThrow(/does not match canonical resource/);
+    });
   });
 });

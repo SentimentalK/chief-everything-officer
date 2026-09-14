@@ -94,7 +94,34 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const githubClientId = env.GITHUB_CLIENT_ID?.trim() || env.CEO_GITHUB_CLIENT_ID?.trim() || undefined;
   const githubClientSecret = env.GITHUB_CLIENT_SECRET?.trim() || env.CEO_GITHUB_CLIENT_SECRET?.trim() || undefined;
   const githubCallbackUrl = env.GITHUB_CALLBACK_URL?.trim() || env.CEO_GITHUB_CALLBACK_URL?.trim() || undefined;
-  const publicOrigin = env.CEO_PUBLIC_ORIGIN?.trim() || env.PUBLIC_ORIGIN?.trim() || undefined;
+  const rawPublicOrigin = env.CEO_PUBLIC_ORIGIN?.trim() || env.PUBLIC_ORIGIN?.trim() || undefined;
+  const oauthEnabled = parseBool(env.CEO_OAUTH_ENABLED, false);
+
+  let publicOrigin = rawPublicOrigin;
+  if (oauthEnabled) {
+    if (!publicOrigin) {
+      throw new Error("CEO_PUBLIC_ORIGIN is required when CEO_OAUTH_ENABLED is true");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(publicOrigin);
+    } catch {
+      throw new Error(`CEO_PUBLIC_ORIGIN must be a valid URL, got '${publicOrigin}'`);
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error(`CEO_PUBLIC_ORIGIN must use https: scheme when CEO_OAUTH_ENABLED is true, got '${publicOrigin}'`);
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error(`CEO_PUBLIC_ORIGIN must not contain credentials, got '${publicOrigin}'`);
+    }
+    if (parsed.pathname !== "/" && parsed.pathname !== "") {
+      throw new Error(`CEO_PUBLIC_ORIGIN must be an origin only without path segments, got '${publicOrigin}'`);
+    }
+    if (parsed.search || parsed.hash) {
+      throw new Error(`CEO_PUBLIC_ORIGIN must not contain query or fragment, got '${publicOrigin}'`);
+    }
+    publicOrigin = parsed.origin;
+  }
 
   return {
     dataRoot,
@@ -126,7 +153,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(githubClientSecret ? { githubClientSecret } : {}),
     ...(githubCallbackUrl ? { githubCallbackUrl } : {}),
     ...(publicOrigin ? { publicOrigin } : {}),
-    oauthEnabled: parseBool(env.CEO_OAUTH_ENABLED, false),
+    oauthEnabled,
     oauthDbPath: env.CEO_OAUTH_DB_PATH ?? path.join(dataRoot, "identity", "oauth.sqlite"),
   };
 }

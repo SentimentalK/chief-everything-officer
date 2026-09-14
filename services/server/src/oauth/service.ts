@@ -40,13 +40,34 @@ const DEFAULT_AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-export function normalizeResource(uri: string): string {
-  try {
-    const u = new URL(uri);
-    return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, "")}`;
-  } catch {
-    return uri.trim().replace(/\/+$/, "");
+export function validateCanonicalResource(uri: unknown, canonicalResource: string): string {
+  if (typeof uri !== "string" || !uri.trim()) {
+    throw new OAuthServerError("invalid_target", "Resource parameter is required", 400);
   }
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    throw new OAuthServerError("invalid_target", `Invalid resource URL: '${uri}'`, 400);
+  }
+  if (parsed.search) {
+    throw new OAuthServerError("invalid_target", "Resource URL must not contain query parameters", 400);
+  }
+  if (parsed.hash) {
+    throw new OAuthServerError("invalid_target", "Resource URL must not contain fragments", 400);
+  }
+  if (parsed.username || parsed.password) {
+    throw new OAuthServerError("invalid_target", "Resource URL must not contain credentials", 400);
+  }
+  const canonicalParsed = new URL(canonicalResource);
+  if (parsed.origin !== canonicalParsed.origin || parsed.pathname !== canonicalParsed.pathname) {
+    throw new OAuthServerError(
+      "invalid_target",
+      `Requested resource '${uri}' does not match canonical resource '${canonicalResource}'`,
+      400
+    );
+  }
+  return canonicalResource;
 }
 
 export class OAuthService {
@@ -89,6 +110,8 @@ export class OAuthService {
       token_endpoint_auth_methods_supported: ["none"],
       scopes_supported: ["mcp", "offline_access"],
       code_challenge_methods_supported: ["S256"],
+      client_id_metadata_document_supported: true,
+      authorization_response_iss_parameter_supported: true,
       service_documentation: "https://github.com/SentimentalK/chief-everything-officer",
     };
   }
@@ -122,6 +145,9 @@ export class OAuthService {
       );
     }
 
+    // Resource validation (mandatory explicit resource binding)
+    const targetResource = validateCanonicalResource(input.resource, this.canonicalResource);
+
     // Resolve client metadata via CIMD
     let clientMetadata: ClientMetadata;
     try {
@@ -144,20 +170,6 @@ export class OAuthService {
         "redirect_uri is not registered in client metadata",
         400
       );
-    }
-
-    // Resource validation
-    let targetResource = this.canonicalResource;
-    if (input.resource) {
-      const normalizedReqResource = normalizeResource(input.resource);
-      if (normalizedReqResource !== this.canonicalResource) {
-        throw new OAuthServerError(
-          "invalid_target",
-          `Requested resource '${input.resource}' does not match canonical resource '${this.canonicalResource}'`,
-          400
-        );
-      }
-      targetResource = normalizedReqResource;
     }
 
     // Scopes validation
@@ -314,9 +326,7 @@ export class OAuthService {
       );
     }
 
-    const targetResource = input.resource
-      ? normalizeResource(input.resource)
-      : this.canonicalResource;
+    const targetResource = validateCanonicalResource(input.resource, this.canonicalResource);
 
     const codeDigest = sha256Hex(input.code);
     const now = Date.now();
@@ -402,13 +412,8 @@ export class OAuthService {
       throw new OAuthServerError("invalid_grant", "Client ID mismatch", 400);
     }
 
-    // Resource check
-    const targetResource = input.resource
-      ? normalizeResource(input.resource)
-      : existing.resource;
-    if (targetResource !== existing.resource) {
-      throw new OAuthServerError("invalid_target", "Requested resource mismatch", 400);
-    }
+    // Resource check (mandatory explicit resource binding)
+    const targetResource = validateCanonicalResource(input.resource, existing.resource);
 
     // Identity validation: user still active & owns workspace
     const userActive = this.identityStore.isUserActive(existing.user_id);

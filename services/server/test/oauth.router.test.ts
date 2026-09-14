@@ -242,6 +242,50 @@ describe("OAuth HTTP Router Endpoints", () => {
       expect(locUrl.pathname).toBe("/callback");
       expect(locUrl.searchParams.get("code")).toMatch(/^oac_/);
       expect(locUrl.searchParams.get("state")).toBe("state_dec");
+      expect(locUrl.searchParams.get("iss")).toBe(env.oauthService.publicOrigin);
+
+      // Deny
+      const reqIdDeny = "oar_dec_deny";
+      env.oauthStore.createAuthorizationRequest({
+        id: reqIdDeny,
+        client_id: "https://example.com/client.json",
+        client_name: "App",
+        redirect_uri: "https://example.com/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp",
+        state: "state_deny",
+        code_challenge: "dummy",
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+
+      const nonceDeny = env.oauthService.createConsentNonce(reqIdDeny);
+      const denyBody = new URLSearchParams({
+        request_id: reqIdDeny,
+        consent_nonce: nonceDeny,
+        decision: "deny",
+      });
+
+      const denyRes = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: `ceo_user_session=${userSession.sessionId}`,
+        },
+        body: denyBody.toString(),
+        redirect: "manual",
+      });
+
+      expect(denyRes.status).toBe(302);
+      const denyLoc = denyRes.headers.get("location");
+      expect(denyLoc).toBeTruthy();
+      const denyLocUrl = new URL(denyLoc!);
+      expect(denyLocUrl.origin).toBe("https://example.com");
+      expect(denyLocUrl.pathname).toBe("/callback");
+      expect(denyLocUrl.searchParams.get("error")).toBe("access_denied");
+      expect(denyLocUrl.searchParams.get("state")).toBe("state_deny");
+      expect(denyLocUrl.searchParams.get("iss")).toBe(env.oauthService.publicOrigin);
     } finally {
       await env.close();
     }
@@ -297,11 +341,12 @@ describe("OAuth HTTP Router Endpoints", () => {
       expect(tokens.refresh_token).toMatch(/^ceo_rt_/);
       expect(tokens.expires_in).toBe(3600);
 
-      // 2. Refresh token rotation
+      // 2. Refresh token rotation (with mandatory resource)
       const refreshReqBody = new URLSearchParams({
         grant_type: "refresh_token",
         client_id: "https://example.com/client.json",
         refresh_token: tokens.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
       });
 
       const refreshRes = await fetch(`${env.baseUrl}/token`, {
@@ -332,7 +377,26 @@ describe("OAuth HTTP Router Endpoints", () => {
       const replayData = (await replayRes.json()) as any;
       expect(replayData.error).toBe("invalid_grant");
 
-      // 4. Empty request returns 400 unsupported_grant_type
+      // 4. Missing resource returns 400 invalid_target
+      const missingResBody = new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: "https://example.com/client.json",
+        redirect_uri: "https://example.com/callback",
+        code: approval.code,
+        code_verifier: verifier,
+      });
+      const missingRes = await fetch(`${env.baseUrl}/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: missingResBody.toString(),
+      });
+      expect(missingRes.status).toBe(400);
+      const missingData = (await missingRes.json()) as any;
+      expect(missingData.error).toBe("invalid_target");
+
+      // 5. Empty request returns 400 unsupported_grant_type
       const emptyRes = await fetch(`${env.baseUrl}/token`, {
         method: "POST",
       });

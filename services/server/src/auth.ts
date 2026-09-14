@@ -106,7 +106,7 @@ export function createMcpAuthMiddleware(
     const token = readBearer(req);
     if (token === null) {
       if (resourceMetadataUrl) {
-        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="mcp"`);
       }
       res.status(401).json({
         jsonrpc: "2.0",
@@ -180,7 +180,7 @@ export function createMcpAuthMiddleware(
         // Token invalid, expired, revoked, or wrong target resource
         res.setHeader(
           "WWW-Authenticate",
-          `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}"`,
+          `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}", scope="mcp"`,
         );
         res.status(401).json({
           jsonrpc: "2.0",
@@ -208,7 +208,7 @@ export function createMcpAuthMiddleware(
 
     // Neither legacy key nor OAuth
     if (resourceMetadataUrl) {
-      res.setHeader("WWW-Authenticate", `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`);
+      res.setHeader("WWW-Authenticate", `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}", scope="mcp"`);
     }
     res.status(401).json({
       jsonrpc: "2.0",

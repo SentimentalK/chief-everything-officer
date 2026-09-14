@@ -296,6 +296,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
           const outcome = oauthService.approveConsent(request_id, consent_nonce, session.userId);
           const redirectUrl = new URL(outcome.redirectUri);
           redirectUrl.searchParams.set("code", outcome.code);
+          redirectUrl.searchParams.set("iss", oauthService.publicOrigin);
           if (outcome.state) {
             redirectUrl.searchParams.set("state", outcome.state);
           }
@@ -305,6 +306,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
           const redirectUrl = new URL(outcome.redirectUri);
           redirectUrl.searchParams.set("error", "access_denied");
           redirectUrl.searchParams.set("error_description", "The user denied the authorization request");
+          redirectUrl.searchParams.set("iss", oauthService.publicOrigin);
           if (outcome.state) {
             redirectUrl.searchParams.set("state", outcome.state);
           }
@@ -347,7 +349,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
             redirectUri: redirect_uri,
             code,
             codeVerifier: code_verifier,
-            resource,
+            resource: typeof resource === "string" ? resource : undefined,
           });
           res.status(200).json(tokens);
           return;
@@ -357,8 +359,8 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
           const tokens = oauthService.refreshTokens({
             clientId: client_id,
             refreshToken: refresh_token,
-            scope,
-            resource,
+            scope: typeof scope === "string" ? scope : undefined,
+            resource: typeof resource === "string" ? resource : undefined,
           });
           res.status(200).json(tokens);
           return;

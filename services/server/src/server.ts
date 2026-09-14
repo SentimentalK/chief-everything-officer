@@ -179,7 +179,7 @@ let oauthStore: OAuthStore | null = null;
 let oauthService: OAuthService | null = null;
 
 if (config.oauthEnabled) {
-  const publicOrigin = config.publicOrigin || `http://${config.bindHost}:${config.port}`;
+  const publicOrigin = config.publicOrigin!;
   oauthStore = new OAuthStore(config.oauthDbPath);
   oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
     publicOrigin,

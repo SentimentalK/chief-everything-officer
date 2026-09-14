@@ -176,7 +176,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
     }
   });
 
-  it("returns 401 with WWW-Authenticate containing resource_metadata on missing token", async () => {
+  it("returns 401 with WWW-Authenticate containing resource_metadata and scope on missing token", async () => {
     const env = await setupMcpAuthTestApp();
     try {
       const res = await fetch(`${env.baseUrl}/mcp`);
@@ -184,6 +184,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
       const wwwAuth = res.headers.get("www-authenticate");
       expect(wwwAuth).toContain("Bearer");
       expect(wwwAuth).toContain(`resource_metadata="${env.publicOrigin}/.well-known/oauth-protected-resource"`);
+      expect(wwwAuth).toContain('scope="mcp"');
     } finally {
       await env.close();
     }
@@ -202,6 +203,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
       const wwwAuth = res.headers.get("www-authenticate");
       expect(wwwAuth).toContain('error="invalid_token"');
       expect(wwwAuth).toContain("resource_metadata=");
+      expect(wwwAuth).toContain('scope="mcp"');
     } finally {
       await env.close();
     }
@@ -286,6 +288,59 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
       expect(badRes.status).toBe(401);
     } finally {
       await env.close();
+    }
+  });
+
+  it("preserves exact legacy behavior without WWW-Authenticate when OAuth is disabled", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-no-oauth-test-"));
+    cleanupDirs.push(dir);
+    const rawApiKey = "legacy-only-key";
+    const apiKeyDigest = sha256Hex(rawApiKey);
+    const identDbPath = path.join(dir, "identity.sqlite");
+    provisionEmptyIdentityDatabase(identDbPath, {
+      remoteUrl: "git@example.com:test/repo.git",
+      branch: "main",
+      apiKeyDigest,
+    });
+    const identityService = IdentityService.open(
+      { remoteUrl: "git@example.com:test/repo.git", branch: "main", envApiKey: rawApiKey },
+      identDbPath
+    );
+    cleanupIdentServices.push(identityService);
+
+    const app = express();
+    app.all(
+      "/mcp",
+      createMcpAuthMiddleware(identityService, null),
+      (_req: Request, res: Response) => {
+        res.status(200).json({ ok: true });
+      }
+    );
+
+    const server = app.listen(0);
+    const port = (server.address() as any).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // 1. Missing token returns 401 and NO WWW-Authenticate
+      const resMissing = await fetch(`${baseUrl}/mcp`);
+      expect(resMissing.status).toBe(401);
+      expect(resMissing.headers.get("www-authenticate")).toBeNull();
+
+      // 2. Invalid token returns 401 and NO WWW-Authenticate
+      const resBad = await fetch(`${baseUrl}/mcp`, {
+        headers: { Authorization: "Bearer bad-token" },
+      });
+      expect(resBad.status).toBe(401);
+      expect(resBad.headers.get("www-authenticate")).toBeNull();
+
+      // 3. Valid legacy key returns 200
+      const resGood = await fetch(`${baseUrl}/mcp`, {
+        headers: { Authorization: `Bearer ${rawApiKey}` },
+      });
+      expect(resGood.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 });

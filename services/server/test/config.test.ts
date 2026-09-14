@@ -161,4 +161,112 @@ describe("Config Validation", () => {
       ).toThrow("CONTENT_RESOLVER_TIMEOUT_MS must be a positive integer");
     });
   });
+
+  describe("OAuth Configuration & CEO_PUBLIC_ORIGIN Validation", () => {
+    it("allows missing or non-https publicOrigin when OAuth is disabled", () => {
+      const config1 = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "false" }));
+      expect(config1.oauthEnabled).toBe(false);
+      expect(config1.publicOrigin).toBeUndefined();
+
+      const config2 = loadConfig(
+        baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "false", CEO_PUBLIC_ORIGIN: "http://insecure.local" }),
+      );
+      expect(config2.oauthEnabled).toBe(false);
+      expect(config2.publicOrigin).toBe("http://insecure.local");
+    });
+
+    it("throws when CEO_OAUTH_ENABLED is true but CEO_PUBLIC_ORIGIN is missing", () => {
+      expect(() =>
+        loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "true" })),
+      ).toThrow("CEO_PUBLIC_ORIGIN is required when CEO_OAUTH_ENABLED is true");
+    });
+
+    it("throws when CEO_PUBLIC_ORIGIN is not a valid URL", () => {
+      expect(() =>
+        loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "true", CEO_PUBLIC_ORIGIN: "not-a-url" })),
+      ).toThrow("CEO_PUBLIC_ORIGIN must be a valid URL");
+    });
+
+    it("throws when CEO_PUBLIC_ORIGIN uses http: scheme", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_ENABLED: "true",
+            CEO_PUBLIC_ORIGIN: "http://ceo.sentimentalk.com",
+          }),
+        ),
+      ).toThrow("CEO_PUBLIC_ORIGIN must use https: scheme when CEO_OAUTH_ENABLED is true");
+    });
+
+    it("throws when CEO_PUBLIC_ORIGIN contains credentials", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_ENABLED: "true",
+            CEO_PUBLIC_ORIGIN: "https://user:pass@ceo.sentimentalk.com",
+          }),
+        ),
+      ).toThrow("CEO_PUBLIC_ORIGIN must not contain credentials");
+    });
+
+    it("throws when CEO_PUBLIC_ORIGIN contains path segments", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_ENABLED: "true",
+            CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com/subpath",
+          }),
+        ),
+      ).toThrow("CEO_PUBLIC_ORIGIN must be an origin only without path segments");
+    });
+
+    it("throws when CEO_PUBLIC_ORIGIN contains query parameters or fragments", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_ENABLED: "true",
+            CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com?query=1",
+          }),
+        ),
+      ).toThrow("CEO_PUBLIC_ORIGIN must not contain query or fragment");
+
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_ENABLED: "true",
+            CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com#fragment",
+          }),
+        ),
+      ).toThrow("CEO_PUBLIC_ORIGIN must not contain query or fragment");
+    });
+
+    it("accepts valid https origin and normalizes trailing slash", () => {
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          CEO_OAUTH_ENABLED: "true",
+          CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com/",
+        }),
+      );
+      expect(config.oauthEnabled).toBe(true);
+      expect(config.publicOrigin).toBe("https://ceo.sentimentalk.com");
+    });
+
+    it("accepts valid https origin with custom port", () => {
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          CEO_OAUTH_ENABLED: "true",
+          CEO_PUBLIC_ORIGIN: "https://localhost:8443",
+        }),
+      );
+      expect(config.oauthEnabled).toBe(true);
+      expect(config.publicOrigin).toBe("https://localhost:8443");
+    });
+  });
 });
