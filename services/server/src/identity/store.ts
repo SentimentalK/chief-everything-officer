@@ -58,7 +58,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 4;
+export const IDENTITY_DB_USER_VERSION = 5;
 
 export type GitHubAccountType = "User" | "Organization";
 export type GitHubRepositorySelection = "all" | "selected";
@@ -82,6 +82,31 @@ export interface GitHubInstallationUserRecord {
   user_id: string;
   created_at_ms: number;
   verified_at_ms: number;
+}
+
+export interface GitHubRepositoryBindingRecord {
+  id: string;
+  workspace_id: string;
+  github_repository_id: string;
+  github_installation_row_id: string;
+  owner_account_id: string;
+  owner_login: string;
+  repository_name: string;
+  full_name: string;
+  branch: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CreateWorkspaceWithRepositoryBindingInput {
+  userId: string;
+  installationRowId: string;
+  githubRepositoryId: string;
+  ownerAccountId: string;
+  ownerLogin: string;
+  repositoryName: string;
+  fullName: string;
+  branch: string;
 }
 
 export interface UserGitHubInstallationItem {
@@ -183,6 +208,22 @@ CREATE TABLE github_installation_users (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE github_repository_bindings (
+  id TEXT PRIMARY KEY NOT NULL,
+  workspace_id TEXT NOT NULL UNIQUE,
+  github_repository_id TEXT NOT NULL UNIQUE,
+  github_installation_row_id TEXT NOT NULL,
+  owner_account_id TEXT NOT NULL,
+  owner_login TEXT NOT NULL,
+  repository_name TEXT NOT NULL,
+  full_name TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+  FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
@@ -191,6 +232,7 @@ CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(worksp
 CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
 CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
 CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
+CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
@@ -202,6 +244,7 @@ const EXPECTED_TABLES = [
   "workspace_memberships",
   "github_installations",
   "github_installation_users",
+  "github_repository_bindings",
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
@@ -228,6 +271,19 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
     "created_at_ms",
     "verified_at_ms",
   ],
+  github_repository_bindings: [
+    "id",
+    "workspace_id",
+    "github_repository_id",
+    "github_installation_row_id",
+    "owner_account_id",
+    "owner_login",
+    "repository_name",
+    "full_name",
+    "branch",
+    "created_at_ms",
+    "updated_at_ms",
+  ],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -242,13 +298,17 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
     { from: "github_installation_row_id", to: "id", referencedTable: "github_installations" },
     { from: "user_id", to: "id", referencedTable: "users" },
   ],
+  github_repository_bindings: [
+    { from: "workspace_id", to: "id", referencedTable: "workspaces" },
+    { from: "github_installation_row_id", to: "id", referencedTable: "github_installations" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -564,6 +624,8 @@ export class IdentityStore {
     this.requirePartialUniqueIndex(db, "workspace_memberships", ["workspace_id"], "role = 'owner'");
     this.requireUniqueIndex(db, "github_installations", ["github_installation_id"]);
     this.requireUniqueIndex(db, "github_installation_users", ["github_installation_row_id", "user_id"]);
+    this.requireUniqueIndex(db, "github_repository_bindings", ["workspace_id"]);
+    this.requireUniqueIndex(db, "github_repository_bindings", ["github_repository_id"]);
 
     this.validateData();
   }
@@ -685,6 +747,58 @@ export class IdentityStore {
       }
       if (!Number.isInteger(link.verified_at_ms) || link.verified_at_ms < 0) {
         throw new IdentityStructureError(`Invalid verified_at_ms in github_installation_users row '${link.id}'.`);
+      }
+    }
+
+    const bindings = db.prepare(
+      "SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms FROM github_repository_bindings;",
+    ).all() as Array<{
+      id: string;
+      workspace_id: string;
+      github_repository_id: string;
+      github_installation_row_id: string;
+      owner_account_id: string;
+      owner_login: string;
+      repository_name: string;
+      full_name: string;
+      branch: string;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+
+    for (const b of bindings) {
+      if (typeof b.id !== "string" || !b.id.startsWith("grb_")) {
+        throw new IdentityStructureError(`Invalid github_repository_bindings id '${b.id}'.`);
+      }
+      if (typeof b.github_repository_id !== "string" || !numericIdRegex.test(b.github_repository_id)) {
+        throw new IdentityStructureError(
+          `github_repository_id '${b.github_repository_id}' must be a positive decimal string.`,
+        );
+      }
+      if (typeof b.owner_account_id !== "string" || !numericIdRegex.test(b.owner_account_id)) {
+        throw new IdentityStructureError(
+          `owner_account_id '${b.owner_account_id}' must be a positive decimal string.`,
+        );
+      }
+      if (typeof b.owner_login !== "string" || b.owner_login.trim().length === 0) {
+        throw new IdentityStructureError(`owner_login '${b.owner_login}' must be a non-empty string.`);
+      }
+      if (typeof b.repository_name !== "string" || b.repository_name.trim().length === 0) {
+        throw new IdentityStructureError(`repository_name '${b.repository_name}' must be a non-empty string.`);
+      }
+      if (typeof b.full_name !== "string" || b.full_name.trim().length === 0) {
+        throw new IdentityStructureError(`full_name '${b.full_name}' must be a non-empty string.`);
+      }
+      if (typeof b.branch !== "string" || b.branch.trim().length === 0 || b.branch.includes("\0")) {
+        throw new IdentityStructureError(
+          `branch '${b.branch}' must be a non-empty string containing no NUL characters.`,
+        );
+      }
+      if (!Number.isInteger(b.created_at_ms) || b.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in github_repository_bindings row '${b.id}'.`);
+      }
+      if (!Number.isInteger(b.updated_at_ms) || b.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in github_repository_bindings row '${b.id}'.`);
       }
     }
 
@@ -1102,6 +1216,9 @@ export class IdentityStore {
         case 3:
           IdentityStore.migrateV3ToV4(db);
           break;
+        case 4:
+          IdentityStore.migrateV4ToV5(db);
+          break;
         default:
           throw new IdentityStructureError(
             `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
@@ -1293,6 +1410,64 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 3 to 4: ${error}`);
+    }
+  }
+
+  static migrateV4ToV5(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 4) {
+        throw new IdentityStructureError("migrateV4ToV5 requires user_version = 4.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v5: missing required v4 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE github_repository_bindings (
+          id TEXT PRIMARY KEY NOT NULL,
+          workspace_id TEXT NOT NULL UNIQUE,
+          github_repository_id TEXT NOT NULL UNIQUE,
+          github_installation_row_id TEXT NOT NULL,
+          owner_account_id TEXT NOT NULL,
+          owner_login TEXT NOT NULL,
+          repository_name TEXT NOT NULL,
+          full_name TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+          FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
+        );
+
+        CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
+
+        PRAGMA user_version = 5;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 4 to 5: ${error}`);
     }
   }
 
@@ -1638,6 +1813,223 @@ export class IdentityStore {
         LIMIT 1;
       `).get(githubInstallationRowId, userId);
       return (row as unknown as GitHubInstallationUserRecord) ?? null;
+    });
+  }
+
+  findGitHubInstallationByRowId(id: string): GitHubInstallationRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, github_installation_id, github_app_id, account_id, account_login, account_type, repository_selection, suspended_at_ms, created_at_ms, updated_at_ms
+        FROM github_installations
+        WHERE id = ?
+        LIMIT 1;
+      `).get(id);
+      return (row as unknown as GitHubInstallationRecord) ?? null;
+    });
+  }
+
+  findRepositoryBindingByWorkspaceId(workspaceId: string): GitHubRepositoryBindingRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        FROM github_repository_bindings
+        WHERE workspace_id = ?
+        LIMIT 1;
+      `).get(workspaceId);
+      return (row as unknown as GitHubRepositoryBindingRecord) ?? null;
+    });
+  }
+
+  findRepositoryBindingByGitHubRepoId(githubRepositoryId: string): GitHubRepositoryBindingRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        FROM github_repository_bindings
+        WHERE github_repository_id = ?
+        LIMIT 1;
+      `).get(githubRepositoryId);
+      return (row as unknown as GitHubRepositoryBindingRecord) ?? null;
+    });
+  }
+
+  findRepositoryBindingById(id: string): GitHubRepositoryBindingRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        FROM github_repository_bindings
+        WHERE id = ?
+        LIMIT 1;
+      `).get(id);
+      return (row as unknown as GitHubRepositoryBindingRecord) ?? null;
+    });
+  }
+
+  listRepositoryBindingsForInstallation(installationRowId: string): GitHubRepositoryBindingRecord[] {
+    return this.withDb((db) => {
+      return db.prepare(`
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        FROM github_repository_bindings
+        WHERE github_installation_row_id = ?
+        ORDER BY created_at_ms ASC, id ASC;
+      `).all(installationRowId) as unknown as GitHubRepositoryBindingRecord[];
+    });
+  }
+
+  countOwnedWorkspacesForUser(userId: string): number {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT COUNT(*) AS c FROM workspace_memberships WHERE user_id = ? AND role = 'owner';",
+      ).get(userId) as { c: number } | undefined;
+      return Number(row?.c ?? 0);
+    });
+  }
+
+  createWorkspaceWithRepositoryBinding(input: CreateWorkspaceWithRepositoryBindingInput): {
+    workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+    membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+    binding: GitHubRepositoryBindingRecord;
+  } {
+    const numericRegex = /^[1-9][0-9]*$/;
+    if (typeof input.githubRepositoryId !== "string" || !numericRegex.test(input.githubRepositoryId)) {
+      throw new IdentityStructureError(
+        `githubRepositoryId must be a positive decimal string, got '${input.githubRepositoryId}'.`,
+      );
+    }
+    if (typeof input.ownerAccountId !== "string" || !numericRegex.test(input.ownerAccountId)) {
+      throw new IdentityStructureError(
+        `ownerAccountId must be a positive decimal string, got '${input.ownerAccountId}'.`,
+      );
+    }
+    if (typeof input.ownerLogin !== "string" || input.ownerLogin.trim().length === 0) {
+      throw new IdentityStructureError("ownerLogin must be a non-empty string.");
+    }
+    if (typeof input.repositoryName !== "string" || input.repositoryName.trim().length === 0) {
+      throw new IdentityStructureError("repositoryName must be a non-empty string.");
+    }
+    if (typeof input.fullName !== "string" || input.fullName.trim().length === 0) {
+      throw new IdentityStructureError("fullName must be a non-empty string.");
+    }
+    if (typeof input.branch !== "string" || input.branch.trim().length === 0 || input.branch.includes("\0")) {
+      throw new IdentityStructureError("branch must be a non-empty string without NUL characters.");
+    }
+
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const userRow = db.prepare(
+          "SELECT id, disabled_at FROM users WHERE id = ? LIMIT 1;",
+        ).get(input.userId) as { id: string; disabled_at: number | null } | undefined;
+
+        if (!userRow) {
+          throw new IdentityStructureError(`User '${input.userId}' does not exist.`);
+        }
+        if (userRow.disabled_at != null) {
+          throw new IdentityConflictError(`User '${input.userId}' is disabled.`);
+        }
+
+        const instRow = db.prepare(
+          "SELECT id FROM github_installations WHERE id = ? LIMIT 1;",
+        ).get(input.installationRowId) as { id: string } | undefined;
+
+        if (!instRow) {
+          throw new IdentityStructureError(`GitHub installation row '${input.installationRowId}' does not exist.`);
+        }
+
+        const userLink = db.prepare(
+          "SELECT id FROM github_installation_users WHERE github_installation_row_id = ? AND user_id = ? LIMIT 1;",
+        ).get(input.installationRowId, input.userId) as { id: string } | undefined;
+
+        if (!userLink) {
+          throw new IdentityConflictError(
+            `User '${input.userId}' has no verified association with installation row '${input.installationRowId}'.`,
+          );
+        }
+
+        const existingBinding = db.prepare(
+          "SELECT id FROM github_repository_bindings WHERE github_repository_id = ? LIMIT 1;",
+        ).get(input.githubRepositoryId) as { id: string } | undefined;
+
+        if (existingBinding) {
+          throw new IdentityConflictError(
+            `GitHub repository '${input.githubRepositoryId}' is already bound to a workspace.`,
+          );
+        }
+
+        const nowMs = Date.now();
+        const workspaceId = newId("ws");
+        const membershipId = newId("wsm");
+        const bindingId = newId("grb");
+        const remoteUrl = `https://github.com/${input.fullName.trim()}.git`;
+
+        db.prepare(
+          "INSERT INTO workspaces (id, owner_user_id, remote_url, branch, created_at) VALUES (?, ?, ?, ?, ?);",
+        ).run(workspaceId, input.userId, remoteUrl, input.branch.trim(), nowMs);
+
+        db.prepare(
+          "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
+        ).run(membershipId, workspaceId, input.userId, nowMs);
+
+        db.prepare(`
+          INSERT INTO github_repository_bindings (
+            id, workspace_id, github_repository_id, github_installation_row_id,
+            owner_account_id, owner_login, repository_name, full_name,
+            branch, created_at_ms, updated_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        `).run(
+          bindingId,
+          workspaceId,
+          input.githubRepositoryId,
+          input.installationRowId,
+          input.ownerAccountId,
+          input.ownerLogin.trim(),
+          input.repositoryName.trim(),
+          input.fullName.trim(),
+          input.branch.trim(),
+          nowMs,
+          nowMs,
+        );
+
+        db.exec("COMMIT;");
+        return {
+          workspace: {
+            id: workspaceId,
+            owner_user_id: input.userId,
+            remote_url: remoteUrl,
+            branch: input.branch.trim(),
+            created_at: nowMs,
+          },
+          membership: {
+            id: membershipId,
+            workspace_id: workspaceId,
+            user_id: input.userId,
+            role: "owner",
+            created_at: nowMs,
+          },
+          binding: {
+            id: bindingId,
+            workspace_id: workspaceId,
+            github_repository_id: input.githubRepositoryId,
+            github_installation_row_id: input.installationRowId,
+            owner_account_id: input.ownerAccountId,
+            owner_login: input.ownerLogin.trim(),
+            repository_name: input.repositoryName.trim(),
+            full_name: input.fullName.trim(),
+            branch: input.branch.trim(),
+            created_at_ms: nowMs,
+            updated_at_ms: nowMs,
+          },
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to create workspace with repository binding: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     });
   }
 }
