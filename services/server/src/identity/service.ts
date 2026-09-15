@@ -129,8 +129,9 @@ export class IdentityService {
         );
       }
 
+      const expectedKey = activeKeys[0]!;
       // Owner has exactly 1 active key: rotate it atomically inside the store.
-      store.rotateUserKeyToDigest(scoped.user.id, envDigest);
+      store.rotateUserKeyToDigest(scoped.user.id, expectedKey.id, envDigest);
       return new IdentityService(store, { user_id: scoped.user.id, workspace_id: scoped.workspace.id });
     } catch (error) {
       store.close();

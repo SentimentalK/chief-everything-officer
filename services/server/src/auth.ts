@@ -48,12 +48,7 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
           });
           return;
         }
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal error" },
-          id: null,
-        });
-        return;
+        throw error;
       }
     } catch (error) {
       if (error instanceof IdentityDbUnavailable) {
@@ -65,9 +60,9 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
         });
         return;
       }
-      res.status(503).json({
+      res.status(500).json({
         jsonrpc: "2.0",
-        error: { code: -32050, message: "Identity service unavailable" },
+        error: { code: -32603, message: "Internal error" },
         id: null,
       });
       return;

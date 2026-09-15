@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   IdentityStore,
   IdentityStructureError,
+  IdentityDbUnavailable,
   sha256Hex,
   IDENTITY_DDL,
   IDENTITY_DB_USER_VERSION,
@@ -397,6 +398,83 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(resRevoked.status).toBe(401);
   });
 
+  it("I2. DB failure during workspace-authorization phase returns 503, while access denial returns 403 and unexpected errors return 500", async () => {
+    const ctx = await createMultiRowCtx();
+
+    const serviceA = IdentityService.open(
+      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
+      ctx.dbPath,
+    );
+    cleanupServices.push(serviceA);
+
+    const app = express();
+    app.use(express.json());
+    app.get("/test", createIdentityAuthMiddleware(serviceA), (_req, res) => {
+      res.status(200).json({ identity: res.locals.identity });
+    });
+
+    const server = await new Promise<HttpServer>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    cleanupServers.push(server);
+    const port = (server.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Verify key A succeeds normally
+    const normalRes = await fetch(`${baseUrl}/test`, {
+      headers: { Authorization: `Bearer ${ctx.keyA}` },
+    });
+    expect(normalRes.status).toBe(200);
+
+    // Verify key B is 403 (ordinary access denial)
+    const resB = await fetch(`${baseUrl}/test`, {
+      headers: { Authorization: `Bearer ${ctx.keyB}` },
+    });
+    expect(resB.status).toBe(403);
+
+    // Simulate DB failure during workspace-authorization phase:
+    // credential authentication succeeds (authenticateApiKey works), but isWorkspaceOwnedByUser throws IdentityDbUnavailable.
+    const origMethod = serviceA.store.isWorkspaceOwnedByUser.bind(serviceA.store);
+    serviceA.store.isWorkspaceOwnedByUser = () => {
+      throw new IdentityDbUnavailable("Simulated DB connection lost during workspace check");
+    };
+
+    try {
+      const dbFailRes = await fetch(`${baseUrl}/test`, {
+        headers: { Authorization: `Bearer ${ctx.keyA}` },
+      });
+      expect(dbFailRes.status).toBe(503);
+      const dbFailBody = await dbFailRes.json();
+      expect(dbFailBody).toEqual({
+        jsonrpc: "2.0",
+        error: { code: -32050, message: "Identity service unavailable" },
+        id: null,
+      });
+    } finally {
+      serviceA.store.isWorkspaceOwnedByUser = origMethod;
+    }
+
+    // Verify that unrelated unexpected programming errors return 500 (not mislabeled as 503)
+    serviceA.store.isWorkspaceOwnedByUser = () => {
+      throw new TypeError("Unrelated unexpected programming error");
+    };
+
+    try {
+      const unexpectedErrRes = await fetch(`${baseUrl}/test`, {
+        headers: { Authorization: `Bearer ${ctx.keyA}` },
+      });
+      expect(unexpectedErrRes.status).toBe(500);
+      const unexpectedErrBody = await unexpectedErrRes.json();
+      expect(unexpectedErrBody).toEqual({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal error" },
+        id: null,
+      });
+    } finally {
+      serviceA.store.isWorkspaceOwnedByUser = origMethod;
+    }
+  });
+
   it("J. Revalidation/session path does not infer a workspace with LIMIT 1 and preserves revoke semantics", async () => {
     const ctx = await createMultiRowCtx();
 
@@ -471,5 +549,72 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     const keysAfterFail = rawAfterFail.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
     rawAfterFail.close();
     expect(keysAfterFail).toEqual(keysBefore);
+  });
+
+  it("L. Key-substitution invariant: stale expected key id fails safely without rotating a newer/different active key or mutating unrelated credentials", async () => {
+    const ctx = await createMultiRowCtx();
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const rawBefore = new DatabaseSync(ctx.dbPath);
+    const aliceKeysBefore = rawBefore
+      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
+      .all(ctx.userA);
+    const bobKeysBefore = rawBefore
+      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
+      .all(ctx.userB);
+    rawBefore.close();
+
+    // 1. Calling rotateUserKeyToDigest with a stale/non-existent expectedActiveKeyId fails safely
+    expect(() =>
+      store.rotateUserKeyToDigest(ctx.userA, "ak_alice_stale", sha256Hex("new-key-1")),
+    ).toThrow(IdentityStructureError);
+
+    // Verify no mutation occurred for either user
+    const rawMid = new DatabaseSync(ctx.dbPath);
+    expect(
+      rawMid.prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;").all(ctx.userA),
+    ).toEqual(aliceKeysBefore);
+    expect(
+      rawMid.prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;").all(ctx.userB),
+    ).toEqual(bobKeysBefore);
+    rawMid.close();
+
+    // 2. Calling rotateUserKeyToDigest with Bob's key ID for Alice fails safely
+    expect(() =>
+      store.rotateUserKeyToDigest(ctx.userA, "ak_bob_1", sha256Hex("new-key-2")),
+    ).toThrow(IdentityStructureError);
+
+    // 3. Simulate TOCTOU: suppose Alice's key was successfully rotated from ak_alice_1 to a new key.
+    // A concurrent / stale caller still presenting ak_alice_1 must fail and cannot rotate the new active key.
+    store.rotateUserKeyToDigest(ctx.userA, "ak_alice_1", sha256Hex("alice-key-v2"));
+
+    const rawAfterFirst = new DatabaseSync(ctx.dbPath);
+    const aliceKeysAfterFirst = rawAfterFirst
+      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
+      .all(ctx.userA) as Array<{ id: string; user_id: string; key_digest: string; revoked_at: number | null }>;
+    rawAfterFirst.close();
+
+    const activeKeyAfterFirst = aliceKeysAfterFirst.find((k) => k.revoked_at === null)!;
+    expect(activeKeyAfterFirst.key_digest).toBe(sha256Hex("alice-key-v2"));
+    expect(activeKeyAfterFirst.id).not.toBe("ak_alice_1");
+
+    // Stale rotation attempt using the now-revoked ak_alice_1
+    expect(() =>
+      store.rotateUserKeyToDigest(ctx.userA, "ak_alice_1", sha256Hex("alice-key-v3")),
+    ).toThrow(IdentityStructureError);
+
+    // Verify the newer active key was NOT rotated and Bob's keys remain untouched
+    const rawFinal = new DatabaseSync(ctx.dbPath);
+    const aliceKeysFinal = rawFinal
+      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
+      .all(ctx.userA);
+    const bobKeysFinal = rawFinal
+      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
+      .all(ctx.userB);
+    rawFinal.close();
+
+    expect(aliceKeysFinal).toEqual(aliceKeysAfterFirst);
+    expect(bobKeysFinal).toEqual(bobKeysBefore);
   });
 });

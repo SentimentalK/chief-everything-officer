@@ -666,11 +666,11 @@ export class IdentityStore {
   /**
    * Scoped startup key rotation in a single transaction:
    * verifies the target user is enabled, validates the new digest is not revoked or bound to another user,
-   * checks that the target user has exactly one active key to rotate,
-   * then revokes that one key and inserts a new active key for the SAME user.
+   * checks that the target user has exactly one active key matching expectedActiveKeyId,
+   * then revokes that one expected key and inserts a new active key for the SAME user.
    * All reads and writes occur inside BEGIN IMMEDIATE...COMMIT.
    */
-  rotateUserKeyToDigest(userId: string, newDigest: string): void {
+  rotateUserKeyToDigest(userId: string, expectedActiveKeyId: string, newDigest: string): void {
     this.withDb((db) => {
       db.exec("BEGIN IMMEDIATE;");
       try {
@@ -679,26 +679,6 @@ export class IdentityStore {
           | undefined;
         if (!userRow) {
           throw new IdentityStructureError(`Identity user '${userId}' is disabled or does not exist; cannot rotate its key.`);
-        }
-
-        const existingKey = db.prepare(
-          "SELECT id, user_id, revoked_at FROM api_keys WHERE key_digest = ?;",
-        ).get(newDigest) as { id: string; user_id: string; revoked_at: number | null } | undefined;
-
-        if (existingKey) {
-          if (existingKey.revoked_at != null) {
-            throw new IdentityStructureError(
-              "The configured MCP_API_KEY matches a previously revoked key. A replaced key is created fresh; revoked credentials are not revived.",
-            );
-          }
-          if (existingKey.user_id !== userId) {
-            throw new IdentityStructureError(
-              `The configured MCP_API_KEY is already bound to another user ('${existingKey.user_id}'). Cannot rebind credentials across users.`,
-            );
-          }
-          // Already active for this user: nothing to mutate.
-          db.exec("COMMIT;");
-          return;
         }
 
         const activeRows = db
@@ -717,6 +697,37 @@ export class IdentityStore {
         }
 
         const current = activeRows[0]!;
+        if (current.id !== expectedActiveKeyId || current.user_id !== userId) {
+          throw new IdentityStructureError(
+            `Expected active key '${expectedActiveKeyId}' for user '${userId}', but found '${current.id}'. Cannot rotate key.`,
+          );
+        }
+
+        const existingKey = db.prepare(
+          "SELECT id, user_id, revoked_at FROM api_keys WHERE key_digest = ?;",
+        ).get(newDigest) as { id: string; user_id: string; revoked_at: number | null } | undefined;
+
+        if (existingKey) {
+          if (existingKey.revoked_at != null) {
+            throw new IdentityStructureError(
+              "The configured MCP_API_KEY matches a previously revoked key. A replaced key is created fresh; revoked credentials are not revived.",
+            );
+          }
+          if (existingKey.user_id !== userId) {
+            throw new IdentityStructureError(
+              `The configured MCP_API_KEY is already bound to another user ('${existingKey.user_id}'). Cannot rebind credentials across users.`,
+            );
+          }
+          if (existingKey.id !== expectedActiveKeyId) {
+            throw new IdentityStructureError(
+              `The configured MCP_API_KEY is already active for key '${existingKey.id}', but expected '${expectedActiveKeyId}'.`,
+            );
+          }
+          // Already active for this user under the expected key id: nothing to mutate.
+          db.exec("COMMIT;");
+          return;
+        }
+
         const nowMs = Date.now();
         const updateResult = db.prepare(
           "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL;",
