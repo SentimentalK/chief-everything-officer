@@ -1,5 +1,10 @@
 import crypto from "node:crypto";
-import type { IdentityStore, UserGitHubInstallationItem } from "../identity/store.js";
+import type {
+  GitHubAccountType,
+  GitHubRepositorySelection,
+  IdentityStore,
+  UserGitHubInstallationItem,
+} from "../identity/store.js";
 import type { GitHubAppClient } from "./app-client.js";
 
 export interface GitHubInstallationServiceOptions {
@@ -142,8 +147,8 @@ export class GitHubInstallationService {
       throw new GitHubInstallationError("Install state does not match active session user", 403);
     }
 
-    if (!input.installationId || typeof input.installationId !== "string" || !/^\d+$/.test(input.installationId)) {
-      throw new GitHubInstallationError("Invalid candidate installation_id", 400);
+    if (!input.installationId || typeof input.installationId !== "string" || !/^[1-9][0-9]*$/.test(input.installationId)) {
+      throw new GitHubInstallationError("Invalid candidate installation_id: must be a positive decimal string", 400);
     }
 
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
@@ -172,17 +177,24 @@ export class GitHubInstallationService {
   }
 
   /**
-   * Step 3: Consumes OAuth state, exchanges code, fetches user profile,
+   * Step 3: Revalidates live CEO session against pending state,
+   * consumes OAuth state, exchanges code, fetches user profile,
    * verifies String(github user id) == existing CEO session providerSubject,
-   * then fetches /user/installations and requires candidate installation to be present.
-   * Only then atomically upserts installation metadata + user link in DB.
-   * Discards GitHub user access token afterward.
+   * then fetches /user/installations with pagination and requires candidate installation to be present.
+   * Validates installation payload semantics strictly, then atomically upserts
+   * installation metadata + user link in DB. Discards GitHub user access token afterward.
    */
   async handleOAuthCallback(input: {
     state: string;
     code: string;
+    currentUserId: string;
+    currentProviderSubject: string;
   }): Promise<{ installationId: string; accountLogin: string }> {
     this.cleanupStates();
+
+    if (!input.currentUserId || !input.currentProviderSubject) {
+      throw new GitHubIdentityMismatchError("Active CEO session required");
+    }
 
     const pending = this.pendingOAuthStates.get(input.state);
     if (!pending) {
@@ -193,6 +205,21 @@ export class GitHubInstallationService {
 
     if (Date.now() > pending.expiresAt) {
       throw new GitHubInstallationError("OAuth state has expired", 400);
+    }
+
+    // Require current session userId/providerSubject to match pending OAuth state
+    if (
+      pending.userId !== input.currentUserId ||
+      pending.providerSubject !== input.currentProviderSubject
+    ) {
+      throw new GitHubIdentityMismatchError(
+        "OAuth state user mismatch: active session does not match state owner",
+      );
+    }
+
+    // Require current session user to be active in identity store
+    if (!this.store.isUserActive(input.currentUserId)) {
+      throw new GitHubInstallationError("User is disabled or does not exist", 401);
     }
 
     // 1. Exchange code for user access token
@@ -250,42 +277,60 @@ export class GitHubInstallationService {
         );
       }
 
-      // 3. Fetch user installations from GitHub
-      const instRes = await this.fetchFn("https://api.github.com/user/installations", {
-        headers: {
-          Authorization: `Bearer ${userAccessToken}`,
-          Accept: "application/vnd.github.v3+json",
-          "User-Agent": "CEO-Server",
-        },
-      });
+      // 3. Fetch user installations from GitHub with bounded pagination
+      const perPage = 100;
+      const maxPages = 100; // Bounded pagination safety limit (up to 10,000 installations)
+      let page = 1;
+      let targetInst: any = null;
 
-      if (!instRes.ok) {
-        throw new GitHubInstallationError(
-          `GitHub user installations fetch failed with HTTP ${instRes.status}`,
-          instRes.status,
+      while (page <= maxPages) {
+        const instRes = await this.fetchFn(
+          `https://api.github.com/user/installations?per_page=${perPage}&page=${page}`,
+          {
+            headers: {
+              Authorization: `Bearer ${userAccessToken}`,
+              Accept: "application/vnd.github.v3+json",
+              "User-Agent": "CEO-Server",
+            },
+          },
         );
+
+        if (!instRes.ok) {
+          throw new GitHubInstallationError(
+            `GitHub user installations fetch failed with HTTP ${instRes.status}`,
+            instRes.status,
+          );
+        }
+
+        const instData = (await instRes.json()) as {
+          total_count?: number;
+          installations?: Array<any>;
+        };
+
+        const installations = Array.isArray(instData.installations)
+          ? instData.installations
+          : [];
+        targetInst = installations.find(
+          (inst) => String(inst?.id) === pending.candidateInstallationId,
+        );
+
+        if (targetInst) {
+          break;
+        }
+
+        if (installations.length === 0 || installations.length < perPage) {
+          break;
+        }
+
+        if (
+          typeof instData.total_count === "number" &&
+          page * perPage >= instData.total_count
+        ) {
+          break;
+        }
+
+        page++;
       }
-
-      const instData = (await instRes.json()) as {
-        total_count?: number;
-        installations?: Array<{
-          id: number;
-          app_id: number;
-          target_id: number;
-          account: {
-            id: number;
-            login: string;
-            type: string;
-          };
-          repository_selection: string;
-          suspended_at: string | null;
-        }>;
-      };
-
-      const installations = instData.installations ?? [];
-      const targetInst = installations.find(
-        (inst) => String(inst.id) === pending.candidateInstallationId,
-      );
 
       if (!targetInst) {
         // Spoofed or inaccessible installation: reject with zero DB writes!
@@ -294,20 +339,76 @@ export class GitHubInstallationService {
         );
       }
 
-      // 4. Atomically upsert installation metadata + user link
-      const accountType =
-        targetInst.account.type === "Organization" ? "Organization" : "User";
-      const repositorySelection =
-        targetInst.repository_selection === "selected" ? "selected" : "all";
-      const suspendedAtMs = targetInst.suspended_at
-        ? new Date(targetInst.suspended_at).getTime()
-        : null;
+      // 4. Validate GitHub installation payload semantics before DB write
+      if (
+        typeof targetInst.id !== "number" ||
+        !Number.isSafeInteger(targetInst.id) ||
+        targetInst.id <= 0
+      ) {
+        throw new GitHubInstallationError("Invalid GitHub installation id: must be a positive safe integer", 400);
+      }
 
+      if (
+        typeof targetInst.app_id !== "number" ||
+        !Number.isSafeInteger(targetInst.app_id) ||
+        targetInst.app_id <= 0
+      ) {
+        throw new GitHubInstallationError("Invalid GitHub installation app_id: must be a positive safe integer", 400);
+      }
+
+      if (!targetInst.account || typeof targetInst.account !== "object") {
+        throw new GitHubInstallationError("Invalid GitHub installation account payload", 400);
+      }
+
+      if (
+        typeof targetInst.account.id !== "number" ||
+        !Number.isSafeInteger(targetInst.account.id) ||
+        targetInst.account.id <= 0
+      ) {
+        throw new GitHubInstallationError("Invalid GitHub installation account id: must be a positive safe integer", 400);
+      }
+
+      if (
+        typeof targetInst.account.login !== "string" ||
+        targetInst.account.login.trim().length === 0
+      ) {
+        throw new GitHubInstallationError("Invalid GitHub installation account login: must be non-empty", 400);
+      }
+
+      if (targetInst.account.type !== "User" && targetInst.account.type !== "Organization") {
+        throw new GitHubInstallationError(
+          `Invalid GitHub installation account type '${targetInst.account.type}': must be 'User' or 'Organization'`,
+          400,
+        );
+      }
+      const accountType: GitHubAccountType = targetInst.account.type;
+
+      if (targetInst.repository_selection !== "all" && targetInst.repository_selection !== "selected") {
+        throw new GitHubInstallationError(
+          `Invalid GitHub installation repository_selection '${targetInst.repository_selection}': must be 'all' or 'selected'`,
+          400,
+        );
+      }
+      const repositorySelection: GitHubRepositorySelection = targetInst.repository_selection;
+
+      let suspendedAtMs: number | null = null;
+      if (targetInst.suspended_at !== null && targetInst.suspended_at !== undefined) {
+        if (typeof targetInst.suspended_at !== "string") {
+          throw new GitHubInstallationError("Invalid GitHub installation suspended_at: must be an ISO string", 400);
+        }
+        const parsed = new Date(targetInst.suspended_at).getTime();
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new GitHubInstallationError("Invalid GitHub installation suspended_at: must parse to a finite positive timestamp", 400);
+        }
+        suspendedAtMs = parsed;
+      }
+
+      // 5. Atomically upsert installation metadata + user link
       this.store.upsertGitHubInstallationWithUser({
         githubInstallationId: String(targetInst.id),
         githubAppId: String(targetInst.app_id),
         accountId: String(targetInst.account.id),
-        accountLogin: targetInst.account.login,
+        accountLogin: targetInst.account.login.trim(),
         accountType,
         repositorySelection,
         suspendedAtMs,
@@ -316,7 +417,7 @@ export class GitHubInstallationService {
 
       return {
         installationId: String(targetInst.id),
-        accountLogin: targetInst.account.login,
+        accountLogin: targetInst.account.login.trim(),
       };
     } finally {
       // User access token discarded immediately. Never persisted or logged.

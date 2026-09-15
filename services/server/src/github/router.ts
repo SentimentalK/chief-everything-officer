@@ -93,6 +93,25 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
 
   // GET /auth/github-app/callback
   router.get("/callback", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      if (req.headers.accept?.includes("application/json")) {
+        res.status(401).json({ error: "unauthenticated" });
+        return;
+      }
+      res.redirect(302, "/login?error=unauthenticated");
+      return;
+    }
+
+    if (session.provider !== "github" || !session.providerSubject) {
+      if (req.headers.accept?.includes("application/json")) {
+        res.status(403).json({ error: "github_identity_required" });
+        return;
+      }
+      res.redirect(302, "/login?error=github_identity_required");
+      return;
+    }
+
     if (req.query.error) {
       const errorMsg = String(req.query.error_description || req.query.error);
       if (req.headers.accept?.includes("application/json")) {
@@ -116,7 +135,12 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
     }
 
     try {
-      await installationService.handleOAuthCallback({ state, code });
+      await installationService.handleOAuthCallback({
+        state,
+        code,
+        currentUserId: session.userId,
+        currentProviderSubject: session.providerSubject,
+      });
       if (req.headers.accept?.includes("application/json")) {
         res.status(200).json({ success: true });
         return;

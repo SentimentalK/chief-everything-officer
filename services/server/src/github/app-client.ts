@@ -115,11 +115,22 @@ export class GitHubAppClient {
     }
 
     const data = (await res.json()) as { token?: string; expires_at?: string };
-    if (!data.token || !data.expires_at) {
-      throw new GitHubAppError("Invalid installation token response from GitHub");
+    if (
+      !data ||
+      typeof data.token !== "string" ||
+      data.token.trim().length === 0 ||
+      typeof data.expires_at !== "string"
+    ) {
+      throw new GitHubAppError("Invalid installation token response from GitHub: missing or empty token/expires_at");
     }
 
     const expiresAtMs = new Date(data.expires_at).getTime();
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+      throw new GitHubAppError(
+        "Invalid installation token response from GitHub: expires_at must be a finite future timestamp",
+      );
+    }
+
     this.tokenCache.set(githubInstallationId, {
       token: data.token,
       expiresAtMs,

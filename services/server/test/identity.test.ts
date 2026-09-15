@@ -1489,5 +1489,92 @@ describe("v4 github_installations control-plane schema & migration", () => {
       }),
     ).toThrow(IdentityConflictError);
   });
+
+  it("I. positive decimal string and positive suspended_at_ms validation (write and open-time)", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    // Rejects zero, signs, leading zero, decimals, empty as IDs at write-time
+    for (const badId of ["0", "-1", "+1", "0123", "", "1.5"]) {
+      expect(() =>
+        store.upsertGitHubInstallationWithUser({
+          githubInstallationId: badId,
+          githubAppId: "100",
+          accountId: "200",
+          accountLogin: "org",
+          accountType: "Organization",
+          repositorySelection: "all",
+          userId: ident.user_id,
+        }),
+      ).toThrow(IdentityStructureError);
+
+      expect(() =>
+        store.upsertGitHubInstallationWithUser({
+          githubInstallationId: "100",
+          githubAppId: badId,
+          accountId: "200",
+          accountLogin: "org",
+          accountType: "Organization",
+          repositorySelection: "all",
+          userId: ident.user_id,
+        }),
+      ).toThrow(IdentityStructureError);
+
+      expect(() =>
+        store.upsertGitHubInstallationWithUser({
+          githubInstallationId: "100",
+          githubAppId: "100",
+          accountId: badId,
+          accountLogin: "org",
+          accountType: "Organization",
+          repositorySelection: "all",
+          userId: ident.user_id,
+        }),
+      ).toThrow(IdentityStructureError);
+    }
+
+    // Rejects zero suspendedAtMs at write-time (must be > 0)
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "Organization",
+        repositorySelection: "all",
+        suspendedAtMs: 0,
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    store.close();
+
+    // Open-time integrity checks:
+    const testOpenViolation = (column: string, badValue: any) => {
+      const raw = new DatabaseSync(ctx.dbPath);
+      raw.prepare("DELETE FROM github_installations;").run();
+      raw.prepare(`
+        INSERT INTO github_installations (
+          id, github_installation_id, github_app_id, account_id,
+          account_login, account_type, repository_selection,
+          suspended_at_ms, created_at_ms, updated_at_ms
+        ) VALUES ('ghi_test', '100', '100', '200', 'org', 'Organization', 'all', NULL, 1000, 1000);
+      `).run();
+      raw.prepare(`UPDATE github_installations SET ${column} = ? WHERE id = 'ghi_test';`).run(badValue);
+      raw.close();
+
+      expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
+    };
+
+    testOpenViolation("github_installation_id", "0");
+    testOpenViolation("github_installation_id", "0123");
+    testOpenViolation("github_app_id", "0");
+    testOpenViolation("github_app_id", "+100");
+    testOpenViolation("account_id", "0");
+    testOpenViolation("account_id", "-200");
+    testOpenViolation("suspended_at_ms", 0);
+    testOpenViolation("suspended_at_ms", -1);
+  });
 });
 

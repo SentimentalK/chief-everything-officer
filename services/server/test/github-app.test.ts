@@ -18,6 +18,7 @@ import {
 } from "../src/github/app-client.js";
 import {
   GitHubInstallationService,
+  GitHubInstallationError,
   GitHubIdentityMismatchError,
   GitHubInstallationNotFoundError,
 } from "../src/github/installation-service.js";
@@ -191,6 +192,45 @@ describe("Installation Token Minting & Skew Cache", () => {
       });
 
       await expect(client.getInstallationToken("12345")).rejects.toThrow(GitHubAppError);
+      expect(client.getCachedToken("12345")).toBeUndefined();
+    }
+  });
+
+  it("rejects malformed token or expiry responses and does not populate cache", async () => {
+    const { privateKey } = generateTestRsaKeyPair();
+    const now = Date.now();
+    const futureDate = new Date(now + 3600 * 1000).toISOString();
+    const pastDate = new Date(now - 1000).toISOString();
+    const nowDate = new Date(now).toISOString();
+
+    const badPayloads = [
+      { token: "", expires_at: futureDate },
+      { token: "   ", expires_at: futureDate },
+      { expires_at: futureDate },
+      { token: null, expires_at: futureDate },
+      { token: "ghs_valid", expires_at: "not-a-valid-date" },
+      { token: "ghs_valid", expires_at: pastDate },
+      { token: "ghs_valid", expires_at: nowDate },
+      { token: "ghs_valid" },
+      { token: "ghs_valid", expires_at: null },
+      {},
+    ];
+
+    for (const payload of badPayloads) {
+      const mockFetch = async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => payload,
+        } as any);
+
+      const client = new GitHubAppClient({
+        clientId: "Iv1.test_client",
+        privateKey,
+        fetchFn: mockFetch,
+      });
+
+      await expect(client.getInstallationToken("12345", now)).rejects.toThrow(GitHubAppError);
       expect(client.getCachedToken("12345")).toBeUndefined();
     }
   });
@@ -395,6 +435,8 @@ describe("GitHub App Authorization Flow & Verification", () => {
       installationService.handleOAuthCallback({
         state: oauthState,
         code: "valid_code",
+        currentUserId: user.user_id,
+        currentProviderSubject: "11111",
       }),
     ).rejects.toThrow(GitHubInstallationNotFoundError);
 
@@ -465,6 +507,8 @@ describe("GitHub App Authorization Flow & Verification", () => {
       installationService.handleOAuthCallback({
         state: oauthState,
         code: "valid_code",
+        currentUserId: user.user_id,
+        currentProviderSubject: "11111",
       }),
     ).rejects.toThrow(GitHubIdentityMismatchError);
 
@@ -553,6 +597,8 @@ describe("GitHub App Authorization Flow & Verification", () => {
     const result = await installationService.handleOAuthCallback({
       state: oauthState,
       code: "code_123",
+      currentUserId: user.user_id,
+      currentProviderSubject: "11111",
     });
 
     expect(result.installationId).toBe("555");
@@ -750,5 +796,852 @@ describe("GitHub App Authorization Flow & Verification", () => {
     );
     expect(redirectUrl).toContain("https://github.com/login/oauth/authorize");
     expect(redirectUrl).toContain("client_id=login_client_id");
+  });
+
+  it("rejects /auth/github-app/callback when session is missing, expired, or logged-out with ZERO DB writes", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    let networkCallMade = false;
+    const mockFetch = async () => {
+      networkCallMade = true;
+      return { ok: true, status: 200, json: async () => ({}) } as any;
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const router = createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: ctx.sessionManager,
+      store: ctx.store,
+    });
+
+    const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+    const installState = new URL(installUrl).searchParams.get("state")!;
+    const setupUrl = installationService.startSetupOAuth({
+      state: installState,
+      installationId: "123",
+      userId: user.user_id,
+    });
+    const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+    // 1. JSON request without session cookie -> 401
+    const reqJson = {
+      method: "GET",
+      url: `/callback?state=${oauthState}&code=test_code`,
+      headers: { accept: "application/json" },
+      query: { state: oauthState, code: "test_code" },
+    } as any;
+    let statusCode = 0;
+    let jsonBody: any = null;
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return {
+            json: (b: any) => {
+              jsonBody = b;
+              resolve();
+            },
+          };
+        },
+        redirect: () => resolve(),
+      } as any;
+      router(reqJson, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(401);
+    expect(jsonBody).toEqual({ error: "unauthenticated" });
+    expect(networkCallMade).toBe(false);
+
+    // 2. HTML request without session cookie -> 302 /login?error=unauthenticated
+    const reqHtml = {
+      method: "GET",
+      url: `/callback?state=${oauthState}&code=test_code`,
+      headers: { accept: "text/html" },
+      query: { state: oauthState, code: "test_code" },
+    } as any;
+    let redirectLocation = "";
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return { json: () => resolve() };
+        },
+        redirect: (s: number, loc: string) => {
+          statusCode = s;
+          redirectLocation = loc;
+          resolve();
+        },
+      } as any;
+      router(reqHtml, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(302);
+    expect(redirectLocation).toBe("/login?error=unauthenticated");
+
+    // Zero DB writes
+    expect(ctx.store.listGitHubInstallationsForUser(user.user_id).length).toBe(0);
+  });
+
+  it("rejects /auth/github-app/callback when user is disabled with ZERO DB writes", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    let networkCallMade = false;
+    const mockFetch = async () => {
+      networkCallMade = true;
+      return { ok: true, status: 200, json: async () => ({}) } as any;
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const router = createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: ctx.sessionManager,
+      store: ctx.store,
+    });
+
+    const session = ctx.sessionManager.createSession({
+      userId: user.user_id,
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    // Disable the user in DB
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("UPDATE users SET disabled_at = ? WHERE id = ?;").run(Date.now(), user.user_id);
+    raw.close();
+
+    const req = {
+      method: "GET",
+      url: "/callback?state=dummy_state&code=test_code",
+      headers: {
+        cookie: `ceo_user_session=${encodeURIComponent(session.sessionId)}`,
+        accept: "application/json",
+      },
+      query: { state: "dummy_state", code: "test_code" },
+    } as any;
+
+    let statusCode = 0;
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return { json: () => resolve() };
+        },
+        redirect: () => resolve(),
+      } as any;
+      router(req, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(401);
+    expect(networkCallMade).toBe(false);
+  });
+
+  it("rejects /auth/github-app/callback when active session user differs from state owner with ZERO DB writes", async () => {
+    const ctx = await createTestContext();
+    const userA = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+    const userB = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "22222",
+      providerLogin: "bob",
+    });
+
+    let networkCallMade = false;
+    const mockFetch = async () => {
+      networkCallMade = true;
+      return { ok: true, status: 200, json: async () => ({}) } as any;
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const router = createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: ctx.sessionManager,
+      store: ctx.store,
+    });
+
+    // Alice starts install & setup flow
+    const installUrl = installationService.createInstallRedirect(userA.user_id, "11111");
+    const installState = new URL(installUrl).searchParams.get("state")!;
+    const setupUrl = installationService.startSetupOAuth({
+      state: installState,
+      installationId: "123",
+      userId: userA.user_id,
+    });
+    const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+    // Bob tries to complete callback using Alice's OAuth state
+    const bobSession = ctx.sessionManager.createSession({
+      userId: userB.user_id,
+      provider: "github",
+      providerSubject: "22222",
+      providerLogin: "bob",
+    });
+
+    const req = {
+      method: "GET",
+      url: `/callback?state=${oauthState}&code=test_code`,
+      headers: {
+        cookie: `ceo_user_session=${encodeURIComponent(bobSession.sessionId)}`,
+        accept: "application/json",
+      },
+      query: { state: oauthState, code: "test_code" },
+    } as any;
+
+    let statusCode = 0;
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return { json: () => resolve() };
+        },
+        redirect: () => resolve(),
+      } as any;
+      router(req, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(403);
+    expect(networkCallMade).toBe(false);
+    expect(ctx.store.listGitHubInstallationsForUser(userA.user_id).length).toBe(0);
+    expect(ctx.store.listGitHubInstallationsForUser(userB.user_id).length).toBe(0);
+  });
+
+  it("rejects /auth/github-app/callback when session provider is not GitHub", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+    });
+
+    const router = createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: ctx.sessionManager,
+      store: ctx.store,
+    });
+
+    // Session with non-github provider
+    const nonGithubSession = ctx.sessionManager.createSession({
+      userId: user.user_id,
+      provider: "google" as any,
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const req = {
+      method: "GET",
+      url: "/callback?state=dummy_state&code=test_code",
+      headers: {
+        cookie: `ceo_user_session=${encodeURIComponent(nonGithubSession.sessionId)}`,
+        accept: "application/json",
+      },
+      query: { state: "dummy_state", code: "test_code" },
+    } as any;
+
+    let statusCode = 0;
+    let jsonBody: any = null;
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return {
+            json: (b: any) => {
+              jsonBody = b;
+              resolve();
+            },
+          };
+        },
+        redirect: () => resolve(),
+      } as any;
+      router(req, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(403);
+    expect(jsonBody).toEqual({ error: "github_identity_required" });
+  });
+
+  it("successfully completes /auth/github-app/callback with matching live GitHub session and links installation", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const mockFetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/login/oauth/access_token")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: "user_token_123" }),
+        } as any;
+      }
+      if (url.includes("/user/installations")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            total_count: 1,
+            installations: [
+              {
+                id: 12345,
+                app_id: 99,
+                target_id: 11111,
+                account: {
+                  id: 11111,
+                  login: "alice",
+                  type: "User",
+                },
+                repository_selection: "all",
+                suspended_at: null,
+              },
+            ],
+          }),
+        } as any;
+      }
+      if (url.includes("/user")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 11111, login: "alice" }),
+        } as any;
+      }
+      throw new Error(`Unexpected url: ${url}`);
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const router = createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: ctx.sessionManager,
+      store: ctx.store,
+    });
+
+    const session = ctx.sessionManager.createSession({
+      userId: user.user_id,
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+    const installState = new URL(installUrl).searchParams.get("state")!;
+    const setupUrl = installationService.startSetupOAuth({
+      state: installState,
+      installationId: "12345",
+      userId: user.user_id,
+    });
+    const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+    const req = {
+      method: "GET",
+      url: `/callback?state=${oauthState}&code=valid_code`,
+      headers: {
+        cookie: `ceo_user_session=${encodeURIComponent(session.sessionId)}`,
+        accept: "application/json",
+      },
+      query: { state: oauthState, code: "valid_code" },
+    } as any;
+
+    let statusCode = 0;
+    let jsonBody: any = null;
+    await new Promise<void>((resolve) => {
+      const res = {
+        status: (c: number) => {
+          statusCode = c;
+          return {
+            json: (b: any) => {
+              jsonBody = b;
+              resolve();
+            },
+          };
+        },
+        redirect: () => resolve(),
+      } as any;
+      router(req, res, () => resolve());
+    });
+
+    expect(statusCode).toBe(200);
+    expect(jsonBody).toEqual({ success: true });
+
+    const installations = ctx.store.listGitHubInstallationsForUser(user.user_id);
+    expect(installations.length).toBe(1);
+    expect(installations[0].github_installation_id).toBe("12345");
+  });
+
+  it("verifies candidate installation located beyond page 1 (>100 installations pagination)", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const requestedPages: number[] = [];
+    const mockFetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/login/oauth/access_token")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: "token_page_test" }),
+        } as any;
+      }
+      if (url.includes("/user/installations")) {
+        const parsedUrl = new URL(url);
+        const page = Number(parsedUrl.searchParams.get("page") || "1");
+        requestedPages.push(page);
+
+        if (page === 1) {
+          // Page 1 has 100 installations (ids 1001..1100), candidate 99999 is NOT here
+          const page1Insts = Array.from({ length: 100 }, (_, i) => ({
+            id: 1001 + i,
+            app_id: 99,
+            account: { id: 11111, login: "alice", type: "User" },
+            repository_selection: "all",
+            suspended_at: null,
+          }));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ total_count: 105, installations: page1Insts }),
+          } as any;
+        } else if (page === 2) {
+          // Page 2 has 5 installations, including candidate 99999
+          const page2Insts = [
+            {
+              id: 99999,
+              app_id: 99,
+              account: { id: 11111, login: "alice", type: "User" },
+              repository_selection: "selected",
+              suspended_at: null,
+            },
+            ...Array.from({ length: 4 }, (_, i) => ({
+              id: 2001 + i,
+              app_id: 99,
+              account: { id: 11111, login: "alice", type: "User" },
+              repository_selection: "all",
+              suspended_at: null,
+            })),
+          ];
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ total_count: 105, installations: page2Insts }),
+          } as any;
+        }
+      }
+      if (url.includes("/user")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 11111, login: "alice" }),
+        } as any;
+      }
+      throw new Error(`Unexpected url: ${url}`);
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+    const installState = new URL(installUrl).searchParams.get("state")!;
+    const setupUrl = installationService.startSetupOAuth({
+      state: installState,
+      installationId: "99999",
+      userId: user.user_id,
+    });
+    const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+    const result = await installationService.handleOAuthCallback({
+      state: oauthState,
+      code: "code_page_test",
+      currentUserId: user.user_id,
+      currentProviderSubject: "11111",
+    });
+
+    expect(result.installationId).toBe("99999");
+    expect(requestedPages).toEqual([1, 2]);
+
+    const inst = ctx.store.findGitHubInstallationById("99999");
+    expect(inst).not.toBeNull();
+    expect(inst?.repository_selection).toBe("selected");
+  });
+
+  it("rejects candidate installation absent across all pages with ZERO DB writes", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const requestedPages: number[] = [];
+    const mockFetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/login/oauth/access_token")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: "token_absent_test" }),
+        } as any;
+      }
+      if (url.includes("/user/installations")) {
+        const parsedUrl = new URL(url);
+        const page = Number(parsedUrl.searchParams.get("page") || "1");
+        requestedPages.push(page);
+
+        if (page === 1) {
+          const page1Insts = Array.from({ length: 100 }, (_, i) => ({
+            id: 1001 + i,
+            app_id: 99,
+            account: { id: 11111, login: "alice", type: "User" },
+            repository_selection: "all",
+            suspended_at: null,
+          }));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ total_count: 105, installations: page1Insts }),
+          } as any;
+        } else if (page === 2) {
+          const page2Insts = Array.from({ length: 5 }, (_, i) => ({
+            id: 2001 + i,
+            app_id: 99,
+            account: { id: 11111, login: "alice", type: "User" },
+            repository_selection: "all",
+            suspended_at: null,
+          }));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ total_count: 105, installations: page2Insts }),
+          } as any;
+        }
+      }
+      if (url.includes("/user")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 11111, login: "alice" }),
+        } as any;
+      }
+      throw new Error(`Unexpected url: ${url}`);
+    };
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+      fetchFn: mockFetch,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+      fetchFn: mockFetch,
+    });
+
+    const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+    const installState = new URL(installUrl).searchParams.get("state")!;
+    const setupUrl = installationService.startSetupOAuth({
+      state: installState,
+      installationId: "88888", // Not in page 1 or page 2
+      userId: user.user_id,
+    });
+    const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+    await expect(
+      installationService.handleOAuthCallback({
+        state: oauthState,
+        code: "code_absent_test",
+        currentUserId: user.user_id,
+        currentProviderSubject: "11111",
+      }),
+    ).rejects.toThrow(GitHubInstallationNotFoundError);
+
+    expect(requestedPages).toEqual([1, 2]);
+
+    // Zero DB writes
+    const raw = new DatabaseSync(ctx.dbPath);
+    const count = raw.prepare("SELECT COUNT(*) as c FROM github_installations;").get() as { c: number };
+    raw.close();
+    expect(Number(count.c)).toBe(0);
+  });
+
+  it("fails closed on malformed installation payload semantics with ZERO DB writes", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const malformedPayloads = [
+      // invalid account.type
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 11111, login: "alice", type: "Bot" },
+        repository_selection: "all",
+        suspended_at: null,
+      },
+      // invalid repository_selection
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 11111, login: "alice", type: "User" },
+        repository_selection: "none",
+        suspended_at: null,
+      },
+      // non-number installation id
+      {
+        id: "555" as any,
+        app_id: 99,
+        account: { id: 11111, login: "alice", type: "User" },
+        repository_selection: "all",
+        suspended_at: null,
+      },
+      // negative app_id
+      {
+        id: 555,
+        app_id: -1,
+        account: { id: 11111, login: "alice", type: "User" },
+        repository_selection: "all",
+        suspended_at: null,
+      },
+      // float account.id
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 1.5, login: "alice", type: "User" },
+        repository_selection: "all",
+        suspended_at: null,
+      },
+      // empty account.login
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 11111, login: "   ", type: "User" },
+        repository_selection: "all",
+        suspended_at: null,
+      },
+      // invalid suspended_at date
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 11111, login: "alice", type: "User" },
+        repository_selection: "all",
+        suspended_at: "not-a-date",
+      },
+      // non-positive suspended_at (epoch 0)
+      {
+        id: 555,
+        app_id: 99,
+        account: { id: 11111, login: "alice", type: "User" },
+        repository_selection: "all",
+        suspended_at: "1970-01-01T00:00:00.000Z",
+      },
+    ];
+
+    for (const badInst of malformedPayloads) {
+      const candidateId = "555";
+      const mockFetch = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/login/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ access_token: "token_test" }),
+          } as any;
+        }
+        if (url.includes("/user/installations")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              total_count: 1,
+              installations: [badInst],
+            }),
+          } as any;
+        }
+        if (url.includes("/user")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ id: 11111, login: "alice" }),
+          } as any;
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const appClient = new GitHubAppClient({
+        clientId: ctx.clientId,
+        privateKey: ctx.rsaKeys.privateKey,
+        fetchFn: mockFetch,
+      });
+      const installationService = new GitHubInstallationService({
+        appClient,
+        store: ctx.store,
+        clientId: ctx.clientId,
+        clientSecret: ctx.clientSecret,
+        slug: ctx.slug,
+        callbackUrl: ctx.callbackUrl,
+        fetchFn: mockFetch,
+      });
+
+      const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+      const installState = new URL(installUrl).searchParams.get("state")!;
+      const setupUrl = installationService.startSetupOAuth({
+        state: installState,
+        installationId: candidateId,
+        userId: user.user_id,
+      });
+      const oauthState = new URL(setupUrl).searchParams.get("state")!;
+
+      await expect(
+        installationService.handleOAuthCallback({
+          state: oauthState,
+          code: "test_code",
+          currentUserId: user.user_id,
+          currentProviderSubject: "11111",
+        }),
+      ).rejects.toThrow(GitHubInstallationError);
+
+      // Verify ZERO DB writes
+      const raw = new DatabaseSync(ctx.dbPath);
+      const count = raw.prepare("SELECT COUNT(*) as c FROM github_installations;").get() as { c: number };
+      raw.close();
+      expect(Number(count.c)).toBe(0);
+    }
+  });
+
+  it("startSetupOAuth rejects non-positive-decimal installation_id", async () => {
+    const ctx = await createTestContext();
+    const user = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "11111",
+      providerLogin: "alice",
+    });
+
+    const appClient = new GitHubAppClient({
+      clientId: ctx.clientId,
+      privateKey: ctx.rsaKeys.privateKey,
+    });
+    const installationService = new GitHubInstallationService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      slug: ctx.slug,
+      callbackUrl: ctx.callbackUrl,
+    });
+
+    for (const badId of ["0", "0123", "-1", "+1", "abc", "", "1.5"]) {
+      const installUrl = installationService.createInstallRedirect(user.user_id, "11111");
+      const installState = new URL(installUrl).searchParams.get("state")!;
+      expect(() =>
+        installationService.startSetupOAuth({
+          state: installState,
+          installationId: badId,
+          userId: user.user_id,
+        }),
+      ).toThrow(GitHubInstallationError);
+    }
   });
 });

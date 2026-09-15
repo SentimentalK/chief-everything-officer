@@ -601,7 +601,7 @@ export class IdentityStore {
       }
     }
 
-    const numericIdRegex = /^\d+$/;
+    const numericIdRegex = /^[1-9][0-9]*$/;
     const installations = db.prepare(
       "SELECT id, github_installation_id, github_app_id, account_id, account_login, account_type, repository_selection, suspended_at_ms, created_at_ms, updated_at_ms FROM github_installations;",
     ).all() as Array<{
@@ -623,17 +623,17 @@ export class IdentityStore {
       }
       if (typeof inst.github_installation_id !== "string" || !numericIdRegex.test(inst.github_installation_id)) {
         throw new IdentityStructureError(
-          `github_installation_id '${inst.github_installation_id}' must be a durable decimal string.`,
+          `github_installation_id '${inst.github_installation_id}' must be a positive decimal string.`,
         );
       }
       if (typeof inst.github_app_id !== "string" || !numericIdRegex.test(inst.github_app_id)) {
         throw new IdentityStructureError(
-          `github_app_id '${inst.github_app_id}' must be a durable decimal string.`,
+          `github_app_id '${inst.github_app_id}' must be a positive decimal string.`,
         );
       }
       if (typeof inst.account_id !== "string" || !numericIdRegex.test(inst.account_id)) {
         throw new IdentityStructureError(
-          `account_id '${inst.account_id}' must be a durable decimal string.`,
+          `account_id '${inst.account_id}' must be a positive decimal string.`,
         );
       }
       if (typeof inst.account_login !== "string" || inst.account_login.trim().length === 0) {
@@ -652,9 +652,9 @@ export class IdentityStore {
         );
       }
       if (inst.suspended_at_ms !== null && inst.suspended_at_ms !== undefined) {
-        if (!Number.isInteger(inst.suspended_at_ms) || inst.suspended_at_ms < 0) {
+        if (!Number.isInteger(inst.suspended_at_ms) || inst.suspended_at_ms <= 0) {
           throw new IdentityStructureError(
-            `Invalid suspended_at_ms '${inst.suspended_at_ms}'; must be a non-negative integer when present.`,
+            `Invalid suspended_at_ms '${inst.suspended_at_ms}'; must be a positive integer when present.`,
           );
         }
       }
@@ -1475,20 +1475,20 @@ export class IdentityStore {
     installation: GitHubInstallationRecord;
     userLink: GitHubInstallationUserRecord;
   } {
-    const numericRegex = /^\d+$/;
+    const numericRegex = /^[1-9][0-9]*$/;
     if (typeof input.githubInstallationId !== "string" || !numericRegex.test(input.githubInstallationId)) {
       throw new IdentityStructureError(
-        `githubInstallationId must be a durable decimal string, got '${input.githubInstallationId}'.`,
+        `githubInstallationId must be a positive decimal string, got '${input.githubInstallationId}'.`,
       );
     }
     if (typeof input.githubAppId !== "string" || !numericRegex.test(input.githubAppId)) {
       throw new IdentityStructureError(
-        `githubAppId must be a durable decimal string, got '${input.githubAppId}'.`,
+        `githubAppId must be a positive decimal string, got '${input.githubAppId}'.`,
       );
     }
     if (typeof input.accountId !== "string" || !numericRegex.test(input.accountId)) {
       throw new IdentityStructureError(
-        `accountId must be a durable decimal string, got '${input.accountId}'.`,
+        `accountId must be a positive decimal string, got '${input.accountId}'.`,
       );
     }
     if (typeof input.accountLogin !== "string" || input.accountLogin.trim().length === 0) {
@@ -1505,9 +1505,9 @@ export class IdentityStore {
       );
     }
     if (input.suspendedAtMs !== undefined && input.suspendedAtMs !== null) {
-      if (!Number.isInteger(input.suspendedAtMs) || input.suspendedAtMs < 0) {
+      if (!Number.isInteger(input.suspendedAtMs) || input.suspendedAtMs <= 0) {
         throw new IdentityStructureError(
-          `Invalid suspendedAtMs '${input.suspendedAtMs}'; must be a non-negative integer when present.`,
+          `Invalid suspendedAtMs '${input.suspendedAtMs}'; must be a positive integer when present.`,
         );
       }
     }
