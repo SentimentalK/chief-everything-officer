@@ -352,11 +352,7 @@ export class IdentityStore {
     try {
       return operation(db);
     } catch (error) {
-      if (
-        error instanceof IdentityStructureError ||
-        error instanceof IdentityDbUnavailable ||
-        error instanceof IdentityDbContextClosed
-      ) {
+      if (error instanceof IdentityError) {
         throw error;
       }
       throw new IdentityDbUnavailable(
@@ -434,12 +430,13 @@ export class IdentityStore {
       }
     }
 
-    // Single-column, non-partial UNIQUE index on api_keys.key_digest.
-    this.requireUniqueKeyDigestIndex(db);
+    this.requireUniqueIndex(db, "api_keys", ["key_digest"]);
+    this.requireUniqueIndex(db, "external_identities", ["provider", "provider_subject"]);
+    this.requireUniqueIndex(db, "external_identities", ["provider", "user_id"]);
   }
 
-  private requireUniqueKeyDigestIndex(db: DatabaseSync): void {
-    const indexes = db.prepare("PRAGMA index_list(api_keys);").all() as Array<{
+  private requireUniqueIndex(db: DatabaseSync, table: string, columns: string[]): void {
+    const indexes = db.prepare(`PRAGMA index_list(${table});`).all() as Array<{
       seq: number;
       name: string;
       unique: number;
@@ -454,12 +451,12 @@ export class IdentityStore {
         name: string | null;
       }>;
       const keyed = cols.filter((c) => c.cid >= 0).map((c) => c.name);
-      if (keyed.length === 1 && keyed[0] === "key_digest") {
-        return; // acceptable single-column unique (e.g. UNIQUE column or explicit index)
+      if (keyed.length === columns.length && columns.every((col, i) => keyed[i] === col)) {
+        return;
       }
     }
     throw new IdentityStructureError(
-      "Identity table 'api_keys' must have a UNIQUE index over exactly the single column 'key_digest'.",
+      `Identity table '${table}' must have a UNIQUE index over exactly the columns (${columns.join(", ")}).`,
     );
   }
 
@@ -750,7 +747,7 @@ export class IdentityStore {
         } catch {
           /* ignore */
         }
-        if (error instanceof IdentityStructureError) throw error;
+        if (error instanceof IdentityError) throw error;
         throw new IdentityDbUnavailable(`Failed to rotate API key: ${error}`);
       }
     });
@@ -806,55 +803,137 @@ export class IdentityStore {
     provider_subject: string;
     user_id: string;
     provider_login: string | null;
+    created_at_ms: number;
+    updated_at_ms: number;
   } | null {
     return this.withDb((db) => {
       const row = db.prepare(
-        "SELECT id, provider, provider_subject, user_id, provider_login FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+        "SELECT id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
       ).get(provider, providerSubject) as
-        | { id: string; provider: string; provider_subject: string; user_id: string; provider_login: string | null }
+        | {
+            id: string;
+            provider: string;
+            provider_subject: string;
+            user_id: string;
+            provider_login: string | null;
+            created_at_ms: number;
+            updated_at_ms: number;
+          }
         | undefined;
       return row ?? null;
     });
   }
 
-  findExternalIdentityForUser(provider: string, userId: string): {
-    id: string;
-    provider: string;
-    provider_subject: string;
-    user_id: string;
-    provider_login: string | null;
-  } | null {
-    return this.withDb((db) => {
-      const row = db.prepare(
-        "SELECT id, provider, provider_subject, user_id, provider_login FROM external_identities WHERE provider = ? AND user_id = ? LIMIT 1;",
-      ).get(provider, userId) as
-        | { id: string; provider: string; provider_subject: string; user_id: string; provider_login: string | null }
-        | undefined;
-      return row ?? null;
-    });
-  }
-
-  bindExternalIdentity(record: {
-    id: string;
+  /**
+   * Atomically resolve an existing CEO user by external identity or create a new
+   * user + external identity pair. Never creates workspaces or API keys.
+   */
+  resolveOrCreateExternalUser(input: {
     provider: string;
     providerSubject: string;
-    userId: string;
     providerLogin?: string;
-  }): void {
-    this.withDb((db) => {
-      const nowMs = Date.now();
-      db.prepare(
-        `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?);`,
-      ).run(
-        record.id,
-        record.provider,
-        record.providerSubject,
-        record.userId,
-        record.providerLogin ?? null,
-        nowMs,
-        nowMs,
-      );
+  }): {
+    user_id: string;
+    external_identity_id: string;
+    created: boolean;
+    provider: string;
+    provider_subject: string;
+    provider_login: string | null;
+  } {
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const existing = db.prepare(
+          "SELECT id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+        ).get(input.provider, input.providerSubject) as
+          | {
+              id: string;
+              provider: string;
+              provider_subject: string;
+              user_id: string;
+              provider_login: string | null;
+              created_at_ms: number;
+              updated_at_ms: number;
+            }
+          | undefined;
+
+        if (existing) {
+          const userRow = db.prepare(
+            "SELECT id, disabled_at FROM users WHERE id = ? LIMIT 1;",
+          ).get(existing.user_id) as { id: string; disabled_at: number | null } | undefined;
+
+          if (!userRow) {
+            throw new IdentityStructureError(
+              `External identity '${existing.id}' references missing user '${existing.user_id}'.`,
+            );
+          }
+          if (userRow.disabled_at != null) {
+            throw new IdentityConflictError(
+              `Bound user '${existing.user_id}' is disabled; cannot authenticate external identity ${input.provider}:${input.providerSubject}.`,
+            );
+          }
+
+          let providerLogin = existing.provider_login;
+          if (input.providerLogin !== undefined) {
+            const nowMs = Date.now();
+            db.prepare(
+              "UPDATE external_identities SET provider_login = ?, updated_at_ms = ? WHERE id = ?;",
+            ).run(input.providerLogin, nowMs, existing.id);
+            providerLogin = input.providerLogin;
+          }
+
+          db.exec("COMMIT;");
+          return {
+            user_id: existing.user_id,
+            external_identity_id: existing.id,
+            created: false,
+            provider: existing.provider,
+            provider_subject: existing.provider_subject,
+            provider_login: providerLogin,
+          };
+        }
+
+        const nowMs = Date.now();
+        const userId = newId("usr");
+        const externalIdentityId = newId("ext");
+
+        db.prepare(
+          "INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);",
+        ).run(userId, nowMs);
+
+        db.prepare(
+          `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?);`,
+        ).run(
+          externalIdentityId,
+          input.provider,
+          input.providerSubject,
+          userId,
+          input.providerLogin ?? null,
+          nowMs,
+          nowMs,
+        );
+
+        db.exec("COMMIT;");
+        return {
+          user_id: userId,
+          external_identity_id: externalIdentityId,
+          created: true,
+          provider: input.provider,
+          provider_subject: input.providerSubject,
+          provider_login: input.providerLogin ?? null,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to resolve or create external user: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     });
   }
 

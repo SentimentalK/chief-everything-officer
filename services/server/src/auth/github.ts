@@ -21,6 +21,22 @@ interface PendingOAuthState {
 
 const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+export function validateGitHubProfile(githubUser: { id: unknown; login: unknown }): {
+  providerSubject: string;
+  providerLogin: string;
+} | null {
+  if (typeof githubUser.id !== "number" || !Number.isSafeInteger(githubUser.id) || githubUser.id <= 0) {
+    return null;
+  }
+  if (typeof githubUser.login !== "string" || githubUser.login.trim().length === 0) {
+    return null;
+  }
+  return {
+    providerSubject: String(githubUser.id),
+    providerLogin: githubUser.login,
+  };
+}
+
 export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router {
   const { clientId, clientSecret, callbackUrl, provisioner, sessionManager } = options;
   const fetchClient = options.fetchFn ?? fetch;
@@ -147,28 +163,28 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
         return;
       }
 
-      const githubUser = (await userRes.json()) as { id: number; login: string };
-      if (!githubUser.id || !githubUser.login) {
+      const githubUser = (await userRes.json()) as { id: unknown; login: unknown };
+      const profile = validateGitHubProfile(githubUser);
+      if (!profile) {
         res.redirect(302, "/login?error=invalid_user_response");
         return;
       }
 
       // Discard accessToken immediately (do not persist)
 
-      // 3. Resolve or bind external identity
-      const result = provisioner.resolveOrBind(
+      // 3. Resolve or create CEO user from external identity
+      const result = provisioner.resolveOrCreate(
         "github",
-        String(githubUser.id),
-        githubUser.login,
+        profile.providerSubject,
+        profile.providerLogin,
       );
 
       // 4. Create CEO product session & set cookie
       const session = sessionManager.createSession({
         userId: result.userId,
-        workspaceId: result.workspaceId,
         provider: "github",
-        providerSubject: String(githubUser.id),
-        providerLogin: githubUser.login,
+        providerSubject: profile.providerSubject,
+        providerLogin: profile.providerLogin,
       });
 
       sessionManager.setCookie(res, session.sessionId);

@@ -15,6 +15,7 @@ import {
 import { OAuthService } from "../src/oauth/service.js";
 import { createOAuthRouter } from "../src/oauth/router.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
+import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
 
 const cleanupDirs: string[] = [];
 const cleanupOAuthStores: OAuthStore[] = [];
@@ -71,6 +72,7 @@ async function setupTestApp() {
   return {
     dir,
     ident,
+    identStore,
     oauthStore,
     oauthService,
     sessionManager,
@@ -144,7 +146,6 @@ describe("OAuth HTTP Router Endpoints", () => {
     try {
       const userSession = env.sessionManager.createSession({
         userId: env.ident.user_id,
-        workspaceId: env.ident.workspace_id,
         provider: "github",
         providerSubject: "12345",
       });
@@ -195,7 +196,6 @@ describe("OAuth HTTP Router Endpoints", () => {
     try {
       const userSession = env.sessionManager.createSession({
         userId: env.ident.user_id,
-        workspaceId: env.ident.workspace_id,
         provider: "github",
         providerSubject: "12345",
       });
@@ -286,6 +286,58 @@ describe("OAuth HTTP Router Endpoints", () => {
       expect(denyLocUrl.searchParams.get("error")).toBe("access_denied");
       expect(denyLocUrl.searchParams.get("state")).toBe("state_deny");
       expect(denyLocUrl.searchParams.get("iss")).toBe(env.oauthService.publicOrigin);
+    } finally {
+      await env.close();
+    }
+  });
+
+  it("K. zero-workspace user cannot approve consent for deployment workspace", async () => {
+    const env = await setupTestApp();
+    try {
+      const provisioner = new IdentityAccountProvisioner(env.identStore);
+      const created = provisioner.resolveOrCreate("github", "999001", "zero-ws-user");
+
+      const userSession = env.sessionManager.createSession({
+        userId: created.userId,
+        provider: "github",
+        providerSubject: "999001",
+      });
+
+      const reqId = "oar_zero_ws";
+      env.oauthStore.createAuthorizationRequest({
+        id: reqId,
+        client_id: "https://example.com/client.json",
+        client_name: "App",
+        redirect_uri: "https://example.com/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp",
+        state: "state_zero",
+        code_challenge: "dummy",
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+
+      const nonce = env.oauthService.createConsentNonce(reqId);
+      const approveBody = new URLSearchParams({
+        request_id: reqId,
+        consent_nonce: nonce,
+        decision: "approve",
+      });
+
+      const approveRes = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: `ceo_user_session=${userSession.sessionId}`,
+        },
+        body: approveBody.toString(),
+        redirect: "manual",
+      });
+
+      expect(approveRes.status).toBe(403);
+      const html = await approveRes.text();
+      expect(html).toContain("Authorization Error");
     } finally {
       await env.close();
     }

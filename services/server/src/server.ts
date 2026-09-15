@@ -13,7 +13,7 @@ import {
   createMcpAuthMiddleware,
 } from "./auth.js";
 import { IdentityService } from "./identity/service.js";
-import { SingletonAccountProvisioner } from "./identity/provisioner.js";
+import { IdentityAccountProvisioner } from "./identity/provisioner.js";
 import { UserSessionManager } from "./auth/user-session.js";
 import { createGitHubAuthRouter } from "./auth/github.js";
 import { createUserRouter } from "./auth/user-router.js";
@@ -68,10 +68,7 @@ const resourceService = new ResourceService(workspace, config);
 const workspaceIdentity = identityService.workspaceIdentityValue;
 
 // CEO Product User provisioner and session manager (independent from Audit auth)
-const userProvisioner = new SingletonAccountProvisioner(
-  identityService.storeInstance,
-  workspaceIdentity,
-);
+const userProvisioner = new IdentityAccountProvisioner(identityService.storeInstance);
 const isSecureOrigin = config.publicOrigin
   ? config.publicOrigin.startsWith("https://")
   : false;
