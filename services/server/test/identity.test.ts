@@ -280,7 +280,7 @@ describe("Provisioning atomicity & no-overwrite publish", () => {
     raw.exec("CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);");
     raw.close();
     // Missing the other two tables => structural rejection (no silent repair).
-    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/missing required table|exactly one user/);
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/missing required table|exactly one user|Cannot migrate to v2/);
     // After removing the half file, a fresh init succeeds.
     fs.rmSync(ctx.dbPath, { force: true });
     const ok = await IdentityService.initialize(
@@ -321,20 +321,21 @@ describe("structural contract rejects bad schemas", () => {
   );
 });
 
-describe("v2 schema & external identities migration", () => {
-  it("provisions fresh database with user_version = 2 and external_identities table", async () => {
+describe("v2/v3 schema & external identities migration", () => {
+  it("provisions fresh database with user_version = 3, external_identities, and workspace_memberships", async () => {
     const ctx = await tempCtx();
     provision(ctx, "key-1");
     const raw = new DatabaseSync(ctx.dbPath);
     const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(2);
+    expect(Number(versionRow.user_version)).toBe(3);
     const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
     const names = tables.map((t) => t.name);
     expect(names).toContain("external_identities");
+    expect(names).toContain("workspace_memberships");
     raw.close();
   });
 
-  it("auto-migrates an existing v1 database to v2 on open", async () => {
+  it("auto-migrates an existing v1 database to v3 on open", async () => {
     const ctx = await tempCtx();
     fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
     const db = new DatabaseSync(ctx.dbPath);
@@ -355,10 +356,359 @@ describe("v2 schema & external identities migration", () => {
 
     const raw = new DatabaseSync(ctx.dbPath);
     const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(2);
+    expect(Number(versionRow.user_version)).toBe(3);
     const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
     const names = tables.map((t) => t.name);
     expect(names).toContain("external_identities");
+    expect(names).toContain("workspace_memberships");
+    const membership = raw.prepare(
+      "SELECT user_id, role FROM workspace_memberships WHERE workspace_id = 'ws_v1';",
+    ).get() as { user_id: string; role: string };
+    expect(membership.user_id).toBe("usr_v1");
+    expect(membership.role).toBe("owner");
+    raw.close();
+  });
+});
+
+function countRows(
+  dbPath: string,
+  table: "users" | "workspaces" | "api_keys" | "external_identities" | "workspace_memberships",
+): number {
+  const raw = new DatabaseSync(dbPath);
+  const row = raw.prepare(`SELECT COUNT(*) AS c FROM ${table};`).get() as { c: number };
+  raw.close();
+  return Number(row.c);
+}
+
+function seedV2Database(
+  dbPath: string,
+  input: {
+    remoteUrl: string;
+    branch: string;
+    users?: Array<{ id: string; created_at: number; disabled_at?: number | null }>;
+    workspaces?: Array<{
+      id: string;
+      owner_user_id: string;
+      remote_url: string;
+      branch: string;
+      created_at: number;
+    }>;
+    apiKeys?: Array<{
+      id: string;
+      user_id: string;
+      key_digest: string;
+      created_at: number;
+      revoked_at?: number | null;
+    }>;
+  },
+): void {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+      branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+      FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    );
+    CREATE TABLE api_keys (
+      id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL, revoked_at INTEGER,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE external_identities (
+      id TEXT PRIMARY KEY NOT NULL,
+      provider TEXT NOT NULL,
+      provider_subject TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider_login TEXT,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      UNIQUE(provider, provider_subject),
+      UNIQUE(provider, user_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_external_identities_user ON external_identities(user_id);
+    PRAGMA user_version = 2;
+  `);
+  for (const user of input.users ?? []) {
+    db.prepare("INSERT INTO users VALUES (?, ?, ?);").run(user.id, user.created_at, user.disabled_at ?? null);
+  }
+  for (const ws of input.workspaces ?? []) {
+    db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
+      ws.id,
+      ws.owner_user_id,
+      ws.remote_url,
+      ws.branch,
+      ws.created_at,
+    );
+  }
+  for (const key of input.apiKeys ?? []) {
+    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
+      key.id,
+      key.user_id,
+      key.key_digest,
+      key.created_at,
+      key.revoked_at ?? null,
+    );
+  }
+  db.close();
+}
+
+describe("v3 workspace_memberships schema & migration", () => {
+  it("A. fresh v3 provision creates exact counts and owner membership with shadow match", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    expect(countRows(ctx.dbPath, "users")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const membership = raw.prepare(
+      "SELECT workspace_id, user_id, role FROM workspace_memberships LIMIT 1;",
+    ).get() as { workspace_id: string; user_id: string; role: string };
+    const workspace = raw.prepare("SELECT owner_user_id FROM workspaces WHERE id = ?;").get(ident.workspace_id) as {
+      owner_user_id: string;
+    };
+    raw.close();
+    expect(membership.workspace_id).toBe(ident.workspace_id);
+    expect(membership.user_id).toBe(ident.user_id);
+    expect(membership.role).toBe("owner");
+    expect(workspace.owner_user_id).toBe(ident.user_id);
+  });
+
+  it("B. v2→v3 migration preserves IDs and adds one owner membership per workspace", async () => {
+    const ctx = await tempCtx();
+    seedV2Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [{ id: "usr_a", created_at: 1000 }],
+      workspaces: [{ id: "ws_a", owner_user_id: "usr_a", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 }],
+      apiKeys: [{ id: "ak_a", user_id: "usr_a", key_digest: sha256Hex("key-1"), created_at: 1000 }],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(3);
+    expect(countRows(ctx.dbPath, "users")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    const membership = raw.prepare(
+      "SELECT user_id, role, created_at FROM workspace_memberships WHERE workspace_id = 'ws_a';",
+    ).get() as { user_id: string; role: string; created_at: number };
+    expect(membership.user_id).toBe("usr_a");
+    expect(membership.role).toBe("owner");
+    expect(membership.created_at).toBe(1000);
+    raw.close();
+  });
+
+  it("C. multi-workspace v2 migration binds each workspace to its owner", async () => {
+    const ctx = await tempCtx();
+    seedV2Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [
+        { id: "usr_a", created_at: 1000 },
+        { id: "usr_b", created_at: 1001 },
+      ],
+      workspaces: [
+        { id: "ws_a", owner_user_id: "usr_a", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 },
+        { id: "ws_b", owner_user_id: "usr_b", remote_url: "git@example.com:org/b.git", branch: "main", created_at: 1001 },
+      ],
+      apiKeys: [
+        { id: "ak_a", user_id: "usr_a", key_digest: sha256Hex("key-a"), created_at: 1000 },
+        { id: "ak_b", user_id: "usr_b", key_digest: sha256Hex("key-b"), created_at: 1001 },
+      ],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const memberships = raw.prepare(
+      "SELECT workspace_id, user_id FROM workspace_memberships ORDER BY workspace_id ASC;",
+    ).all() as Array<{ workspace_id: string; user_id: string }>;
+    raw.close();
+    expect(memberships).toEqual([
+      { workspace_id: "ws_a", user_id: "usr_a" },
+      { workspace_id: "ws_b", user_id: "usr_b" },
+    ]);
+  });
+
+  it("D. zero-workspace user survives migration with zero memberships", async () => {
+    const ctx = await tempCtx();
+    seedV2Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [
+        { id: "usr_a", created_at: 1000 },
+        { id: "usr_b", created_at: 1001 },
+      ],
+      workspaces: [{ id: "ws_a", owner_user_id: "usr_a", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 }],
+      apiKeys: [{ id: "ak_a", user_id: "usr_a", key_digest: sha256Hex("key-a"), created_at: 1000 }],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const bMemberships = raw.prepare(
+      "SELECT COUNT(*) AS c FROM workspace_memberships WHERE user_id = 'usr_b';",
+    ).get() as { c: number };
+    raw.close();
+    expect(Number(bMemberships.c)).toBe(0);
+  });
+
+  it("E. user may own multiple workspaces after migration", async () => {
+    const ctx = await tempCtx();
+    seedV2Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [{ id: "usr_a", created_at: 1000 }],
+      workspaces: [
+        { id: "ws_1", owner_user_id: "usr_a", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 },
+        { id: "ws_2", owner_user_id: "usr_a", remote_url: "git@example.com:org/other.git", branch: "dev", created_at: 1001 },
+      ],
+      apiKeys: [{ id: "ak_a", user_id: "usr_a", key_digest: sha256Hex("key-a"), created_at: 1000 }],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const count = raw.prepare(
+      "SELECT COUNT(*) AS c FROM workspace_memberships WHERE user_id = 'usr_a';",
+    ).get() as { c: number };
+    raw.close();
+    expect(Number(count.c)).toBe(2);
+  });
+
+  it("F. duplicate (user, workspace) membership violates UNIQUE constraint", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(() =>
+      raw.prepare(
+        "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
+      ).run("wsm_dup", (raw.prepare("SELECT id FROM workspaces LIMIT 1;").get() as { id: string }).id, (raw.prepare("SELECT id FROM users LIMIT 1;").get() as { id: string }).id, Date.now()),
+    ).toThrow();
+    raw.close();
+  });
+
+  it("G. duplicate owner for same workspace violates partial unique index", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const raw = new DatabaseSync(ctx.dbPath);
+    const ws = raw.prepare("SELECT id FROM workspaces LIMIT 1;").get() as { id: string };
+    raw.prepare("INSERT INTO users VALUES ('usr_other', 2000, NULL);").run();
+    expect(() =>
+      raw.prepare(
+        "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES ('wsm_other', ?, 'usr_other', 'owner', 2000);",
+      ).run(ws.id),
+    ).toThrow();
+    raw.close();
+  });
+
+  it("H. shadow mismatch fails open()", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("INSERT INTO users VALUES ('usr_other', 2000, NULL);").run();
+    raw.exec("UPDATE workspaces SET owner_user_id = 'usr_other' WHERE 1=1;");
+    raw.close();
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
+  });
+
+  it("M. forced v2→v3 migration error leaves version at 2 with no partial truth", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER
+      );
+      CREATE TABLE external_identities (
+        id TEXT PRIMARY KEY NOT NULL,
+        provider TEXT NOT NULL,
+        provider_subject TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        provider_login TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        UNIQUE(provider, provider_subject),
+        UNIQUE(provider, user_id)
+      );
+      PRAGMA user_version = 2;
+      INSERT INTO users VALUES ('usr_a', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_a', 'usr_missing', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+    `);
+    raw.close();
+
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/version 2 to 3|FOREIGN KEY/);
+    const after = new DatabaseSync(ctx.dbPath);
+    expect(Number((after.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(2);
+    const tables = after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_memberships';").all();
+    expect(tables).toEqual([]);
+    after.close();
+  });
+
+  it("M2. forced v1→v2 migration error leaves version at 1", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      PRAGMA user_version = 1;
+    `);
+    db.close();
+
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/Cannot migrate to v2|version 1 to 2/);
+    const after = new DatabaseSync(ctx.dbPath);
+    expect(Number((after.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(1);
+    const tables = after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='external_identities';").all();
+    expect(tables).toEqual([]);
+    after.close();
+  });
+
+  it("N. v1 fixture migrates through v2 to v3", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      PRAGMA user_version = 1;
+      INSERT INTO users VALUES ('usr_chain', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_chain', 'usr_chain', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+      INSERT INTO api_keys VALUES ('ak_chain', 'usr_chain', '${sha256Hex("key-chain")}', 1000, NULL);
+    `);
+    db.close();
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(3);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
     raw.close();
   });
 });
@@ -390,13 +740,6 @@ function seedExternalIdentity(
     input.updatedAtMs ?? now,
   );
   raw.close();
-}
-
-function countRows(dbPath: string, table: "users" | "workspaces" | "api_keys" | "external_identities"): number {
-  const raw = new DatabaseSync(dbPath);
-  const row = raw.prepare(`SELECT COUNT(*) AS c FROM ${table};`).get() as { c: number };
-  raw.close();
-  return Number(row.c);
 }
 
 describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
