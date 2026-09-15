@@ -58,7 +58,56 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 3;
+export const IDENTITY_DB_USER_VERSION = 4;
+
+export type GitHubAccountType = "User" | "Organization";
+export type GitHubRepositorySelection = "all" | "selected";
+
+export interface GitHubInstallationRecord {
+  id: string;
+  github_installation_id: string;
+  github_app_id: string;
+  account_id: string;
+  account_login: string;
+  account_type: GitHubAccountType;
+  repository_selection: GitHubRepositorySelection;
+  suspended_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface GitHubInstallationUserRecord {
+  id: string;
+  github_installation_row_id: string;
+  user_id: string;
+  created_at_ms: number;
+  verified_at_ms: number;
+}
+
+export interface UserGitHubInstallationItem {
+  id: string;
+  github_installation_id: string;
+  github_app_id: string;
+  account_id: string;
+  account_login: string;
+  account_type: GitHubAccountType;
+  repository_selection: GitHubRepositorySelection;
+  suspended_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  verified_at_ms: number;
+}
+
+export interface UpsertGitHubInstallationInput {
+  githubInstallationId: string;
+  githubAppId: string;
+  accountId: string;
+  accountLogin: string;
+  accountType: GitHubAccountType;
+  repositorySelection: GitHubRepositorySelection;
+  suspendedAtMs?: number | null;
+  userId: string;
+}
 
 // Application data schema. DDL runs inside a single provisioning transaction.
 export const IDENTITY_DDL = `
@@ -110,16 +159,50 @@ CREATE TABLE workspace_memberships (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+CREATE TABLE github_installations (
+  id TEXT PRIMARY KEY NOT NULL,
+  github_installation_id TEXT NOT NULL UNIQUE,
+  github_app_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  account_login TEXT NOT NULL,
+  account_type TEXT NOT NULL,
+  repository_selection TEXT NOT NULL,
+  suspended_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE github_installation_users (
+  id TEXT PRIMARY KEY NOT NULL,
+  github_installation_row_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  verified_at_ms INTEGER NOT NULL,
+  UNIQUE(github_installation_row_id, user_id),
+  FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
 CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
 CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
 CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
+CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
+CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
-const EXPECTED_TABLES = ["users", "workspaces", "api_keys", "external_identities", "workspace_memberships"] as const;
+const EXPECTED_TABLES = [
+  "users",
+  "workspaces",
+  "api_keys",
+  "external_identities",
+  "workspace_memberships",
+  "github_installations",
+  "github_installation_users",
+] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
   users: ["id", "created_at"],
@@ -127,6 +210,24 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
   api_keys: ["id", "user_id", "key_digest", "created_at"],
   external_identities: ["id", "provider", "provider_subject", "user_id", "created_at_ms", "updated_at_ms"],
   workspace_memberships: ["id", "workspace_id", "user_id", "role", "created_at"],
+  github_installations: [
+    "id",
+    "github_installation_id",
+    "github_app_id",
+    "account_id",
+    "account_login",
+    "account_type",
+    "repository_selection",
+    "created_at_ms",
+    "updated_at_ms",
+  ],
+  github_installation_users: [
+    "id",
+    "github_installation_row_id",
+    "user_id",
+    "created_at_ms",
+    "verified_at_ms",
+  ],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -137,13 +238,17 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
     { from: "workspace_id", to: "id", referencedTable: "workspaces" },
     { from: "user_id", to: "id", referencedTable: "users" },
   ],
+  github_installation_users: [
+    { from: "github_installation_row_id", to: "id", referencedTable: "github_installations" },
+    { from: "user_id", to: "id", referencedTable: "users" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -457,6 +562,8 @@ export class IdentityStore {
     this.requireUniqueIndex(db, "external_identities", ["provider", "user_id"]);
     this.requireUniqueIndex(db, "workspace_memberships", ["workspace_id", "user_id"]);
     this.requirePartialUniqueIndex(db, "workspace_memberships", ["workspace_id"], "role = 'owner'");
+    this.requireUniqueIndex(db, "github_installations", ["github_installation_id"]);
+    this.requireUniqueIndex(db, "github_installation_users", ["github_installation_row_id", "user_id"]);
 
     this.validateData();
   }
@@ -491,6 +598,93 @@ export class IdentityStore {
         throw new IdentityStructureError(
           `Workspace '${workspace.id}' owner membership user '${owner.user_id}' does not match shadow owner '${workspace.owner_user_id}'.`,
         );
+      }
+    }
+
+    const numericIdRegex = /^\d+$/;
+    const installations = db.prepare(
+      "SELECT id, github_installation_id, github_app_id, account_id, account_login, account_type, repository_selection, suspended_at_ms, created_at_ms, updated_at_ms FROM github_installations;",
+    ).all() as Array<{
+      id: string;
+      github_installation_id: string;
+      github_app_id: string;
+      account_id: string;
+      account_login: string;
+      account_type: string;
+      repository_selection: string;
+      suspended_at_ms: number | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+
+    for (const inst of installations) {
+      if (typeof inst.id !== "string" || !inst.id.startsWith("ghi_")) {
+        throw new IdentityStructureError(`Invalid github_installations id '${inst.id}'.`);
+      }
+      if (typeof inst.github_installation_id !== "string" || !numericIdRegex.test(inst.github_installation_id)) {
+        throw new IdentityStructureError(
+          `github_installation_id '${inst.github_installation_id}' must be a durable decimal string.`,
+        );
+      }
+      if (typeof inst.github_app_id !== "string" || !numericIdRegex.test(inst.github_app_id)) {
+        throw new IdentityStructureError(
+          `github_app_id '${inst.github_app_id}' must be a durable decimal string.`,
+        );
+      }
+      if (typeof inst.account_id !== "string" || !numericIdRegex.test(inst.account_id)) {
+        throw new IdentityStructureError(
+          `account_id '${inst.account_id}' must be a durable decimal string.`,
+        );
+      }
+      if (typeof inst.account_login !== "string" || inst.account_login.trim().length === 0) {
+        throw new IdentityStructureError(
+          `account_login '${inst.account_login}' must be a non-empty string.`,
+        );
+      }
+      if (inst.account_type !== "User" && inst.account_type !== "Organization") {
+        throw new IdentityStructureError(
+          `Invalid account_type '${inst.account_type}'; must be 'User' or 'Organization'.`,
+        );
+      }
+      if (inst.repository_selection !== "all" && inst.repository_selection !== "selected") {
+        throw new IdentityStructureError(
+          `Invalid repository_selection '${inst.repository_selection}'; must be 'all' or 'selected'.`,
+        );
+      }
+      if (inst.suspended_at_ms !== null && inst.suspended_at_ms !== undefined) {
+        if (!Number.isInteger(inst.suspended_at_ms) || inst.suspended_at_ms < 0) {
+          throw new IdentityStructureError(
+            `Invalid suspended_at_ms '${inst.suspended_at_ms}'; must be a non-negative integer when present.`,
+          );
+        }
+      }
+      if (!Number.isInteger(inst.created_at_ms) || inst.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in github_installations row '${inst.id}'.`);
+      }
+      if (!Number.isInteger(inst.updated_at_ms) || inst.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in github_installations row '${inst.id}'.`);
+      }
+    }
+
+    const installationUsers = db.prepare(
+      "SELECT id, github_installation_row_id, user_id, created_at_ms, verified_at_ms FROM github_installation_users;",
+    ).all() as Array<{
+      id: string;
+      github_installation_row_id: string;
+      user_id: string;
+      created_at_ms: number;
+      verified_at_ms: number;
+    }>;
+
+    for (const link of installationUsers) {
+      if (typeof link.id !== "string" || !link.id.startsWith("ghiu_")) {
+        throw new IdentityStructureError(`Invalid github_installation_users id '${link.id}'.`);
+      }
+      if (!Number.isInteger(link.created_at_ms) || link.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in github_installation_users row '${link.id}'.`);
+      }
+      if (!Number.isInteger(link.verified_at_ms) || link.verified_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid verified_at_ms in github_installation_users row '${link.id}'.`);
       }
     }
 
@@ -905,6 +1099,9 @@ export class IdentityStore {
         case 2:
           IdentityStore.migrateV2ToV3(db);
           break;
+        case 3:
+          IdentityStore.migrateV3ToV4(db);
+          break;
         default:
           throw new IdentityStructureError(
             `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
@@ -1031,6 +1228,71 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 2 to 3: ${error}`);
+    }
+  }
+
+  static migrateV3ToV4(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 3) {
+        throw new IdentityStructureError("migrateV3ToV4 requires user_version = 3.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v4: missing required v3 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE github_installations (
+          id TEXT PRIMARY KEY NOT NULL,
+          github_installation_id TEXT NOT NULL UNIQUE,
+          github_app_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          account_login TEXT NOT NULL,
+          account_type TEXT NOT NULL,
+          repository_selection TEXT NOT NULL,
+          suspended_at_ms INTEGER,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE github_installation_users (
+          id TEXT PRIMARY KEY NOT NULL,
+          github_installation_row_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          verified_at_ms INTEGER NOT NULL,
+          UNIQUE(github_installation_row_id, user_id),
+          FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
+        CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
+
+        PRAGMA user_version = 4;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 3 to 4: ${error}`);
     }
   }
 
@@ -1209,6 +1471,175 @@ export class IdentityStore {
     });
   }
 
+  upsertGitHubInstallationWithUser(input: UpsertGitHubInstallationInput): {
+    installation: GitHubInstallationRecord;
+    userLink: GitHubInstallationUserRecord;
+  } {
+    const numericRegex = /^\d+$/;
+    if (typeof input.githubInstallationId !== "string" || !numericRegex.test(input.githubInstallationId)) {
+      throw new IdentityStructureError(
+        `githubInstallationId must be a durable decimal string, got '${input.githubInstallationId}'.`,
+      );
+    }
+    if (typeof input.githubAppId !== "string" || !numericRegex.test(input.githubAppId)) {
+      throw new IdentityStructureError(
+        `githubAppId must be a durable decimal string, got '${input.githubAppId}'.`,
+      );
+    }
+    if (typeof input.accountId !== "string" || !numericRegex.test(input.accountId)) {
+      throw new IdentityStructureError(
+        `accountId must be a durable decimal string, got '${input.accountId}'.`,
+      );
+    }
+    if (typeof input.accountLogin !== "string" || input.accountLogin.trim().length === 0) {
+      throw new IdentityStructureError("accountLogin must be a non-empty string.");
+    }
+    if (input.accountType !== "User" && input.accountType !== "Organization") {
+      throw new IdentityStructureError(
+        `Invalid accountType '${input.accountType}'; must be 'User' or 'Organization'.`,
+      );
+    }
+    if (input.repositorySelection !== "all" && input.repositorySelection !== "selected") {
+      throw new IdentityStructureError(
+        `Invalid repositorySelection '${input.repositorySelection}'; must be 'all' or 'selected'.`,
+      );
+    }
+    if (input.suspendedAtMs !== undefined && input.suspendedAtMs !== null) {
+      if (!Number.isInteger(input.suspendedAtMs) || input.suspendedAtMs < 0) {
+        throw new IdentityStructureError(
+          `Invalid suspendedAtMs '${input.suspendedAtMs}'; must be a non-negative integer when present.`,
+        );
+      }
+    }
+
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const userRow = db.prepare(
+          "SELECT id, disabled_at FROM users WHERE id = ? LIMIT 1;",
+        ).get(input.userId) as { id: string; disabled_at: number | null } | undefined;
+
+        if (!userRow) {
+          throw new IdentityStructureError(`User '${input.userId}' does not exist.`);
+        }
+        if (userRow.disabled_at != null) {
+          throw new IdentityConflictError(`User '${input.userId}' is disabled.`);
+        }
+
+        const nowMs = Date.now();
+        const candidateGhiId = newId("ghi");
+        const suspendedAt = input.suspendedAtMs ?? null;
+
+        const installRow = db.prepare(`
+          INSERT INTO github_installations (
+            id, github_installation_id, github_app_id, account_id,
+            account_login, account_type, repository_selection,
+            suspended_at_ms, created_at_ms, updated_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(github_installation_id) DO UPDATE SET
+            github_app_id = excluded.github_app_id,
+            account_id = excluded.account_id,
+            account_login = excluded.account_login,
+            account_type = excluded.account_type,
+            repository_selection = excluded.repository_selection,
+            suspended_at_ms = excluded.suspended_at_ms,
+            updated_at_ms = excluded.updated_at_ms
+          RETURNING id, github_installation_id, github_app_id, account_id, account_login, account_type, repository_selection, suspended_at_ms, created_at_ms, updated_at_ms;
+        `).get(
+          candidateGhiId,
+          input.githubInstallationId,
+          input.githubAppId,
+          input.accountId,
+          input.accountLogin,
+          input.accountType,
+          input.repositorySelection,
+          suspendedAt,
+          nowMs,
+          nowMs,
+        ) as unknown as GitHubInstallationRecord;
+
+        const candidateGhiuId = newId("ghiu");
+
+        const userLinkRow = db.prepare(`
+          INSERT INTO github_installation_users (
+            id, github_installation_row_id, user_id, created_at_ms, verified_at_ms
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(github_installation_row_id, user_id) DO UPDATE SET
+            verified_at_ms = excluded.verified_at_ms
+          RETURNING id, github_installation_row_id, user_id, created_at_ms, verified_at_ms;
+        `).get(
+          candidateGhiuId,
+          installRow.id,
+          input.userId,
+          nowMs,
+          nowMs,
+        ) as unknown as GitHubInstallationUserRecord;
+
+        db.exec("COMMIT;");
+        return {
+          installation: installRow,
+          userLink: userLinkRow,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to upsert GitHub installation: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  }
+
+  listGitHubInstallationsForUser(userId: string): UserGitHubInstallationItem[] {
+    return this.withDb((db) => {
+      return db.prepare(`
+        SELECT
+          i.id,
+          i.github_installation_id,
+          i.github_app_id,
+          i.account_id,
+          i.account_login,
+          i.account_type,
+          i.repository_selection,
+          i.suspended_at_ms,
+          i.created_at_ms,
+          i.updated_at_ms,
+          u.verified_at_ms
+        FROM github_installations i
+        JOIN github_installation_users u ON u.github_installation_row_id = i.id
+        WHERE u.user_id = ?
+        ORDER BY u.verified_at_ms DESC, i.id ASC;
+      `).all(userId) as unknown as UserGitHubInstallationItem[];
+    });
+  }
+
+  findGitHubInstallationById(githubInstallationId: string): GitHubInstallationRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, github_installation_id, github_app_id, account_id, account_login, account_type, repository_selection, suspended_at_ms, created_at_ms, updated_at_ms
+        FROM github_installations
+        WHERE github_installation_id = ?
+        LIMIT 1;
+      `).get(githubInstallationId);
+      return (row as unknown as GitHubInstallationRecord) ?? null;
+    });
+  }
+
+  findGitHubInstallationUser(githubInstallationRowId: string, userId: string): GitHubInstallationUserRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT id, github_installation_row_id, user_id, created_at_ms, verified_at_ms
+        FROM github_installation_users
+        WHERE github_installation_row_id = ? AND user_id = ?
+        LIMIT 1;
+      `).get(githubInstallationRowId, userId);
+      return (row as unknown as GitHubInstallationUserRecord) ?? null;
+    });
+  }
 }
 
 function quoteIdent(name: string): string {

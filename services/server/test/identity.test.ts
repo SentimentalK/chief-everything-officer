@@ -321,21 +321,23 @@ describe("structural contract rejects bad schemas", () => {
   );
 });
 
-describe("v2/v3 schema & external identities migration", () => {
-  it("provisions fresh database with user_version = 3, external_identities, and workspace_memberships", async () => {
+describe("v2/v3/v4 schema & external identities migration", () => {
+  it("provisions fresh database with user_version = 4, external_identities, workspace_memberships, and github_installations", async () => {
     const ctx = await tempCtx();
     provision(ctx, "key-1");
     const raw = new DatabaseSync(ctx.dbPath);
     const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(3);
+    expect(Number(versionRow.user_version)).toBe(IDENTITY_DB_USER_VERSION);
     const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
     const names = tables.map((t) => t.name);
     expect(names).toContain("external_identities");
     expect(names).toContain("workspace_memberships");
+    expect(names).toContain("github_installations");
+    expect(names).toContain("github_installation_users");
     raw.close();
   });
 
-  it("auto-migrates an existing v1 database to v3 on open", async () => {
+  it("auto-migrates an existing v1 database to v4 on open", async () => {
     const ctx = await tempCtx();
     fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
     const db = new DatabaseSync(ctx.dbPath);
@@ -356,11 +358,13 @@ describe("v2/v3 schema & external identities migration", () => {
 
     const raw = new DatabaseSync(ctx.dbPath);
     const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(3);
+    expect(Number(versionRow.user_version)).toBe(IDENTITY_DB_USER_VERSION);
     const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as { name: string }[];
     const names = tables.map((t) => t.name);
     expect(names).toContain("external_identities");
     expect(names).toContain("workspace_memberships");
+    expect(names).toContain("github_installations");
+    expect(names).toContain("github_installation_users");
     const membership = raw.prepare(
       "SELECT user_id, role FROM workspace_memberships WHERE workspace_id = 'ws_v1';",
     ).get() as { user_id: string; role: string };
@@ -372,7 +376,14 @@ describe("v2/v3 schema & external identities migration", () => {
 
 function countRows(
   dbPath: string,
-  table: "users" | "workspaces" | "api_keys" | "external_identities" | "workspace_memberships",
+  table:
+    | "users"
+    | "workspaces"
+    | "api_keys"
+    | "external_identities"
+    | "workspace_memberships"
+    | "github_installations"
+    | "github_installation_users",
 ): number {
   const raw = new DatabaseSync(dbPath);
   const row = raw.prepare(`SELECT COUNT(*) AS c FROM ${table};`).get() as { c: number };
@@ -455,6 +466,132 @@ function seedV2Database(
   db.close();
 }
 
+function seedV3Database(
+  dbPath: string,
+  input: {
+    remoteUrl: string;
+    branch: string;
+    users?: Array<{ id: string; created_at: number; disabled_at?: number | null }>;
+    workspaces?: Array<{
+      id: string;
+      owner_user_id: string;
+      remote_url: string;
+      branch: string;
+      created_at: number;
+    }>;
+    workspaceMemberships?: Array<{
+      id: string;
+      workspace_id: string;
+      user_id: string;
+      role: string;
+      created_at: number;
+    }>;
+    apiKeys?: Array<{
+      id: string;
+      user_id: string;
+      key_digest: string;
+      created_at: number;
+      revoked_at?: number | null;
+    }>;
+    externalIdentities?: Array<{
+      id: string;
+      provider: string;
+      provider_subject: string;
+      user_id: string;
+      provider_login?: string | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+  },
+): void {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+      branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+      FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    );
+    CREATE TABLE api_keys (
+      id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL, revoked_at INTEGER,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE external_identities (
+      id TEXT PRIMARY KEY NOT NULL,
+      provider TEXT NOT NULL,
+      provider_subject TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider_login TEXT,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      UNIQUE(provider, provider_subject),
+      UNIQUE(provider, user_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE workspace_memberships (
+      id TEXT PRIMARY KEY NOT NULL,
+      workspace_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      UNIQUE(workspace_id, user_id),
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
+    CREATE INDEX idx_api_keys_user ON api_keys(user_id);
+    CREATE INDEX idx_external_identities_user ON external_identities(user_id);
+    CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
+    CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
+    CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
+    PRAGMA user_version = 3;
+  `);
+  for (const user of input.users ?? []) {
+    db.prepare("INSERT INTO users VALUES (?, ?, ?);").run(user.id, user.created_at, user.disabled_at ?? null);
+  }
+  for (const ws of input.workspaces ?? []) {
+    db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
+      ws.id,
+      ws.owner_user_id,
+      ws.remote_url,
+      ws.branch,
+      ws.created_at,
+    );
+  }
+  for (const m of input.workspaceMemberships ?? []) {
+    db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+      m.id,
+      m.workspace_id,
+      m.user_id,
+      m.role,
+      m.created_at,
+    );
+  }
+  for (const key of input.apiKeys ?? []) {
+    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
+      key.id,
+      key.user_id,
+      key.key_digest,
+      key.created_at,
+      key.revoked_at ?? null,
+    );
+  }
+  for (const ext of input.externalIdentities ?? []) {
+    db.prepare("INSERT INTO external_identities VALUES (?, ?, ?, ?, ?, ?, ?);").run(
+      ext.id,
+      ext.provider,
+      ext.provider_subject,
+      ext.user_id,
+      ext.provider_login ?? null,
+      ext.created_at_ms,
+      ext.updated_at_ms,
+    );
+  }
+  db.close();
+}
+
 describe("v3 workspace_memberships schema & migration", () => {
   it("A. fresh v3 provision creates exact counts and owner membership with shadow match", async () => {
     const ctx = await tempCtx();
@@ -493,7 +630,7 @@ describe("v3 workspace_memberships schema & migration", () => {
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(3);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(4);
     expect(countRows(ctx.dbPath, "users")).toBe(1);
     expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
@@ -707,7 +844,7 @@ describe("v3 workspace_memberships schema & migration", () => {
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(3);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(4);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
     raw.close();
   });
@@ -991,3 +1128,366 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
     expect(after).toEqual(before);
   });
 });
+
+describe("v4 github_installations control-plane schema & migration", () => {
+  it("A. fresh v4 provision creates zero installation rows and sets user_version = 4", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    expect(countRows(ctx.dbPath, "users")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(0);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const ver = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
+    raw.close();
+    expect(Number(ver.user_version)).toBe(4);
+  });
+
+  it("B. v3→v4 migration preserves v3 data, performs no backfill, and sets user_version = 4", async () => {
+    const ctx = await tempCtx();
+    seedV3Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [{ id: "usr_v3", created_at: 1000 }],
+      workspaces: [
+        { id: "ws_v3", owner_user_id: "usr_v3", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 },
+      ],
+      workspaceMemberships: [
+        { id: "wsm_v3", workspace_id: "ws_v3", user_id: "usr_v3", role: "owner", created_at: 1000 },
+      ],
+      apiKeys: [{ id: "ak_v3", user_id: "usr_v3", key_digest: sha256Hex("key-3"), created_at: 1000 }],
+      externalIdentities: [
+        {
+          id: "ext_v3",
+          provider: "github",
+          provider_subject: "98765",
+          user_id: "usr_v3",
+          provider_login: "octocat",
+          created_at_ms: 1000,
+          updated_at_ms: 1000,
+        },
+      ],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(4);
+    raw.close();
+
+    expect(countRows(ctx.dbPath, "users")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(0);
+
+    const ext = store.findExternalIdentity("github", "98765");
+    expect(ext).not.toBeNull();
+    expect(ext?.provider_login).toBe("octocat");
+  });
+
+  it("C. v1→v4 migration chain executes all steps sequentially up to v4", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      PRAGMA user_version = 1;
+      INSERT INTO users VALUES ('usr_v1', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_v1', 'usr_v1', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+      INSERT INTO api_keys VALUES ('ak_v1', 'usr_v1', '${sha256Hex("key-1")}', 1000, NULL);
+    `);
+    db.close();
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(4);
+    raw.close();
+
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(0);
+  });
+
+  it("D. failed v3→v4 migration rolls back cleanly to v3", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER
+      );
+      CREATE TABLE external_identities (
+        id TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL, provider_subject TEXT NOT NULL,
+        user_id TEXT NOT NULL, provider_login TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+      );
+      PRAGMA user_version = 3;
+      INSERT INTO users VALUES ('usr_a', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_a', 'usr_a', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+    `);
+    // Note: missing workspace_memberships table!
+    raw.close();
+
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/version 3 to 4|missing required v3 table/);
+    const after = new DatabaseSync(ctx.dbPath);
+    expect(Number((after.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(3);
+    const tables = after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='github_installations';").all();
+    expect(tables).toEqual([]);
+    after.close();
+  });
+
+  it("E. duplicate callbacks for same user and installation are idempotent via ON CONFLICT", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const first = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "123456",
+      githubAppId: "999",
+      accountId: "888",
+      accountLogin: "acme-corp",
+      accountType: "Organization",
+      repositorySelection: "all",
+      suspendedAtMs: null,
+      userId: ident.user_id,
+    });
+
+    expect(first.installation.github_installation_id).toBe("123456");
+    expect(first.installation.account_login).toBe("acme-corp");
+    expect(first.installation.repository_selection).toBe("all");
+    expect(first.userLink.user_id).toBe(ident.user_id);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(1);
+
+    // Call again with updated repositorySelection
+    const second = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "123456",
+      githubAppId: "999",
+      accountId: "888",
+      accountLogin: "acme-corp",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      suspendedAtMs: null,
+      userId: ident.user_id,
+    });
+
+    expect(second.installation.id).toBe(first.installation.id);
+    expect(second.installation.repository_selection).toBe("selected");
+    expect(second.userLink.id).toBe(first.userLink.id);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(1);
+
+    const list = store.listGitHubInstallationsForUser(ident.user_id);
+    expect(list.length).toBe(1);
+    expect(list[0]?.repository_selection).toBe("selected");
+  });
+
+  it("F. shared installation across two CEO users links correctly (M:N)", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const userB = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "55555",
+      providerLogin: "user-b",
+    });
+
+    // User A links installation 777
+    const linkA = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "777",
+      githubAppId: "100",
+      accountId: "200",
+      accountLogin: "shared-org",
+      accountType: "Organization",
+      repositorySelection: "all",
+      userId: ident.user_id,
+    });
+
+    // User B links same installation 777
+    const linkB = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "777",
+      githubAppId: "100",
+      accountId: "200",
+      accountLogin: "shared-org",
+      accountType: "Organization",
+      repositorySelection: "all",
+      userId: userB.user_id,
+    });
+
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(2);
+    expect(linkA.installation.id).toBe(linkB.installation.id);
+    expect(linkA.userLink.id).not.toBe(linkB.userLink.id);
+
+    const listA = store.listGitHubInstallationsForUser(ident.user_id);
+    const listB = store.listGitHubInstallationsForUser(userB.user_id);
+    expect(listA.length).toBe(1);
+    expect(listB.length).toBe(1);
+    expect(listA[0]?.id).toBe(listB[0]?.id);
+  });
+
+  it("G. multiple installations for one CEO user links correctly (M:N)", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "101",
+      githubAppId: "100",
+      accountId: "201",
+      accountLogin: "org-1",
+      accountType: "Organization",
+      repositorySelection: "all",
+      userId: ident.user_id,
+    });
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "102",
+      githubAppId: "100",
+      accountId: "202",
+      accountLogin: "org-2",
+      accountType: "User",
+      repositorySelection: "selected",
+      userId: ident.user_id,
+    });
+
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(2);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(2);
+
+    const list = store.listGitHubInstallationsForUser(ident.user_id);
+    expect(list.length).toBe(2);
+    const ids = list.map((i) => i.github_installation_id);
+    expect(ids).toContain("101");
+    expect(ids).toContain("102");
+  });
+
+  it("H. validation rejects non-numeric IDs, invalid enums, negative suspended_at, and disabled users", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    // Non-numeric installation id
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "abc",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "Organization",
+        repositorySelection: "all",
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Non-numeric app id
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "invalid",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "Organization",
+        repositorySelection: "all",
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Non-numeric account id
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "invalid",
+        accountLogin: "org",
+        accountType: "Organization",
+        repositorySelection: "all",
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Invalid accountType
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "Bot" as any,
+        repositorySelection: "all",
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Invalid repositorySelection
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "User",
+        repositorySelection: "none" as any,
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Negative suspendedAtMs
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "User",
+        repositorySelection: "all",
+        suspendedAtMs: -50,
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityStructureError);
+
+    // Disabled user
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("UPDATE users SET disabled_at = ? WHERE id = ?;").run(Date.now(), ident.user_id);
+    raw.close();
+
+    expect(() =>
+      store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "100",
+        githubAppId: "100",
+        accountId: "200",
+        accountLogin: "org",
+        accountType: "User",
+        repositorySelection: "all",
+        userId: ident.user_id,
+      }),
+    ).toThrow(IdentityConflictError);
+  });
+});
+
