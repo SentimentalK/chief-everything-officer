@@ -1,0 +1,772 @@
+import crypto from "node:crypto";
+import type {
+  IdentityStore,
+  GitHubRepositoryBindingRecord,
+} from "../identity/store.js";
+import { IdentityConflictError, IdentityStructureError } from "../identity/store.js";
+import type { GitHubAppClient } from "./app-client.js";
+
+export interface GitHubRepositoryServiceOptions {
+  appClient: GitHubAppClient;
+  store: IdentityStore;
+  clientId: string;
+  clientSecret: string;
+  callbackUrl: string;
+  fetchFn?: typeof fetch;
+  stateTtlMs?: number;
+  grantTtlMs?: number;
+}
+
+export interface PendingRepoOAuthState {
+  codeVerifier: string;
+  userId: string;
+  providerSubject: string;
+  installationRowId: string;
+  installationId: string;
+  expiresAt: number;
+}
+
+export interface RepositoryAuthorizationGrant {
+  id: string;
+  userId: string;
+  providerSubject: string;
+  installationRowId: string;
+  installationId: string;
+  installationAccountId: string;
+  installationAccountLogin: string;
+  installationAccountType: "User" | "Organization";
+  userAccessToken: string;
+  expiresAtMs: number;
+}
+
+export interface SafeRepositoryMetadata {
+  id: string;
+  name: string;
+  full_name: string;
+  owner: {
+    id: string;
+    login: string;
+  };
+  private: boolean;
+  archived: boolean;
+  disabled: boolean;
+  default_branch: string;
+  permissions?: {
+    admin: boolean;
+    push: boolean;
+    pull: boolean;
+  };
+}
+
+export class GitHubRepositoryError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "GitHubRepositoryError";
+    this.status = status;
+  }
+}
+
+export class GitHubAppPermissionUpgradeRequiredError extends GitHubRepositoryError {
+  constructor(message: string) {
+    super(message, 403);
+    this.name = "GitHubAppPermissionUpgradeRequiredError";
+  }
+}
+
+export class GitHubPartialCreationError extends Error {
+  readonly status = 500;
+  readonly repository: SafeRepositoryMetadata;
+  constructor(message: string, repository: SafeRepositoryMetadata) {
+    super(message);
+    this.name = "GitHubPartialCreationError";
+    this.repository = repository;
+  }
+}
+
+export class GitHubRepositoryService {
+  private readonly appClient: GitHubAppClient;
+  private readonly store: IdentityStore;
+  private readonly clientId: string;
+  private readonly clientSecret: string;
+  private readonly callbackUrl: string;
+  private readonly fetchFn: typeof fetch;
+  private readonly stateTtlMs: number;
+  private readonly grantTtlMs: number;
+
+  private readonly pendingStates = new Map<string, PendingRepoOAuthState>();
+  private readonly grants = new Map<string, RepositoryAuthorizationGrant>();
+  private readonly activeCreations = new Set<string>();
+
+  constructor(options: GitHubRepositoryServiceOptions) {
+    this.appClient = options.appClient;
+    this.store = options.store;
+    this.clientId = options.clientId;
+    this.clientSecret = options.clientSecret;
+    this.callbackUrl = options.callbackUrl;
+    this.fetchFn = options.fetchFn ?? fetch;
+    this.stateTtlMs = options.stateTtlMs ?? 10 * 60 * 1000;
+    this.grantTtlMs = options.grantTtlMs ?? 10 * 60 * 1000;
+  }
+
+  get appClientInstance(): GitHubAppClient {
+    return this.appClient;
+  }
+
+  private cleanup(): void {
+    const now = Date.now();
+    for (const [state, data] of this.pendingStates.entries()) {
+      if (now > data.expiresAt) {
+        this.pendingStates.delete(state);
+      }
+    }
+    for (const [grantId, grant] of this.grants.entries()) {
+      if (now > grant.expiresAtMs) {
+        this.grants.delete(grantId);
+      }
+    }
+  }
+
+  /**
+   * Begins a purpose-bound repository authorization flow for an already authenticated CEO GitHub browser session.
+   * Generates PKCE verifier/challenge and binds pending state to userId + providerSubject + installation.
+   */
+  createAuthorizationRedirect(input: {
+    userId: string;
+    providerSubject: string;
+    installationId: string;
+  }): { authorizationUrl: string; state: string } {
+    this.cleanup();
+
+    if (!input.userId || !input.providerSubject) {
+      throw new GitHubRepositoryError("Active CEO GitHub session required", 401);
+    }
+    if (!this.store.isUserActive(input.userId)) {
+      throw new GitHubRepositoryError("User is disabled or does not exist", 401);
+    }
+    if (!input.installationId || typeof input.installationId !== "string" || input.installationId.trim().length === 0) {
+      throw new GitHubRepositoryError("installation_id is required", 400);
+    }
+
+    const trimmedInstId = input.installationId.trim();
+    // Resolve installation by external numeric ID or internal row ID
+    const inst =
+      this.store.findGitHubInstallationById(trimmedInstId) ||
+      this.store.findGitHubInstallationByRowId(trimmedInstId);
+
+    if (!inst) {
+      throw new GitHubRepositoryError("GitHub installation not found", 404);
+    }
+
+    const userLink = this.store.findGitHubInstallationUser(inst.id, input.userId);
+    if (!userLink) {
+      throw new GitHubRepositoryError("User has no verified association with this installation", 403);
+    }
+
+    const codeVerifier = crypto.randomBytes(32).toString("base64url");
+    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+    const state = crypto.randomBytes(32).toString("hex");
+
+    this.pendingStates.set(state, {
+      codeVerifier,
+      userId: input.userId,
+      providerSubject: input.providerSubject,
+      installationRowId: inst.id,
+      installationId: inst.github_installation_id,
+      expiresAt: Date.now() + this.stateTtlMs,
+    });
+
+    const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
+    authorizeUrl.searchParams.set("client_id", this.clientId);
+    authorizeUrl.searchParams.set("redirect_uri", this.callbackUrl);
+    authorizeUrl.searchParams.set("state", state);
+    authorizeUrl.searchParams.set("code_challenge", codeChallenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+    return {
+      authorizationUrl: authorizeUrl.toString(),
+      state,
+    };
+  }
+
+  /**
+   * Completes OAuth callback: exchanges code, validates user identity and live installation access,
+   * then creates an ephemeral in-memory RepositoryAuthorizationGrant.
+   */
+  async handleOAuthCallback(input: {
+    state: string;
+    code: string;
+    currentUserId: string;
+    currentProviderSubject: string;
+  }): Promise<{ grant: string; expiresAtMs: number }> {
+    this.cleanup();
+
+    if (!input.currentUserId || !input.currentProviderSubject) {
+      throw new GitHubRepositoryError("Active CEO GitHub session required", 401);
+    }
+
+    const pending = this.pendingStates.get(input.state);
+    if (!pending) {
+      throw new GitHubRepositoryError("Invalid or expired authorization state", 400);
+    }
+    // Single-use
+    this.pendingStates.delete(input.state);
+
+    if (Date.now() > pending.expiresAt) {
+      throw new GitHubRepositoryError("Authorization state has expired", 400);
+    }
+
+    if (
+      pending.userId !== input.currentUserId ||
+      pending.providerSubject !== input.currentProviderSubject
+    ) {
+      throw new GitHubRepositoryError("Session user mismatch: active session does not match authorization state", 403);
+    }
+
+    if (!this.store.isUserActive(input.currentUserId)) {
+      throw new GitHubRepositoryError("User is disabled or does not exist", 401);
+    }
+
+    // 1. Exchange code for user access token
+    const tokenRes = await this.fetchFn("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        client_id: this.clientId,
+        client_secret: this.clientSecret,
+        code: input.code,
+        code_verifier: pending.codeVerifier,
+        redirect_uri: this.callbackUrl,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      throw new GitHubRepositoryError(`Token exchange failed with HTTP ${tokenRes.status}`, tokenRes.status);
+    }
+
+    const tokenData = (await tokenRes.json()) as { access_token?: string; error?: string; error_description?: string };
+    if (tokenData.error || !tokenData.access_token) {
+      throw new GitHubRepositoryError(tokenData.error_description || tokenData.error || "Token exchange failed", 400);
+    }
+
+    const userAccessToken = tokenData.access_token;
+
+    // 2. Fetch authenticated GitHub user
+    const userRes = await this.fetchFn("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${userAccessToken}`,
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "CEO-Server",
+      },
+    });
+
+    if (!userRes.ok) {
+      throw new GitHubRepositoryError(`GitHub user profile fetch failed with HTTP ${userRes.status}`, userRes.status);
+    }
+
+    const githubUser = (await userRes.json()) as { id?: unknown; login?: unknown };
+    if (typeof githubUser.id !== "number" || typeof githubUser.login !== "string") {
+      throw new GitHubRepositoryError("Invalid GitHub user response", 400);
+    }
+
+    const githubSubject = String(githubUser.id);
+    if (githubSubject !== pending.providerSubject) {
+      throw new GitHubRepositoryError(
+        `GitHub user mismatch: authenticated as '${githubSubject}' (${githubUser.login}), expected '${pending.providerSubject}'`,
+        403,
+      );
+    }
+
+    // 3. Live-verify the installation is accessible to this user
+    const perPage = 100;
+    const maxPages = 100;
+    let page = 1;
+    let targetInst: any = null;
+
+    while (page <= maxPages) {
+      const instRes = await this.fetchFn(
+        `https://api.github.com/user/installations?per_page=${perPage}&page=${page}`,
+        {
+          headers: {
+            Authorization: `Bearer ${userAccessToken}`,
+            Accept: "application/vnd.github.v3+json",
+            "User-Agent": "CEO-Server",
+          },
+        },
+      );
+
+      if (!instRes.ok) {
+        throw new GitHubRepositoryError(
+          `GitHub user installations fetch failed with HTTP ${instRes.status}`,
+          instRes.status,
+        );
+      }
+
+      const instData = (await instRes.json()) as {
+        total_count?: number;
+        installations?: Array<any>;
+      };
+
+      const installations = Array.isArray(instData.installations) ? instData.installations : [];
+      targetInst = installations.find((inst) => String(inst?.id) === pending.installationId);
+      if (targetInst) break;
+      if (installations.length === 0 || installations.length < perPage) break;
+      if (typeof instData.total_count === "number" && page * perPage >= instData.total_count) break;
+      page++;
+    }
+
+    if (!targetInst) {
+      throw new GitHubRepositoryError(
+        `Installation '${pending.installationId}' is not accessible by GitHub user '${githubSubject}'`,
+        403,
+      );
+    }
+
+    if (!targetInst.account || typeof targetInst.account !== "object" || !targetInst.account.id || !targetInst.account.login) {
+      throw new GitHubRepositoryError("Invalid installation account payload from GitHub", 400);
+    }
+
+    // 4. Create ephemeral in-memory grant
+    const grantId = crypto.randomBytes(32).toString("hex");
+    const expiresAtMs = Date.now() + this.grantTtlMs;
+
+    this.grants.set(grantId, {
+      id: grantId,
+      userId: pending.userId,
+      providerSubject: pending.providerSubject,
+      installationRowId: pending.installationRowId,
+      installationId: pending.installationId,
+      installationAccountId: String(targetInst.account.id),
+      installationAccountLogin: String(targetInst.account.login),
+      installationAccountType: targetInst.account.type === "Organization" ? "Organization" : "User",
+      userAccessToken,
+      expiresAtMs,
+    });
+
+    return {
+      grant: grantId,
+      expiresAtMs,
+    };
+  }
+
+  getValidGrant(
+    grantId: string,
+    currentUserId: string,
+    currentProviderSubject: string,
+  ): RepositoryAuthorizationGrant {
+    this.cleanup();
+
+    if (!grantId || typeof grantId !== "string") {
+      throw new GitHubRepositoryError("Grant id required", 400);
+    }
+
+    const grant = this.grants.get(grantId);
+    if (!grant) {
+      throw new GitHubRepositoryError("Invalid or expired repository grant", 401);
+    }
+
+    if (Date.now() > grant.expiresAtMs) {
+      this.grants.delete(grantId);
+      throw new GitHubRepositoryError("Repository grant has expired", 401);
+    }
+
+    if (grant.userId !== currentUserId || grant.providerSubject !== currentProviderSubject) {
+      throw new GitHubRepositoryError("Repository grant does not belong to the active session user", 403);
+    }
+
+    if (!this.store.isUserActive(currentUserId)) {
+      throw new GitHubRepositoryError("User is disabled or does not exist", 401);
+    }
+
+    const userLink = this.store.findGitHubInstallationUser(grant.installationRowId, currentUserId);
+    if (!userLink) {
+      throw new GitHubRepositoryError("User has no verified association with this installation", 403);
+    }
+
+    return grant;
+  }
+
+  /**
+   * Lists repositories in user∩installation scope with bounded pagination.
+   */
+  async listRepositories(
+    grantId: string,
+    currentUserId: string,
+    currentProviderSubject: string,
+  ): Promise<{ repositories: SafeRepositoryMetadata[]; total_count: number }> {
+    const grant = this.getValidGrant(grantId, currentUserId, currentProviderSubject);
+
+    const perPage = 100;
+    const maxPages = 100;
+    let page = 1;
+    const allRepos: SafeRepositoryMetadata[] = [];
+    let reportedTotal = 0;
+
+    while (page <= maxPages) {
+      const res = await this.fetchFn(
+        `https://api.github.com/user/installations/${encodeURIComponent(grant.installationId)}/repositories?per_page=${perPage}&page=${page}`,
+        {
+          headers: {
+            Authorization: `Bearer ${grant.userAccessToken}`,
+            Accept: "application/vnd.github.v3+json",
+            "User-Agent": "CEO-Server",
+          },
+        },
+      );
+
+      if (!res.ok) {
+        throw new GitHubRepositoryError(
+          `GitHub user installation repositories fetch failed with HTTP ${res.status}`,
+          res.status,
+        );
+      }
+
+      const data = (await res.json()) as {
+        total_count?: number;
+        repositories?: Array<any>;
+      };
+
+      if (typeof data.total_count === "number") {
+        reportedTotal = data.total_count;
+      }
+
+      const rawRepos = Array.isArray(data.repositories) ? data.repositories : [];
+      for (const r of rawRepos) {
+        if (!r || typeof r.id !== "number" || typeof r.name !== "string" || typeof r.full_name !== "string") {
+          continue;
+        }
+        allRepos.push({
+          id: String(r.id),
+          name: r.name,
+          full_name: r.full_name,
+          owner: {
+            id: String(r.owner?.id ?? ""),
+            login: String(r.owner?.login ?? ""),
+          },
+          private: Boolean(r.private),
+          archived: Boolean(r.archived),
+          disabled: Boolean(r.disabled),
+          default_branch: String(r.default_branch || "main"),
+          permissions: r.permissions
+            ? {
+                admin: Boolean(r.permissions.admin),
+                push: Boolean(r.permissions.push),
+                pull: Boolean(r.permissions.pull),
+              }
+            : undefined,
+        });
+      }
+
+      if (rawRepos.length === 0 || rawRepos.length < perPage) {
+        break;
+      }
+      if (typeof data.total_count === "number" && page * perPage >= data.total_count) {
+        break;
+      }
+
+      page++;
+    }
+
+    return {
+      repositories: allRepos,
+      total_count: reportedTotal || allRepos.length,
+    };
+  }
+
+  /**
+   * Imports an existing private repository.
+   */
+  async importRepository(
+    grantId: string,
+    currentUserId: string,
+    currentProviderSubject: string,
+    repositoryId: string,
+  ): Promise<{
+    workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+    membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+    binding: GitHubRepositoryBindingRecord;
+  }> {
+    const numericRegex = /^[1-9][0-9]*$/;
+    if (!repositoryId || typeof repositoryId !== "string" || !numericRegex.test(repositoryId)) {
+      throw new GitHubRepositoryError("repository_id must be a positive decimal string", 400);
+    }
+
+    const grant = this.getValidGrant(grantId, currentUserId, currentProviderSubject);
+
+    // Product V1 provisioning policy: reject if user already owns a workspace
+    if (this.store.countOwnedWorkspacesForUser(currentUserId) > 0) {
+      throw new GitHubRepositoryError("USER_ALREADY_OWNS_WORKSPACE: User already owns a workspace", 409);
+    }
+
+    // Reject if repo already bound
+    if (this.store.findRepositoryBindingByGitHubRepoId(repositoryId)) {
+      throw new GitHubRepositoryError("REPOSITORY_ALREADY_BOUND: GitHub repository is already bound to a workspace", 409);
+    }
+
+    // Re-fetch / live-check exact repo in user∩installation scope
+    const repoListResult = await this.listRepositories(grantId, currentUserId, currentProviderSubject);
+    const repo = repoListResult.repositories.find((r) => r.id === repositoryId);
+
+    if (!repo) {
+      throw new GitHubRepositoryError(
+        "Repository not found in installation or not accessible by user",
+        404,
+      );
+    }
+
+    // Security check: require authenticated user has admin permission
+    if (!repo.permissions?.admin) {
+      throw new GitHubRepositoryError(
+        "ADMIN_PERMISSION_REQUIRED: User must have admin permission on the repository to import",
+        403,
+      );
+    }
+
+    // Validate repo properties
+    if (!repo.private) {
+      throw new GitHubRepositoryError("REPOSITORY_NOT_PRIVATE: Only private repositories may be bound", 400);
+    }
+    if (repo.archived) {
+      throw new GitHubRepositoryError("REPOSITORY_ARCHIVED: Archived repositories cannot be bound", 400);
+    }
+    if (repo.disabled) {
+      throw new GitHubRepositoryError("REPOSITORY_DISABLED: Disabled repositories cannot be bound", 400);
+    }
+    if (!numericRegex.test(repo.owner.id) || !repo.owner.login || !repo.name || !repo.full_name || !repo.default_branch) {
+      throw new GitHubRepositoryError("Malformed repository metadata", 400);
+    }
+    if (repo.owner.id !== grant.installationAccountId) {
+      throw new GitHubRepositoryError(
+        "INSTALLATION_OWNER_MISMATCH: Repository owner does not match installation account",
+        400,
+      );
+    }
+
+    // Live installation capability check: Contents: write
+    const instDetails = await this.appClient.getInstallation(grant.installationId);
+    if (instDetails.permissions?.contents !== "write") {
+      throw new GitHubAppPermissionUpgradeRequiredError(
+        "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED: GitHub App installation requires Contents: write permission",
+      );
+    }
+
+    // Verify installation token access to exact repo
+    const instToken = await this.appClient.getInstallationToken(grant.installationId);
+    const repoRes = await this.fetchFn(
+      `https://api.github.com/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${instToken}`,
+          Accept: "application/vnd.github.v3+json",
+          "User-Agent": "CEO-Server",
+        },
+      },
+    );
+
+    if (!repoRes.ok) {
+      throw new GitHubRepositoryError(
+        `Installation token failed to access repository with HTTP ${repoRes.status}`,
+        repoRes.status === 404 ? 404 : 403,
+      );
+    }
+
+    const verifiedRepo = (await repoRes.json()) as any;
+    if (
+      !verifiedRepo ||
+      typeof verifiedRepo.id !== "number" ||
+      String(verifiedRepo.id) !== repositoryId ||
+      !verifiedRepo.private ||
+      verifiedRepo.archived ||
+      verifiedRepo.disabled
+    ) {
+      throw new GitHubRepositoryError("Repository validation failed through installation token", 400);
+    }
+
+    // Atomically create Workspace + membership + binding
+    return this.store.createWorkspaceWithRepositoryBinding({
+      userId: currentUserId,
+      installationRowId: grant.installationRowId,
+      githubRepositoryId: repositoryId,
+      ownerAccountId: repo.owner.id,
+      ownerLogin: repo.owner.login,
+      repositoryName: repo.name,
+      fullName: repo.full_name,
+      branch: repo.default_branch,
+    });
+  }
+
+  /**
+   * Programmatically creates a new private repository and provisions a workspace.
+   */
+  async createRepository(
+    grantId: string,
+    currentUserId: string,
+    currentProviderSubject: string,
+    input: { name: string; description?: string },
+  ): Promise<{
+    workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+    membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+    binding: GitHubRepositoryBindingRecord;
+  }> {
+    // Single-pod in-memory per-CEO-user provisioning guard
+    if (this.activeCreations.has(currentUserId)) {
+      throw new GitHubRepositoryError("Repository creation already in progress for this user", 409);
+    }
+    this.activeCreations.add(currentUserId);
+
+    try {
+      if (!input.name || typeof input.name !== "string" || input.name.trim().length === 0) {
+        throw new GitHubRepositoryError("Repository name is required", 400);
+      }
+      const repoName = input.name.trim();
+      if (!/^[a-zA-Z0-9._-]+$/.test(repoName) || repoName === "." || repoName === ".." || repoName.length > 100) {
+        throw new GitHubRepositoryError("Invalid repository name", 400);
+      }
+
+      const grant = this.getValidGrant(grantId, currentUserId, currentProviderSubject);
+
+      // Product V1 provisioning policy: reject BEFORE external side effect
+      if (this.store.countOwnedWorkspacesForUser(currentUserId) > 0) {
+        throw new GitHubRepositoryError("USER_ALREADY_OWNS_WORKSPACE: User already owns a workspace", 409);
+      }
+
+      // Live installation capability check BEFORE external side effect
+      const instDetails = await this.appClient.getInstallation(grant.installationId);
+      if (instDetails.permissions?.administration !== "write") {
+        throw new GitHubAppPermissionUpgradeRequiredError(
+          "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED: GitHub App requires Administration: write permission for repository creation",
+        );
+      }
+      if (instDetails.permissions?.contents !== "write") {
+        throw new GitHubAppPermissionUpgradeRequiredError(
+          "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED: GitHub App requires Contents: write permission",
+        );
+      }
+
+      // External creation via user access token
+      let createUrl: string;
+      if (grant.installationAccountType === "User") {
+        if (grant.installationAccountId !== grant.providerSubject) {
+          throw new GitHubRepositoryError("User installation account does not match authenticated user", 403);
+        }
+        createUrl = "https://api.github.com/user/repos";
+      } else {
+        createUrl = `https://api.github.com/orgs/${encodeURIComponent(grant.installationAccountLogin)}/repos`;
+      }
+
+      const createRes = await this.fetchFn(createUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${grant.userAccessToken}`,
+          Accept: "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+          "User-Agent": "CEO-Server",
+        },
+        body: JSON.stringify({
+          name: repoName,
+          description: input.description?.trim() || undefined,
+          private: true,
+          auto_init: false,
+        }),
+      });
+
+      if (!createRes.ok) {
+        const errJson = (await createRes.json().catch(() => ({}))) as { message?: string };
+        const msg = errJson.message || `GitHub repository creation failed with HTTP ${createRes.status}`;
+        throw new GitHubRepositoryError(msg, createRes.status >= 400 && createRes.status < 500 ? createRes.status : 400);
+      }
+
+      const createdRepo = (await createRes.json()) as any;
+      const numericRegex = /^[1-9][0-9]*$/;
+
+      if (
+        !createdRepo ||
+        typeof createdRepo.id !== "number" ||
+        !numericRegex.test(String(createdRepo.id)) ||
+        typeof createdRepo.name !== "string" ||
+        typeof createdRepo.full_name !== "string" ||
+        !createdRepo.owner ||
+        typeof createdRepo.owner.id !== "number" ||
+        !numericRegex.test(String(createdRepo.owner.id)) ||
+        typeof createdRepo.owner.login !== "string"
+      ) {
+        throw new GitHubRepositoryError("Invalid repository payload returned from GitHub creation", 400);
+      }
+
+      const repoId = String(createdRepo.id);
+      const ownerId = String(createdRepo.owner.id);
+      const ownerLogin = createdRepo.owner.login;
+      const fullName = createdRepo.full_name;
+      const defaultBranch = typeof createdRepo.default_branch === "string" && createdRepo.default_branch.length > 0
+        ? createdRepo.default_branch
+        : "main";
+
+      const safeRepo: SafeRepositoryMetadata = {
+        id: repoId,
+        name: createdRepo.name,
+        full_name: fullName,
+        owner: {
+          id: ownerId,
+          login: ownerLogin,
+        },
+        private: Boolean(createdRepo.private),
+        archived: Boolean(createdRepo.archived),
+        disabled: Boolean(createdRepo.disabled),
+        default_branch: defaultBranch,
+      };
+
+      if (!createdRepo.private) {
+        throw new GitHubRepositoryError("Created repository is not private", 400);
+      }
+      if (ownerId !== grant.installationAccountId) {
+        throw new GitHubRepositoryError("Created repository owner does not match installation account", 400);
+      }
+
+      // Verify newly created repo through installation token & atomically bind in DB
+      try {
+        const instToken = await this.appClient.getInstallationToken(grant.installationId);
+        const verifyRes = await this.fetchFn(
+          `https://api.github.com/repos/${encodeURIComponent(ownerLogin)}/${encodeURIComponent(createdRepo.name)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${instToken}`,
+              Accept: "application/vnd.github.v3+json",
+              "User-Agent": "CEO-Server",
+            },
+          },
+        );
+
+        if (!verifyRes.ok) {
+          throw new Error(`Installation token failed to access created repository with HTTP ${verifyRes.status}`);
+        }
+
+        const verifyData = (await verifyRes.json()) as any;
+        if (String(verifyData.id) !== repoId || !verifyData.private) {
+          throw new Error("Created repository metadata mismatch or not private");
+        }
+
+        return this.store.createWorkspaceWithRepositoryBinding({
+          userId: currentUserId,
+          installationRowId: grant.installationRowId,
+          githubRepositoryId: repoId,
+          ownerAccountId: ownerId,
+          ownerLogin,
+          repositoryName: createdRepo.name,
+          fullName,
+          branch: defaultBranch,
+        });
+      } catch (err) {
+        // Partial-side-effect: NEVER delete repo, NEVER report workspace success / READY
+        throw new GitHubPartialCreationError(
+          `Repository '${fullName}' was created on GitHub, but workspace binding failed: ${err instanceof Error ? err.message : String(err)}. Please import this repository.`,
+          safeRepo,
+        );
+      }
+    } finally {
+      this.activeCreations.delete(currentUserId);
+    }
+  }
+}

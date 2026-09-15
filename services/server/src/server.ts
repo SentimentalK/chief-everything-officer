@@ -20,9 +20,11 @@ import { createGitHubAuthRouter } from "./auth/github.js";
 import { createUserRouter } from "./auth/user-router.js";
 import { GitHubAppClient } from "./github/app-client.js";
 import { GitHubInstallationService } from "./github/installation-service.js";
+import { GitHubRepositoryService } from "./github/repository-service.js";
 import {
   createGitHubAppAuthRouter,
   createGitHubInstallationsApiRouter,
+  createGitHubRepositoryAuthorizationsRouter,
 } from "./github/router.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
@@ -207,10 +209,24 @@ if (config.githubAppEnabled) {
     callbackUrl: appCallbackUrl,
   });
 
+  const defaultRepoCallback = config.publicOrigin
+    ? `${config.publicOrigin.replace(/\/+$/, "")}/auth/github-app/repository/callback`
+    : `http://${config.bindHost}:${config.port}/auth/github-app/repository/callback`;
+  const repoCallbackUrl = defaultRepoCallback;
+
+  const repositoryService = new GitHubRepositoryService({
+    appClient,
+    store: identityService.storeInstance,
+    clientId: config.githubAppClientId!,
+    clientSecret: config.githubAppClientSecret!,
+    callbackUrl: repoCallbackUrl,
+  });
+
   app.use(
     "/auth/github-app",
     createGitHubAppAuthRouter({
       installationService,
+      repositoryService,
       sessionManager: userSessionManager,
       store: identityService.storeInstance,
     }),
@@ -220,6 +236,15 @@ if (config.githubAppEnabled) {
     "/api/github/installations",
     createGitHubInstallationsApiRouter({
       installationService,
+      sessionManager: userSessionManager,
+      store: identityService.storeInstance,
+    }),
+  );
+
+  app.use(
+    "/api/github/repository-authorizations",
+    createGitHubRepositoryAuthorizationsRouter({
+      repositoryService,
       sessionManager: userSessionManager,
       store: identityService.storeInstance,
     }),

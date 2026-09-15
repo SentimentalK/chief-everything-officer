@@ -146,4 +146,43 @@ export class GitHubAppClient {
   clearTokenCache(): void {
     this.tokenCache.clear();
   }
+
+  /**
+   * Retrieves GitHub App installation metadata (including permissions) using App JWT.
+   */
+  async getInstallation(
+    githubInstallationId: string,
+    nowMs = Date.now(),
+  ): Promise<{
+    id: number;
+    permissions?: Record<string, string>;
+    [key: string]: unknown;
+  }> {
+    const jwt = this.createAppJwt(nowMs);
+    const res = await this.fetchFn(
+      `https://api.github.com/app/installations/${encodeURIComponent(githubInstallationId)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: "application/vnd.github.v3+json",
+          "User-Agent": "CEO-Server",
+        },
+      },
+    );
+
+    if (!res.ok) {
+      throw new GitHubAppError(
+        `GitHub App getInstallation failed with HTTP ${res.status}`,
+        res.status,
+      );
+    }
+
+    const data = (await res.json()) as { id?: unknown; permissions?: unknown };
+    if (!data || typeof data.id !== "number") {
+      throw new GitHubAppError("Invalid installation response from GitHub: missing id");
+    }
+
+    return data as { id: number; permissions?: Record<string, string>; [key: string]: unknown };
+  }
 }

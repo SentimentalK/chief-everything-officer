@@ -1,5 +1,5 @@
 import express, { type Request, type Response, type Router } from "express";
-import type { IdentityStore } from "../identity/store.js";
+import { type IdentityStore, IdentityConflictError } from "../identity/store.js";
 import type { UserSessionManager } from "../auth/user-session.js";
 import {
   GitHubInstallationService,
@@ -7,9 +7,16 @@ import {
   GitHubIdentityMismatchError,
   GitHubInstallationNotFoundError,
 } from "./installation-service.js";
+import {
+  type GitHubRepositoryService,
+  GitHubRepositoryError,
+  GitHubAppPermissionUpgradeRequiredError,
+  GitHubPartialCreationError,
+} from "./repository-service.js";
 
 export interface GitHubAppAuthRouterOptions {
   installationService: GitHubInstallationService;
+  repositoryService?: GitHubRepositoryService;
   sessionManager: UserSessionManager;
   store: IdentityStore;
 }
@@ -164,6 +171,75 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
     }
   });
 
+  // GET /auth/github-app/repository/callback
+  if (options.repositoryService) {
+    const repoService = options.repositoryService;
+    router.get("/repository/callback", async (req: Request, res: Response) => {
+      const session = sessionManager.getSession(req);
+      if (!session || !store.isUserActive(session.userId)) {
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(401).json({ error: "unauthenticated" });
+          return;
+        }
+        res.redirect(302, "/login?error=unauthenticated");
+        return;
+      }
+
+      if (session.provider !== "github" || !session.providerSubject) {
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(403).json({ error: "github_identity_required" });
+          return;
+        }
+        res.redirect(302, "/login?error=github_identity_required");
+        return;
+      }
+
+      if (req.query.error) {
+        const errorMsg = String(req.query.error_description || req.query.error);
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(400).json({ error: errorMsg });
+          return;
+        }
+        res.redirect(302, `/settings/workspaces/new?error=${encodeURIComponent(errorMsg)}`);
+        return;
+      }
+
+      const state = typeof req.query.state === "string" ? req.query.state : null;
+      const code = typeof req.query.code === "string" ? req.query.code : null;
+
+      if (!state || !code) {
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(400).json({ error: "missing_code_or_state" });
+          return;
+        }
+        res.redirect(302, "/settings/workspaces/new?error=missing_code_or_state");
+        return;
+      }
+
+      try {
+        const result = await repoService.handleOAuthCallback({
+          state,
+          code,
+          currentUserId: session.userId,
+          currentProviderSubject: session.providerSubject,
+        });
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(200).json(result);
+          return;
+        }
+        res.redirect(302, `/settings/workspaces/new?grant=${encodeURIComponent(result.grant)}`);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        const status = error instanceof GitHubRepositoryError ? error.status : 500;
+        if (req.headers.accept?.includes("application/json")) {
+          res.status(status).json({ error: msg });
+          return;
+        }
+        res.redirect(302, `/settings/workspaces/new?error=${encodeURIComponent(msg)}`);
+      }
+    });
+  }
+
   return router;
 }
 
@@ -189,6 +265,200 @@ export function createGitHubInstallationsApiRouter(
 
     const installations = installationService.listUserInstallations(session.userId);
     res.status(200).json({ installations });
+  });
+
+  return router;
+}
+
+export interface GitHubRepositoryAuthorizationsRouterOptions {
+  repositoryService: GitHubRepositoryService;
+  sessionManager: UserSessionManager;
+  store: IdentityStore;
+}
+
+export function createGitHubRepositoryAuthorizationsRouter(
+  options: GitHubRepositoryAuthorizationsRouterOptions,
+): Router {
+  const { repositoryService, sessionManager, store } = options;
+  const router = express.Router();
+
+  // Support JSON and urlencoded body if mounted independently
+  router.use(express.json());
+  router.use(express.urlencoded({ extended: false }));
+
+  // POST /api/github/repository-authorizations
+  router.post("/", (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+    if (session.provider !== "github" || !session.providerSubject) {
+      res.status(403).json({ error: "github_identity_required" });
+      return;
+    }
+
+    const installationId =
+      typeof req.body?.installation_id === "string"
+        ? req.body.installation_id
+        : typeof req.body?.installationId === "string"
+        ? req.body.installationId
+        : typeof req.query?.installation_id === "string"
+        ? req.query.installation_id
+        : typeof req.query?.installationId === "string"
+        ? req.query.installationId
+        : null;
+
+    if (!installationId) {
+      res.status(400).json({ error: "missing_installation_id" });
+      return;
+    }
+
+    try {
+      const { authorizationUrl, state } = repositoryService.createAuthorizationRedirect({
+        userId: session.userId,
+        providerSubject: session.providerSubject,
+        installationId,
+      });
+
+      if (req.headers.accept?.includes("application/json") || req.is("application/json")) {
+        res.status(200).json({ authorization_url: authorizationUrl, state });
+        return;
+      }
+      res.redirect(302, authorizationUrl);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const status = error instanceof GitHubRepositoryError ? error.status : 400;
+      res.status(status).json({ error: msg });
+    }
+  });
+
+  // GET /api/github/repository-authorizations/:grant/repositories
+  router.get("/:grant/repositories", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+    if (session.provider !== "github" || !session.providerSubject) {
+      res.status(403).json({ error: "github_identity_required" });
+      return;
+    }
+
+    const grant = typeof req.params.grant === "string" ? req.params.grant : "";
+    if (!grant) {
+      res.status(400).json({ error: "missing_grant" });
+      return;
+    }
+
+    try {
+      const result = await repositoryService.listRepositories(
+        grant,
+        session.userId,
+        session.providerSubject,
+      );
+      res.status(200).json(result);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const status = error instanceof GitHubRepositoryError ? error.status : 500;
+      res.status(status).json({ error: msg });
+    }
+  });
+
+  // POST /api/github/repository-authorizations/:grant/workspace
+  router.post("/:grant/workspace", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+    if (session.provider !== "github" || !session.providerSubject) {
+      res.status(403).json({ error: "github_identity_required" });
+      return;
+    }
+
+    const grant = typeof req.params.grant === "string" ? req.params.grant : "";
+    if (!grant) {
+      res.status(400).json({ error: "missing_grant" });
+      return;
+    }
+
+    const mode = req.body?.mode;
+
+    try {
+      if (mode === "import") {
+        const repositoryId =
+          typeof req.body?.repository_id === "string"
+            ? req.body.repository_id
+            : typeof req.body?.repositoryId === "string"
+            ? req.body.repositoryId
+            : null;
+
+        if (!repositoryId) {
+          res.status(400).json({ error: "missing_repository_id" });
+          return;
+        }
+
+        const result = await repositoryService.importRepository(
+          grant,
+          session.userId,
+          session.providerSubject,
+          repositoryId,
+        );
+        res.status(201).json(result);
+        return;
+      }
+
+      if (mode === "create") {
+        const name = typeof req.body?.name === "string" ? req.body.name : null;
+        if (!name) {
+          res.status(400).json({ error: "missing_name" });
+          return;
+        }
+        const description =
+          typeof req.body?.description === "string" ? req.body.description : undefined;
+
+        const result = await repositoryService.createRepository(
+          grant,
+          session.userId,
+          session.providerSubject,
+          { name, description },
+        );
+        res.status(201).json(result);
+        return;
+      }
+
+      res.status(400).json({ error: "invalid_mode", message: "mode must be 'import' or 'create'" });
+    } catch (error) {
+      if (error instanceof GitHubPartialCreationError) {
+        res.status(500).json({
+          error: "PARTIAL_REPOSITORY_CREATION_FAILURE",
+          message: error.message,
+          repository: error.repository,
+        });
+        return;
+      }
+
+      if (error instanceof GitHubAppPermissionUpgradeRequiredError) {
+        res.status(403).json({
+          error: "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED",
+          message: error.message,
+        });
+        return;
+      }
+
+      if (error instanceof IdentityConflictError) {
+        res.status(409).json({
+          error: "conflict",
+          message: error.message,
+        });
+        return;
+      }
+
+      const msg = error instanceof Error ? error.message : String(error);
+      const status = error instanceof GitHubRepositoryError ? error.status : 500;
+      res.status(status).json({ error: msg });
+    }
   });
 
   return router;
