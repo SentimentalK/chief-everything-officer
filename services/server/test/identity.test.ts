@@ -10,9 +10,10 @@ import {
   sha256Hex,
   IDENTITY_DB_USER_VERSION,
   IdentityConflictError,
+  IdentityStructureError,
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
-import { SingletonAccountProvisioner } from "../src/identity/provisioner.js";
+import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
 
 const cleanupDirs: string[] = [];
 const cleanupStores: IdentityStore[] = [];
@@ -201,6 +202,9 @@ function topicBrokenSchema(
   const wsForeignKey = noFk ? "" : ", FOREIGN KEY (owner_user_id) REFERENCES users(id)";
   const akForeignKey = noFk ? "" : ", FOREIGN KEY (user_id) REFERENCES users(id)";
   const digestUnique = noUnique ? "" : "UNIQUE";
+  const extForeignKey = noFk ? "" : ", FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE";
+  const extUniqueSubject = noUnique ? "" : ", UNIQUE(provider, provider_subject)";
+  const extUniqueUser = noUnique ? "" : ", UNIQUE(provider, user_id)";
 
   db.exec("PRAGMA foreign_keys = OFF;");
   db.exec(`
@@ -220,8 +224,19 @@ function topicBrokenSchema(
       id TEXT PRIMARY KEY NOT NULL,
       user_id TEXT NOT NULL,
       key_digest TEXT NOT NULL ${digestUnique},
-      created_at INTEGER NOT NULL${akForeignKey}
+      created_at INTEGER NOT NULL,
+      revoked_at INTEGER${akForeignKey}
     );
+    CREATE TABLE external_identities (
+      id TEXT PRIMARY KEY NOT NULL,
+      provider TEXT NOT NULL,
+      provider_subject TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider_login TEXT,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL${extUniqueSubject}${extUniqueUser}${extForeignKey}
+    );
+    PRAGMA user_version = 2;
   `);
   db.close();
 }
@@ -348,63 +363,288 @@ describe("v2 schema & external identities migration", () => {
   });
 });
 
-describe("SingletonAccountProvisioner", () => {
-  it("binds new external identity to the singleton user and is idempotent", async () => {
+function seedExternalIdentity(
+  dbPath: string,
+  input: {
+    id: string;
+    provider: string;
+    providerSubject: string;
+    userId: string;
+    providerLogin?: string | null;
+    createdAtMs?: number;
+    updatedAtMs?: number;
+  },
+): void {
+  const raw = new DatabaseSync(dbPath);
+  const now = input.createdAtMs ?? Date.now();
+  raw.prepare(
+    `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?);`,
+  ).run(
+    input.id,
+    input.provider,
+    input.providerSubject,
+    input.userId,
+    input.providerLogin ?? null,
+    now,
+    input.updatedAtMs ?? now,
+  );
+  raw.close();
+}
+
+function countRows(dbPath: string, table: "users" | "workspaces" | "api_keys" | "external_identities"): number {
+  const raw = new DatabaseSync(dbPath);
+  const row = raw.prepare(`SELECT COUNT(*) AS c FROM ${table};`).get() as { c: number };
+  raw.close();
+  return Number(row.c);
+}
+
+describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
+  it("A. existing dogfood binding resolves same user without side effects", async () => {
     const ctx = await tempCtx();
     const ident = provision(ctx, "key-1");
     const store = openRaw(ctx);
-
-    const provisioner = new SingletonAccountProvisioner(store, ident);
-
-    // First bind: creates new external identity
-    const res1 = provisioner.resolveOrBind("github", "40360455", "SentimentalK");
-    expect(res1.isNewBinding).toBe(true);
-    expect(res1.userId).toBe(ident.user_id);
-    expect(res1.workspaceId).toBe(ident.workspace_id);
-    expect(res1.providerLogin).toBe("SentimentalK");
-
-    // Re-bind: idempotent, returns existing binding
-    const res2 = provisioner.resolveOrBind("github", "40360455", "SentimentalK");
-    expect(res2.isNewBinding).toBe(false);
-    expect(res2.userId).toBe(ident.user_id);
-    expect(res2.workspaceId).toBe(ident.workspace_id);
-  });
-
-  it("throws IdentityConflictError when user is already bound to a different github id", async () => {
-    const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
-    const store = openRaw(ctx);
-
-    const provisioner = new SingletonAccountProvisioner(store, ident);
-    provisioner.resolveOrBind("github", "40360455", "SentimentalK");
-
-    // Second github ID attempting to bind to the same user
-    expect(() =>
-      provisioner.resolveOrBind("github", "99999999", "OtherUser"),
-    ).toThrow(IdentityConflictError);
-  });
-
-  it("throws IdentityConflictError if external identity belongs to a different user", async () => {
-    const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
-    const store = openRaw(ctx);
-
-    // Insert second user into users table first to satisfy FK
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO users VALUES ('usr_other', 1000, NULL);").run();
-    raw.close();
-
-    // Bind github:40360455 to usr_other
-    store.bindExternalIdentity({
-      id: "ext_1",
+    seedExternalIdentity(ctx.dbPath, {
+      id: "ext_a",
       provider: "github",
-      providerSubject: "40360455",
-      userId: "usr_other",
+      providerSubject: "123",
+      userId: ident.user_id,
+      providerLogin: "dogfood",
     });
 
-    const provisioner = new SingletonAccountProvisioner(store, ident);
-    expect(() =>
-      provisioner.resolveOrBind("github", "40360455", "SentimentalK"),
-    ).toThrow(IdentityConflictError);
+    const usersBefore = countRows(ctx.dbPath, "users");
+    const wsBefore = countRows(ctx.dbPath, "workspaces");
+    const keysBefore = countRows(ctx.dbPath, "api_keys");
+
+    const provisioner = new IdentityAccountProvisioner(store);
+    const res = provisioner.resolveOrCreate("github", "123", "dogfood");
+
+    expect(res.createdUser).toBe(false);
+    expect(res.userId).toBe(ident.user_id);
+    expect(countRows(ctx.dbPath, "users")).toBe(usersBefore);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(wsBefore);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(keysBefore);
+  });
+
+  it("B. new GitHub user creates user + identity with zero workspace and zero api keys", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const res = provisioner.resolveOrCreate("github", "456", "new-user");
+    expect(res.createdUser).toBe(true);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const ws = raw.prepare("SELECT COUNT(*) AS c FROM workspaces WHERE owner_user_id = ?;").get(res.userId) as { c: number };
+    const keys = raw.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?;").get(res.userId) as { c: number };
+    raw.close();
+    expect(Number(ws.c)).toBe(0);
+    expect(Number(keys.c)).toBe(0);
+  });
+
+  it("C. repeat login is idempotent", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const first = provisioner.resolveOrCreate("github", "456", "user");
+    const second = provisioner.resolveOrCreate("github", "456", "user");
+
+    expect(second.userId).toBe(first.userId);
+    expect(second.createdUser).toBe(false);
+    expect(countRows(ctx.dbPath, "users")).toBe(2);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(1);
+  });
+
+  it("D. two different GitHub subjects resolve to different users", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const u1 = provisioner.resolveOrCreate("github", "111", "one");
+    const u2 = provisioner.resolveOrCreate("github", "222", "two");
+    expect(u1.userId).not.toBe(u2.userId);
+  });
+
+  it("E. login rename refreshes provider_login metadata", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const first = provisioner.resolveOrCreate("github", "456", "old-name");
+    const before = store.findExternalIdentity("github", "456");
+    expect(before?.provider_login).toBe("old-name");
+
+    const second = provisioner.resolveOrCreate("github", "456", "new-name");
+    expect(second.userId).toBe(first.userId);
+    const after = store.findExternalIdentity("github", "456");
+    expect(after?.provider_login).toBe("new-name");
+    expect(after!.updated_at_ms).toBeGreaterThanOrEqual(before!.updated_at_ms);
+  });
+
+  it("preserves provider_login when providerLogin is omitted on existing binding", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    seedExternalIdentity(ctx.dbPath, {
+      id: "ext_keep",
+      provider: "github",
+      providerSubject: "789",
+      userId: ident.user_id,
+      providerLogin: "keep-me",
+    });
+
+    const provisioner = new IdentityAccountProvisioner(store);
+    provisioner.resolveOrCreate("github", "789");
+    const row = store.findExternalIdentity("github", "789");
+    expect(row?.provider_login).toBe("keep-me");
+  });
+
+  it("F. same login with different GitHub IDs creates two users", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const u1 = provisioner.resolveOrCreate("github", "111", "shared-name");
+    const u2 = provisioner.resolveOrCreate("github", "222", "shared-name");
+    expect(u1.userId).not.toBe(u2.userId);
+  });
+
+  it("G. disabled bound user fails without creating replacement account", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("INSERT INTO users VALUES ('usr_disabled', 1000, 2000);").run();
+    raw.close();
+    seedExternalIdentity(ctx.dbPath, {
+      id: "ext_disabled",
+      provider: "github",
+      providerSubject: "456",
+      userId: "usr_disabled",
+    });
+
+    const usersBefore = countRows(ctx.dbPath, "users");
+    const extBefore = countRows(ctx.dbPath, "external_identities");
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    expect(() => provisioner.resolveOrCreate("github", "456", "user")).toThrow(IdentityConflictError);
+    expect(countRows(ctx.dbPath, "users")).toBe(usersBefore);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(extBefore);
+  });
+
+  it("M. external identity insert failure rolls back user creation", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.exec(`
+      CREATE TRIGGER trg_abort_ext_insert
+      BEFORE INSERT ON external_identities
+      BEGIN
+        SELECT RAISE(ABORT, 'forced external identity insert failure');
+      END;
+    `);
+    raw.close();
+
+    const usersBefore = countRows(ctx.dbPath, "users");
+    expect(() => store.resolveOrCreateExternalUser({ provider: "github", providerSubject: "999", providerLogin: "x" })).toThrow();
+    expect(countRows(ctx.dbPath, "users")).toBe(usersBefore);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
+  });
+
+  it("N. rejects database missing external_identities unique indexes", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE TABLE external_identities (
+        id TEXT PRIMARY KEY NOT NULL,
+        provider TEXT NOT NULL,
+        provider_subject TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        provider_login TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      PRAGMA user_version = 2;
+    `);
+    db.close();
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
+  });
+
+  it("O. creating ten GitHub users does not create workspaces, api keys, or extra side effects", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+    const provisioner = new IdentityAccountProvisioner(store);
+
+    const wsBefore = countRows(ctx.dbPath, "workspaces");
+    const keysBefore = countRows(ctx.dbPath, "api_keys");
+
+    for (let i = 0; i < 10; i++) {
+      provisioner.resolveOrCreate("github", String(10_000 + i), `user-${i}`);
+    }
+
+    expect(countRows(ctx.dbPath, "users")).toBe(1 + 10);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(10);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(wsBefore);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(keysBefore);
+
+    const runtimeWs = new DatabaseSync(ctx.dbPath);
+    const runtimeOwner = runtimeWs.prepare("SELECT owner_user_id FROM workspaces WHERE id = ?;").get(ident.workspace_id) as {
+      owner_user_id: string;
+    };
+    runtimeWs.close();
+    expect(runtimeOwner.owner_user_id).toBe(ident.user_id);
+  });
+
+  it("P. store reopen resolves same user for existing subject", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+
+    const storeA = IdentityStore.open(ctx.dbPath);
+    const provisionerA = new IdentityAccountProvisioner(storeA);
+    const created = provisionerA.resolveOrCreate("github", "456", "user-b");
+    expect(created.createdUser).toBe(true);
+    storeA.close();
+
+    const storeB = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(storeB);
+    const provisionerB = new IdentityAccountProvisioner(storeB);
+    const resolved = provisionerB.resolveOrCreate("github", "456", "user-b");
+    expect(resolved.createdUser).toBe(false);
+    expect(resolved.userId).toBe(created.userId);
+  });
+
+  it("J. runtime IdentityService.open remains unchanged after unrelated user creation", async () => {
+    const ctx = await tempCtx();
+    provision(ctx, "key-1");
+    const before = openService(ctx, "key-1").workspaceIdentityValue;
+
+    const store = openRaw(ctx);
+    new IdentityAccountProvisioner(store).resolveOrCreate("github", "456", "other");
+
+    const after = openService(ctx, "key-1").workspaceIdentityValue;
+    expect(after).toEqual(before);
   });
 });

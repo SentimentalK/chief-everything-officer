@@ -4,7 +4,6 @@ import type { Request, Response } from "express";
 export interface UserSession {
   sessionId: string;
   userId: string;
-  workspaceId: string;
   provider: string;
   providerSubject: string;
   providerLogin?: string;
@@ -31,7 +30,6 @@ export class UserSessionManager {
 
   createSession(input: {
     userId: string;
-    workspaceId: string;
     provider: string;
     providerSubject: string;
     providerLogin?: string;
@@ -42,7 +40,6 @@ export class UserSessionManager {
     const session: UserSession = {
       sessionId,
       userId: input.userId,
-      workspaceId: input.workspaceId,
       provider: input.provider,
       providerSubject: input.providerSubject,
       providerLogin: input.providerLogin,

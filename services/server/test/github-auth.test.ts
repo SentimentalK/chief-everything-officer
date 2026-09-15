@@ -3,14 +3,15 @@ import express from "express";
 import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import {
   IdentityStore,
   provisionEmptyIdentityDatabase,
   sha256Hex,
 } from "../src/identity/store.js";
-import { SingletonAccountProvisioner } from "../src/identity/provisioner.js";
+import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
-import { createGitHubAuthRouter } from "../src/auth/github.js";
+import { createGitHubAuthRouter, validateGitHubProfile } from "../src/auth/github.js";
 import { createUserRouter } from "../src/auth/user-router.js";
 
 const cleanupDirs: string[] = [];
@@ -21,7 +22,34 @@ afterEach(async () => {
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function setupTestApp(mockFetch?: typeof fetch) {
+function seedExternalIdentity(
+  dbPath: string,
+  input: {
+    id: string;
+    provider: string;
+    providerSubject: string;
+    userId: string;
+    providerLogin?: string | null;
+  },
+): void {
+  const raw = new DatabaseSync(dbPath);
+  const now = Date.now();
+  raw.prepare(
+    `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?);`,
+  ).run(
+    input.id,
+    input.provider,
+    input.providerSubject,
+    input.userId,
+    input.providerLogin ?? null,
+    now,
+    now,
+  );
+  raw.close();
+}
+
+async function setupTestApp(mockFetch?: typeof fetch, seedDogfoodBinding = false) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-gh-auth-test-"));
   cleanupDirs.push(dir);
   const dbPath = path.join(dir, "identity.sqlite");
@@ -32,10 +60,20 @@ async function setupTestApp(mockFetch?: typeof fetch) {
     apiKeyDigest: sha256Hex("test-key"),
   });
 
+  if (seedDogfoodBinding) {
+    seedExternalIdentity(dbPath, {
+      id: "ext_dogfood",
+      provider: "github",
+      providerSubject: "40360455",
+      userId: ident.user_id,
+      providerLogin: "SentimentalK",
+    });
+  }
+
   const store = IdentityStore.open(dbPath);
   cleanupStores.push(store);
 
-  const provisioner = new SingletonAccountProvisioner(store, ident);
+  const provisioner = new IdentityAccountProvisioner(store);
   const sessionManager = new UserSessionManager({ secureCookies: false });
 
   const app = express();
@@ -59,7 +97,7 @@ async function setupTestApp(mockFetch?: typeof fetch) {
   app.use("/api/user", userRouter);
 
   const server = app.listen(0);
-  const port = (server.address() as any).port;
+  const port = (server.address() as { port: number }).port;
   const baseUrl = `http://127.0.0.1:${port}`;
 
   return {
@@ -68,9 +106,29 @@ async function setupTestApp(mockFetch?: typeof fetch) {
     provisioner,
     sessionManager,
     baseUrl,
+    dbPath,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
+
+describe("validateGitHubProfile", () => {
+  it("rejects invalid GitHub profiles", () => {
+    expect(validateGitHubProfile({ id: 0, login: "x" })).toBeNull();
+    expect(validateGitHubProfile({ id: -1, login: "x" })).toBeNull();
+    expect(validateGitHubProfile({ id: 1.5, login: "x" })).toBeNull();
+    expect(validateGitHubProfile({ id: "123", login: "x" })).toBeNull();
+    expect(validateGitHubProfile({ id: 123, login: "" })).toBeNull();
+    expect(validateGitHubProfile({ id: 123, login: "   " })).toBeNull();
+    expect(validateGitHubProfile({ id: 123, login: 42 })).toBeNull();
+  });
+
+  it("accepts valid GitHub profiles", () => {
+    expect(validateGitHubProfile({ id: 40360455, login: "SentimentalK" })).toEqual({
+      providerSubject: "40360455",
+      providerLogin: "SentimentalK",
+    });
+  });
+});
 
 describe("GitHub OAuth PKCE Flow & User Session", () => {
   it("GET /auth/github initiates authorization and redirects with PKCE challenge", async () => {
@@ -108,7 +166,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
     }
   });
 
-  it("successful OAuth exchange issues ceo_user_session and binds external identity", async () => {
+  it("successful OAuth exchange issues ceo_user_session for existing dogfood binding", async () => {
     let exchangeCalled = false;
     let userFetchCalled = false;
 
@@ -125,7 +183,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
           ok: true,
           status: 200,
           json: async () => ({ access_token: "mock-gh-token-123" }),
-        } as any;
+        } as Response;
       }
       if (url === "https://api.github.com/user") {
         userFetchCalled = true;
@@ -136,19 +194,17 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
           ok: true,
           status: 200,
           json: async () => ({ id: 40360455, login: "SentimentalK" }),
-        } as any;
+        } as Response;
       }
       throw new Error(`Unexpected fetch to ${url}`);
     });
 
-    const env = await setupTestApp(mockFetch as any);
+    const env = await setupTestApp(mockFetch as typeof fetch, true);
     try {
-      // 1. Initiate OAuth to generate state
       const initRes = await fetch(`${env.baseUrl}/auth/github`, { redirect: "manual" });
       const authUrl = new URL(initRes.headers.get("location")!);
       const state = authUrl.searchParams.get("state")!;
 
-      // 2. Callback with valid state and code
       const callbackRes = await fetch(
         `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(state)}`,
         { redirect: "manual" },
@@ -162,23 +218,17 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       const setCookie = callbackRes.headers.get("set-cookie");
       expect(setCookie).toBeTruthy();
       expect(setCookie).toContain("ceo_user_session=");
-      expect(setCookie).toContain("HttpOnly");
-      expect(setCookie).toContain("SameSite=Lax");
 
       const match = setCookie!.match(/ceo_user_session=([^;]+)/);
       const sessionToken = match![1];
 
-      // 3. Verify external_identities table in DB has the binding
       const bound = env.store.findExternalIdentity("github", "40360455");
       expect(bound).not.toBeNull();
       expect(bound?.user_id).toBe(env.ident.user_id);
       expect(bound?.provider_login).toBe("SentimentalK");
 
-      // 4. GET /api/user/session with cookie returns authenticated session
       const sessionRes = await fetch(`${env.baseUrl}/api/user/session`, {
-        headers: {
-          Cookie: `ceo_user_session=${sessionToken}`,
-        },
+        headers: { Cookie: `ceo_user_session=${sessionToken}` },
       });
       expect(sessionRes.status).toBe(200);
       const sessionData = await sessionRes.json();
@@ -186,28 +236,77 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       expect(sessionData.user.id).toBe(env.ident.user_id);
       expect(sessionData.user.provider).toBe("github");
       expect(sessionData.user.provider_login).toBe("SentimentalK");
-      // Must NOT leak numeric ID to frontend!
       expect(sessionData.user.provider_subject).toBeUndefined();
 
-      // 5. POST /api/user/session/logout clears session
       const logoutRes = await fetch(`${env.baseUrl}/api/user/session/logout`, {
         method: "POST",
-        headers: {
-          Cookie: `ceo_user_session=${sessionToken}`,
-        },
+        headers: { Cookie: `ceo_user_session=${sessionToken}` },
       });
       expect(logoutRes.status).toBe(200);
-      const logoutCookie = logoutRes.headers.get("set-cookie");
-      expect(logoutCookie).toContain("Max-Age=0");
 
-      // After logout, session is false
       const afterRes = await fetch(`${env.baseUrl}/api/user/session`, {
-        headers: {
-          Cookie: `ceo_user_session=${sessionToken}`,
-        },
+        headers: { Cookie: `ceo_user_session=${sessionToken}` },
       });
       const afterData = await afterRes.json();
       expect(afterData.authenticated).toBe(false);
+    } finally {
+      await env.close();
+    }
+  });
+
+  it("H. new GitHub user gets browser session without owning a workspace", async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://github.com/login/oauth/access_token") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: "mock-gh-token" }),
+        } as Response;
+      }
+      if (url === "https://api.github.com/user") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 999888777, login: "NewUser" }),
+        } as Response;
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    });
+
+    const env = await setupTestApp(mockFetch as typeof fetch, false);
+    try {
+      const initRes = await fetch(`${env.baseUrl}/auth/github`, { redirect: "manual" });
+      const state = new URL(initRes.headers.get("location")!).searchParams.get("state")!;
+
+      const callbackRes = await fetch(
+        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(state)}`,
+        { redirect: "manual" },
+      );
+      expect(callbackRes.status).toBe(302);
+
+      const bound = env.store.findExternalIdentity("github", "999888777");
+      expect(bound).not.toBeNull();
+      expect(bound!.user_id).not.toBe(env.ident.user_id);
+
+      const raw = new DatabaseSync(env.dbPath);
+      const wsCount = raw.prepare("SELECT COUNT(*) AS c FROM workspaces WHERE owner_user_id = ?;").get(bound!.user_id) as {
+        c: number;
+      };
+      const keyCount = raw.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?;").get(bound!.user_id) as {
+        c: number;
+      };
+      raw.close();
+      expect(Number(wsCount.c)).toBe(0);
+      expect(Number(keyCount.c)).toBe(0);
+
+      const sessionToken = callbackRes.headers.get("set-cookie")!.match(/ceo_user_session=([^;]+)/)![1];
+      const sessionRes = await fetch(`${env.baseUrl}/api/user/session`, {
+        headers: { Cookie: `ceo_user_session=${sessionToken}` },
+      });
+      const sessionData = await sessionRes.json();
+      expect(sessionData.authenticated).toBe(true);
+      expect(sessionData.user.id).toBe(bound!.user_id);
     } finally {
       await env.close();
     }

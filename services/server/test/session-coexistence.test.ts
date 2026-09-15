@@ -93,7 +93,6 @@ describe("Session Coexistence: ceo_audit_session vs ceo_user_session", () => {
     // 2. Create ceo_user_session via UserSessionManager
     const userSession = env.sessionManager.createSession({
       userId: env.ident.user_id,
-      workspaceId: env.ident.workspace_id,
       provider: "github",
       providerSubject: "40360455",
       providerLogin: "SentimentalK",
