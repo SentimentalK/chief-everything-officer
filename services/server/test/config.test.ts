@@ -269,4 +269,98 @@ describe("Config Validation", () => {
       expect(config.publicOrigin).toBe("https://localhost:8443");
     });
   });
+
+  describe("GitHub App Configuration", () => {
+    it("defaults to disabled when omitted and preserves old deployment config", () => {
+      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));
+      expect(config.githubAppEnabled).toBe(false);
+      expect(config.githubAppClientId).toBeUndefined();
+    });
+
+    it("requires CLIENT_ID when enabled", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_GITHUB_APP_ENABLED: "true",
+          }),
+        ),
+      ).toThrow("CEO_GITHUB_APP_CLIENT_ID is required when CEO_GITHUB_APP_ENABLED is true");
+    });
+
+    it("requires CLIENT_SECRET when enabled", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_GITHUB_APP_ENABLED: "true",
+            CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
+          }),
+        ),
+      ).toThrow("CEO_GITHUB_APP_CLIENT_SECRET is required when CEO_GITHUB_APP_ENABLED is true");
+    });
+
+    it("requires SLUG when enabled", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_GITHUB_APP_ENABLED: "true",
+            CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
+            CEO_GITHUB_APP_CLIENT_SECRET: "secret",
+          }),
+        ),
+      ).toThrow("CEO_GITHUB_APP_SLUG is required when CEO_GITHUB_APP_ENABLED is true");
+    });
+
+    it("requires PRIVATE_KEY_PATH when enabled", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_GITHUB_APP_ENABLED: "true",
+            CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
+            CEO_GITHUB_APP_CLIENT_SECRET: "secret",
+            CEO_GITHUB_APP_SLUG: "my-app",
+          }),
+        ),
+      ).toThrow("CEO_GITHUB_APP_PRIVATE_KEY_PATH is required when CEO_GITHUB_APP_ENABLED is true");
+    });
+
+    it("requires PRIVATE_KEY_PATH file to exist", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_GITHUB_APP_ENABLED: "true",
+            CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
+            CEO_GITHUB_APP_CLIENT_SECRET: "secret",
+            CEO_GITHUB_APP_SLUG: "my-app",
+            CEO_GITHUB_APP_PRIVATE_KEY_PATH: "/non/existent/path/key.pem",
+          }),
+        ),
+      ).toThrow("CEO_GITHUB_APP_PRIVATE_KEY_PATH file not found");
+    });
+
+    it("accepts valid GitHub App configuration", () => {
+      // package.json exists and can be used as a stand-in existing file
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          CEO_GITHUB_APP_ENABLED: "true",
+          CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
+          CEO_GITHUB_APP_CLIENT_SECRET: "secret123",
+          CEO_GITHUB_APP_SLUG: "my-app",
+          CEO_GITHUB_APP_PRIVATE_KEY_PATH: "package.json",
+          CEO_GITHUB_APP_CALLBACK_URL: "https://example.com/callback",
+        }),
+      );
+      expect(config.githubAppEnabled).toBe(true);
+      expect(config.githubAppClientId).toBe("Iv1.test");
+      expect(config.githubAppClientSecret).toBe("secret123");
+      expect(config.githubAppSlug).toBe("my-app");
+      expect(config.githubAppPrivateKeyPath).toBe("package.json");
+      expect(config.githubAppCallbackUrl).toBe("https://example.com/callback");
+    });
+  });
 });

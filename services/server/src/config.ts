@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 
 export interface Config {
   dataRoot: string;
@@ -32,6 +33,12 @@ export interface Config {
   publicOrigin?: string;
   oauthEnabled: boolean;
   oauthDbPath: string;
+  githubAppEnabled: boolean;
+  githubAppClientId?: string;
+  githubAppClientSecret?: string;
+  githubAppSlug?: string;
+  githubAppPrivateKeyPath?: string;
+  githubAppCallbackUrl?: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -123,6 +130,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     publicOrigin = parsed.origin;
   }
 
+  const githubAppEnabled = parseBool(env.CEO_GITHUB_APP_ENABLED, false);
+  const githubAppClientId = env.CEO_GITHUB_APP_CLIENT_ID?.trim() || undefined;
+  const githubAppClientSecret = env.CEO_GITHUB_APP_CLIENT_SECRET?.trim() || undefined;
+  const githubAppSlug = env.CEO_GITHUB_APP_SLUG?.trim() || undefined;
+  const githubAppPrivateKeyPath = env.CEO_GITHUB_APP_PRIVATE_KEY_PATH?.trim() || undefined;
+  const githubAppCallbackUrl = env.CEO_GITHUB_APP_CALLBACK_URL?.trim() || undefined;
+
+  if (githubAppEnabled) {
+    if (!githubAppClientId) {
+      throw new Error("CEO_GITHUB_APP_CLIENT_ID is required when CEO_GITHUB_APP_ENABLED is true");
+    }
+    if (!githubAppClientSecret) {
+      throw new Error("CEO_GITHUB_APP_CLIENT_SECRET is required when CEO_GITHUB_APP_ENABLED is true");
+    }
+    if (!githubAppSlug) {
+      throw new Error("CEO_GITHUB_APP_SLUG is required when CEO_GITHUB_APP_ENABLED is true");
+    }
+    if (!githubAppPrivateKeyPath) {
+      throw new Error("CEO_GITHUB_APP_PRIVATE_KEY_PATH is required when CEO_GITHUB_APP_ENABLED is true");
+    }
+    if (!fs.existsSync(githubAppPrivateKeyPath)) {
+      throw new Error(`CEO_GITHUB_APP_PRIVATE_KEY_PATH file not found: ${githubAppPrivateKeyPath}`);
+    }
+  }
+
   return {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
@@ -155,6 +187,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(publicOrigin ? { publicOrigin } : {}),
     oauthEnabled,
     oauthDbPath: env.CEO_OAUTH_DB_PATH ?? path.join(dataRoot, "identity", "oauth.sqlite"),
+    githubAppEnabled,
+    ...(githubAppClientId ? { githubAppClientId } : {}),
+    ...(githubAppClientSecret ? { githubAppClientSecret } : {}),
+    ...(githubAppSlug ? { githubAppSlug } : {}),
+    ...(githubAppPrivateKeyPath ? { githubAppPrivateKeyPath } : {}),
+    ...(githubAppCallbackUrl ? { githubAppCallbackUrl } : {}),
   };
 }
 

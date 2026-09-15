@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import express, { type Request, type Response } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
@@ -17,6 +18,12 @@ import { IdentityAccountProvisioner } from "./identity/provisioner.js";
 import { UserSessionManager } from "./auth/user-session.js";
 import { createGitHubAuthRouter } from "./auth/github.js";
 import { createUserRouter } from "./auth/user-router.js";
+import { GitHubAppClient } from "./github/app-client.js";
+import { GitHubInstallationService } from "./github/installation-service.js";
+import {
+  createGitHubAppAuthRouter,
+  createGitHubInstallationsApiRouter,
+} from "./github/router.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
@@ -163,6 +170,58 @@ if (config.githubClientId && config.githubClientSecret) {
       callbackUrl,
       provisioner: userProvisioner,
       sessionManager: userSessionManager,
+    }),
+  );
+}
+
+// GitHub App authorization & installation capability (when enabled)
+if (config.githubAppEnabled) {
+  const defaultAppCallback = config.publicOrigin
+    ? `${config.publicOrigin.replace(/\/+$/, "")}/auth/github-app/callback`
+    : `http://${config.bindHost}:${config.port}/auth/github-app/callback`;
+  const appCallbackUrl = config.githubAppCallbackUrl || defaultAppCallback;
+
+  let privateKey: string;
+  try {
+    privateKey = fs.readFileSync(config.githubAppPrivateKeyPath!, "utf8");
+  } catch (error) {
+    fatal("github-app", error);
+  }
+
+  let appClient: GitHubAppClient;
+  try {
+    appClient = new GitHubAppClient({
+      clientId: config.githubAppClientId!,
+      privateKey,
+    });
+  } catch (error) {
+    fatal("github-app", error);
+  }
+
+  const installationService = new GitHubInstallationService({
+    appClient,
+    store: identityService.storeInstance,
+    clientId: config.githubAppClientId!,
+    clientSecret: config.githubAppClientSecret!,
+    slug: config.githubAppSlug!,
+    callbackUrl: appCallbackUrl,
+  });
+
+  app.use(
+    "/auth/github-app",
+    createGitHubAppAuthRouter({
+      installationService,
+      sessionManager: userSessionManager,
+      store: identityService.storeInstance,
+    }),
+  );
+
+  app.use(
+    "/api/github/installations",
+    createGitHubInstallationsApiRouter({
+      installationService,
+      sessionManager: userSessionManager,
+      store: identityService.storeInstance,
     }),
   );
 }
