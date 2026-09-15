@@ -268,6 +268,7 @@ fn test_8_agy_headless_unattended_command_line_flags() {
         attempt_dir: &attempt_dir,
         prompt_file: &prompt_file,
         model: None,
+        timeout_secs: None,
     };
     let args_default = adapter.build_command_args(&req_default);
     assert!(args_default.contains(&"--input-format".to_string()));
@@ -277,10 +278,12 @@ fn test_8_agy_headless_unattended_command_line_flags() {
     assert!(args_default.contains(&"accept-edits".to_string()));
     assert!(args_default.contains(&"--dangerously-skip-permissions".to_string()));
     assert!(args_default.contains(&"--sandbox".to_string()));
+    assert!(args_default.contains(&"--print-timeout".to_string()));
+    assert!(args_default.contains(&"3600s".to_string()));
     assert!(args_default.contains(&"--model".to_string()));
     assert!(args_default.contains(&"gemini-3.8-flash-medium".to_string()));
 
-    // Case 2: Explicit model override
+    // Case 2: Explicit model override and explicit timeout
     let req_override = ceo_worker::executor::ExecutionRequest {
         job_id: "job-1",
         attempt_id: "att-1",
@@ -288,7 +291,10 @@ fn test_8_agy_headless_unattended_command_line_flags() {
         attempt_dir: &attempt_dir,
         prompt_file: &prompt_file,
         model: Some("gemini-1.5-pro"),
+        timeout_secs: Some(7200),
     };
     let args_override = adapter.build_command_args(&req_override);
     assert!(args_override.contains(&"gemini-1.5-pro".to_string()));
+    assert!(args_override.contains(&"--print-timeout".to_string()));
+    assert!(args_override.contains(&"7200s".to_string()));
 }

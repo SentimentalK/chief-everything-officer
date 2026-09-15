@@ -965,6 +965,7 @@ impl Runner {
             attempt_dir: &current_attempt_dir,
             prompt_file,
             model: self.config.agent_model.as_deref(),
+            timeout_secs: Some(timeout_secs),
         };
         let launch_config = adapter.get_launch_config(&exec_request);
         let doctor_prompt = doctor_ctx.build_probe_prompt();
@@ -1801,6 +1802,7 @@ impl Runner {
             attempt_dir: &doctor_dir,
             prompt_file: &canonical_workspace.join("AGENTS.md"),
             model: self.config.agent_model.as_deref(),
+            timeout_secs: Some(self.config.doctor_timeout_secs),
         };
 
         // Check local precheck first

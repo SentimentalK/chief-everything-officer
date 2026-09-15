@@ -37,6 +37,7 @@ pub struct ExecutionRequest<'a> {
     pub attempt_dir: &'a Path,
     pub prompt_file: &'a Path,
     pub model: Option<&'a str>,
+    pub timeout_secs: Option<u64>,
 }
 
 pub trait ManagedProcess: Send + Sync {

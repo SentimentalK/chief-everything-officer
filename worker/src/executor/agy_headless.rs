@@ -33,6 +33,10 @@ impl AgyHeadlessAdapter {
                 .to_string(),
         ];
 
+        let timeout_secs = request.timeout_secs.unwrap_or(3600);
+        args.push("--print-timeout".to_string());
+        args.push(format!("{}s", timeout_secs));
+
         let model = request.model.unwrap_or("gemini-3.8-flash-medium");
         args.push("--model".to_string());
         args.push(model.to_string());
