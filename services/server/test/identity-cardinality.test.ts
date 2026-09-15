@@ -85,6 +85,13 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     ctx.branchA,
     nowMs,
   );
+  db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+    "wsm_alice",
+    ctx.workspaceA,
+    ctx.userA,
+    "owner",
+    nowMs,
+  );
   db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
     "ak_alice_1",
     ctx.userA,
@@ -99,6 +106,13 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     ctx.userB,
     ctx.remoteB,
     ctx.branchB,
+    nowMs + 1,
+  );
+  db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+    "wsm_bob",
+    ctx.workspaceB,
+    ctx.userB,
+    "owner",
     nowMs + 1,
   );
   db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
@@ -293,6 +307,13 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
       ctx.branchA,
       3000000,
     );
+    raw.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+      "wsm_dup",
+      "ws_duplicate",
+      ctx.userA,
+      "owner",
+      3000000,
+    );
     raw.close();
 
     expect(() =>
@@ -485,6 +506,13 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
       ctx.userA,
       "git@example.com:org/repo-a-other.git",
       "main",
+      4000000,
+    );
+    raw.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+      "wsm_alpha_2",
+      "ws_alpha_2",
+      ctx.userA,
+      "owner",
       4000000,
     );
     raw.close();

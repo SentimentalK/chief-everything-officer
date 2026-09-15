@@ -58,7 +58,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 2;
+export const IDENTITY_DB_USER_VERSION = 3;
 
 // Application data schema. DDL runs inside a single provisioning transaction.
 export const IDENTITY_DDL = `
@@ -99,33 +99,51 @@ CREATE TABLE external_identities (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE workspace_memberships (
+  id TEXT PRIMARY KEY NOT NULL,
+  workspace_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(workspace_id, user_id),
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
+CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
+CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
+CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
-// Used only for precise structural validation of the four fixed tables.
-const EXPECTED_TABLES = ["users", "workspaces", "api_keys", "external_identities"] as const;
+const EXPECTED_TABLES = ["users", "workspaces", "api_keys", "external_identities", "workspace_memberships"] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
   users: ["id", "created_at"],
   workspaces: ["id", "owner_user_id", "remote_url", "branch", "created_at"],
   api_keys: ["id", "user_id", "key_digest", "created_at"],
   external_identities: ["id", "provider", "provider_subject", "user_id", "created_at_ms", "updated_at_ms"],
+  workspace_memberships: ["id", "workspace_id", "user_id", "role", "created_at"],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
   workspaces: [{ from: "owner_user_id", to: "id", referencedTable: "users" }],
   api_keys: [{ from: "user_id", to: "id", referencedTable: "users" }],
   external_identities: [{ from: "user_id", to: "id", referencedTable: "users" }],
+  workspace_memberships: [
+    { from: "workspace_id", to: "id", referencedTable: "workspaces" },
+    { from: "user_id", to: "id", referencedTable: "users" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -177,6 +195,7 @@ export function provisionEmptyIdentityDatabase(
 
   const userId = newId("usr");
   const workspaceId = newId("ws");
+  const membershipId = newId("wsm");
   const apiKeyId = newId("ak");
 
   try {
@@ -195,6 +214,9 @@ export function provisionEmptyIdentityDatabase(
         db.prepare(
           "INSERT INTO workspaces (id, owner_user_id, remote_url, branch, created_at) VALUES (?, ?, ?, ?, ?);",
         ).run(workspaceId, userId, input.remoteUrl, input.branch, nowMs);
+        db.prepare(
+          "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
+        ).run(membershipId, workspaceId, userId, nowMs);
         db.prepare(
           "INSERT INTO api_keys (id, user_id, key_digest, created_at, revoked_at) VALUES (?, ?, ?, ?, NULL);",
         ).run(apiKeyId, userId, input.apiKeyDigest, nowMs);
@@ -298,7 +320,7 @@ export class IdentityStore {
       db.exec("PRAGMA busy_timeout = 100;");
       ensureJournalMode(db);
 
-      IdentityStore.migrateIfVersion1(db);
+      IdentityStore.migrateToCurrent(db);
 
       const store = new IdentityStore(resolved, db);
       store.validateStructure();
@@ -433,6 +455,57 @@ export class IdentityStore {
     this.requireUniqueIndex(db, "api_keys", ["key_digest"]);
     this.requireUniqueIndex(db, "external_identities", ["provider", "provider_subject"]);
     this.requireUniqueIndex(db, "external_identities", ["provider", "user_id"]);
+    this.requireUniqueIndex(db, "workspace_memberships", ["workspace_id", "user_id"]);
+    this.requirePartialUniqueIndex(db, "workspace_memberships", ["workspace_id"], "role = 'owner'");
+
+    this.validateData();
+  }
+
+  private validateData(): void {
+    const db = this.requireDb();
+
+    const badRole = db.prepare(
+      "SELECT id FROM workspace_memberships WHERE role != 'owner' LIMIT 1;",
+    ).get() as { id: string } | undefined;
+    if (badRole) {
+      throw new IdentityStructureError(
+        `Identity database contains workspace membership '${badRole.id}' with unsupported role (only 'owner' is allowed).`,
+      );
+    }
+
+    const workspaces = db.prepare("SELECT id, owner_user_id FROM workspaces;").all() as Array<{
+      id: string;
+      owner_user_id: string;
+    }>;
+    for (const workspace of workspaces) {
+      const owners = db.prepare(
+        "SELECT id, user_id FROM workspace_memberships WHERE workspace_id = ? AND role = 'owner';",
+      ).all(workspace.id) as Array<{ id: string; user_id: string }>;
+      if (owners.length !== 1) {
+        throw new IdentityStructureError(
+          `Workspace '${workspace.id}' must have exactly one owner membership, found ${owners.length}.`,
+        );
+      }
+      const owner = owners[0]!;
+      if (owner.user_id !== workspace.owner_user_id) {
+        throw new IdentityStructureError(
+          `Workspace '${workspace.id}' owner membership user '${owner.user_id}' does not match shadow owner '${workspace.owner_user_id}'.`,
+        );
+      }
+    }
+
+    const fkViolations = db.prepare("PRAGMA foreign_key_check;").all() as Array<{
+      table: string;
+      rowid: number;
+      parent: string;
+      fkid: number;
+    }>;
+    if (fkViolations.length > 0) {
+      const sample = fkViolations[0]!;
+      throw new IdentityStructureError(
+        `Identity database foreign key check failed (${fkViolations.length} violation(s); first: table '${sample.table}' rowid ${sample.rowid}).`,
+      );
+    }
   }
 
   private requireUniqueIndex(db: DatabaseSync, table: string, columns: string[]): void {
@@ -457,6 +530,44 @@ export class IdentityStore {
     }
     throw new IdentityStructureError(
       `Identity table '${table}' must have a UNIQUE index over exactly the columns (${columns.join(", ")}).`,
+    );
+  }
+
+  private requirePartialUniqueIndex(
+    db: DatabaseSync,
+    table: string,
+    columns: string[],
+    whereClause: string,
+  ): void {
+    const normalizedWhere = whereClause.replace(/\s+/g, " ").trim().toLowerCase();
+    const indexes = db.prepare(`PRAGMA index_list(${table});`).all() as Array<{
+      seq: number;
+      name: string;
+      unique: number;
+      origin: string;
+      partial: number;
+    }>;
+    for (const idx of indexes) {
+      if (idx.unique !== 1 || idx.partial !== 1) continue;
+      const cols = db.prepare(`PRAGMA index_xinfo(${quoteIdent(idx.name)});`).all() as Array<{
+        seqno: number;
+        cid: number;
+        name: string | null;
+      }>;
+      const keyed = cols.filter((c) => c.cid >= 0).map((c) => c.name);
+      if (keyed.length !== columns.length || !columns.every((col, i) => keyed[i] === col)) {
+        continue;
+      }
+      const master = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?;").get(idx.name) as
+        | { sql: string | null }
+        | undefined;
+      const sqlNorm = (master?.sql ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (sqlNorm.includes(`where ${normalizedWhere}`)) {
+        return;
+      }
+    }
+    throw new IdentityStructureError(
+      `Identity table '${table}' must have a partial UNIQUE index over (${columns.join(", ")}) WHERE ${whereClause}.`,
     );
   }
 
@@ -490,15 +601,32 @@ export class IdentityStore {
       }
 
       const workspace = workspaces[0]!;
+      const membership = db.prepare(
+        "SELECT id, workspace_id, user_id, role, created_at FROM workspace_memberships WHERE workspace_id = ? AND role = 'owner' LIMIT 1;",
+      ).get(workspace.id) as
+        | { id: string; workspace_id: string; user_id: string; role: string; created_at: number }
+        | undefined;
+
+      if (!membership) {
+        throw new IdentityStructureError(
+          `Workspace '${workspace.id}' has no owner membership.`,
+        );
+      }
+      if (membership.user_id !== workspace.owner_user_id) {
+        throw new IdentityStructureError(
+          `Workspace '${workspace.id}' owner membership user '${membership.user_id}' does not match shadow owner '${workspace.owner_user_id}'.`,
+        );
+      }
+
       const user = db.prepare(
         "SELECT id, created_at, disabled_at FROM users WHERE id = ?;",
-      ).get(workspace.owner_user_id) as
+      ).get(membership.user_id) as
         | { id: string; created_at: number; disabled_at: number | null }
         | undefined;
 
       if (!user) {
         throw new IdentityStructureError(
-          `Workspace owner user '${workspace.owner_user_id}' does not exist.`,
+          `Workspace owner user '${membership.user_id}' does not exist.`,
         );
       }
       if (user.disabled_at != null) {
@@ -763,37 +891,146 @@ export class IdentityStore {
     });
   }
 
-  static migrateIfVersion1(db: DatabaseSync): void {
-    const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number } | undefined;
-    const version = Number(versionRow?.user_version ?? 0);
-    if (version === 1) {
-      db.exec("BEGIN IMMEDIATE;");
-      try {
-        db.exec(`
-          CREATE TABLE IF NOT EXISTS external_identities (
-            id TEXT PRIMARY KEY NOT NULL,
-            provider TEXT NOT NULL,
-            provider_subject TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            provider_login TEXT,
-            created_at_ms INTEGER NOT NULL,
-            updated_at_ms INTEGER NOT NULL,
-            UNIQUE(provider, provider_subject),
-            UNIQUE(provider, user_id),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-          );
-          CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
-          PRAGMA user_version = 2;
-        `);
-        db.exec("COMMIT;");
-      } catch (error) {
-        try {
-          db.exec("ROLLBACK;");
-        } catch {
-          /* ignore */
-        }
-        throw new IdentityStructureError(`Failed to migrate identity database from version 1 to 2: ${error}`);
+  static migrateToCurrent(db: DatabaseSync): void {
+    while (true) {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      const version = Number(versionRow.user_version);
+      if (version >= IDENTITY_DB_USER_VERSION) {
+        return;
       }
+      switch (version) {
+        case 1:
+          IdentityStore.migrateV1ToV2(db);
+          break;
+        case 2:
+          IdentityStore.migrateV2ToV3(db);
+          break;
+        default:
+          throw new IdentityStructureError(
+            `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
+          );
+      }
+    }
+  }
+
+  static migrateV1ToV2(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 1) {
+        throw new IdentityStructureError("migrateV1ToV2 requires user_version = 1.");
+      }
+
+      for (const table of ["users", "workspaces", "api_keys"] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v2: missing required v1 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS external_identities (
+          id TEXT PRIMARY KEY NOT NULL,
+          provider TEXT NOT NULL,
+          provider_subject TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          provider_login TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          UNIQUE(provider, provider_subject),
+          UNIQUE(provider, user_id),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
+        PRAGMA user_version = 2;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 1 to 2: ${error}`);
+    }
+  }
+
+  static migrateV2ToV3(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 2) {
+        throw new IdentityStructureError("migrateV2ToV3 requires user_version = 2.");
+      }
+
+      for (const table of ["users", "workspaces", "api_keys", "external_identities"] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v3: missing required v2 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE workspace_memberships (
+          id TEXT PRIMARY KEY NOT NULL,
+          workspace_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE(workspace_id, user_id),
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
+        CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
+        CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
+      `);
+
+      const workspaces = db.prepare(
+        "SELECT id, owner_user_id, created_at FROM workspaces ORDER BY id ASC;",
+      ).all() as Array<{ id: string; owner_user_id: string; created_at: number }>;
+
+      const insertMembership = db.prepare(
+        "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
+      );
+      for (const workspace of workspaces) {
+        insertMembership.run(newId("wsm"), workspace.id, workspace.owner_user_id, workspace.created_at);
+      }
+
+      const workspaceCount = db.prepare("SELECT COUNT(*) AS c FROM workspaces;").get() as { c: number };
+      const membershipCount = db.prepare("SELECT COUNT(*) AS c FROM workspace_memberships;").get() as { c: number };
+      if (Number(membershipCount.c) !== Number(workspaceCount.c)) {
+        throw new IdentityStructureError(
+          `v2→v3 migration membership count ${membershipCount.c} does not match workspace count ${workspaceCount.c}.`,
+        );
+      }
+
+      for (const workspace of workspaces) {
+        const owner = db.prepare(
+          "SELECT user_id FROM workspace_memberships WHERE workspace_id = ? AND role = 'owner' LIMIT 1;",
+        ).get(workspace.id) as { user_id: string } | undefined;
+        if (!owner || owner.user_id !== workspace.owner_user_id) {
+          throw new IdentityStructureError(
+            `v2→v3 migration owner membership for workspace '${workspace.id}' does not match shadow owner.`,
+          );
+        }
+      }
+
+      db.exec("PRAGMA user_version = 3;");
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 2 to 3: ${error}`);
     }
   }
 
@@ -946,6 +1183,33 @@ export class IdentityStore {
     });
   }
 
+  hasWorkspaceAccess(workspaceId: string, userId: string): boolean {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ? AND role = 'owner' LIMIT 1;",
+      ).get(workspaceId, userId) as { id: string } | undefined;
+      return Boolean(row);
+    });
+  }
+
+  getOwnerMembershipForWorkspace(workspaceId: string): {
+    id: string;
+    workspace_id: string;
+    user_id: string;
+    role: string;
+    created_at: number;
+  } | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, workspace_id, user_id, role, created_at FROM workspace_memberships WHERE workspace_id = ? AND role = 'owner' LIMIT 1;",
+      ).get(workspaceId) as
+        | { id: string; workspace_id: string; user_id: string; role: string; created_at: number }
+        | undefined;
+      return row ?? null;
+    });
+  }
+
+  /** Kept during 3.3A; authorization still uses this until 3.3B cutover. */
   isWorkspaceOwnedByUser(workspaceId: string, userId: string): boolean {
     return this.withDb((db) => {
       const row = db.prepare(
