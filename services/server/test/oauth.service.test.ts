@@ -403,4 +403,49 @@ describe("OAuthService Core & Security Constraints", () => {
       ).toThrow(/does not match canonical resource/);
     });
   });
+
+  it("L. deleting owner membership invalidates access tokens and refresh revokes family", async () => {
+    const { service, ident, identStore, oauthStore } = await setupTestEnv();
+
+    const verifier = "verifier_membership_revoke_test_123456789012345678";
+    const challenge = sha256Base64Url(verifier);
+    const reqId = "oar_flow_membership_revoke";
+    oauthStore.createAuthorizationRequest({
+      id: reqId,
+      client_id: "https://chatgpt.com/client.json",
+      client_name: "ChatGPT",
+      redirect_uri: "https://chatgpt.com/oauth/callback",
+      resource: "https://ceo.sentimentalk.com/mcp",
+      scope: "mcp offline_access",
+      state: null,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 600000,
+    });
+
+    const nonce = service.createConsentNonce(reqId);
+    const approval = service.approveConsent(reqId, nonce, ident.user_id);
+    const tokens = service.exchangeAuthorizationCode({
+      clientId: "https://chatgpt.com/client.json",
+      redirectUri: "https://chatgpt.com/oauth/callback",
+      code: approval.code,
+      codeVerifier: verifier,
+      resource: "https://ceo.sentimentalk.com/mcp",
+    });
+
+    const db = (identStore as { requireDb(): import("node:sqlite").DatabaseSync }).requireDb();
+    db.prepare("DELETE FROM workspace_memberships WHERE workspace_id = ?;").run(ident.workspace_id);
+
+    const atCheck = service.validateAccessToken(tokens.access_token);
+    expect(atCheck.valid).toBe(false);
+
+    expect(() =>
+      service.refreshTokens({
+        clientId: "https://chatgpt.com/client.json",
+        refreshToken: tokens.refresh_token,
+        resource: "https://ceo.sentimentalk.com/mcp",
+      }),
+    ).toThrow(OAuthServerError);
+  });
 });

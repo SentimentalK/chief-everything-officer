@@ -14,6 +14,7 @@ import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
 import { fixture, seedIdentity, createIdentityService } from "./helpers.js";
 import { IdentityService } from "../src/identity/service.js";
+import { sha256Hex } from "../src/identity/store.js";
 import type { Config } from "../src/config.js";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "@modelcontextprotocol/server";
@@ -378,6 +379,21 @@ describe("Audit HTTP API & Session Management", () => {
 
     return { baseUrl, auditStore, apiKey, config, service };
   }
+
+  it("returns 403 when a valid API key belongs to a user without workspace access", async () => {
+    const { baseUrl, config } = await setupTestApp("alice-key");
+
+    const raw = new DatabaseSync(config.identityDbPath);
+    raw.prepare("INSERT INTO users VALUES ('usr_bob', 2000, NULL);").run();
+    raw.prepare("INSERT INTO api_keys VALUES ('ak_bob', 'usr_bob', ?, 2000, NULL);").run(sha256Hex("bob-key"));
+    raw.close();
+
+    const res = await fetch(`${baseUrl}/api/audit/traces`, {
+      headers: { Authorization: "Bearer bob-key" },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "Forbidden: workspace access denied" });
+  });
 
   it("enforces authentication on /api/audit/traces", async () => {
     const { baseUrl } = await setupTestApp();

@@ -424,7 +424,7 @@ export function createAuditRouter(options: {
           return;
         }
         if (!identityService.holdsWorkspace(ident)) {
-          res.status(403).json({ error: "Forbidden: workspace not owned" });
+          res.status(403).json({ error: "Forbidden: workspace access denied" });
           return;
         }
         next();
@@ -451,7 +451,7 @@ export function createAuditRouter(options: {
         return;
       }
       if (!identityService.holdsWorkspace(identity)) {
-        res.status(403).json({ error: "Forbidden: workspace not owned" });
+        res.status(403).json({ error: "Forbidden: workspace access denied" });
         return;
       }
       next();
@@ -479,7 +479,7 @@ export function createAuditRouter(options: {
         return;
       }
       if (!identityService.holdsWorkspace(result)) {
-        res.status(403).json({ error: "Forbidden: workspace not owned" });
+        res.status(403).json({ error: "Forbidden: workspace access denied" });
         return;
       }
       identity = identityService.assertWorkspaceAccess(result);

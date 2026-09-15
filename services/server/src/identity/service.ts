@@ -153,7 +153,7 @@ export class IdentityService {
    * Re-derives an identity from a known api_key_id + user_id (used by cookie sessions).
    * Authenticates the credential in the DB first without selecting an arbitrary workspace,
    * then applies runtime workspace authorization explicitly. Returns a fresh AuthIdentity,
-   * or null if the key was revoked / user disabled / user does not own this deployment's workspace.
+   * or null if the key was revoked / user disabled / user lacks access to this deployment's workspace.
    * Throws IdentityDbUnavailable on runtime DB faults.
    */
   revalidateAndOwnership(identity: { api_key_id: string; user_id: string }): AuthIdentity | null {
@@ -174,19 +174,19 @@ export class IdentityService {
 
   /**
    * Confirms whether an authenticated identity is authorized for the served runtime workspace
-   * based on the credential owner owning the selected workspace.
+   * based on workspace membership for the selected runtime workspace.
    */
   holdsWorkspace(identity: CredentialIdentity | AuthIdentity): boolean {
     if ("workspace_id" in identity && identity.workspace_id !== this.workspaceIdentity.workspace_id) {
       return false;
     }
-    return this.store.isWorkspaceOwnedByUser(this.workspaceIdentity.workspace_id, identity.user_id);
+    return this.store.hasWorkspaceAccess(this.workspaceIdentity.workspace_id, identity.user_id);
   }
 
   /**
    * Authorizes an authenticated identity against the served runtime workspace.
    * Produces the request AuthIdentity scoped to the current runtime workspace,
-   * or throws WorkspaceAccessDeniedError if the user does not own this workspace.
+   * or throws WorkspaceAccessDeniedError if the user lacks workspace access.
    */
   assertWorkspaceAccess(identity: CredentialIdentity | AuthIdentity): AuthIdentity {
     if ("workspace_id" in identity && identity.workspace_id !== this.workspaceIdentity.workspace_id) {
@@ -194,9 +194,9 @@ export class IdentityService {
         `Authenticated identity is bound to workspace '${identity.workspace_id}' but this deployment serves '${this.workspaceIdentity.workspace_id}'.`,
       );
     }
-    if (!this.store.isWorkspaceOwnedByUser(this.workspaceIdentity.workspace_id, identity.user_id)) {
+    if (!this.store.hasWorkspaceAccess(this.workspaceIdentity.workspace_id, identity.user_id)) {
       throw new WorkspaceAccessDeniedError(
-        `Authenticated user '${identity.user_id}' does not own workspace '${this.workspaceIdentity.workspace_id}'.`,
+        `Authenticated user '${identity.user_id}' workspace access denied for '${this.workspaceIdentity.workspace_id}'.`,
       );
     }
     return {

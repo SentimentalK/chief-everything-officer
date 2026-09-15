@@ -454,9 +454,9 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(resB.status).toBe(403);
 
     // Simulate DB failure during workspace-authorization phase:
-    // credential authentication succeeds (authenticateApiKey works), but isWorkspaceOwnedByUser throws IdentityDbUnavailable.
-    const origMethod = serviceA.store.isWorkspaceOwnedByUser.bind(serviceA.store);
-    serviceA.store.isWorkspaceOwnedByUser = () => {
+    // credential authentication succeeds (authenticateApiKey works), but hasWorkspaceAccess throws IdentityDbUnavailable.
+    const origMethod = serviceA.store.hasWorkspaceAccess.bind(serviceA.store);
+    serviceA.store.hasWorkspaceAccess = () => {
       throw new IdentityDbUnavailable("Simulated DB connection lost during workspace check");
     };
 
@@ -472,11 +472,11 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.isWorkspaceOwnedByUser = origMethod;
+      serviceA.store.hasWorkspaceAccess = origMethod;
     }
 
     // Verify that unrelated unexpected programming errors return 500 (not mislabeled as 503)
-    serviceA.store.isWorkspaceOwnedByUser = () => {
+    serviceA.store.hasWorkspaceAccess = () => {
       throw new TypeError("Unrelated unexpected programming error");
     };
 
@@ -492,7 +492,7 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.isWorkspaceOwnedByUser = origMethod;
+      serviceA.store.hasWorkspaceAccess = origMethod;
     }
   });
 

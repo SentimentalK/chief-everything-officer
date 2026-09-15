@@ -247,8 +247,8 @@ export class OAuthService {
     if (!this.identityStore.isUserActive(userId)) {
       throw new OAuthServerError("access_denied", "User is disabled or inactive", 403);
     }
-    if (!this.identityStore.isWorkspaceOwnedByUser(this.workspaceId, userId)) {
-      throw new OAuthServerError("access_denied", "User does not own deployment workspace", 403);
+    if (!this.identityStore.hasWorkspaceAccess(this.workspaceId, userId)) {
+      throw new OAuthServerError("access_denied", "User does not have access to deployment workspace", 403);
     }
 
     const nonceDigest = sha256Hex(nonce);
@@ -415,11 +415,11 @@ export class OAuthService {
     // Resource check (mandatory explicit resource binding)
     const targetResource = validateCanonicalResource(input.resource, existing.resource);
 
-    // Identity validation: user still active & owns workspace
+    // Identity validation: user still active & has workspace access
     const userActive = this.identityStore.isUserActive(existing.user_id);
     const workspaceValid =
       existing.workspace_id === this.workspaceId &&
-      this.identityStore.isWorkspaceOwnedByUser(existing.workspace_id, existing.user_id);
+      this.identityStore.hasWorkspaceAccess(existing.workspace_id, existing.user_id);
 
     if (!userActive || !workspaceValid) {
       // Invalidate the token family
@@ -523,9 +523,9 @@ export class OAuthService {
 
     if (
       record.workspace_id !== this.workspaceId ||
-      !this.identityStore.isWorkspaceOwnedByUser(record.workspace_id, record.user_id)
+      !this.identityStore.hasWorkspaceAccess(record.workspace_id, record.user_id)
     ) {
-      return { valid: false, error: "invalid_token", description: "Workspace mismatch or not owned by user" };
+      return { valid: false, error: "invalid_token", description: "Workspace mismatch or access denied" };
     }
 
     return {

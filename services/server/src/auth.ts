@@ -17,7 +17,7 @@ declare global {
  *
  * Status contract (single deployment workspace):
  *   - missing / wrong / revoked key, or disabled user  -> 401
- *   - authenticated but bound to a different workspace -> 403
+ *   - authenticated but lacks workspace access -> 403
  *   - identity database unavailable on a live request  -> 503
  *
  * Identity is never taken from the body, query, or X-User-ID.
@@ -43,7 +43,7 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
           process.stderr.write(`auth: rejected workspace binding\n`);
           res.status(403).json({
             jsonrpc: "2.0",
-            error: { code: -32003, message: "Forbidden: workspace not owned" },
+            error: { code: -32003, message: "Forbidden: workspace access denied" },
             id: null,
           });
           return;
@@ -120,7 +120,7 @@ export function createMcpAuthMiddleware(
           if (error instanceof WorkspaceAccessDeniedError) {
             res.status(403).json({
               jsonrpc: "2.0",
-              error: { code: -32003, message: "Forbidden: workspace not owned" },
+              error: { code: -32003, message: "Forbidden: workspace access denied" },
               id: null,
             });
             return;
