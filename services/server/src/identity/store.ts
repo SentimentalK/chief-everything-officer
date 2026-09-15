@@ -1209,15 +1209,6 @@ export class IdentityStore {
     });
   }
 
-  /** Kept during 3.3A; authorization still uses this until 3.3B cutover. */
-  isWorkspaceOwnedByUser(workspaceId: string, userId: string): boolean {
-    return this.withDb((db) => {
-      const row = db.prepare(
-        "SELECT id FROM workspaces WHERE id = ? AND owner_user_id = ? LIMIT 1;",
-      ).get(workspaceId, userId) as { id: string } | undefined;
-      return Boolean(row);
-    });
-  }
 }
 
 function quoteIdent(name: string): string {
