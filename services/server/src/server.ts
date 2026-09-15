@@ -34,8 +34,8 @@ const config = loadConfig();
 
 // ---- Identity layer (authoritative, required, fail-fast) ----
 // Identity DB must already exist (created by `dist/identity/cli.js init`).
-// The service runs the full check + optional key-rotation sequence; any
-// mismatch, missing/corrupt DB, or disabled/binding error aborts startup.
+// The service selects the configured runtime workspace and performs optional
+// scoped key rotation; any mismatch, corrupt DB, or disabled owner aborts startup.
 let identityService: IdentityService;
 try {
   identityService = IdentityService.open(
@@ -80,7 +80,7 @@ const userSessionManager = new UserSessionManager({
 });
 
 // Optional worker-bridge job layer (disabled unless configured). Resource
-// existence for new tasks is checked against the single-user repo contents.
+// existence for new tasks is checked against repo contents.
 const jobBridge = openJobBridge({
   bridgeEnabled: config.bridgeEnabled,
   redisUrl: config.redisUrl,
@@ -129,7 +129,7 @@ app.get(
     res.status(200).json({
       user_id: identityService.workspaceIdentityValue.user_id,
       workspace_id: identityService.workspaceIdentityValue.workspace_id,
-      deployment_mode: "single_user",
+      deployment_mode: "single_workspace_runtime",
     });
   },
 );

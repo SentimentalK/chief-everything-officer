@@ -56,19 +56,20 @@ Requests authenticate against the stored identity, not against a raw env value.
   protected middleware scope.
 
 `GET /api/identity` (Bearer-authenticated) returns who this key connects to:
-`{ user_id, workspace_id, deployment_mode: "single_user" }`.
+`{ user_id, workspace_id, deployment_mode: "single_workspace_runtime" }`.
 
 The audit console keeps its login endpoint and session cookie but binds
 sessions to the same identity. Audit queries accept either a valid Bearer key
 or the bound session cookie, both identity-checked.
 
-### Persistent single-user identity
+### Persistent identity database
 
 CEO keeps a durable identity in a dedicated SQLite database at
-`<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`)
-holding exactly one `users`, one `workspaces`, and one active `api_keys` row.
-The original `MCP_API_KEY` is injected via Kubernetes/Infisical Secret; only
-its SHA-256 digest is stored.
+`<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`).
+The schema supports multiple users, workspaces, and credentials, while the current
+server process explicitly serves one transitional workspace configured via `CEO_REMOTE`
+and `CEO_BRANCH`. The original `MCP_API_KEY` is injected via Kubernetes/Infisical Secret;
+only its SHA-256 digest is stored.
 
 This database is **created only by** `node dist/identity/cli.js init`; the
 service never creates one silently. On missing/corrupt/structurally-mismatched

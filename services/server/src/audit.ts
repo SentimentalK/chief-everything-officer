@@ -478,18 +478,17 @@ export function createAuditRouter(options: {
         res.status(401).json({ error: "Invalid access token" });
         return;
       }
-      identity = result;
+      if (!identityService.holdsWorkspace(result)) {
+        res.status(403).json({ error: "Forbidden: workspace not owned" });
+        return;
+      }
+      identity = identityService.assertWorkspaceAccess(result);
     } catch (error) {
       if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
         return;
       }
       throw error;
-    }
-
-    if (!identityService.holdsWorkspace(identity)) {
-      res.status(403).json({ error: "Forbidden: workspace not owned" });
-      return;
     }
 
     const sessionId = crypto.randomBytes(32).toString("hex");

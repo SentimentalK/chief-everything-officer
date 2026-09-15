@@ -31,12 +31,30 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
         rejectMissingBearer(res);
         return;
       }
-      const result = identityService.authenticateApiKey(token);
-      if (result === null) {
+      const credential = identityService.authenticateApiKey(token);
+      if (credential === null) {
         res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
         return;
       }
-      identity = result;
+      try {
+        identity = identityService.assertWorkspaceAccess(credential);
+      } catch (error) {
+        if (error instanceof WorkspaceAccessDeniedError) {
+          process.stderr.write(`auth: rejected workspace binding\n`);
+          res.status(403).json({
+            jsonrpc: "2.0",
+            error: { code: -32003, message: "Forbidden: workspace not owned" },
+            id: null,
+          });
+          return;
+        }
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal error" },
+          id: null,
+        });
+        return;
+      }
     } catch (error) {
       if (error instanceof IdentityDbUnavailable) {
         process.stderr.write(`auth: identity database unavailable: ${error.message}\n`);
@@ -50,28 +68,6 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
       res.status(503).json({
         jsonrpc: "2.0",
         error: { code: -32050, message: "Identity service unavailable" },
-        id: null,
-      });
-      return;
-    }
-
-    // Confirm the authenticated identity is authorized for the workspace this
-    // deployment currently serves before letting the request proceed.
-    try {
-      identityService.assertWorkspaceAccess(identity);
-    } catch (error) {
-      if (error instanceof WorkspaceAccessDeniedError) {
-        process.stderr.write(`auth: rejected workspace binding\n`);
-        res.status(403).json({
-          jsonrpc: "2.0",
-          error: { code: -32003, message: "Forbidden: workspace not owned" },
-          id: null,
-        });
-        return;
-      }
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal error" },
         id: null,
       });
       return;
@@ -121,8 +117,8 @@ export function createMcpAuthMiddleware(
       const apiKeyResult = identityService.authenticateApiKey(token);
       if (apiKeyResult !== null) {
         try {
-          identityService.assertWorkspaceAccess(apiKeyResult);
-          res.locals.identity = apiKeyResult;
+          const authIdentity = identityService.assertWorkspaceAccess(apiKeyResult);
+          res.locals.identity = authIdentity;
           next();
           return;
         } catch (error) {

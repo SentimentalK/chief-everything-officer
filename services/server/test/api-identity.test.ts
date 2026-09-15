@@ -53,7 +53,7 @@ async function buildServer() {
       res.status(200).json({
         user_id: identityService.workspaceIdentityValue.user_id,
         workspace_id: identityService.workspaceIdentityValue.workspace_id,
-        deployment_mode: "single_user",
+        deployment_mode: "single_workspace_runtime",
       });
     },
   );
@@ -79,7 +79,7 @@ async function buildServer() {
 }
 
 describe("GET /api/identity", () => {
-  it("returns stable user/workspace and single_user mode for a valid key", async () => {
+  it("returns stable user/workspace and single_workspace_runtime mode for a valid key", async () => {
     const { baseUrl, workspaceIdentity } = await buildServer();
     const res = await fetch(`${baseUrl}/api/identity`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
@@ -89,7 +89,7 @@ describe("GET /api/identity", () => {
     expect(body.user_id).toBe(workspaceIdentity.user_id);
     expect(body.user_id).toMatch(/^usr_/);
     expect(body.workspace_id).toBe(workspaceIdentity.workspace_id);
-    expect(body.deployment_mode).toBe("single_user");
+    expect(body.deployment_mode).toBe("single_workspace_runtime");
     // Sensitive info must never be exposed.
     expect(JSON.stringify(body)).not.toContain("key_digest");
   });
