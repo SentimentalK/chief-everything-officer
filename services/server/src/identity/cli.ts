@@ -30,7 +30,7 @@ function main(): void {
         `identity: initialization ${result.created ? "completed" : "already-initialized, unchanged"}`,
         `  user_id:      ${result.userId}`,
         `  workspace_id: ${result.workspaceId}`,
-        `  deployment_mode: single_user`,
+        `  deployment_mode: single_workspace_runtime`,
         ``,
       ].join("\n"),
     );

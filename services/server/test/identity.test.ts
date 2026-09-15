@@ -101,7 +101,7 @@ describe("Identity store: schema, invariants and permissions", () => {
     expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/user_version/);
   });
 
-  it("rules out multiple active keys at startup", async () => {
+  it("rules out ambiguous key rotation when user has multiple active keys and env key is unknown", async () => {
     const ctx = await tempCtx();
     provision(ctx, "key-1");
     const raw = new DatabaseSync(ctx.dbPath);
@@ -110,10 +110,10 @@ describe("Identity store: schema, invariants and permissions", () => {
         `VALUES ('ak_extra', (SELECT id FROM users), '${sha256Hex("extra")}', ${Date.now()}, NULL);`,
     );
     raw.close();
-    // Startup invariant validation (service-level) rejects the second active key.
+    // Startup invariant validation rejects ambiguous rotation when env key is unknown.
     expect(() =>
-      IdentityService.open({ remoteUrl: ctx.remoteUrl, branch: ctx.branch, envApiKey: "key-1" }, ctx.dbPath),
-    ).toThrow(/exactly one active \(unrevoked\) key/);
+      IdentityService.open({ remoteUrl: ctx.remoteUrl, branch: ctx.branch, envApiKey: "key-unknown" }, ctx.dbPath),
+    ).toThrow(/multiple active keys/);
   });
 });
 
@@ -131,11 +131,14 @@ describe("Identity service: startup validation and key lifecycle", () => {
 
     // Rotation invalidates the old key and activates the new one.
     expect(rotated.authenticateApiKey("key-1")).toBeNull();
-    const auth = rotated.authenticateApiKey("key-2");
-    expect(auth).not.toBeNull();
-    expect(auth!.user_id).toBe(first.user_id);
-    expect(auth!.workspace_id).toBe(first.workspace_id);
-    expect(auth!.api_key_id).toMatch(/^ak_/);
+    const cred = rotated.authenticateApiKey("key-2");
+    expect(cred).not.toBeNull();
+    expect(cred!.user_id).toBe(first.user_id);
+    expect(cred!.api_key_id).toMatch(/^ak_/);
+    const auth = rotated.assertWorkspaceAccess(cred!);
+    expect(auth.user_id).toBe(first.user_id);
+    expect(auth.workspace_id).toBe(first.workspace_id);
+    expect(auth.api_key_id).toBe(cred!.api_key_id);
   });
 
   it("refuses to revive a previously revoked key", async () => {
