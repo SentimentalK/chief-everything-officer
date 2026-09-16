@@ -348,7 +348,8 @@ const mcpHandler = createMcpHandler(
     jobs: { service: jobBridge.service },
     resourceService,
   }),
-  { legacy: "reject" },
+  // 2025-era hosts still send initialize; this is the SDK's standard fallback.
+  { legacy: "stateless" },
 );
 const nodeHandler = toNodeHandler(mcpHandler);
 

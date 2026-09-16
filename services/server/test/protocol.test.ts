@@ -85,14 +85,14 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     await client.close();
   });
 
-  it("Test C — Legacy 2025 protocol requests are rejected with unsupported protocol version", async () => {
+  it("Test C — Legacy 2025 protocol is served via stateless fallback", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
     const policy = await loadProductPolicy();
 
-    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "reject" });
+    const handler = createMcpHandler(() => createMcpServer(workspace, policy), { legacy: "stateless" });
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -102,7 +102,13 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       { versionNegotiation: { mode: "legacy" } },
     );
 
-    await expect(client.connect(transport)).rejects.toThrow(/Unsupported protocol version.*-32022|-32022/);
+    await client.connect(transport);
+    expect(client.getProtocolEra()).toBe("legacy");
+
+    const toolsResponse = await client.listTools();
+    expect(toolsResponse.tools.map((t) => t.name)).toContain("workspace_status");
+
+    await client.close();
   });
 
   it("Test D — Security regressions rejected before MCP handler, modern client succeeds", async () => {
