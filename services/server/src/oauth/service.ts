@@ -29,6 +29,7 @@ export interface OAuthServiceOptions {
   publicOrigin: string;
   workspaceId: string;
   clientResolver: OAuthClientResolver;
+  registrationEndpoint?: string;
   authCodeTtlMs?: number; // default 5m
   authRequestTtlMs?: number; // default 10m
   accessTokenTtlMs?: number; // default 1h
@@ -77,6 +78,7 @@ export class OAuthService {
   private readonly store: OAuthStore;
   private readonly identityStore: IdentityStore;
   private readonly clientResolver: OAuthClientResolver;
+  private readonly registrationEndpoint?: string;
   private readonly authCodeTtlMs: number;
   private readonly authRequestTtlMs: number;
   private readonly accessTokenTtlMs: number;
@@ -93,6 +95,7 @@ export class OAuthService {
     this.canonicalResource = `${this.publicOrigin}/mcp`;
     this.workspaceId = options.workspaceId;
     this.clientResolver = options.clientResolver;
+    this.registrationEndpoint = options.registrationEndpoint;
     this.authCodeTtlMs = options.authCodeTtlMs ?? DEFAULT_AUTH_CODE_TTL_MS;
     this.authRequestTtlMs = options.authRequestTtlMs ?? DEFAULT_AUTH_REQUEST_TTL_MS;
     this.accessTokenTtlMs = options.accessTokenTtlMs ?? DEFAULT_ACCESS_TOKEN_TTL_MS;
@@ -113,6 +116,7 @@ export class OAuthService {
       client_id_metadata_document_supported: true,
       authorization_response_iss_parameter_supported: true,
       service_documentation: "https://github.com/SentimentalK/chief-everything-officer",
+      ...(this.registrationEndpoint ? { registration_endpoint: this.registrationEndpoint } : {}),
     };
   }
 

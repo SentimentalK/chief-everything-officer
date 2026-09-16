@@ -185,7 +185,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
       expect(res.status).toBe(401);
       const wwwAuth = res.headers.get("www-authenticate");
       expect(wwwAuth).toContain("Bearer");
-      expect(wwwAuth).toContain(`resource_metadata="${env.publicOrigin}/.well-known/oauth-protected-resource"`);
+      expect(wwwAuth).toContain(`resource_metadata="${env.publicOrigin}/.well-known/oauth-protected-resource/mcp"`);
       expect(wwwAuth).toContain('scope="mcp"');
     } finally {
       await env.close();

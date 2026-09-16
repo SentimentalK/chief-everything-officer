@@ -31,6 +31,12 @@ export function isCimdClientId(
   }
 }
 
+const DCR_CLIENT_ID_PATTERN = /^dcr_[A-Za-z0-9_-]{43}$/;
+
+export function isDcrClientId(clientId: string): boolean {
+  return DCR_CLIENT_ID_PATTERN.test(clientId);
+}
+
 export class CimdClientResolver implements OAuthClientResolver {
   constructor(private readonly options: ClientMetadataResolverOptions = {}) {}
 
@@ -46,21 +52,28 @@ export class CimdClientResolver implements OAuthClientResolver {
 
 export interface CompositeClientResolverOptions {
   cimd: OAuthClientResolver;
+  dcr?: OAuthClientResolver;
   allowHttpForTest?: boolean;
 }
 
 export class CompositeClientResolver implements OAuthClientResolver {
   private readonly cimd: OAuthClientResolver;
+  private readonly dcr?: OAuthClientResolver;
   private readonly allowHttpForTest: boolean;
 
   constructor(options: CompositeClientResolverOptions) {
     this.cimd = options.cimd;
+    this.dcr = options.dcr;
     this.allowHttpForTest = options.allowHttpForTest ?? false;
   }
 
   async resolve(clientId: string): Promise<ClientMetadata> {
     if (isCimdClientId(clientId, { allowHttpForTest: this.allowHttpForTest })) {
       return this.cimd.resolve(clientId);
+    }
+
+    if (this.dcr && isDcrClientId(clientId)) {
+      return this.dcr.resolve(clientId);
     }
 
     throw new OAuthClientResolutionError("invalid_client", "Unknown OAuth client");

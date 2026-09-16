@@ -273,18 +273,43 @@ if (config.githubAppEnabled) {
 import { OAuthStore } from "./oauth/store.js";
 import { OAuthService } from "./oauth/service.js";
 import { createOAuthRouter } from "./oauth/router.js";
-import { createCimdOnlyClientResolver } from "./oauth/client-resolver.js";
+import {
+  CimdClientResolver,
+  CompositeClientResolver,
+  type OAuthClientResolver,
+} from "./oauth/client-resolver.js";
+import { DcrStore } from "./oauth/dcr/store.js";
+import { DcrClientResolver, DcrService } from "./oauth/dcr/service.js";
+import { createDcrRouter } from "./oauth/dcr/router.js";
 
 let oauthStore: OAuthStore | null = null;
 let oauthService: OAuthService | null = null;
+let dcrStore: DcrStore | null = null;
 
 if (config.oauthEnabled) {
   const publicOrigin = config.publicOrigin!;
   oauthStore = new OAuthStore(config.oauthDbPath);
+
+  const cimdResolver = new CimdClientResolver();
+  let dcrResolver: OAuthClientResolver | undefined;
+  let dcrService: DcrService | undefined;
+  if (config.oauthDcrEnabled) {
+    dcrStore = new DcrStore(config.oauthDcrDbPath);
+    dcrService = new DcrService(dcrStore);
+    dcrResolver = new DcrClientResolver(dcrService);
+    app.use(createDcrRouter({ dcrService }));
+  }
+
+  const clientResolver = new CompositeClientResolver({
+    cimd: cimdResolver,
+    dcr: dcrResolver,
+  });
+
   oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
     publicOrigin,
     workspaceId: workspaceIdentity.workspace_id,
-    clientResolver: createCimdOnlyClientResolver(),
+    clientResolver,
+    ...(config.oauthDcrEnabled ? { registrationEndpoint: `${publicOrigin}/register` } : {}),
   });
 
   app.use(
@@ -337,6 +362,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     auditStore.close();
     oauthStore?.close();
+    dcrStore?.close();
     identityService.close();
     void jobBridge.dispose();
     listener.close(() => process.exit(0));

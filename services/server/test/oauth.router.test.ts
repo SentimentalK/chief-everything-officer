@@ -116,6 +116,49 @@ describe("OAuth HTTP Router Endpoints", () => {
     }
   });
 
+  it("omits registration_endpoint when DCR is not composed", async () => {
+    const env = await setupTestApp();
+    try {
+      const res = await fetch(`${env.baseUrl}/.well-known/oauth-authorization-server`);
+      const data = (await res.json()) as { registration_endpoint?: string };
+      expect(data.registration_endpoint).toBeUndefined();
+
+      const registerRes = await fetch(`${env.baseUrl}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://127.0.0.1:1/cb"] }),
+      });
+      expect(registerRes.status).toBe(404);
+    } finally {
+      await env.close();
+    }
+  });
+
+  it("exposes path-aware RFC 9728 and RFC 8414 aliases without changing issuer", async () => {
+    const env = await setupTestApp();
+    try {
+      const prRoot = await fetch(`${env.baseUrl}/.well-known/oauth-protected-resource`);
+      const prMcp = await fetch(`${env.baseUrl}/.well-known/oauth-protected-resource/mcp`);
+      expect(prRoot.status).toBe(200);
+      expect(prMcp.status).toBe(200);
+      const prRootBody = (await prRoot.json()) as { resource: string };
+      const prMcpBody = (await prMcp.json()) as { resource: string };
+      expect(prRootBody.resource).toBe("https://ceo.sentimentalk.com/mcp");
+      expect(prMcpBody).toEqual(prRootBody);
+
+      const asRoot = await fetch(`${env.baseUrl}/.well-known/oauth-authorization-server`);
+      const asMcp = await fetch(`${env.baseUrl}/.well-known/oauth-authorization-server/mcp`);
+      expect(asRoot.status).toBe(200);
+      expect(asMcp.status).toBe(200);
+      const asRootBody = (await asRoot.json()) as { issuer: string };
+      const asMcpBody = (await asMcp.json()) as { issuer: string };
+      expect(asRootBody.issuer).toBe("https://ceo.sentimentalk.com");
+      expect(asMcpBody).toEqual(asRootBody);
+    } finally {
+      await env.close();
+    }
+  });
+
   it("GET /authorize redirects to /login?oauth_request=... when unauthenticated", async () => {
     const env = await setupTestApp();
     try {

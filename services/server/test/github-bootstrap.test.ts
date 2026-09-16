@@ -2160,9 +2160,9 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
   });
 
-  it("Z. package versions are 0.3.10", () => {
-    expect(packageJson.version).toBe("0.3.10");
-    expect(packageLockJson.version).toBe("0.3.10");
-    expect(packageLockJson.packages[""].version).toBe("0.3.10");
+  it("Z. package versions are 0.3.11", () => {
+    expect(packageJson.version).toBe("0.3.11");
+    expect(packageLockJson.version).toBe("0.3.11");
+    expect(packageLockJson.packages[""].version).toBe("0.3.11");
   });
 });

@@ -67,6 +67,7 @@ describe("OAuthService Core & Security Constraints", () => {
     expect(meta.token_endpoint_auth_methods_supported).toEqual(["none"]);
     expect(meta.client_id_metadata_document_supported).toBe(true);
     expect(meta.authorization_response_iss_parameter_supported).toBe(true);
+    expect(meta.registration_endpoint).toBeUndefined();
   });
 
   it("handles complete authorize -> consent -> code exchange -> refresh flow", async () => {

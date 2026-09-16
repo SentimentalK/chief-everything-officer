@@ -33,6 +33,8 @@ export interface Config {
   publicOrigin?: string;
   oauthEnabled: boolean;
   oauthDbPath: string;
+  oauthDcrEnabled: boolean;
+  oauthDcrDbPath: string;
   githubAppEnabled: boolean;
   githubAppClientId?: string;
   githubAppClientSecret?: string;
@@ -103,6 +105,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const githubCallbackUrl = env.GITHUB_CALLBACK_URL?.trim() || env.CEO_GITHUB_CALLBACK_URL?.trim() || undefined;
   const rawPublicOrigin = env.CEO_PUBLIC_ORIGIN?.trim() || env.PUBLIC_ORIGIN?.trim() || undefined;
   const oauthEnabled = parseBool(env.CEO_OAUTH_ENABLED, false);
+  const oauthDcrEnabled = parseBool(env.CEO_OAUTH_DCR_ENABLED, false);
+  if (oauthDcrEnabled && !oauthEnabled) {
+    throw new Error("CEO_OAUTH_DCR_ENABLED=true requires CEO_OAUTH_ENABLED=true");
+  }
 
   let publicOrigin = rawPublicOrigin;
   if (oauthEnabled) {
@@ -187,6 +193,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(publicOrigin ? { publicOrigin } : {}),
     oauthEnabled,
     oauthDbPath: env.CEO_OAUTH_DB_PATH ?? path.join(dataRoot, "identity", "oauth.sqlite"),
+    oauthDcrEnabled,
+    oauthDcrDbPath: env.CEO_OAUTH_DCR_DB_PATH ?? path.join(dataRoot, "identity", "oauth-dcr.sqlite"),
     githubAppEnabled,
     ...(githubAppClientId ? { githubAppClientId } : {}),
     ...(githubAppClientSecret ? { githubAppClientSecret } : {}),

@@ -6,6 +6,7 @@ import {
   OAuthClientResolutionError,
   createCimdOnlyClientResolver,
   isCimdClientId,
+  isDcrClientId,
 } from "../src/oauth/client-resolver.js";
 import { clearClientMetadataCache } from "../src/oauth/client-metadata.js";
 
@@ -122,6 +123,81 @@ describe("OAuthClientResolver (CIMD-only)", () => {
       resolver.resolve("https://unreachable.example.com/oauth/client.json"),
     ).rejects.toMatchObject({
       errorCode: "invalid_client",
+    });
+  });
+});
+
+describe("OAuthClientResolver DCR routing", () => {
+  const sampleDcrId = `dcr_${"A".repeat(43)}`;
+
+  it("isDcrClientId accepts 32-byte base64url DCR IDs", () => {
+    expect(isDcrClientId(sampleDcrId)).toBe(true);
+    expect(isDcrClientId("dcr_short")).toBe(false);
+  });
+
+  it("routes dcr_ IDs to the DCR resolver and never fetches CIMD", async () => {
+    let cimdCalled = false;
+    let dcrCalled = false;
+    const resolver = new CompositeClientResolver({
+      cimd: {
+        resolve: async () => {
+          cimdCalled = true;
+          throw new Error("CIMD should not be called");
+        },
+      },
+      dcr: {
+        resolve: async (clientId) => {
+          dcrCalled = true;
+          return {
+            client_id: clientId,
+            client_name: "DCR",
+            redirect_uris: ["http://127.0.0.1:1/cb"],
+          };
+        },
+      },
+    });
+    const metadata = await resolver.resolve(sampleDcrId);
+    expect(metadata.client_name).toBe("DCR");
+    expect(dcrCalled).toBe(true);
+    expect(cimdCalled).toBe(false);
+  });
+
+  it("does not fall back to DCR when a CIMD URL fails", async () => {
+    let dcrCalled = false;
+    const resolver = new CompositeClientResolver({
+      cimd: {
+        resolve: async () => {
+          throw new OAuthClientResolutionError("invalid_client", "CIMD failed");
+        },
+      },
+      dcr: {
+        resolve: async () => {
+          dcrCalled = true;
+          return {
+            client_id: "x",
+            client_name: "DCR",
+            redirect_uris: ["http://127.0.0.1:1/cb"],
+          };
+        },
+      },
+    });
+    await expect(
+      resolver.resolve("https://unreachable.example.com/oauth/client.json"),
+    ).rejects.toMatchObject({ errorCode: "invalid_client", message: "CIMD failed" });
+    expect(dcrCalled).toBe(false);
+  });
+
+  it("rejects dcr_ IDs when DCR is not composed", async () => {
+    const resolver = new CompositeClientResolver({
+      cimd: {
+        resolve: async () => {
+          throw new Error("CIMD should not be called");
+        },
+      },
+    });
+    await expect(resolver.resolve(sampleDcrId)).rejects.toMatchObject({
+      errorCode: "invalid_client",
+      message: "Unknown OAuth client",
     });
   });
 });

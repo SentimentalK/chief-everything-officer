@@ -270,6 +270,37 @@ describe("Config Validation", () => {
     });
   });
 
+  describe("OAuth DCR Configuration", () => {
+    it("defaults DCR to disabled with oauth-dcr.sqlite under identity/", () => {
+      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_DATA_ROOT: "/custom/data" }));
+      expect(config.oauthDcrEnabled).toBe(false);
+      expect(config.oauthDcrDbPath).toBe("/custom/data/identity/oauth-dcr.sqlite");
+    });
+
+    it("throws when DCR is enabled without OAuth", () => {
+      expect(() =>
+        loadConfig(
+          baseEnv({
+            CEO_REMOTE: "repo.git",
+            CEO_OAUTH_DCR_ENABLED: "true",
+          }),
+        ),
+      ).toThrow("CEO_OAUTH_DCR_ENABLED=true requires CEO_OAUTH_ENABLED=true");
+    });
+
+    it("accepts DCR when OAuth is enabled", () => {
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          CEO_OAUTH_ENABLED: "true",
+          CEO_OAUTH_DCR_ENABLED: "true",
+          CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com",
+        }),
+      );
+      expect(config.oauthDcrEnabled).toBe(true);
+    });
+  });
+
   describe("GitHub App Configuration", () => {
     it("defaults to disabled when omitted and preserves old deployment config", () => {
       const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));

@@ -90,7 +90,7 @@ export function createMcpAuthMiddleware(
   oauthService: OAuthService | null,
 ): RequestHandler {
   const resourceMetadataUrl = oauthService
-    ? `${oauthService.publicOrigin}/.well-known/oauth-protected-resource`
+    ? `${oauthService.publicOrigin}/.well-known/oauth-protected-resource/mcp`
     : undefined;
 
   return (req: Request, res: Response, next: NextFunction): void => {

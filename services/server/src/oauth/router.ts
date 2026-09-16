@@ -173,28 +173,42 @@ function renderErrorHtml(title: string, message: string): string {
 </html>`;
 }
 
+function sendJson(res: Response, body: unknown): void {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.status(200).json(body);
+}
+
+function getProtectedResourceMetadata(oauthService: OAuthService): Record<string, unknown> {
+  return {
+    resource: oauthService.canonicalResource,
+    authorization_servers: [oauthService.publicOrigin],
+    scopes_supported: ["mcp"],
+    bearer_methods_supported: ["header"],
+    resource_documentation: "https://github.com/SentimentalK/chief-everything-officer",
+  };
+}
+
 export function createOAuthRouter(options: OAuthRouterOptions): Router {
   const { oauthService, sessionManager } = options;
   const router = express.Router();
 
-  // 1. RFC 8414 Authorization Server Metadata
+  // RFC 8414 Authorization Server Metadata (canonical for issuer origin)
   router.get("/.well-known/oauth-authorization-server", (_req: Request, res: Response) => {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.status(200).json(oauthService.getAuthorizationServerMetadata());
+    sendJson(res, oauthService.getAuthorizationServerMetadata());
+  });
+  // Compatibility alias for path-aware discovery of the /mcp resource. Issuer stays the origin.
+  router.get("/.well-known/oauth-authorization-server/mcp", (_req: Request, res: Response) => {
+    sendJson(res, oauthService.getAuthorizationServerMetadata());
   });
 
-  // 2. RFC 9728 Protected Resource Metadata
+  // RFC 9728 Protected Resource Metadata (root alias kept for backwards compatibility)
   router.get("/.well-known/oauth-protected-resource", (_req: Request, res: Response) => {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    res.status(200).json({
-      resource: oauthService.canonicalResource,
-      authorization_servers: [oauthService.publicOrigin],
-      scopes_supported: ["mcp"],
-      bearer_methods_supported: ["header"],
-      resource_documentation: "https://github.com/SentimentalK/chief-everything-officer",
-    });
+    sendJson(res, getProtectedResourceMetadata(oauthService));
+  });
+  // Canonical RFC 9728 URL for resource https://<origin>/mcp
+  router.get("/.well-known/oauth-protected-resource/mcp", (_req: Request, res: Response) => {
+    sendJson(res, getProtectedResourceMetadata(oauthService));
   });
 
   // 3. GET /authorize

@@ -620,9 +620,9 @@ describe("Step 3.7 existing workspace adoption — GitHub/CLI gates", () => {
     expect(parsed.expectedExistingRemoteUrl).toBe("git@github.com:SentimentalK/LifeOS.git");
   });
 
-  it("package versions are 0.3.10", () => {
-    expect(packageJson.version).toBe("0.3.10");
-    expect(packageLockJson.version).toBe("0.3.10");
-    expect(packageLockJson.packages[""].version).toBe("0.3.10");
+  it("package versions are 0.3.11", () => {
+    expect(packageJson.version).toBe("0.3.11");
+    expect(packageLockJson.version).toBe("0.3.11");
+    expect(packageLockJson.packages[""].version).toBe("0.3.11");
   });
 });

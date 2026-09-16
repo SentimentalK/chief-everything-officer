@@ -2297,9 +2297,9 @@ describe("Step 3.5 Routes & Package Version", () => {
     });
   });
 
-  it("27. package versions are 0.3.10", () => {
-    expect(packageJson.version).toBe("0.3.10");
-    expect(packageLockJson.version).toBe("0.3.10");
-    expect(packageLockJson.packages[""].version).toBe("0.3.10");
+  it("27. package versions are 0.3.11", () => {
+    expect(packageJson.version).toBe("0.3.11");
+    expect(packageLockJson.version).toBe("0.3.11");
+    expect(packageLockJson.packages[""].version).toBe("0.3.11");
   });
 });
