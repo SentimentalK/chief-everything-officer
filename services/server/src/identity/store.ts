@@ -1955,6 +1955,17 @@ export class IdentityStore {
           );
         }
 
+        // V1 Product Policy: User may only own a single workspace
+        const ownerRow = db.prepare(
+          "SELECT COUNT(*) AS c FROM workspace_memberships WHERE user_id = ? AND role = 'owner';",
+        ).get(input.userId) as { c: number } | undefined;
+
+        if ((ownerRow?.c ?? 0) > 0) {
+          throw new IdentityConflictError(
+            `User '${input.userId}' already owns a workspace; V1 policy restricts users to one owned workspace.`,
+          );
+        }
+
         const nowMs = Date.now();
         const workspaceId = newId("ws");
         const membershipId = newId("wsm");

@@ -178,9 +178,25 @@ export class GitHubAppClient {
       );
     }
 
-    const data = (await res.json()) as { id?: unknown; permissions?: unknown };
-    if (!data || typeof data.id !== "number") {
-      throw new GitHubAppError("Invalid installation response from GitHub: missing id");
+    const data = (await res.json()) as any;
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new GitHubAppError("Invalid installation response from GitHub: response is not an object");
+    }
+
+    if (typeof data.id !== "number" || !Number.isSafeInteger(data.id) || data.id <= 0) {
+      throw new GitHubAppError("Invalid installation response from GitHub: id must be a positive safe integer");
+    }
+
+    if (String(data.id) !== String(githubInstallationId)) {
+      throw new GitHubAppError(
+        `GitHub installation id mismatch: expected '${githubInstallationId}', got '${data.id}'`,
+      );
+    }
+
+    if (data.permissions !== undefined) {
+      if (typeof data.permissions !== "object" || data.permissions === null || Array.isArray(data.permissions)) {
+        throw new GitHubAppError("Invalid installation response from GitHub: permissions must be an object");
+      }
     }
 
     return data as { id: number; permissions?: Record<string, string>; [key: string]: unknown };

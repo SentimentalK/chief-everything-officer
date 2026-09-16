@@ -1979,8 +1979,14 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
 
   it("6. duplicate GitHub repo binding rejected by DB constraint", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    provision(ctx, "key-1");
     const store = openRaw(ctx);
+
+    const testUser = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "99999",
+      providerLogin: "test-org",
+    });
 
     const instResult = store.upsertGitHubInstallationWithUser({
       githubInstallationId: "12345",
@@ -1989,11 +1995,11 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
       accountLogin: "test-org",
       accountType: "Organization",
       repositorySelection: "selected",
-      userId: ident.user_id,
+      userId: testUser.user_id,
     });
 
     const res1 = store.createWorkspaceWithRepositoryBinding({
-      userId: ident.user_id,
+      userId: testUser.user_id,
       installationRowId: instResult.installation.id,
       githubRepositoryId: "100",
       ownerAccountId: "99999",
@@ -2008,7 +2014,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     // Attempting to bind same repository ID "100" again to a new workspace fails
     expect(() => {
       store.createWorkspaceWithRepositoryBinding({
-        userId: ident.user_id,
+        userId: testUser.user_id,
         installationRowId: instResult.installation.id,
         githubRepositoryId: "100",
         ownerAccountId: "99999",
@@ -2021,7 +2027,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
 
     // Also verify DB level constraint directly
     const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO workspaces VALUES ('ws_extra', ?, 'https://github.com/extra.git', 'main', 1000);").run(ident.user_id);
+    raw.prepare("INSERT INTO workspaces VALUES ('ws_extra', ?, 'https://github.com/extra.git', 'main', 1000);").run(testUser.user_id);
     expect(() => {
       raw.exec(`
         INSERT INTO github_repository_bindings (
@@ -2036,8 +2042,14 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
 
   it("7. atomic new workspace operation creates exactly Workspace + owner WorkspaceMembership + binding and no API key; owner shadow/membership match; workspace remote has no token", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    provision(ctx, "key-1");
     const store = openRaw(ctx);
+
+    const testUser = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "44444",
+      providerLogin: "acme-corp",
+    });
 
     const instResult = store.upsertGitHubInstallationWithUser({
       githubInstallationId: "55555",
@@ -2046,7 +2058,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
       accountLogin: "acme-corp",
       accountType: "Organization",
       repositorySelection: "selected",
-      userId: ident.user_id,
+      userId: testUser.user_id,
     });
 
     const beforeWs = countRows(ctx.dbPath, "workspaces");
@@ -2055,7 +2067,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     const beforeKeys = countRows(ctx.dbPath, "api_keys");
 
     const created = store.createWorkspaceWithRepositoryBinding({
-      userId: ident.user_id,
+      userId: testUser.user_id,
       installationRowId: instResult.installation.id,
       githubRepositoryId: "987654",
       ownerAccountId: "44444",
@@ -2071,14 +2083,14 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     expect(countRows(ctx.dbPath, "api_keys")).toBe(beforeKeys); // NO API key created!
 
     expect(created.workspace.id).toMatch(/^ws_/);
-    expect(created.workspace.owner_user_id).toBe(ident.user_id);
+    expect(created.workspace.owner_user_id).toBe(testUser.user_id);
     expect(created.workspace.remote_url).toBe("https://github.com/acme-corp/super-repo.git");
     expect(created.workspace.remote_url).not.toMatch(/ghp_|github_pat_|Bearer|x-access-token|@/);
     expect(created.workspace.branch).toBe("release-v1");
 
     expect(created.membership.id).toMatch(/^wsm_/);
     expect(created.membership.workspace_id).toBe(created.workspace.id);
-    expect(created.membership.user_id).toBe(ident.user_id);
+    expect(created.membership.user_id).toBe(testUser.user_id);
     expect(created.membership.role).toBe("owner");
 
     expect(created.binding.id).toMatch(/^grb_/);

@@ -220,6 +220,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         const result = await repoService.handleOAuthCallback({
           state,
           code,
+          currentSessionId: session.sessionId,
           currentUserId: session.userId,
           currentProviderSubject: session.providerSubject,
         });
@@ -316,6 +317,7 @@ export function createGitHubRepositoryAuthorizationsRouter(
 
     try {
       const { authorizationUrl, state } = repositoryService.createAuthorizationRedirect({
+        sessionId: session.sessionId,
         userId: session.userId,
         providerSubject: session.providerSubject,
         installationId,
@@ -354,6 +356,7 @@ export function createGitHubRepositoryAuthorizationsRouter(
     try {
       const result = await repositoryService.listRepositories(
         grant,
+        session.sessionId,
         session.userId,
         session.providerSubject,
       );
@@ -401,6 +404,7 @@ export function createGitHubRepositoryAuthorizationsRouter(
 
         const result = await repositoryService.importRepository(
           grant,
+          session.sessionId,
           session.userId,
           session.providerSubject,
           repositoryId,
@@ -420,6 +424,7 @@ export function createGitHubRepositoryAuthorizationsRouter(
 
         const result = await repositoryService.createRepository(
           grant,
+          session.sessionId,
           session.userId,
           session.providerSubject,
           { name, description },
@@ -434,7 +439,7 @@ export function createGitHubRepositoryAuthorizationsRouter(
         res.status(500).json({
           error: "PARTIAL_REPOSITORY_CREATION_FAILURE",
           message: error.message,
-          repository: error.repository,
+          ...(error.repository ? { repository: error.repository } : {}),
         });
         return;
       }

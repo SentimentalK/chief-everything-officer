@@ -220,6 +220,7 @@ if (config.githubAppEnabled) {
     clientId: config.githubAppClientId!,
     clientSecret: config.githubAppClientSecret!,
     callbackUrl: repoCallbackUrl,
+    sessionManager: userSessionManager,
   });
 
   app.use(
