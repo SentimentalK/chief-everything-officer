@@ -37,7 +37,8 @@ Requires Node.js 22+ and Git.
 | `PORT` | `3000` | MCP HTTP port |
 | `MCP_API_KEY` | **(required, all binds)** | Static Bearer token; leading/trailing whitespace is rejected |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames accepted by the Host guard |
-| `ALLOWED_ORIGINS` | (empty) | Comma-separated Origins accepted by the Origin guard; absent Origin is always allowed |
+| `ALLOWED_ORIGINS` | (empty) | Comma-separated Origins for CEO product/API Origin guard; absent Origin is always allowed |
+| `CEO_PROTOCOL_ALLOWED_ORIGINS` | (empty) | Comma-separated Origins allowed as browser MCP/OAuth protocol clients; independent of `ALLOWED_ORIGINS` |
 
 ## Authentication
 

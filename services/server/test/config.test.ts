@@ -301,6 +301,34 @@ describe("Config Validation", () => {
     });
   });
 
+  describe("Protocol Origin Configuration", () => {
+    it("defaults protocol origins to empty and independent of ALLOWED_ORIGINS", () => {
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          ALLOWED_ORIGINS: "https://ceo-web.example",
+        }),
+      );
+      expect(config.allowedOrigins).toEqual(["https://ceo-web.example"]);
+      expect(config.protocolAllowedOrigins).toEqual([]);
+    });
+
+    it("parses CEO_PROTOCOL_ALLOWED_ORIGINS without changing product origins", () => {
+      const config = loadConfig(
+        baseEnv({
+          CEO_REMOTE: "repo.git",
+          ALLOWED_ORIGINS: "https://ceo-web.example",
+          CEO_PROTOCOL_ALLOWED_ORIGINS: "https://gemini.google.com, https://future-host.example",
+        }),
+      );
+      expect(config.allowedOrigins).toEqual(["https://ceo-web.example"]);
+      expect(config.protocolAllowedOrigins).toEqual([
+        "https://gemini.google.com",
+        "https://future-host.example",
+      ]);
+    });
+  });
+
   describe("GitHub App Configuration", () => {
     it("defaults to disabled when omitted and preserves old deployment config", () => {
       const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));

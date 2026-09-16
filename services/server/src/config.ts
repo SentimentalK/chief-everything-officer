@@ -19,6 +19,7 @@ export interface Config {
   mcpApiKey: string;
   allowedHosts: string[];
   allowedOrigins: string[];
+  protocolAllowedOrigins: string[];
   auditDir: string;
   auditDbPath: string;
   identityDbPath: string;
@@ -77,6 +78,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const allowedHosts = env.ALLOWED_HOSTS ? env.ALLOWED_HOSTS.split(",").map(s => s.trim()).filter(Boolean) : ["localhost", "127.0.0.1"];
   const allowedOrigins = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : [];
+  const protocolAllowedOrigins = env.CEO_PROTOCOL_ALLOWED_ORIGINS
+    ? env.CEO_PROTOCOL_ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
 
   const gitCommitterName = env.CEO_GIT_COMMITTER_NAME ?? "CEO State MCP";
   const gitCommitterEmail = env.CEO_GIT_COMMITTER_EMAIL ?? "ceo-mcp@users.noreply.github.com";
@@ -179,6 +183,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mcpApiKey,
     allowedHosts,
     allowedOrigins,
+    protocolAllowedOrigins,
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: env.CEO_AUDIT_DB_PATH ?? path.join(dataRoot, "audit", "ceo-trace.sqlite"),
     identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),

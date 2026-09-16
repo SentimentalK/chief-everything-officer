@@ -7,6 +7,7 @@ import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
+import { createProtocolCorsMiddleware } from "./http/protocol-cors.js";
 import {
   createHostGuard,
   createOriginGuard,
@@ -98,6 +99,14 @@ const jobBridge = openJobBridge({
 });
 
 const app = createMcpExpressApp({ host: config.bindHost });
+
+const protocolCors = createProtocolCorsMiddleware(config.protocolAllowedOrigins);
+// Protocol CORS must run before the global JSON parser so browser clients can
+// read parser errors (400/413) instead of a CORS/network failure.
+app.use("/mcp", createHostGuard(config.allowedHosts), protocolCors);
+app.use("/.well-known", protocolCors);
+app.use("/register", protocolCors);
+app.use("/token", protocolCors);
 
 // Managed result route FIRST with dedicated 9 MiB body limit:
 // Host -> Origin -> Identity -> 9mb parser -> resultHandler
@@ -345,7 +354,6 @@ const nodeHandler = toNodeHandler(mcpHandler);
 app.all(
   "/mcp",
   createHostGuard(config.allowedHosts),
-  createOriginGuard(config.allowedOrigins),
   config.oauthEnabled && oauthService
     ? createMcpAuthMiddleware(identityService, oauthService)
     : createIdentityAuthMiddleware(identityService),
