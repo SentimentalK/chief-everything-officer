@@ -84,6 +84,7 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
  */
 import type { OAuthService } from "./oauth/service.js";
 import { OAuthStoreUnavailable } from "./oauth/store.js";
+import { writeOAuthFlowLog } from "./oauth/observability.js";
 
 export function createMcpAuthMiddleware(
   identityService: IdentityService,
@@ -146,6 +147,12 @@ export function createMcpAuthMiddleware(
       try {
         const oauthResult = oauthService.validateAccessToken(token);
         if (oauthResult.valid) {
+          writeOAuthFlowLog("mcp-auth:", {
+            outcome: "success",
+            credential: "oauth",
+            user: oauthResult.user_id,
+            workspace: oauthResult.workspace_id,
+          });
           res.locals.identity = {
             user_id: oauthResult.user_id,
             workspace_id: oauthResult.workspace_id,
@@ -156,6 +163,12 @@ export function createMcpAuthMiddleware(
         }
 
         if (oauthResult.error === "insufficient_scope") {
+          writeOAuthFlowLog("mcp-auth:", {
+            outcome: "rejected",
+            credential: "oauth",
+            reason: "insufficient_scope",
+            status: 403,
+          });
           res.setHeader(
             "WWW-Authenticate",
             `Bearer error="insufficient_scope", scope="mcp", resource_metadata="${resourceMetadataUrl}"`,
@@ -169,6 +182,12 @@ export function createMcpAuthMiddleware(
         }
 
         // Token invalid, expired, revoked, or wrong target resource
+        writeOAuthFlowLog("mcp-auth:", {
+          outcome: "rejected",
+          credential: "oauth",
+          reason: oauthResult.error,
+          status: 401,
+        });
         res.setHeader(
           "WWW-Authenticate",
           `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}", scope="mcp"`,

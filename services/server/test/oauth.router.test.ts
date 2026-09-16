@@ -17,6 +17,7 @@ import { createOAuthRouter } from "../src/oauth/router.js";
 import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
 import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
+import { oauthClientRef } from "../src/oauth/observability.js";
 
 const cleanupDirs: string[] = [];
 const cleanupOAuthStores: OAuthStore[] = [];
@@ -503,4 +504,192 @@ describe("OAuth HTTP Router Endpoints", () => {
       await env.close();
     }
   });
+
+  it("logs decision and token semantic events without secrets", async () => {
+    const env = await setupTestApp();
+    const dcrClientId = "dcr_observability_client_id_must_not_be_logged";
+    const verifier = "verifier_observability_secret_do_not_log_123456";
+    const challenge = sha256Base64Url(verifier);
+    const reqId = "oar_obs_decision";
+    const userSession = env.sessionManager.createSession({
+      userId: env.ident.user_id,
+      provider: "github",
+      providerSubject: "12345",
+    });
+
+    env.oauthStore.createAuthorizationRequest({
+      id: reqId,
+      client_id: dcrClientId,
+      client_name: "Google",
+      redirect_uri: "https://oauth-redirect.googleusercontent.com/r/ceo-test",
+      resource: "https://ceo.sentimentalk.com/mcp",
+      scope: "mcp",
+      state: "state_obs",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 600000,
+    });
+    const nonce = env.oauthService.createConsentNonce(reqId);
+
+    try {
+      let code = "";
+      let redirectLocation = "";
+      const approveLogs = await captureStderr(async () => {
+        const approveRes = await fetch(`${env.baseUrl}/authorize/decision`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Cookie: `ceo_user_session=${userSession.sessionId}`,
+          },
+          body: new URLSearchParams({
+            request_id: reqId,
+            consent_nonce: nonce,
+            decision: "approve",
+          }).toString(),
+          redirect: "manual",
+        });
+        expect(approveRes.status).toBe(302);
+        redirectLocation = approveRes.headers.get("location")!;
+        code = new URL(redirectLocation).searchParams.get("code")!;
+        expect(code).toMatch(/^oac_/);
+      });
+      const approveJoined = approveLogsJoin(approveLogs);
+      expect(approveJoined).toContain("oauth: decision outcome=approved");
+      expect(approveJoined).toContain(`request_id=${reqId}`);
+      expect(approveJoined).toContain("client_kind=dcr");
+      expect(approveJoined).toContain(`client_ref=${oauthClientRef(dcrClientId)}`);
+      expect(approveJoined).toContain("redirect_host=oauth-redirect.googleusercontent.com");
+      assertNoOAuthSecrets(approveJoined, [
+        dcrClientId,
+        nonce,
+        userSession.sessionId,
+        code,
+        verifier,
+        redirectLocation,
+        "/r/ceo-test",
+      ]);
+
+      let accessToken = "";
+      let refreshToken = "";
+      const tokenLogs = await captureStderr(async () => {
+        const tokenRes = await fetch(`${env.baseUrl}/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: dcrClientId,
+            redirect_uri: "https://oauth-redirect.googleusercontent.com/r/ceo-test",
+            code,
+            code_verifier: verifier,
+            resource: "https://ceo.sentimentalk.com/mcp",
+          }).toString(),
+        });
+        expect(tokenRes.status).toBe(200);
+        const tokens = (await tokenRes.json()) as { access_token: string; refresh_token: string };
+        accessToken = tokens.access_token;
+        refreshToken = tokens.refresh_token;
+      });
+      const tokenJoined = approveLogsJoin(tokenLogs);
+      expect(tokenJoined).toContain("oauth: token outcome=success");
+      expect(tokenJoined).toContain("grant_type=authorization_code");
+      expect(tokenJoined).toContain("client_kind=dcr");
+      expect(tokenJoined).toContain("status=200");
+      assertNoOAuthSecrets(tokenJoined, [
+        dcrClientId,
+        nonce,
+        code,
+        verifier,
+        accessToken,
+        refreshToken,
+      ]);
+    } finally {
+      await env.close();
+    }
+  });
+
+  it("logs token and decision errors without request secrets", async () => {
+    const env = await setupTestApp();
+    const dcrClientId = "dcr_observability_error_client_must_not_log";
+    try {
+      const tokenLogs = await captureStderr(async () => {
+        const tokenRes = await fetch(`${env.baseUrl}/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: dcrClientId,
+            redirect_uri: "https://oauth-redirect.googleusercontent.com/r/ceo-test",
+            code: "oac_this_code_must_not_appear_in_logs",
+            code_verifier: "verifier_error_secret_do_not_log",
+            resource: "https://ceo.sentimentalk.com/mcp",
+          }).toString(),
+        });
+        expect(tokenRes.status).toBe(400);
+      });
+      const tokenJoined = approveLogsJoin(tokenLogs);
+      expect(tokenJoined).toContain("oauth: token outcome=error");
+      expect(tokenJoined).toContain("grant_type=authorization_code");
+      expect(tokenJoined).toContain("client_kind=dcr");
+      expect(tokenJoined).toContain("error=invalid_grant");
+      expect(tokenJoined).toContain("status=400");
+      assertNoOAuthSecrets(tokenJoined, [
+        dcrClientId,
+        "oac_this_code_must_not_appear_in_logs",
+        "verifier_error_secret_do_not_log",
+      ]);
+
+      const decisionLogs = await captureStderr(async () => {
+        const decisionRes = await fetch(`${env.baseUrl}/authorize/decision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            request_id: "oar_missing_session",
+            consent_nonce: "nonce_must_not_be_logged",
+            decision: "approve",
+          }).toString(),
+        });
+        expect(decisionRes.status).toBe(401);
+      });
+      const decisionJoined = approveLogsJoin(decisionLogs);
+      expect(decisionJoined).toContain("oauth: decision outcome=error");
+      expect(decisionJoined).toContain("request_id=oar_missing_session");
+      expect(decisionJoined).toContain("error=unauthorized");
+      expect(decisionJoined).toContain("status=401");
+      assertNoOAuthSecrets(decisionJoined, ["nonce_must_not_be_logged"]);
+    } finally {
+      await env.close();
+    }
+  });
 });
+
+async function captureStderr(fn: () => Promise<void>): Promise<string[]> {
+  const orig = process.stderr.write.bind(process.stderr);
+  const lines: string[] = [];
+  const fake = (chunk: unknown) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  (process.stderr as unknown as { write: (chunk: unknown) => boolean }).write = fake as never;
+  try {
+    await fn();
+  } finally {
+    (process.stderr as unknown as { write: typeof orig }).write = orig as never;
+  }
+  return lines;
+}
+
+function approveLogsJoin(lines: string[]): string {
+  return lines.join("");
+}
+
+function assertNoOAuthSecrets(log: string, secrets: string[]): void {
+  for (const secret of secrets) {
+    expect(log).not.toContain(secret);
+  }
+  expect(log).not.toMatch(/consent_nonce=/);
+  expect(log).not.toMatch(/code_verifier=/);
+  expect(log).not.toMatch(/access_token=/);
+  expect(log).not.toMatch(/refresh_token=/);
+  expect(log).not.toMatch(/Authorization=/i);
+}

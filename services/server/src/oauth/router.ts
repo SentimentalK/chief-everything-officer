@@ -2,6 +2,12 @@ import express, { type Request, type Response, type Router } from "express";
 import { OAuthService, OAuthServerError } from "./service.js";
 import { UserSessionManager } from "../auth/user-session.js";
 import type { AuthorizationRequestRecord } from "./store.js";
+import {
+  classifyOAuthClientKind,
+  oauthClientRef,
+  oauthRedirectHost,
+  writeOAuthFlowLog,
+} from "./observability.js";
 
 export interface OAuthRouterOptions {
   oauthService: OAuthService;
@@ -293,22 +299,51 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
     "/authorize/decision",
     express.urlencoded({ extended: false }),
     (req: Request, res: Response) => {
+      const body = (req.body && typeof req.body === "object") ? req.body : {};
+      const { request_id, consent_nonce, decision } = body;
+      const requestId = typeof request_id === "string" ? request_id : "";
+
+      const decisionFields = () => {
+        const authReq = requestId ? oauthService.getAuthorizationRequest(requestId) : null;
+        return {
+          request_id: requestId || undefined,
+          client_kind: classifyOAuthClientKind(authReq?.client_id),
+          client_ref: oauthClientRef(authReq?.client_id),
+          redirect_host: oauthRedirectHost(authReq?.redirect_uri),
+        };
+      };
+
       const session = sessionManager.getSession(req);
       if (!session) {
+        writeOAuthFlowLog("oauth: decision", {
+          outcome: "error",
+          ...decisionFields(),
+          error: "unauthorized",
+          status: 401,
+        });
         res.status(401).send(renderErrorHtml("Unauthorized", "Session expired. Please sign in again."));
         return;
       }
 
-      const body = (req.body && typeof req.body === "object") ? req.body : {};
-      const { request_id, consent_nonce, decision } = body;
-      if (!request_id || !consent_nonce || !decision) {
+      if (!requestId || !consent_nonce || !decision) {
+        writeOAuthFlowLog("oauth: decision", {
+          outcome: "error",
+          ...decisionFields(),
+          error: "invalid_request",
+          status: 400,
+        });
         res.status(400).send(renderErrorHtml("Invalid Request", "Missing decision parameters"));
         return;
       }
 
       try {
         if (decision === "approve") {
-          const outcome = oauthService.approveConsent(request_id, consent_nonce, session.userId);
+          const outcome = oauthService.approveConsent(requestId, consent_nonce, session.userId);
+          writeOAuthFlowLog("oauth: decision", {
+            outcome: "approved",
+            ...decisionFields(),
+            status: 302,
+          });
           const redirectUrl = new URL(outcome.redirectUri);
           redirectUrl.searchParams.set("code", outcome.code);
           redirectUrl.searchParams.set("iss", oauthService.publicOrigin);
@@ -317,7 +352,12 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
           }
           res.redirect(302, redirectUrl.toString());
         } else {
-          const outcome = oauthService.denyConsent(request_id, consent_nonce);
+          const outcome = oauthService.denyConsent(requestId, consent_nonce);
+          writeOAuthFlowLog("oauth: decision", {
+            outcome: "denied",
+            ...decisionFields(),
+            status: 302,
+          });
           const redirectUrl = new URL(outcome.redirectUri);
           redirectUrl.searchParams.set("error", "access_denied");
           redirectUrl.searchParams.set("error_description", "The user denied the authorization request");
@@ -329,9 +369,21 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         }
       } catch (err: any) {
         if (err instanceof OAuthServerError) {
+          writeOAuthFlowLog("oauth: decision", {
+            outcome: "error",
+            ...decisionFields(),
+            error: err.errorCode,
+            status: err.statusCode,
+          });
           res.status(err.statusCode).send(renderErrorHtml("Authorization Error", err.errorDescription || err.errorCode));
           return;
         }
+        writeOAuthFlowLog("oauth: decision", {
+          outcome: "error",
+          ...decisionFields(),
+          error: "server_error",
+          status: 500,
+        });
         res.status(500).send(renderErrorHtml("Server Error", "An error occurred while processing your decision"));
       }
     }
@@ -357,6 +409,13 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         resource,
       } = body;
 
+      const clientId = typeof client_id === "string" ? client_id : undefined;
+      const tokenFields = {
+        grant_type: typeof grant_type === "string" ? grant_type : undefined,
+        client_kind: classifyOAuthClientKind(clientId),
+        client_ref: oauthClientRef(clientId),
+      };
+
       try {
         if (grant_type === "authorization_code") {
           const tokens = oauthService.exchangeAuthorizationCode({
@@ -365,6 +424,11 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
             code,
             codeVerifier: code_verifier,
             resource: typeof resource === "string" ? resource : undefined,
+          });
+          writeOAuthFlowLog("oauth: token", {
+            outcome: "success",
+            ...tokenFields,
+            status: 200,
           });
           res.status(200).json(tokens);
           return;
@@ -377,22 +441,45 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
             scope: typeof scope === "string" ? scope : undefined,
             resource: typeof resource === "string" ? resource : undefined,
           });
+          writeOAuthFlowLog("oauth: token", {
+            outcome: "success",
+            ...tokenFields,
+            status: 200,
+          });
           res.status(200).json(tokens);
           return;
         }
 
+        writeOAuthFlowLog("oauth: token", {
+          outcome: "error",
+          ...tokenFields,
+          error: "unsupported_grant_type",
+          status: 400,
+        });
         res.status(400).json({
           error: "unsupported_grant_type",
           error_description: "Supported grant types: authorization_code, refresh_token",
         });
       } catch (err: any) {
         if (err instanceof OAuthServerError) {
+          writeOAuthFlowLog("oauth: token", {
+            outcome: "error",
+            ...tokenFields,
+            error: err.errorCode,
+            status: err.statusCode,
+          });
           res.status(err.statusCode).json({
             error: err.errorCode,
             error_description: err.errorDescription,
           });
           return;
         }
+        writeOAuthFlowLog("oauth: token", {
+          outcome: "error",
+          ...tokenFields,
+          error: "server_error",
+          status: 500,
+        });
         res.status(500).json({
           error: "server_error",
           error_description: "Internal server error",
