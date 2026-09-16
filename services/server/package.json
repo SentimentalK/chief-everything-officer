@@ -1,6 +1,6 @@
 {
   "name": "@sentimentalk/ceo-server",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,7 +10,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test": "vitest run --dir test",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate:existing-workspace": "node dist/migrate-existing-workspace.js"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
