@@ -8,6 +8,7 @@ import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { CeoWorkspace } from "./workspace.js";
 import { createProtocolCorsMiddleware } from "./http/protocol-cors.js";
+import { attachMcpProtocolLog } from "./http/mcp-observability.js";
 import {
   createHostGuard,
   createOriginGuard,
@@ -358,6 +359,7 @@ app.all(
     ? createMcpAuthMiddleware(identityService, oauthService)
     : createIdentityAuthMiddleware(identityService),
   (req: Request, res: Response) => {
+    attachMcpProtocolLog(req, res);
     void nodeHandler(req, res, req.body);
   },
 );
