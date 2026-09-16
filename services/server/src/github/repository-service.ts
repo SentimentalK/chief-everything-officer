@@ -95,6 +95,26 @@ export class GitHubPartialCreationError extends Error {
   }
 }
 
+export class GitHubWorkspaceProvisioningIncompleteError extends Error {
+  readonly status = 500;
+  readonly workspaceId: string;
+  readonly repository?: SafeRepositoryMetadata;
+  readonly bootstrap?: WorkspaceBootstrapRecord;
+
+  constructor(
+    message: string,
+    workspaceId: string,
+    repository?: SafeRepositoryMetadata,
+    bootstrap?: WorkspaceBootstrapRecord,
+  ) {
+    super(message);
+    this.name = "GitHubWorkspaceProvisioningIncompleteError";
+    this.workspaceId = workspaceId;
+    this.repository = repository;
+    this.bootstrap = bootstrap;
+  }
+}
+
 export const POSITIVE_SAFE_INT_REGEX = /^[1-9][0-9]*$/;
 
 export function parseStrictRepositoryPayload(
@@ -944,13 +964,14 @@ export class GitHubRepositoryService {
           bootstrap: provisioning.bootstrap,
           status: provisioning.status,
         };
-      } catch {
+      } catch (err) {
         const currentBootstrap = this.store.findWorkspaceBootstrapByWorkspaceId(created.workspace.id) ?? created.bootstrap;
-        return {
-          ...created,
-          bootstrap: currentBootstrap,
-          status: deriveProductProvisioningStatus(currentBootstrap.state),
-        };
+        throw new GitHubWorkspaceProvisioningIncompleteError(
+          `Workspace provisioning incomplete due to bootstrap failure: ${err instanceof Error ? err.message : String(err)}`,
+          created.workspace.id,
+          verifiedRepo,
+          currentBootstrap,
+        );
       }
     }
 
@@ -1052,6 +1073,7 @@ export class GitHubRepositoryService {
         binding: GitHubRepositoryBindingRecord;
         bootstrap: WorkspaceBootstrapRecord;
       };
+      let verifiedRepo: SafeRepositoryMetadata | undefined;
 
       try {
         let createdRaw: unknown;
@@ -1159,7 +1181,7 @@ export class GitHubRepositoryService {
         }
 
         const verifyDataRaw = await verifyRes.json();
-        const verifiedRepo = parseStrictRepositoryPayload(verifyDataRaw);
+        verifiedRepo = parseStrictRepositoryPayload(verifyDataRaw);
 
         if (verifiedRepo.id !== createdRepo.id) {
           throw new Error(`Installation verified repository id '${verifiedRepo.id}' does not match created repository id '${createdRepo.id}'`);
@@ -1218,13 +1240,14 @@ export class GitHubRepositoryService {
             bootstrap: provisioning.bootstrap,
             status: provisioning.status,
           };
-        } catch {
+        } catch (err) {
           const currentBootstrap = this.store.findWorkspaceBootstrapByWorkspaceId(created.workspace.id) ?? created.bootstrap;
-          return {
-            ...created,
-            bootstrap: currentBootstrap,
-            status: deriveProductProvisioningStatus(currentBootstrap.state),
-          };
+          throw new GitHubWorkspaceProvisioningIncompleteError(
+            `Workspace provisioning incomplete due to bootstrap failure: ${err instanceof Error ? err.message : String(err)}`,
+            created.workspace.id,
+            verifiedRepo,
+            currentBootstrap,
+          );
         }
       }
 

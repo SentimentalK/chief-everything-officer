@@ -16,9 +16,11 @@ import {
 } from "../src/github/bootstrap-service.js";
 import {
   GitHubRepositoryService,
+  GitHubWorkspaceProvisioningIncompleteError,
 } from "../src/github/repository-service.js";
 import {
   createWorkspaceProvisioningRouter,
+  createGitHubRepositoryAuthorizationsRouter,
 } from "../src/github/router.js";
 import packageJson from "../package.json" with { type: "json" };
 import packageLockJson from "../package-lock.json" with { type: "json" };
@@ -79,12 +81,17 @@ interface MockGitState {
   commitCreations: Array<{ tree: string; parents: string[]; message: string }>;
   refUpdates: Array<{ sha: string; force: boolean }>;
   refCreations: Array<{ ref: string; sha: string }>;
+  contentsPuts?: Array<{ path: string; message: string; content: string; branch?: string }>;
+  branches?: Array<{ name: string; commit?: { sha: string } }>;
+  repoSize?: number;
   // Injected fault flags
   failTreeCreateStatus?: number;
   failCommitCreateStatus?: number;
   failRefUpdateStatus?: number;
   failRefCreateStatus?: number;
   failGetRefStatus?: number;
+  failContentsStatus?: number;
+  failBranchesStatus?: number;
   failPostWriteVerification?: boolean;
 }
 
@@ -136,6 +143,7 @@ function createMockGitFetch(state: MockGitState) {
           archived: state.repoArchived,
           disabled: state.repoDisabled,
           default_branch: state.branch,
+          size: state.repoSize !== undefined ? state.repoSize : (state.branchRefSha === null && state.commits.size === 0 ? 0 : 100),
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -291,10 +299,101 @@ function createMockGitFetch(state: MockGitState) {
       );
     }
 
+    // Branches GET: /repos/:owner/:repo/branches
+    const branchesMatch = pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/branches$/);
+    if (branchesMatch && method === "GET") {
+      if (!state.repoExists) {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      }
+      if (state.failBranchesStatus) {
+        return new Response(JSON.stringify({ message: "Branches error" }), { status: state.failBranchesStatus });
+      }
+      if (state.branches !== undefined) {
+        return new Response(JSON.stringify(state.branches), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (state.branchRefSha === null && state.commits.size === 0) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify([
+          {
+            name: state.branch,
+            commit: { sha: state.branchRefSha ?? "head_sha" },
+          },
+        ]),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    // Contents PUT: /repos/:owner/:repo/contents/:path
+    const contentsMatch = pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/);
+    if (contentsMatch && method === "PUT") {
+      if (!state.repoExists) {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      }
+      if (state.failContentsStatus) {
+        return new Response(JSON.stringify({ message: "Contents error" }), { status: state.failContentsStatus });
+      }
+      const filePath = decodeURIComponent(contentsMatch[3]);
+      const parsed = JSON.parse(bodyStr);
+      state.contentsPuts = state.contentsPuts || [];
+      state.contentsPuts.push({ path: filePath, ...parsed });
+
+      const decodedContent = Buffer.from(parsed.content, "base64").toString("utf-8");
+      const blobSha = nextSha();
+      const treeSha = nextSha();
+      const commitSha = nextSha();
+
+      const items = [
+        {
+          path: filePath,
+          mode: "100644",
+          type: "blob",
+          sha: blobSha,
+          content: decodedContent,
+        },
+      ];
+      state.trees.set(treeSha, items);
+      state.commits.set(commitSha, {
+        tree: treeSha,
+        parents: [],
+        message: parsed.message,
+      });
+      state.branchRefSha = commitSha;
+
+      return new Response(
+        JSON.stringify({
+          content: { name: path.basename(filePath), path: filePath, sha: blobSha },
+          commit: { sha: commitSha, message: parsed.message },
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
     // Ref POST: /repos/:owner/:repo/git/refs
     if (pathname.endsWith("/git/refs") && method === "POST") {
       const parsed = JSON.parse(bodyStr);
       state.refCreations.push(parsed);
+
+      if (state.branchRefSha === null && state.commits.size === 0) {
+        // GitHub REST docs explicitly state Create a reference cannot create refs in an empty repository!
+        return new Response(
+          JSON.stringify({
+            message: "Git Repository is empty.",
+            documentation_url: "https://docs.github.com/rest/git/refs#create-a-reference",
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       if (state.failRefCreateStatus) {
         return new Response(JSON.stringify({ message: "Ref create conflict" }), { status: state.failRefCreateStatus });
@@ -434,12 +533,23 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(result.bootstrap.last_error_code).toBeNull();
 
     // Verify git API actions
+    // 1. Exactly one manifest anchor (README.md) initialized via Contents PUT
+    expect(gitState.contentsPuts?.length).toBe(1);
+    expect(gitState.contentsPuts?.[0].path).toBe("README.md");
+    // 2. POST /git/refs was NOT called as the first-ref mechanism
+    expect(gitState.refCreations.length).toBe(0);
+    // 3. Normal reconciliation added the remaining 2 anchors (JOURNAL.md, SYSTEM.md) via additive base_tree
     expect(gitState.treeCreations.length).toBe(1);
-    expect(gitState.treeCreations[0].tree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "README.md", "SYSTEM.md"]);
+    expect(gitState.treeCreations[0].tree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "SYSTEM.md"]);
     expect(gitState.commitCreations.length).toBe(1);
-    expect(gitState.commitCreations[0].parents).toEqual([]);
-    expect(gitState.refCreations.length).toBe(1);
-    expect(gitState.refCreations[0].ref).toBe("refs/heads/main");
+    expect(gitState.commitCreations[0].parents.length).toBe(1);
+    expect(gitState.refUpdates.length).toBe(1);
+    expect(gitState.refUpdates[0].force).toBe(false);
+
+    // 4. Resulting tree contains all 3 anchors
+    const readyCommit = gitState.commits.get(result.bootstrap.ready_commit_sha!)!;
+    const readyTree = gitState.trees.get(readyCommit.tree)!;
+    expect(readyTree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "README.md", "SYSTEM.md"]);
   });
 
   it("J. additive bootstrap preserving existing user repository content", async () => {
@@ -747,7 +857,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       commitCreations: [],
       refUpdates: [],
       refCreations: [],
-      failRefCreateStatus: 422, // ref already exists
+      failContentsStatus: 422, // concurrent init race
     };
 
     const fetchFn = createMockGitFetch(gitState);
@@ -1287,6 +1397,767 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(store.hasWorkspaceAccess(ident.workspace_id, ident.user_id)).toBe(true);
     const ws = store.findWorkspaceById(ident.workspace_id);
     expect(ws?.id).toBe(ident.workspace_id);
+  });
+
+  it("Y1. distinguishes empty repo from missing bound branch (populated repo -> MANUAL_RECOVERY; no writes)", async () => {
+    const ctx = await createBootstrapTestContext();
+    // Repository is populated with 'develop' branch, but bound branch 'main' does not exist
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch, // "main"
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null, // GET /git/ref/heads/main returns 404
+      branches: [{ name: "develop", commit: { sha: "d".repeat(40) } }],
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+    };
+
+    const fetchFn = createMockGitFetch(gitState);
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    const result = await service.bootstrapWorkspace(ctx.workspaceId);
+
+    expect(result.status).toBe("MANUAL_RECOVERY");
+    expect(result.bootstrap.state).toBe("MANUAL_RECOVERY");
+    expect(result.bootstrap.last_error_code).toBe("BRANCH_UNAVAILABLE");
+    expect(result.bootstrap.last_error_kind).toBe("manual");
+
+    // Proves NO writes/mutations occurred
+    expect(gitState.contentsPuts?.length ?? 0).toBe(0);
+    expect(gitState.treeCreations.length).toBe(0);
+    expect(gitState.commitCreations.length).toBe(0);
+    expect(gitState.refCreations.length).toBe(0);
+    expect(gitState.refUpdates.length).toBe(0);
+  });
+
+  it("Y2. branch-created race transitions to RETRYABLE_FAILURE STALE_REMOTE, then reconciles on retry", async () => {
+    const ctx = await createBootstrapTestContext();
+    // Bound branch ref GET returned 404 initially, but branches check shows the branch was concurrently created
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch,
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null, // first check 404
+      branches: [{ name: ctx.branch, commit: { sha: "e".repeat(40) } }], // branches check sees branch created
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+    };
+
+    const fetchFn = createMockGitFetch(gitState);
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    const result = await service.bootstrapWorkspace(ctx.workspaceId);
+
+    expect(result.status).toBe("RETRYABLE_FAILURE");
+    expect(result.bootstrap.state).toBe("RETRYABLE_FAILURE");
+    expect(result.bootstrap.last_error_code).toBe("STALE_REMOTE");
+
+    // Now branch ref is live with valid tree
+    const commitSha = "f".repeat(40);
+    const treeSha = "1".repeat(40);
+    gitState.commits.set(commitSha, { tree: treeSha, parents: [], message: "Init" });
+    gitState.trees.set(treeSha, [
+      { path: "README.md", mode: "100644", type: "blob", sha: "2".repeat(40) },
+      { path: "SYSTEM.md", mode: "100644", type: "blob", sha: "3".repeat(40) },
+      { path: "JOURNAL.md", mode: "100644", type: "blob", sha: "4".repeat(40) },
+    ]);
+    gitState.branchRefSha = commitSha;
+
+    // Retry should reconcile cleanly
+    const retryResult = await service.bootstrapWorkspace(ctx.workspaceId);
+    expect(retryResult.status).toBe("READY");
+    expect(retryResult.bootstrap.state).toBe("READY");
+    expect(retryResult.bootstrap.ready_commit_sha).toBe(commitSha);
+  });
+
+  it("Y3. control-plane preflight failures persist durable MANUAL_RECOVERY using attempt CAS", async () => {
+    // 1. Missing owner membership
+    {
+      const ctx = await createBootstrapTestContext();
+      // Remove owner membership from DB
+      const db = (ctx.store as any).db;
+      db.prepare("DELETE FROM workspace_memberships WHERE workspace_id = ?").run(ctx.workspaceId);
+
+      const fetchFn = createMockGitFetch({
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map(),
+        trees: new Map(),
+        branchRefSha: null,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.state).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("INVALID_BINDING");
+
+      // Verify row in DB is durably MANUAL_RECOVERY (not PENDING or APPLYING)
+      const persisted = ctx.store.findWorkspaceBootstrapByWorkspaceId(ctx.workspaceId);
+      expect(persisted?.state).toBe("MANUAL_RECOVERY");
+      expect(persisted?.last_error_code).toBe("INVALID_BINDING");
+    }
+
+    // 2. Disabled owner user
+    {
+      const ctx = await createBootstrapTestContext();
+      // Disable the owner user in DB
+      const db = (ctx.store as any).db;
+      db.prepare("UPDATE users SET disabled_at = unixepoch() WHERE id = ?").run(ctx.userId);
+
+      const fetchFn = createMockGitFetch({
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map(),
+        trees: new Map(),
+        branchRefSha: null,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.state).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("INVALID_BINDING");
+
+      const persisted = ctx.store.findWorkspaceBootstrapByWorkspaceId(ctx.workspaceId);
+      expect(persisted?.state).toBe("MANUAL_RECOVERY");
+    }
+
+    // 3. Missing installation row in DB
+    {
+      const ctx = await createBootstrapTestContext();
+      const db = (ctx.store as any).db;
+      db.exec("PRAGMA foreign_keys = OFF;");
+      db.prepare("DELETE FROM github_installations WHERE id = ?").run(ctx.installationRowId);
+      db.exec("PRAGMA foreign_keys = ON;");
+
+      const fetchFn = createMockGitFetch({
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map(),
+        trees: new Map(),
+        branchRefSha: null,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.state).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("INSTALLATION_UNAVAILABLE");
+
+      const persisted = ctx.store.findWorkspaceBootstrapByWorkspaceId(ctx.workspaceId);
+      expect(persisted?.state).toBe("MANUAL_RECOVERY");
+    }
+
+    // 4. Missing github_installation_users association in DB
+    {
+      const ctx = await createBootstrapTestContext();
+      const db = (ctx.store as any).db;
+      db.prepare("DELETE FROM github_installation_users WHERE github_installation_row_id = ? AND user_id = ?").run(
+        ctx.installationRowId,
+        ctx.userId,
+      );
+
+      const fetchFn = createMockGitFetch({
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map(),
+        trees: new Map(),
+        branchRefSha: null,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.state).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("INSTALLATION_UNAVAILABLE");
+
+      const persisted = ctx.store.findWorkspaceBootstrapByWorkspaceId(ctx.workspaceId);
+      expect(persisted?.state).toBe("MANUAL_RECOVERY");
+    }
+  });
+
+  it("Y4. live repository metadata validation strictly fails closed", async () => {
+    const ctx = await createBootstrapTestContext();
+
+    const makeFetchWithCustomRepo = (customRepoData: Record<string, unknown>) => {
+      return async (url: string | URL | Request) => {
+        const u = new URL(String(url));
+        if (u.pathname.startsWith("/app/installations/")) {
+          if (u.pathname.endsWith("/access_tokens")) {
+            return new Response(JSON.stringify({ token: "ghs_tok", expires_at: "2099-01-01T00:00:00Z" }), {
+              status: 201,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response(
+            JSON.stringify({ id: 5555, account: { id: 999, login: ctx.ownerLogin, type: "User" }, permissions: { contents: "write" } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (u.pathname.match(/^\/repos\/[^/]+\/[^/]+$/)) {
+          return new Response(JSON.stringify(customRepoData), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      };
+    };
+
+    const validBase = {
+      id: Number(ctx.repoId),
+      name: ctx.repoName,
+      full_name: `${ctx.ownerLogin}/${ctx.repoName}`,
+      owner: { id: 999, login: ctx.ownerLogin },
+      private: true,
+      archived: false,
+      disabled: false,
+      default_branch: ctx.branch,
+    };
+
+    // 1. Malformed boolean (string "false" instead of boolean)
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, private: "false" });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("MALFORMED_REPOSITORY_PAYLOAD");
+    }
+
+    // 2. Malformed repo ID (negative)
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, id: -100 });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("MALFORMED_REPOSITORY_PAYLOAD");
+    }
+
+    // 3. Owner ID mismatch with binding
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, owner: { id: 88888, login: ctx.ownerLogin } });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_IDENTITY_MISMATCH");
+    }
+
+    // 4. Repo is not private (public)
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, private: false });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
+    }
+
+    // 5. Repo is archived
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, archived: true });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
+    }
+
+    // 6. Repo is disabled
+    {
+      const fetchFn = makeFetchWithCustomRepo({ ...validBase, disabled: true });
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
+    }
+  });
+
+  it("Y5. mid-attempt auth/access loss (401/403) and object 404 map to MANUAL_RECOVERY (REPOSITORY_UNAVAILABLE)", async () => {
+    const ctx = await createBootstrapTestContext();
+    const existingCommitSha = "c".repeat(40);
+    const existingTreeSha = "t".repeat(40);
+
+    // 1. 403 on commit fetch mid-attempt
+    {
+      const gitState: MockGitState = {
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map([[existingCommitSha, { tree: existingTreeSha, parents: [], message: "Existing" }]]),
+        trees: new Map(),
+        branchRefSha: existingCommitSha,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      };
+
+      const baseFetch = createMockGitFetch(gitState);
+      const fetchFn = async (url: string | URL | Request, init?: RequestInit) => {
+        const u = new URL(String(url));
+        if (u.pathname.includes("/git/commits/")) {
+          return new Response(JSON.stringify({ message: "Forbidden" }), { status: 403 });
+        }
+        return baseFetch(url, init);
+      };
+
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
+      expect(res.bootstrap.last_error_kind).toBe("manual");
+    }
+
+    // 2. Unexpected 404 on commit object
+    {
+      const gitState: MockGitState = {
+        repoExists: true,
+        repoPrivate: true,
+        repoArchived: false,
+        repoDisabled: false,
+        repoId: Number(ctx.repoId),
+        ownerLogin: ctx.ownerLogin,
+        repoName: ctx.repoName,
+        branch: ctx.branch,
+        appPermissions: { contents: "write" },
+        appSuspended: false,
+        commits: new Map(), // empty map => commit will 404!
+        trees: new Map(),
+        branchRefSha: existingCommitSha,
+        treeCreations: [],
+        commitCreations: [],
+        refUpdates: [],
+        refCreations: [],
+      };
+
+      const fetchFn = createMockGitFetch(gitState);
+      const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+      const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+      const res = await service.bootstrapWorkspace(ctx.workspaceId);
+      expect(res.status).toBe("MANUAL_RECOVERY");
+      expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
+    }
+  });
+
+  it("Y6. forced store/DB failure during bootstrap raises GitHubWorkspaceProvisioningIncompleteError / HTTP 500 without masking as PROVISIONING", async () => {
+    const ctx = await createBootstrapTestContext();
+    const user4 = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "55555",
+      providerLogin: "user4",
+    });
+    const session4 = ctx.sessionManager.createSession({
+      userId: user4.user_id,
+      provider: "github",
+      providerSubject: "55555",
+      providerLogin: "user4",
+    });
+
+    ctx.store.upsertGitHubInstallationWithUser({
+      githubAppId: "10",
+      githubInstallationId: "8888",
+      accountId: "55555",
+      accountLogin: "user4",
+      accountType: "User",
+      repositorySelection: "all",
+      userId: user4.user_id,
+      rawPayload: { id: 8888 },
+    });
+
+    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(url));
+      if (u.pathname.includes("oauth/access_token")) {
+        const bodyStr = init?.body ? String(init.body) : "";
+        const isUser5 = bodyStr.includes("code2");
+        return new Response(JSON.stringify({ access_token: isUser5 ? "mock_user5_token" : "mock_user_token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (u.pathname === "/user") {
+        const authHeader = String((init?.headers as any)?.authorization || (init?.headers as any)?.Authorization || "");
+        const isUser5 = authHeader.includes("mock_user5_token");
+        return new Response(
+          JSON.stringify({ id: isUser5 ? 55556 : 55555, login: isUser5 ? "user5" : "user4" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/user/installations") {
+        const authHeader = String((init?.headers as any)?.authorization || (init?.headers as any)?.Authorization || "");
+        const isUser5 = authHeader.includes("mock_user5_token");
+        return new Response(
+          JSON.stringify({
+            total_count: 1,
+            installations: [
+              isUser5
+                ? { id: 8889, app_id: 10, account: { id: 55556, login: "user5", type: "User" } }
+                : { id: 8888, app_id: 10, account: { id: 55555, login: "user4", type: "User" } },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (u.pathname.includes("/repositories")) {
+        return new Response(
+          JSON.stringify({
+            total_count: 2,
+            repositories: [
+              {
+                id: 99991,
+                name: "db-fail-repo",
+                full_name: "user4/db-fail-repo",
+                owner: { id: 55555, login: "user4" },
+                private: true,
+                archived: false,
+                disabled: false,
+                default_branch: "main",
+                permissions: { admin: true, push: true, pull: true },
+              },
+              {
+                id: 99992,
+                name: "db-fail-repo-2",
+                full_name: "user5/db-fail-repo-2",
+                owner: { id: 55556, login: "user5" },
+                private: true,
+                archived: false,
+                disabled: false,
+                default_branch: "main",
+                permissions: { admin: true, push: true, pull: true },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (u.pathname.startsWith("/app/installations/")) {
+        if (u.pathname.endsWith("/access_tokens")) {
+          return new Response(JSON.stringify({ token: "ghs_mock", expires_at: "2099-01-01T00:00:00Z" }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const isInst8889 = u.pathname.includes("/8889");
+        return new Response(
+          JSON.stringify({
+            id: isInst8889 ? 8889 : 8888,
+            account: isInst8889 ? { id: 55556, login: "user5", type: "User" } : { id: 55555, login: "user4", type: "User" },
+            permissions: { contents: "write" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/repos/user4/db-fail-repo") {
+        return new Response(
+          JSON.stringify({
+            id: 99991,
+            name: "db-fail-repo",
+            full_name: "user4/db-fail-repo",
+            owner: { id: 55555, login: "user4" },
+            private: true,
+            archived: false,
+            disabled: false,
+            default_branch: "main",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/repos/user5/db-fail-repo-2") {
+        return new Response(
+          JSON.stringify({
+            id: 99992,
+            name: "db-fail-repo-2",
+            full_name: "user5/db-fail-repo-2",
+            owner: { id: 55556, login: "user5" },
+            private: true,
+            archived: false,
+            disabled: false,
+            default_branch: "main",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+    };
+
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn: mockFetch });
+
+    // Create a mock bootstrap service whose bootstrapWorkspace throws an unexpected DB / lifecycle error
+    const faultyBootstrapService = {
+      async bootstrapWorkspace(_workspaceId: string) {
+        throw new Error("Simulated fatal SQLite database disk I/O error");
+      },
+    } as unknown as WorkspaceBootstrapService;
+
+    const repoService = new GitHubRepositoryService({
+      appClient,
+      store: ctx.store,
+      clientId: ctx.clientId,
+      clientSecret: ctx.clientSecret,
+      callbackUrl: "http://localhost/callback",
+      fetchFn: mockFetch,
+      bootstrapService: faultyBootstrapService,
+    });
+
+    const start = repoService.createAuthorizationRedirect({
+      sessionId: session4.sessionId,
+      userId: user4.user_id,
+      providerSubject: "55555",
+      installationId: "8888",
+    });
+
+    const cb = await repoService.handleOAuthCallback({
+      state: start.state,
+      code: "code",
+      currentSessionId: session4.sessionId,
+      currentUserId: user4.user_id,
+      currentProviderSubject: "55555",
+    });
+
+    // importRepository must throw GitHubWorkspaceProvisioningIncompleteError and NOT return 201 PROVISIONING
+    await expect(
+      repoService.importRepository(cb.grant, session4.sessionId, user4.user_id, "55555", "99991"),
+    ).rejects.toThrow(GitHubWorkspaceProvisioningIncompleteError);
+
+    // Verify router integration maps this to 500 PROVISIONING_INCOMPLETE
+    const user5 = ctx.store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "55556",
+      providerLogin: "user5",
+    });
+    const session5 = ctx.sessionManager.createSession({
+      userId: user5.user_id,
+      provider: "github",
+      providerSubject: "55556",
+      providerLogin: "user5",
+    });
+    ctx.store.upsertGitHubInstallationWithUser({
+      githubAppId: "10",
+      githubInstallationId: "8889",
+      accountId: "55556",
+      accountLogin: "user5",
+      accountType: "User",
+      repositorySelection: "all",
+      userId: user5.user_id,
+      rawPayload: { id: 8889 },
+    });
+
+    const start2 = repoService.createAuthorizationRedirect({
+      sessionId: session5.sessionId,
+      userId: user5.user_id,
+      providerSubject: "55556",
+      installationId: "8889",
+    });
+
+    const cb2 = await repoService.handleOAuthCallback({
+      state: start2.state,
+      code: "code2",
+      currentSessionId: session5.sessionId,
+      currentUserId: user5.user_id,
+      currentProviderSubject: "55556",
+    });
+
+    const app = express();
+    app.use(express.json());
+    app.use(
+      "/api/github/repository-authorizations",
+      createGitHubRepositoryAuthorizationsRouter({
+        repositoryService: repoService,
+        sessionManager: ctx.sessionManager,
+        store: ctx.store,
+      }),
+    );
+
+    const res = await new Promise<{ status: number; body: any }>((resolve) => {
+      const req = {
+        method: "POST",
+        url: `/api/github/repository-authorizations/${cb2.grant}/workspace`,
+        originalUrl: `/api/github/repository-authorizations/${cb2.grant}/workspace`,
+        headers: {
+          cookie: `ceo_user_session=${session5.sessionId}`,
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: { mode: "import", repository_id: "99992" },
+        params: { grant: cb2.grant },
+        query: {},
+      } as any;
+      let resStatus = 200;
+      const responseObj = {
+        status: (s: number) => {
+          resStatus = s;
+          return responseObj;
+        },
+        setHeader: () => {},
+        getHeader: () => undefined,
+        json: (data: any) => {
+          resolve({ status: resStatus, body: data });
+        },
+      } as any;
+      app(req, responseObj, () => {
+        resolve({ status: 404, body: {} });
+      });
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("PROVISIONING_INCOMPLETE");
+    expect(res.body.workspace_id).toBeTruthy();
+
+    // Verify workspace and binding are preserved in DB
+    const binding = ctx.store.findRepositoryBindingByWorkspaceId(res.body.workspace_id);
+    expect(binding).toBeTruthy();
+    expect(binding?.github_repository_id).toBe("99992");
+  });
+
+  it("Y7. post-write verification fails closed if repository metadata changes before verify", async () => {
+    const ctx = await createBootstrapTestContext();
+    let repoCheckCount = 0;
+
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch,
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null,
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+    };
+
+    const baseFetch = createMockGitFetch(gitState);
+    const fetchFn = async (url: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(url));
+      if (u.pathname === `/repos/${ctx.ownerLogin}/${ctx.repoName}` && (!init?.method || init.method === "GET")) {
+        repoCheckCount++;
+        if (repoCheckCount > 1) {
+          // Repo changed to public during post-write verification!
+          return new Response(
+            JSON.stringify({
+              id: Number(ctx.repoId),
+              name: ctx.repoName,
+              full_name: `${ctx.ownerLogin}/${ctx.repoName}`,
+              owner: { id: 999, login: ctx.ownerLogin },
+              private: false, // Made public!
+              archived: false,
+              disabled: false,
+              default_branch: ctx.branch,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+      }
+      return baseFetch(url, init);
+    };
+
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    const res = await service.bootstrapWorkspace(ctx.workspaceId);
+    expect(res.status).toBe("MANUAL_RECOVERY");
+    expect(res.bootstrap.state).toBe("MANUAL_RECOVERY");
+    expect(res.bootstrap.last_error_code).toBe("REPOSITORY_UNAVAILABLE");
   });
 
   it("Z. package versions are 0.3.9", () => {

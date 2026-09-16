@@ -12,6 +12,7 @@ import {
   GitHubRepositoryError,
   GitHubAppPermissionUpgradeRequiredError,
   GitHubPartialCreationError,
+  GitHubWorkspaceProvisioningIncompleteError,
 } from "./repository-service.js";
 import {
   type WorkspaceBootstrapService,
@@ -444,6 +445,17 @@ export function createGitHubRepositoryAuthorizationsRouter(
           error: "PARTIAL_REPOSITORY_CREATION_FAILURE",
           message: error.message,
           ...(error.repository ? { repository: error.repository } : {}),
+        });
+        return;
+      }
+
+      if (error instanceof GitHubWorkspaceProvisioningIncompleteError) {
+        res.status(500).json({
+          error: "PROVISIONING_INCOMPLETE",
+          message: error.message,
+          workspace_id: error.workspaceId,
+          ...(error.repository ? { repository: error.repository } : {}),
+          ...(error.bootstrap ? { bootstrap: error.bootstrap } : {}),
         });
         return;
       }
