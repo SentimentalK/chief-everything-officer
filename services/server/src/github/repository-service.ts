@@ -2,10 +2,16 @@ import crypto from "node:crypto";
 import type {
   IdentityStore,
   GitHubRepositoryBindingRecord,
+  WorkspaceBootstrapRecord,
 } from "../identity/store.js";
 import { IdentityConflictError, IdentityStructureError } from "../identity/store.js";
 import type { GitHubAppClient } from "./app-client.js";
 import type { UserSessionManager } from "../auth/user-session.js";
+import {
+  WorkspaceBootstrapService,
+  type ProductProvisioningStatus,
+  deriveProductProvisioningStatus,
+} from "./bootstrap-service.js";
 
 export interface GitHubRepositoryServiceOptions {
   appClient: GitHubAppClient;
@@ -17,6 +23,7 @@ export interface GitHubRepositoryServiceOptions {
   stateTtlMs?: number;
   grantTtlMs?: number;
   sessionManager?: UserSessionManager;
+  bootstrapService?: WorkspaceBootstrapService;
 }
 
 export interface PendingRepoOAuthState {
@@ -257,6 +264,7 @@ export class GitHubRepositoryService {
   private readonly stateTtlMs: number;
   private readonly grantTtlMs: number;
   private readonly sessionManager?: UserSessionManager;
+  private readonly bootstrapService?: WorkspaceBootstrapService;
 
   private readonly pendingStates = new Map<string, PendingRepoOAuthState>();
   private readonly grants = new Map<string, RepositoryAuthorizationGrant>();
@@ -272,6 +280,7 @@ export class GitHubRepositoryService {
     this.stateTtlMs = options.stateTtlMs ?? 10 * 60 * 1000;
     this.grantTtlMs = options.grantTtlMs ?? 10 * 60 * 1000;
     this.sessionManager = options.sessionManager;
+    this.bootstrapService = options.bootstrapService;
   }
 
   get appClientInstance(): GitHubAppClient {
@@ -815,6 +824,8 @@ export class GitHubRepositoryService {
     workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
     membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
     binding: GitHubRepositoryBindingRecord;
+    bootstrap: WorkspaceBootstrapRecord;
+    status: ProductProvisioningStatus;
   }> {
     if (!repositoryId || typeof repositoryId !== "string" || !POSITIVE_SAFE_INT_REGEX.test(repositoryId)) {
       throw new GitHubRepositoryError("repository_id must be a positive decimal string", 400);
@@ -914,7 +925,7 @@ export class GitHubRepositoryService {
     }
 
     // Atomically create Workspace + membership + binding
-    return this.store.createWorkspaceWithRepositoryBinding({
+    const created = this.store.createWorkspaceWithRepositoryBinding({
       userId: currentUserId,
       installationRowId: grant.installationRowId,
       githubRepositoryId: verifiedRepo.id,
@@ -924,6 +935,29 @@ export class GitHubRepositoryService {
       fullName: verifiedRepo.full_name,
       branch: verifiedRepo.default_branch,
     });
+
+    if (this.bootstrapService) {
+      try {
+        const provisioning = await this.bootstrapService.bootstrapWorkspace(created.workspace.id);
+        return {
+          ...created,
+          bootstrap: provisioning.bootstrap,
+          status: provisioning.status,
+        };
+      } catch {
+        const currentBootstrap = this.store.findWorkspaceBootstrapByWorkspaceId(created.workspace.id) ?? created.bootstrap;
+        return {
+          ...created,
+          bootstrap: currentBootstrap,
+          status: deriveProductProvisioningStatus(currentBootstrap.state),
+        };
+      }
+    }
+
+    return {
+      ...created,
+      status: deriveProductProvisioningStatus(created.bootstrap.state),
+    };
   }
 
   /**
@@ -939,6 +973,8 @@ export class GitHubRepositoryService {
     workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
     membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
     binding: GitHubRepositoryBindingRecord;
+    bootstrap: WorkspaceBootstrapRecord;
+    status: ProductProvisioningStatus;
   }> {
     // Single-pod in-memory per-CEO-user provisioning guard
     if (this.activeCreations.has(currentUserId)) {
@@ -1010,6 +1046,12 @@ export class GitHubRepositoryService {
 
       // IMMEDIATELY after createRes.ok, all steps are inside the partial-side-effect boundary!
       let safeRecoveryRepo: SafeRepositoryMetadata | undefined;
+      let created: {
+        workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+        membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+        binding: GitHubRepositoryBindingRecord;
+        bootstrap: WorkspaceBootstrapRecord;
+      };
 
       try {
         let createdRaw: unknown;
@@ -1142,7 +1184,7 @@ export class GitHubRepositoryService {
         }
 
         // Atomically bind in DB
-        return this.store.createWorkspaceWithRepositoryBinding({
+        created = this.store.createWorkspaceWithRepositoryBinding({
           userId: currentUserId,
           installationRowId: grant.installationRowId,
           githubRepositoryId: verifiedRepo.id,
@@ -1167,6 +1209,29 @@ export class GitHubRepositoryService {
           );
         }
       }
+
+      if (this.bootstrapService) {
+        try {
+          const provisioning = await this.bootstrapService.bootstrapWorkspace(created.workspace.id);
+          return {
+            ...created,
+            bootstrap: provisioning.bootstrap,
+            status: provisioning.status,
+          };
+        } catch {
+          const currentBootstrap = this.store.findWorkspaceBootstrapByWorkspaceId(created.workspace.id) ?? created.bootstrap;
+          return {
+            ...created,
+            bootstrap: currentBootstrap,
+            status: deriveProductProvisioningStatus(currentBootstrap.state),
+          };
+        }
+      }
+
+      return {
+        ...created,
+        status: deriveProductProvisioningStatus(created.bootstrap.state),
+      };
     } finally {
       this.activeCreations.delete(currentUserId);
     }

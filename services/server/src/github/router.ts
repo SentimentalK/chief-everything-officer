@@ -13,6 +13,10 @@ import {
   GitHubAppPermissionUpgradeRequiredError,
   GitHubPartialCreationError,
 } from "./repository-service.js";
+import {
+  type WorkspaceBootstrapService,
+  WorkspaceBootstrapError,
+} from "./bootstrap-service.js";
 
 export interface GitHubAppAuthRouterOptions {
   installationService: GitHubInstallationService;
@@ -463,6 +467,99 @@ export function createGitHubRepositoryAuthorizationsRouter(
       const msg = error instanceof Error ? error.message : String(error);
       const status = error instanceof GitHubRepositoryError ? error.status : 500;
       res.status(status).json({ error: msg });
+    }
+  });
+
+  return router;
+}
+
+export interface WorkspaceProvisioningRouterOptions {
+  bootstrapService: WorkspaceBootstrapService;
+  sessionManager: UserSessionManager;
+  store: IdentityStore;
+}
+
+export function createWorkspaceProvisioningRouter(
+  options: WorkspaceProvisioningRouterOptions,
+): Router {
+  const { bootstrapService, sessionManager, store } = options;
+  const router = express.Router();
+
+  // GET /api/workspaces/:workspace_id/provisioning
+  router.get("/:workspace_id/provisioning", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+
+    const rawWorkspaceId = req.params.workspace_id ?? req.params.workspaceId;
+    const workspaceId = typeof rawWorkspaceId === "string" ? rawWorkspaceId.trim() : "";
+    if (!workspaceId) {
+      res.status(400).json({ error: "missing_workspace_id" });
+      return;
+    }
+
+    const workspace = store.findWorkspaceById(workspaceId);
+    if (!workspace) {
+      res.status(404).json({ error: "workspace_not_found", message: `Workspace '${workspaceId}' not found` });
+      return;
+    }
+
+    if (!store.hasWorkspaceAccess(workspaceId, session.userId)) {
+      res.status(403).json({ error: "forbidden", message: "User is not the owner of this workspace" });
+      return;
+    }
+
+    try {
+      const result = await bootstrapService.getProvisioningStatus(workspaceId);
+      res.status(200).json(result);
+    } catch (error) {
+      if (error instanceof WorkspaceBootstrapError) {
+        res.status(error.status).json({ error: error.code, message: error.message });
+        return;
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // POST /api/workspaces/:workspace_id/bootstrap/retry
+  router.post("/:workspace_id/bootstrap/retry", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    if (!session || !store.isUserActive(session.userId)) {
+      res.status(401).json({ error: "unauthenticated" });
+      return;
+    }
+
+    const rawWorkspaceId = req.params.workspace_id ?? req.params.workspaceId;
+    const workspaceId = typeof rawWorkspaceId === "string" ? rawWorkspaceId.trim() : "";
+    if (!workspaceId) {
+      res.status(400).json({ error: "missing_workspace_id" });
+      return;
+    }
+
+    const workspace = store.findWorkspaceById(workspaceId);
+    if (!workspace) {
+      res.status(404).json({ error: "workspace_not_found", message: `Workspace '${workspaceId}' not found` });
+      return;
+    }
+
+    if (!store.hasWorkspaceAccess(workspaceId, session.userId)) {
+      res.status(403).json({ error: "forbidden", message: "User is not the owner of this workspace" });
+      return;
+    }
+
+    try {
+      const result = await bootstrapService.bootstrapWorkspace(workspaceId);
+      res.status(200).json(result);
+    } catch (error) {
+      if (error instanceof WorkspaceBootstrapError) {
+        res.status(error.status).json({ error: error.code, message: error.message });
+        return;
+      }
+      const msg = error instanceof Error ? error.message : String(error);
+      res.status(500).json({ error: msg });
     }
   });
 

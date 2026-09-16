@@ -1896,6 +1896,23 @@ export class IdentityStore {
     });
   }
 
+  findWorkspaceById(workspaceId: string): {
+    id: string;
+    owner_user_id: string;
+    remote_url: string;
+    branch: string;
+    created_at: number;
+  } | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, owner_user_id, remote_url, branch, created_at FROM workspaces WHERE id = ? LIMIT 1;",
+      ).get(workspaceId) as
+        | { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number }
+        | undefined;
+      return row ?? null;
+    });
+  }
+
   upsertGitHubInstallationWithUser(input: UpsertGitHubInstallationInput): {
     installation: GitHubInstallationRecord;
     userLink: GitHubInstallationUserRecord;
