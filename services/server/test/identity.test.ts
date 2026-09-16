@@ -790,6 +790,248 @@ function seedV4Database(
   db.close();
 }
 
+function seedV5Database(
+  dbPath: string,
+  input: {
+    remoteUrl: string;
+    branch: string;
+    users?: Array<{ id: string; created_at: number; disabled_at?: number | null }>;
+    workspaces?: Array<{
+      id: string;
+      owner_user_id: string;
+      remote_url: string;
+      branch: string;
+      created_at: number;
+    }>;
+    workspaceMemberships?: Array<{
+      id: string;
+      workspace_id: string;
+      user_id: string;
+      role: string;
+      created_at: number;
+    }>;
+    apiKeys?: Array<{
+      id: string;
+      user_id: string;
+      key_digest: string;
+      created_at: number;
+      revoked_at?: number | null;
+    }>;
+    externalIdentities?: Array<{
+      id: string;
+      provider: string;
+      provider_subject: string;
+      user_id: string;
+      provider_login?: string | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+    githubInstallations?: Array<{
+      id: string;
+      github_installation_id: string;
+      github_app_id: string;
+      account_id: string;
+      account_login: string;
+      account_type: string;
+      repository_selection: string;
+      suspended_at_ms?: number | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+    githubInstallationUsers?: Array<{
+      id: string;
+      github_installation_row_id: string;
+      user_id: string;
+      created_at_ms: number;
+      verified_at_ms: number;
+    }>;
+    githubRepositoryBindings?: Array<{
+      id: string;
+      workspace_id: string;
+      github_repository_id: string;
+      github_installation_row_id: string;
+      owner_account_id: string;
+      owner_login: string;
+      repository_name: string;
+      full_name: string;
+      branch: string;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+  },
+): void {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+      branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+      FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    );
+    CREATE TABLE api_keys (
+      id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL, revoked_at INTEGER,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE external_identities (
+      id TEXT PRIMARY KEY NOT NULL,
+      provider TEXT NOT NULL,
+      provider_subject TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider_login TEXT,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      UNIQUE(provider, provider_subject),
+      UNIQUE(provider, user_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE workspace_memberships (
+      id TEXT PRIMARY KEY NOT NULL,
+      workspace_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      UNIQUE(workspace_id, user_id),
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE github_installations (
+      id TEXT PRIMARY KEY NOT NULL,
+      github_installation_id TEXT NOT NULL UNIQUE,
+      github_app_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      account_login TEXT NOT NULL,
+      account_type TEXT NOT NULL,
+      repository_selection TEXT NOT NULL,
+      suspended_at_ms INTEGER,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE github_installation_users (
+      id TEXT PRIMARY KEY NOT NULL,
+      github_installation_row_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      verified_at_ms INTEGER NOT NULL,
+      UNIQUE(github_installation_row_id, user_id),
+      FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE github_repository_bindings (
+      id TEXT PRIMARY KEY NOT NULL,
+      workspace_id TEXT NOT NULL UNIQUE,
+      github_repository_id TEXT NOT NULL UNIQUE,
+      github_installation_row_id TEXT NOT NULL,
+      owner_account_id TEXT NOT NULL,
+      owner_login TEXT NOT NULL,
+      repository_name TEXT NOT NULL,
+      full_name TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+      FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
+    );
+    CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
+    CREATE INDEX idx_api_keys_user ON api_keys(user_id);
+    CREATE INDEX idx_external_identities_user ON external_identities(user_id);
+    CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
+    CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
+    CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
+    CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
+    CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
+    CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
+    PRAGMA user_version = 5;
+  `);
+  for (const user of input.users ?? []) {
+    db.prepare("INSERT INTO users VALUES (?, ?, ?);").run(user.id, user.created_at, user.disabled_at ?? null);
+  }
+  for (const ws of input.workspaces ?? []) {
+    db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
+      ws.id,
+      ws.owner_user_id,
+      ws.remote_url,
+      ws.branch,
+      ws.created_at,
+    );
+  }
+  for (const m of input.workspaceMemberships ?? []) {
+    db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+      m.id,
+      m.workspace_id,
+      m.user_id,
+      m.role,
+      m.created_at,
+    );
+  }
+  for (const key of input.apiKeys ?? []) {
+    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
+      key.id,
+      key.user_id,
+      key.key_digest,
+      key.created_at,
+      key.revoked_at ?? null,
+    );
+  }
+  for (const ext of input.externalIdentities ?? []) {
+    db.prepare("INSERT INTO external_identities VALUES (?, ?, ?, ?, ?, ?, ?);").run(
+      ext.id,
+      ext.provider,
+      ext.provider_subject,
+      ext.user_id,
+      ext.provider_login ?? null,
+      ext.created_at_ms,
+      ext.updated_at_ms,
+    );
+  }
+  for (const inst of input.githubInstallations ?? []) {
+    db.prepare(`
+      INSERT INTO github_installations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    `).run(
+      inst.id,
+      inst.github_installation_id,
+      inst.github_app_id,
+      inst.account_id,
+      inst.account_login,
+      inst.account_type,
+      inst.repository_selection,
+      inst.suspended_at_ms ?? null,
+      inst.created_at_ms,
+      inst.updated_at_ms,
+    );
+  }
+  for (const iu of input.githubInstallationUsers ?? []) {
+    db.prepare(`
+      INSERT INTO github_installation_users VALUES (?, ?, ?, ?, ?);
+    `).run(
+      iu.id,
+      iu.github_installation_row_id,
+      iu.user_id,
+      iu.created_at_ms,
+      iu.verified_at_ms,
+    );
+  }
+  for (const grb of input.githubRepositoryBindings ?? []) {
+    db.prepare(`
+      INSERT INTO github_repository_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    `).run(
+      grb.id,
+      grb.workspace_id,
+      grb.github_repository_id,
+      grb.github_installation_row_id,
+      grb.owner_account_id,
+      grb.owner_login,
+      grb.repository_name,
+      grb.full_name,
+      grb.branch,
+      grb.created_at_ms,
+      grb.updated_at_ms,
+    );
+  }
+  db.close();
+}
+
 describe("v3 workspace_memberships schema & migration", () => {
   it("A. fresh v3 provision creates exact counts and owner membership with shadow match", async () => {
     const ctx = await tempCtx();
@@ -1789,7 +2031,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     const ver = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
     const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='github_repository_bindings';").all();
     raw.close();
-    expect(Number(ver.user_version)).toBe(5);
+    expect(Number(ver.user_version)).toBe(IDENTITY_DB_USER_VERSION);
     expect(tables.length).toBe(1);
 
     const store = openRaw(ctx);
@@ -1848,7 +2090,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(5);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(IDENTITY_DB_USER_VERSION);
     raw.close();
 
     expect(countRows(ctx.dbPath, "users")).toBe(1);
@@ -1892,7 +2134,7 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(5);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(IDENTITY_DB_USER_VERSION);
     raw.close();
 
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
@@ -2266,4 +2508,583 @@ describe("v5 github_repository_bindings control-plane schema & migration", () =>
     expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
   });
 });
+
+describe("v6 workspace_bootstraps schema & lifecycle state machine (Step 3.6A)", () => {
+  it("A. Fresh v6 schema contains workspace_bootstraps", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(0);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    const ver = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
+    const tables = raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_bootstraps';").all();
+    const indexes = raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_workspace_bootstraps_state';").all();
+    raw.close();
+
+    expect(Number(ver.user_version)).toBe(IDENTITY_DB_USER_VERSION);
+    expect(Number(ver.user_version)).toBe(6);
+    expect(tables.length).toBe(1);
+    expect(indexes.length).toBe(1);
+
+    const store = openRaw(ctx);
+    expect(store.findWorkspaceBootstrapByWorkspaceId(ident.workspace_id)).toBeNull();
+  });
+
+  it("B. v5->v6 preserves all IDs and creates PENDING bootstrap rows exactly for existing repository bindings, not unbound legacy workspaces", async () => {
+    const ctx = await tempCtx();
+    seedV5Database(ctx.dbPath, {
+      remoteUrl: ctx.remoteUrl,
+      branch: ctx.branch,
+      users: [
+        { id: "usr_legacy", created_at: 1000 },
+        { id: "usr_bound", created_at: 1100 },
+      ],
+      workspaces: [
+        { id: "ws_legacy", owner_user_id: "usr_legacy", remote_url: ctx.remoteUrl, branch: ctx.branch, created_at: 1000 },
+        { id: "ws_bound", owner_user_id: "usr_bound", remote_url: "https://github.com/org/repo.git", branch: "main", created_at: 1100 },
+      ],
+      workspaceMemberships: [
+        { id: "wsm_legacy", workspace_id: "ws_legacy", user_id: "usr_legacy", role: "owner", created_at: 1000 },
+        { id: "wsm_bound", workspace_id: "ws_bound", user_id: "usr_bound", role: "owner", created_at: 1100 },
+      ],
+      apiKeys: [
+        { id: "ak_legacy", user_id: "usr_legacy", key_digest: sha256Hex("key-legacy"), created_at: 1000 },
+      ],
+      externalIdentities: [
+        {
+          id: "ext_bound",
+          provider: "github",
+          provider_subject: "55555",
+          user_id: "usr_bound",
+          provider_login: "devbound",
+          created_at_ms: 1100,
+          updated_at_ms: 1100,
+        },
+      ],
+      githubInstallations: [
+        {
+          id: "ghi_bound",
+          github_installation_id: "77777",
+          github_app_id: "8888",
+          account_id: "9999",
+          account_login: "test-org",
+          account_type: "Organization",
+          repository_selection: "selected",
+          created_at_ms: 1100,
+          updated_at_ms: 1100,
+        },
+      ],
+      githubInstallationUsers: [
+        {
+          id: "ghiu_bound",
+          github_installation_row_id: "ghi_bound",
+          user_id: "usr_bound",
+          created_at_ms: 1100,
+          verified_at_ms: 1100,
+        },
+      ],
+      githubRepositoryBindings: [
+        {
+          id: "grb_bound",
+          workspace_id: "ws_bound",
+          github_repository_id: "123456",
+          github_installation_row_id: "ghi_bound",
+          owner_account_id: "9999",
+          owner_login: "test-org",
+          repository_name: "repo",
+          full_name: "test-org/repo",
+          branch: "main",
+          created_at_ms: 1150,
+          updated_at_ms: 1160,
+        },
+      ],
+    });
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(6);
+    raw.close();
+
+    // Verify all rows preserved
+    expect(countRows(ctx.dbPath, "users")).toBe(2);
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(2);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(2);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(1);
+    expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(1);
+
+    // Exactly one bootstrap row created for the bound workspace, NONE for legacy unbound workspace
+    expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(1);
+    expect(store.findWorkspaceBootstrapByWorkspaceId("ws_legacy")).toBeNull();
+
+    const boot = store.findWorkspaceBootstrapByWorkspaceId("ws_bound");
+    expect(boot).not.toBeNull();
+    expect(boot).toEqual({
+      workspace_id: "ws_bound",
+      bootstrap_version: 1,
+      state: "PENDING",
+      attempt_count: 0,
+      last_attempt_id: null,
+      last_base_commit_sha: null,
+      ready_commit_sha: null,
+      last_error_kind: null,
+      last_error_code: null,
+      last_error_message: null,
+      created_at_ms: 1150,
+      updated_at_ms: 1160,
+      ready_at_ms: null,
+    });
+  });
+
+  it("C. v1 fixture migrates through v6", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const db = new DatabaseSync(ctx.dbPath);
+    db.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      PRAGMA user_version = 1;
+      INSERT INTO users VALUES ('usr_v1_6', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_v1_6', 'usr_v1_6', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+      INSERT INTO api_keys VALUES ('ak_v1_6', 'usr_v1_6', '${sha256Hex("key-v1-6")}', 1000, NULL);
+    `);
+    db.close();
+
+    const store = IdentityStore.open(ctx.dbPath);
+    cleanupStores.push(store);
+
+    const raw = new DatabaseSync(ctx.dbPath);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(6);
+    raw.close();
+
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
+    expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installations")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_installation_users")).toBe(0);
+    expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(0);
+    expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(0);
+  });
+
+  it("D. forced v5->v6 failure rolls back cleanly to v5", async () => {
+    const ctx = await tempCtx();
+    fs.mkdirSync(path.dirname(ctx.dbPath), { recursive: true });
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY NOT NULL, owner_user_id TEXT NOT NULL, remote_url TEXT NOT NULL,
+        branch TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE api_keys (
+        id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, key_digest TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL, revoked_at INTEGER
+      );
+      CREATE TABLE external_identities (
+        id TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL, provider_subject TEXT NOT NULL,
+        user_id TEXT NOT NULL, provider_login TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE workspace_memberships (
+        id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE github_installations (
+        id TEXT PRIMARY KEY NOT NULL, github_installation_id TEXT NOT NULL UNIQUE, github_app_id TEXT NOT NULL, account_id TEXT NOT NULL, account_login TEXT NOT NULL, account_type TEXT NOT NULL, repository_selection TEXT NOT NULL, suspended_at_ms INTEGER, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE github_installation_users (
+        id TEXT PRIMARY KEY NOT NULL, github_installation_row_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL, verified_at_ms INTEGER NOT NULL
+      );
+      PRAGMA user_version = 5;
+      INSERT INTO users VALUES ('usr_a', 1000, NULL);
+      INSERT INTO workspaces VALUES ('ws_a', 'usr_a', '${ctx.remoteUrl}', '${ctx.branch}', 1000);
+    `);
+    // Missing required v5 table github_repository_bindings!
+    raw.close();
+
+    expect(() => IdentityStore.open(ctx.dbPath)).toThrow(/version 5 to 6|missing required v5 table/);
+    const after = new DatabaseSync(ctx.dbPath);
+    expect(Number((after.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(5);
+    const tables = after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_bootstraps';").all();
+    expect(tables).toEqual([]);
+    after.close();
+  });
+
+  it("E. new createWorkspaceWithRepositoryBinding atomically creates exactly Workspace + owner membership + binding + PENDING bootstrap, no API key", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const inst = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: ident.user_id,
+    });
+
+    const user2 = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "sub-user-2",
+      providerLogin: "login2",
+    });
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: user2.user_id,
+    });
+
+    const result = store.createWorkspaceWithRepositoryBinding({
+      userId: user2.user_id,
+      installationRowId: inst.installation.id,
+      githubRepositoryId: "2001",
+      ownerAccountId: "999",
+      ownerLogin: "org",
+      repositoryName: "bound-repo",
+      fullName: "org/bound-repo",
+      branch: "main",
+    });
+
+    expect(result.workspace.owner_user_id).toBe(user2.user_id);
+    expect(result.membership.role).toBe("owner");
+    expect(result.binding.github_repository_id).toBe("2001");
+    expect(result.bootstrap).toEqual({
+      workspace_id: result.workspace.id,
+      bootstrap_version: 1,
+      state: "PENDING",
+      attempt_count: 0,
+      last_attempt_id: null,
+      last_base_commit_sha: null,
+      ready_commit_sha: null,
+      last_error_kind: null,
+      last_error_code: null,
+      last_error_message: null,
+      created_at_ms: expect.any(Number),
+      updated_at_ms: expect.any(Number),
+      ready_at_ms: null,
+    });
+
+    // Verify DB counts: no API key created
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(2);
+    expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(2);
+    expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(1);
+    expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(1);
+    expect(countRows(ctx.dbPath, "api_keys")).toBe(1); // Only the initial key for user 1
+
+    expect(store.findWorkspaceBootstrapByWorkspaceId(result.workspace.id)).toEqual(result.bootstrap);
+  });
+
+  it("F. forced transaction failure leaves none of those partial rows", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const inst = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: ident.user_id,
+    });
+
+    const user2 = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "sub-user-fail",
+      providerLogin: "loginfail",
+    });
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: user2.user_id,
+    });
+
+    // Create a first workspace for user2
+    store.createWorkspaceWithRepositoryBinding({
+      userId: user2.user_id,
+      installationRowId: inst.installation.id,
+      githubRepositoryId: "3001",
+      ownerAccountId: "999",
+      ownerLogin: "org",
+      repositoryName: "repo-1",
+      fullName: "org/repo-1",
+      branch: "main",
+    });
+
+    const beforeWs = countRows(ctx.dbPath, "workspaces");
+    const beforeBindings = countRows(ctx.dbPath, "github_repository_bindings");
+    const beforeBootstraps = countRows(ctx.dbPath, "workspace_bootstraps");
+
+    // Second call fails due to single-owned-workspace invariant
+    expect(() => {
+      store.createWorkspaceWithRepositoryBinding({
+        userId: user2.user_id,
+        installationRowId: inst.installation.id,
+        githubRepositoryId: "3002",
+        ownerAccountId: "999",
+        ownerLogin: "org",
+        repositoryName: "repo-2",
+        fullName: "org/repo-2",
+        branch: "main",
+      });
+    }).toThrow(IdentityConflictError);
+
+    // Assert counts did not change (clean rollback)
+    expect(countRows(ctx.dbPath, "workspaces")).toBe(beforeWs);
+    expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(beforeBindings);
+    expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(beforeBootstraps);
+  });
+
+  it("G. begin attempt increments count and records opaque attempt id; stale attempt cannot mark READY/failure after a newer attempt begins", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const inst = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: ident.user_id,
+    });
+
+    const user2 = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "sub-user-lifecycle",
+      providerLogin: "loginlifecycle",
+    });
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: user2.user_id,
+    });
+
+    const res = store.createWorkspaceWithRepositoryBinding({
+      userId: user2.user_id,
+      installationRowId: inst.installation.id,
+      githubRepositoryId: "4001",
+      ownerAccountId: "999",
+      ownerLogin: "org",
+      repositoryName: "lifecycle-repo",
+      fullName: "org/lifecycle-repo",
+      branch: "main",
+    });
+    const wsId = res.workspace.id;
+
+    // First attempt
+    const att1 = store.beginWorkspaceBootstrapAttempt(wsId);
+    expect(att1.attemptId).toMatch(/^wba_[0-9a-f-]{36}$/);
+    expect(att1.bootstrap.state).toBe("APPLYING");
+    expect(att1.bootstrap.attempt_count).toBe(1);
+    expect(att1.bootstrap.last_attempt_id).toBe(att1.attemptId);
+
+    // Second attempt started before first completes (e.g. process crash or retry)
+    const att2 = store.beginWorkspaceBootstrapAttempt(wsId);
+    expect(att2.attemptId).toMatch(/^wba_[0-9a-f-]{36}$/);
+    expect(att2.attemptId).not.toBe(att1.attemptId);
+    expect(att2.bootstrap.state).toBe("APPLYING");
+    expect(att2.bootstrap.attempt_count).toBe(2);
+    expect(att2.bootstrap.last_attempt_id).toBe(att2.attemptId);
+
+    const sha1 = "1".repeat(40);
+    const sha2 = "2".repeat(40);
+
+    // Old attempt cannot mark READY
+    expect(() => {
+      store.markWorkspaceBootstrapReady(wsId, att1.attemptId, { readyCommitSha: sha1 });
+    }).toThrow(IdentityConflictError);
+
+    // Old attempt cannot mark retryable failure
+    expect(() => {
+      store.markWorkspaceBootstrapRetryableFailure(wsId, att1.attemptId, { code: "NETWORK_ERROR", message: "fail" });
+    }).toThrow(IdentityConflictError);
+
+    // Old attempt cannot mark manual recovery
+    expect(() => {
+      store.markWorkspaceBootstrapManualRecovery(wsId, att1.attemptId, { code: "INVALID_BINDING", message: "manual" });
+    }).toThrow(IdentityConflictError);
+
+    // State is still APPLYING under att2
+    const current = store.getWorkspaceBootstrap(wsId);
+    expect(current?.state).toBe("APPLYING");
+    expect(current?.last_attempt_id).toBe(att2.attemptId);
+
+    // Active attempt att2 can mark ready
+    const ready = store.markWorkspaceBootstrapReady(wsId, att2.attemptId, { readyCommitSha: sha2 });
+    expect(ready.state).toBe("READY");
+    expect(ready.ready_commit_sha).toBe(sha2);
+    expect(ready.ready_at_ms).toBeGreaterThan(0);
+    expect(ready.last_error_kind).toBeNull();
+    expect(ready.last_error_code).toBeNull();
+    expect(ready.last_error_message).toBeNull();
+
+    // After ready, another mark on same or old attempt is rejected
+    expect(() => {
+      store.markWorkspaceBootstrapReady(wsId, att2.attemptId, { readyCommitSha: sha2 });
+    }).toThrow(IdentityConflictError);
+  });
+
+  it("H. READY/failure state semantic validation rejects impossible combinations", async () => {
+    const ctx = await tempCtx();
+    const ident = provision(ctx, "key-1");
+    const store = openRaw(ctx);
+
+    const inst = store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: ident.user_id,
+    });
+
+    const user2 = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "sub-user-validation",
+      providerLogin: "loginval",
+    });
+
+    store.upsertGitHubInstallationWithUser({
+      githubInstallationId: "12345",
+      githubAppId: "6789",
+      accountId: "999",
+      accountLogin: "org",
+      accountType: "Organization",
+      repositorySelection: "selected",
+      userId: user2.user_id,
+    });
+
+    const res = store.createWorkspaceWithRepositoryBinding({
+      userId: user2.user_id,
+      installationRowId: inst.installation.id,
+      githubRepositoryId: "5001",
+      ownerAccountId: "999",
+      ownerLogin: "org",
+      repositoryName: "val-repo",
+      fullName: "org/val-repo",
+      branch: "main",
+    });
+    store.close();
+
+    const wsId = res.workspace.id;
+
+    // Helper to mutate DB directly and verify IdentityStore.open throws IdentityStructureError
+    const testDirectViolation = (sql: string, params: unknown[] = []) => {
+      const raw = new DatabaseSync(ctx.dbPath);
+      raw.prepare(sql).run(...params);
+      raw.close();
+      expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
+    };
+
+    // 1. READY missing ready_commit_sha
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='READY', ready_commit_sha=NULL, ready_at_ms=1000 WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 2. READY missing ready_at_ms
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='READY', ready_commit_sha=?, ready_at_ms=NULL WHERE workspace_id=?",
+      ["a".repeat(40), wsId],
+    );
+
+    // 3. READY with active failure field
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='READY', ready_commit_sha=?, ready_at_ms=1000, last_error_kind='retryable', last_error_code='ERR', last_error_message='msg' WHERE workspace_id=?",
+      ["a".repeat(40), wsId],
+    );
+
+    // 4. PENDING claiming ready
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='PENDING', ready_commit_sha=?, ready_at_ms=1000, last_error_kind=NULL, last_error_code=NULL, last_error_message=NULL WHERE workspace_id=?",
+      ["a".repeat(40), wsId],
+    );
+
+    // 5. APPLYING claiming ready
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='APPLYING', ready_commit_sha=?, ready_at_ms=1000, last_error_kind=NULL, last_error_code=NULL, last_error_message=NULL WHERE workspace_id=?",
+      ["a".repeat(40), wsId],
+    );
+
+    // 6. RETRYABLE_FAILURE with wrong error kind (manual)
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='RETRYABLE_FAILURE', ready_commit_sha=NULL, ready_at_ms=NULL, last_error_kind='manual', last_error_code='ERR', last_error_message='msg' WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 7. MANUAL_RECOVERY with wrong error kind (retryable)
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='MANUAL_RECOVERY', ready_commit_sha=NULL, ready_at_ms=NULL, last_error_kind='retryable', last_error_code='ERR', last_error_message='msg' WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 8. RETRYABLE_FAILURE with empty error code
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='RETRYABLE_FAILURE', ready_commit_sha=NULL, ready_at_ms=NULL, last_error_kind='retryable', last_error_code='', last_error_message='msg' WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 9. MANUAL_RECOVERY with empty error message
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='MANUAL_RECOVERY', ready_commit_sha=NULL, ready_at_ms=NULL, last_error_kind='manual', last_error_code='ERR', last_error_message='' WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 10. Invalid commit SHA length
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='READY', ready_commit_sha='badsha', ready_at_ms=1000, last_error_kind=NULL, last_error_code=NULL, last_error_message=NULL WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 11. Unsupported bootstrap version
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='PENDING', bootstrap_version=2, ready_commit_sha=NULL, ready_at_ms=NULL, last_error_kind=NULL, last_error_code=NULL, last_error_message=NULL WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 12. Negative attempt count
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='PENDING', bootstrap_version=1, attempt_count=-1 WHERE workspace_id=?",
+      [wsId],
+    );
+
+    // 13. Negative created_at_ms
+    testDirectViolation(
+      "UPDATE workspace_bootstraps SET state='PENDING', attempt_count=0, created_at_ms=-100 WHERE workspace_id=?",
+      [wsId],
+    );
+  });
+});
+
 

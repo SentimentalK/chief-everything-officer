@@ -58,7 +58,32 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 5;
+export const IDENTITY_DB_USER_VERSION = 6;
+
+export type WorkspaceBootstrapState =
+  | "PENDING"
+  | "APPLYING"
+  | "RETRYABLE_FAILURE"
+  | "MANUAL_RECOVERY"
+  | "READY";
+
+export type WorkspaceBootstrapErrorKind = "retryable" | "manual";
+
+export interface WorkspaceBootstrapRecord {
+  workspace_id: string;
+  bootstrap_version: number;
+  state: WorkspaceBootstrapState;
+  attempt_count: number;
+  last_attempt_id: string | null;
+  last_base_commit_sha: string | null;
+  ready_commit_sha: string | null;
+  last_error_kind: WorkspaceBootstrapErrorKind | null;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  ready_at_ms: number | null;
+}
 
 export type GitHubAccountType = "User" | "Organization";
 export type GitHubRepositorySelection = "all" | "selected";
@@ -224,6 +249,23 @@ CREATE TABLE github_repository_bindings (
   FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
 );
 
+CREATE TABLE workspace_bootstraps (
+  workspace_id TEXT PRIMARY KEY NOT NULL,
+  bootstrap_version INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL,
+  last_attempt_id TEXT,
+  last_base_commit_sha TEXT,
+  ready_commit_sha TEXT,
+  last_error_kind TEXT,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  ready_at_ms INTEGER,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
@@ -233,6 +275,7 @@ CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(work
 CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
 CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
 CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
+CREATE INDEX idx_workspace_bootstraps_state ON workspace_bootstraps(state);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
@@ -245,6 +288,7 @@ const EXPECTED_TABLES = [
   "github_installations",
   "github_installation_users",
   "github_repository_bindings",
+  "workspace_bootstraps",
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
@@ -284,6 +328,14 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
     "created_at_ms",
     "updated_at_ms",
   ],
+  workspace_bootstraps: [
+    "workspace_id",
+    "bootstrap_version",
+    "state",
+    "attempt_count",
+    "created_at_ms",
+    "updated_at_ms",
+  ],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -302,13 +354,16 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
     { from: "workspace_id", to: "id", referencedTable: "workspaces" },
     { from: "github_installation_row_id", to: "id", referencedTable: "github_installations" },
   ],
+  workspace_bootstraps: [
+    { from: "workspace_id", to: "id", referencedTable: "workspaces" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -578,11 +633,12 @@ export class IdentityStore {
         pk: number;
       }>;
 
-      // PK must be exactly the `id` column.
+      // PK must be exactly the expected primary key column ('workspace_id' for workspace_bootstraps, 'id' for other tables).
+      const expectedPk = table === "workspace_bootstraps" ? "workspace_id" : "id";
       const pkColumns = columns.filter((c) => c.pk > 0).map((c) => c.name);
-      if (pkColumns.length !== 1 || pkColumns[0] !== "id") {
+      if (pkColumns.length !== 1 || pkColumns[0] !== expectedPk) {
         throw new IdentityStructureError(
-          `Identity table '${table}' must have exactly one primary key column 'id' (found: ${pkColumns.join(",")})`,
+          `Identity table '${table}' must have exactly one primary key column '${expectedPk}' (found: ${pkColumns.join(",")})`,
         );
       }
 
@@ -799,6 +855,124 @@ export class IdentityStore {
       }
       if (!Number.isInteger(b.updated_at_ms) || b.updated_at_ms < 0) {
         throw new IdentityStructureError(`Invalid updated_at_ms in github_repository_bindings row '${b.id}'.`);
+      }
+    }
+
+    const bootstraps = db.prepare(
+      "SELECT workspace_id, bootstrap_version, state, attempt_count, last_attempt_id, last_base_commit_sha, ready_commit_sha, last_error_kind, last_error_code, last_error_message, created_at_ms, updated_at_ms, ready_at_ms FROM workspace_bootstraps;",
+    ).all() as Array<{
+      workspace_id: string;
+      bootstrap_version: number;
+      state: string;
+      attempt_count: number;
+      last_attempt_id: string | null;
+      last_base_commit_sha: string | null;
+      ready_commit_sha: string | null;
+      last_error_kind: string | null;
+      last_error_code: string | null;
+      last_error_message: string | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+      ready_at_ms: number | null;
+    }>;
+
+    const commitShaRegex = /^[0-9a-fA-F]{40,64}$/;
+    const validBootstrapStates = new Set([
+      "PENDING",
+      "APPLYING",
+      "RETRYABLE_FAILURE",
+      "MANUAL_RECOVERY",
+      "READY",
+    ]);
+
+    for (const b of bootstraps) {
+      if (typeof b.workspace_id !== "string" || !b.workspace_id.startsWith("ws_")) {
+        throw new IdentityStructureError(`Invalid workspace_bootstraps workspace_id '${b.workspace_id}'.`);
+      }
+      if (!Number.isInteger(b.bootstrap_version) || b.bootstrap_version !== 1) {
+        throw new IdentityStructureError(
+          `workspace_bootstraps bootstrap_version must be 1, found '${b.bootstrap_version}' in row '${b.workspace_id}'.`,
+        );
+      }
+      if (!Number.isInteger(b.attempt_count) || b.attempt_count < 0) {
+        throw new IdentityStructureError(
+          `workspace_bootstraps attempt_count must be a non-negative integer, found '${b.attempt_count}' in row '${b.workspace_id}'.`,
+        );
+      }
+      if (!Number.isInteger(b.created_at_ms) || b.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in workspace_bootstraps row '${b.workspace_id}'.`);
+      }
+      if (!Number.isInteger(b.updated_at_ms) || b.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in workspace_bootstraps row '${b.workspace_id}'.`);
+      }
+      if (!validBootstrapStates.has(b.state)) {
+        throw new IdentityStructureError(`Invalid workspace_bootstraps state '${b.state}' in row '${b.workspace_id}'.`);
+      }
+      if (b.last_attempt_id !== null) {
+        if (typeof b.last_attempt_id !== "string" || b.last_attempt_id.trim().length === 0) {
+          throw new IdentityStructureError(`Invalid last_attempt_id in workspace_bootstraps row '${b.workspace_id}'.`);
+        }
+      }
+      if (b.last_base_commit_sha !== null) {
+        if (typeof b.last_base_commit_sha !== "string" || !commitShaRegex.test(b.last_base_commit_sha)) {
+          throw new IdentityStructureError(`Invalid last_base_commit_sha in workspace_bootstraps row '${b.workspace_id}'.`);
+        }
+      }
+      if (b.ready_commit_sha !== null) {
+        if (typeof b.ready_commit_sha !== "string" || !commitShaRegex.test(b.ready_commit_sha)) {
+          throw new IdentityStructureError(`Invalid ready_commit_sha in workspace_bootstraps row '${b.workspace_id}'.`);
+        }
+      }
+      if (b.ready_at_ms !== null) {
+        if (!Number.isInteger(b.ready_at_ms) || b.ready_at_ms < 0) {
+          throw new IdentityStructureError(`Invalid ready_at_ms in workspace_bootstraps row '${b.workspace_id}'.`);
+        }
+      }
+
+      if (b.state === "READY") {
+        if (b.ready_commit_sha === null || b.ready_at_ms === null) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in READY state requires ready_commit_sha and ready_at_ms in row '${b.workspace_id}'.`,
+          );
+        }
+        if (b.last_error_kind !== null || b.last_error_code !== null || b.last_error_message !== null) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in READY state cannot have failure fields in row '${b.workspace_id}'.`,
+          );
+        }
+      } else if (b.state === "PENDING" || b.state === "APPLYING") {
+        if (b.ready_commit_sha !== null || b.ready_at_ms !== null) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in ${b.state} state cannot have ready_commit_sha or ready_at_ms in row '${b.workspace_id}'.`,
+          );
+        }
+        if (b.last_error_kind !== null || b.last_error_code !== null || b.last_error_message !== null) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in ${b.state} state cannot have failure fields in row '${b.workspace_id}'.`,
+          );
+        }
+      } else if (b.state === "RETRYABLE_FAILURE" || b.state === "MANUAL_RECOVERY") {
+        if (b.ready_commit_sha !== null || b.ready_at_ms !== null) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in failure state cannot have ready_commit_sha or ready_at_ms in row '${b.workspace_id}'.`,
+          );
+        }
+        const expectedKind = b.state === "RETRYABLE_FAILURE" ? "retryable" : "manual";
+        if (b.last_error_kind !== expectedKind) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in state '${b.state}' requires last_error_kind '${expectedKind}', found '${b.last_error_kind}' in row '${b.workspace_id}'.`,
+          );
+        }
+        if (typeof b.last_error_code !== "string" || b.last_error_code.trim().length === 0) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in failure state requires non-empty last_error_code in row '${b.workspace_id}'.`,
+          );
+        }
+        if (typeof b.last_error_message !== "string" || b.last_error_message.trim().length === 0) {
+          throw new IdentityStructureError(
+            `workspace_bootstraps in failure state requires non-empty last_error_message in row '${b.workspace_id}'.`,
+          );
+        }
       }
     }
 
@@ -1219,6 +1393,9 @@ export class IdentityStore {
         case 4:
           IdentityStore.migrateV4ToV5(db);
           break;
+        case 5:
+          IdentityStore.migrateV5ToV6(db);
+          break;
         default:
           throw new IdentityStructureError(
             `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
@@ -1468,6 +1645,79 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 4 to 5: ${error}`);
+    }
+  }
+
+  static migrateV5ToV6(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 5) {
+        throw new IdentityStructureError("migrateV5ToV6 requires user_version = 5.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+        "github_repository_bindings",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v6: missing required v5 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE workspace_bootstraps (
+          workspace_id TEXT PRIMARY KEY NOT NULL,
+          bootstrap_version INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL,
+          last_attempt_id TEXT,
+          last_base_commit_sha TEXT,
+          ready_commit_sha TEXT,
+          last_error_kind TEXT,
+          last_error_code TEXT,
+          last_error_message TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          ready_at_ms INTEGER,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+        );
+
+        CREATE INDEX idx_workspace_bootstraps_state ON workspace_bootstraps(state);
+
+        INSERT INTO workspace_bootstraps (
+          workspace_id, bootstrap_version, state, attempt_count,
+          last_attempt_id, last_base_commit_sha, ready_commit_sha,
+          last_error_kind, last_error_code, last_error_message,
+          created_at_ms, updated_at_ms, ready_at_ms
+        )
+        SELECT
+          workspace_id, 1, 'PENDING', 0,
+          NULL, NULL, NULL,
+          NULL, NULL, NULL,
+          created_at_ms, updated_at_ms, NULL
+        FROM github_repository_bindings;
+
+        PRAGMA user_version = 6;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 5 to 6: ${error}`);
     }
   }
 
@@ -1888,6 +2138,7 @@ export class IdentityStore {
     workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
     membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
     binding: GitHubRepositoryBindingRecord;
+    bootstrap: WorkspaceBootstrapRecord;
   } {
     const numericRegex = /^[1-9][0-9]*$/;
     if (typeof input.githubRepositoryId !== "string" || !numericRegex.test(input.githubRepositoryId)) {
@@ -2000,6 +2251,15 @@ export class IdentityStore {
           nowMs,
         );
 
+        db.prepare(`
+          INSERT INTO workspace_bootstraps (
+            workspace_id, bootstrap_version, state, attempt_count,
+            last_attempt_id, last_base_commit_sha, ready_commit_sha,
+            last_error_kind, last_error_code, last_error_message,
+            created_at_ms, updated_at_ms, ready_at_ms
+          ) VALUES (?, 1, 'PENDING', 0, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL);
+        `).run(workspaceId, nowMs, nowMs);
+
         db.exec("COMMIT;");
         return {
           workspace: {
@@ -2029,6 +2289,21 @@ export class IdentityStore {
             created_at_ms: nowMs,
             updated_at_ms: nowMs,
           },
+          bootstrap: {
+            workspace_id: workspaceId,
+            bootstrap_version: 1,
+            state: "PENDING",
+            attempt_count: 0,
+            last_attempt_id: null,
+            last_base_commit_sha: null,
+            ready_commit_sha: null,
+            last_error_kind: null,
+            last_error_code: null,
+            last_error_message: null,
+            created_at_ms: nowMs,
+            updated_at_ms: nowMs,
+            ready_at_ms: null,
+          },
         };
       } catch (error) {
         try {
@@ -2043,10 +2318,381 @@ export class IdentityStore {
       }
     });
   }
+
+  findWorkspaceBootstrapByWorkspaceId(workspaceId: string): WorkspaceBootstrapRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT workspace_id, bootstrap_version, state, attempt_count,
+               last_attempt_id, last_base_commit_sha, ready_commit_sha,
+               last_error_kind, last_error_code, last_error_message,
+               created_at_ms, updated_at_ms, ready_at_ms
+        FROM workspace_bootstraps
+        WHERE workspace_id = ?
+        LIMIT 1;
+      `).get(workspaceId);
+      return (row as unknown as WorkspaceBootstrapRecord) ?? null;
+    });
+  }
+
+  getWorkspaceBootstrap(workspaceId: string): WorkspaceBootstrapRecord | null {
+    return this.findWorkspaceBootstrapByWorkspaceId(workspaceId);
+  }
+
+  beginWorkspaceBootstrapAttempt(workspaceId: string): {
+    attemptId: string;
+    bootstrap: WorkspaceBootstrapRecord;
+  } {
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const row = db.prepare(`
+          SELECT workspace_id, bootstrap_version, state, attempt_count,
+                 last_attempt_id, last_base_commit_sha, ready_commit_sha,
+                 last_error_kind, last_error_code, last_error_message,
+                 created_at_ms, updated_at_ms, ready_at_ms
+          FROM workspace_bootstraps
+          WHERE workspace_id = ?
+          LIMIT 1;
+        `).get(workspaceId) as WorkspaceBootstrapRecord | undefined;
+
+        if (!row) {
+          throw new IdentityStructureError(`No workspace bootstrap row found for workspace '${workspaceId}'.`);
+        }
+
+        const attemptId = `wba_${crypto.randomUUID()}`;
+        const nowMs = Date.now();
+        const nextAttemptCount = row.attempt_count + 1;
+
+        db.prepare(`
+          UPDATE workspace_bootstraps
+          SET state = 'APPLYING',
+              attempt_count = ?,
+              last_attempt_id = ?,
+              ready_commit_sha = NULL,
+              ready_at_ms = NULL,
+              last_error_kind = NULL,
+              last_error_code = NULL,
+              last_error_message = NULL,
+              updated_at_ms = ?
+          WHERE workspace_id = ?;
+        `).run(nextAttemptCount, attemptId, nowMs, workspaceId);
+
+        db.exec("COMMIT;");
+        return {
+          attemptId,
+          bootstrap: {
+            workspace_id: workspaceId,
+            bootstrap_version: row.bootstrap_version,
+            state: "APPLYING",
+            attempt_count: nextAttemptCount,
+            last_attempt_id: attemptId,
+            last_base_commit_sha: row.last_base_commit_sha,
+            ready_commit_sha: null,
+            last_error_kind: null,
+            last_error_code: null,
+            last_error_message: null,
+            created_at_ms: row.created_at_ms,
+            updated_at_ms: nowMs,
+            ready_at_ms: null,
+          },
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to begin workspace bootstrap attempt: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  }
+
+  markWorkspaceBootstrapReady(
+    workspaceId: string,
+    attemptId: string,
+    input: { readyCommitSha: string; baseCommitSha?: string | null },
+  ): WorkspaceBootstrapRecord {
+    const readySha = normalizeSha(input.readyCommitSha);
+    const baseSha = input.baseCommitSha ? normalizeSha(input.baseCommitSha) : null;
+
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const row = db.prepare(`
+          SELECT workspace_id, bootstrap_version, state, attempt_count,
+                 last_attempt_id, last_base_commit_sha, ready_commit_sha,
+                 last_error_kind, last_error_code, last_error_message,
+                 created_at_ms, updated_at_ms, ready_at_ms
+          FROM workspace_bootstraps
+          WHERE workspace_id = ?
+          LIMIT 1;
+        `).get(workspaceId) as WorkspaceBootstrapRecord | undefined;
+
+        if (!row) {
+          throw new IdentityStructureError(`No workspace bootstrap row found for workspace '${workspaceId}'.`);
+        }
+
+        if (row.last_attempt_id !== attemptId || row.state !== "APPLYING") {
+          throw new IdentityConflictError(
+            `Stale bootstrap attempt '${attemptId}'; current attempt is '${row.last_attempt_id}' (state: ${row.state}).`,
+          );
+        }
+
+        const nowMs = Date.now();
+        const effectiveBaseSha = baseSha ?? row.last_base_commit_sha;
+
+        const updateRes = db.prepare(`
+          UPDATE workspace_bootstraps
+          SET state = 'READY',
+              ready_commit_sha = ?,
+              ready_at_ms = ?,
+              last_base_commit_sha = ?,
+              last_error_kind = NULL,
+              last_error_code = NULL,
+              last_error_message = NULL,
+              updated_at_ms = ?
+          WHERE workspace_id = ? AND last_attempt_id = ? AND state = 'APPLYING';
+        `).run(readySha, nowMs, effectiveBaseSha, nowMs, workspaceId, attemptId);
+
+        if (Number(updateRes.changes) !== 1) {
+          throw new IdentityConflictError(
+            `Concurrent update conflict while marking workspace '${workspaceId}' ready for attempt '${attemptId}'.`,
+          );
+        }
+
+        db.exec("COMMIT;");
+        return {
+          workspace_id: workspaceId,
+          bootstrap_version: row.bootstrap_version,
+          state: "READY",
+          attempt_count: row.attempt_count,
+          last_attempt_id: attemptId,
+          last_base_commit_sha: effectiveBaseSha,
+          ready_commit_sha: readySha,
+          last_error_kind: null,
+          last_error_code: null,
+          last_error_message: null,
+          created_at_ms: row.created_at_ms,
+          updated_at_ms: nowMs,
+          ready_at_ms: nowMs,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to mark workspace bootstrap ready: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  }
+
+  markWorkspaceBootstrapRetryableFailure(
+    workspaceId: string,
+    attemptId: string,
+    error: { code: string; message: string; baseCommitSha?: string | null },
+  ): WorkspaceBootstrapRecord {
+    const baseSha = error.baseCommitSha ? normalizeSha(error.baseCommitSha) : null;
+    const safeCode = sanitizeErrorCode(error.code);
+    const safeMessage = sanitizeErrorMessage(error.message);
+
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const row = db.prepare(`
+          SELECT workspace_id, bootstrap_version, state, attempt_count,
+                 last_attempt_id, last_base_commit_sha, ready_commit_sha,
+                 last_error_kind, last_error_code, last_error_message,
+                 created_at_ms, updated_at_ms, ready_at_ms
+          FROM workspace_bootstraps
+          WHERE workspace_id = ?
+          LIMIT 1;
+        `).get(workspaceId) as WorkspaceBootstrapRecord | undefined;
+
+        if (!row) {
+          throw new IdentityStructureError(`No workspace bootstrap row found for workspace '${workspaceId}'.`);
+        }
+
+        if (row.last_attempt_id !== attemptId || row.state !== "APPLYING") {
+          throw new IdentityConflictError(
+            `Stale bootstrap attempt '${attemptId}'; current attempt is '${row.last_attempt_id}' (state: ${row.state}).`,
+          );
+        }
+
+        const nowMs = Date.now();
+        const effectiveBaseSha = baseSha ?? row.last_base_commit_sha;
+
+        const updateRes = db.prepare(`
+          UPDATE workspace_bootstraps
+          SET state = 'RETRYABLE_FAILURE',
+              last_error_kind = 'retryable',
+              last_error_code = ?,
+              last_error_message = ?,
+              last_base_commit_sha = ?,
+              ready_commit_sha = NULL,
+              ready_at_ms = NULL,
+              updated_at_ms = ?
+          WHERE workspace_id = ? AND last_attempt_id = ? AND state = 'APPLYING';
+        `).run(safeCode, safeMessage, effectiveBaseSha, nowMs, workspaceId, attemptId);
+
+        if (Number(updateRes.changes) !== 1) {
+          throw new IdentityConflictError(
+            `Concurrent update conflict while marking workspace '${workspaceId}' retryable failure for attempt '${attemptId}'.`,
+          );
+        }
+
+        db.exec("COMMIT;");
+        return {
+          workspace_id: workspaceId,
+          bootstrap_version: row.bootstrap_version,
+          state: "RETRYABLE_FAILURE",
+          attempt_count: row.attempt_count,
+          last_attempt_id: attemptId,
+          last_base_commit_sha: effectiveBaseSha,
+          ready_commit_sha: null,
+          last_error_kind: "retryable",
+          last_error_code: safeCode,
+          last_error_message: safeMessage,
+          created_at_ms: row.created_at_ms,
+          updated_at_ms: nowMs,
+          ready_at_ms: null,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to mark workspace bootstrap retryable failure: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  }
+
+  markWorkspaceBootstrapManualRecovery(
+    workspaceId: string,
+    attemptId: string,
+    error: { code: string; message: string; baseCommitSha?: string | null },
+  ): WorkspaceBootstrapRecord {
+    const baseSha = error.baseCommitSha ? normalizeSha(error.baseCommitSha) : null;
+    const safeCode = sanitizeErrorCode(error.code);
+    const safeMessage = sanitizeErrorMessage(error.message);
+
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const row = db.prepare(`
+          SELECT workspace_id, bootstrap_version, state, attempt_count,
+                 last_attempt_id, last_base_commit_sha, ready_commit_sha,
+                 last_error_kind, last_error_code, last_error_message,
+                 created_at_ms, updated_at_ms, ready_at_ms
+          FROM workspace_bootstraps
+          WHERE workspace_id = ?
+          LIMIT 1;
+        `).get(workspaceId) as WorkspaceBootstrapRecord | undefined;
+
+        if (!row) {
+          throw new IdentityStructureError(`No workspace bootstrap row found for workspace '${workspaceId}'.`);
+        }
+
+        if (row.last_attempt_id !== attemptId || row.state !== "APPLYING") {
+          throw new IdentityConflictError(
+            `Stale bootstrap attempt '${attemptId}'; current attempt is '${row.last_attempt_id}' (state: ${row.state}).`,
+          );
+        }
+
+        const nowMs = Date.now();
+        const effectiveBaseSha = baseSha ?? row.last_base_commit_sha;
+
+        const updateRes = db.prepare(`
+          UPDATE workspace_bootstraps
+          SET state = 'MANUAL_RECOVERY',
+              last_error_kind = 'manual',
+              last_error_code = ?,
+              last_error_message = ?,
+              last_base_commit_sha = ?,
+              ready_commit_sha = NULL,
+              ready_at_ms = NULL,
+              updated_at_ms = ?
+          WHERE workspace_id = ? AND last_attempt_id = ? AND state = 'APPLYING';
+        `).run(safeCode, safeMessage, effectiveBaseSha, nowMs, workspaceId, attemptId);
+
+        if (Number(updateRes.changes) !== 1) {
+          throw new IdentityConflictError(
+            `Concurrent update conflict while marking workspace '${workspaceId}' manual recovery for attempt '${attemptId}'.`,
+          );
+        }
+
+        db.exec("COMMIT;");
+        return {
+          workspace_id: workspaceId,
+          bootstrap_version: row.bootstrap_version,
+          state: "MANUAL_RECOVERY",
+          attempt_count: row.attempt_count,
+          last_attempt_id: attemptId,
+          last_base_commit_sha: effectiveBaseSha,
+          ready_commit_sha: null,
+          last_error_kind: "manual",
+          last_error_code: safeCode,
+          last_error_message: safeMessage,
+          created_at_ms: row.created_at_ms,
+          updated_at_ms: nowMs,
+          ready_at_ms: null,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(
+          `Failed to mark workspace bootstrap manual recovery: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+  }
+
 }
 
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
+}
+
+function sanitizeErrorMessage(msg: string): string {
+  let cleaned = String(msg)
+    .replace(/ghp_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/ghs_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/github_pat_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/Bearer\s+[^\s]+/gi, "Bearer [REDACTED]")
+    .replace(/token\s+[^\s]+/gi, "token [REDACTED]")
+    .replace(/https:\/\/[^@/\s]+@/g, "https://[REDACTED]@");
+  if (cleaned.length > 500) {
+    cleaned = cleaned.slice(0, 497) + "...";
+  }
+  return cleaned;
+}
+
+function sanitizeErrorCode(code: string): string {
+  const cleaned = String(code).trim().replace(/[^a-zA-Z0-9_]/g, "_").toUpperCase();
+  return cleaned.slice(0, 64) || "UNKNOWN_ERROR";
+}
+
+const COMMIT_HEX_REGEX = /^[0-9a-fA-F]{40,64}$/;
+function normalizeSha(sha: string): string {
+  const trimmed = sha.trim();
+  if (!COMMIT_HEX_REGEX.test(trimmed)) {
+    throw new IdentityStructureError(`Invalid commit SHA format '${sha}'; expected 40-64 hex characters.`);
+  }
+  return trimmed.toLowerCase();
 }
 
 function ensureJournalMode(db: DatabaseSync): void {
