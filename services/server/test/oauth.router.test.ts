@@ -14,6 +14,7 @@ import {
 } from "../src/identity/store.js";
 import { OAuthService } from "../src/oauth/service.js";
 import { createOAuthRouter } from "../src/oauth/router.js";
+import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
 import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
 
@@ -50,11 +51,11 @@ async function setupTestApp() {
   const oauthService = new OAuthService(oauthStore, identStore, {
     publicOrigin,
     workspaceId: ident.workspace_id,
-    clientMetadataResolverOptions: {
+    clientResolver: createCimdOnlyClientResolver({
       allowHttpForTest: true,
       allowPrivateIpsForTest: true,
       dnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
-    },
+    }),
   });
 
   const app = express();

@@ -273,6 +273,7 @@ if (config.githubAppEnabled) {
 import { OAuthStore } from "./oauth/store.js";
 import { OAuthService } from "./oauth/service.js";
 import { createOAuthRouter } from "./oauth/router.js";
+import { createCimdOnlyClientResolver } from "./oauth/client-resolver.js";
 
 let oauthStore: OAuthStore | null = null;
 let oauthService: OAuthService | null = null;
@@ -283,6 +284,7 @@ if (config.oauthEnabled) {
   oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
     publicOrigin,
     workspaceId: workspaceIdentity.workspace_id,
+    clientResolver: createCimdOnlyClientResolver(),
   });
 
   app.use(

@@ -12,6 +12,7 @@ import {
   sha256Hex,
 } from "../src/identity/store.js";
 import { OAuthService, OAuthServerError } from "../src/oauth/service.js";
+import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 
 const cleanupDirs: string[] = [];
 const cleanupOAuthStores: OAuthStore[] = [];
@@ -44,11 +45,11 @@ async function setupTestEnv() {
   const service = new OAuthService(oauthStore, identStore, {
     publicOrigin,
     workspaceId: ident.workspace_id,
-    clientMetadataResolverOptions: {
+    clientResolver: createCimdOnlyClientResolver({
       allowHttpForTest: true,
       allowPrivateIpsForTest: true,
       dnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
-    },
+    }),
   });
 
   return { dir, ident, identStore, oauthStore, service, publicOrigin };

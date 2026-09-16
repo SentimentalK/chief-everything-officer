@@ -7,11 +7,11 @@ import {
   RefreshTokenRecord,
   sha256Hex,
 } from "./store.js";
+import { ClientMetadata } from "./client-metadata.js";
 import {
-  resolveClientMetadata,
-  ClientMetadata,
-  ClientMetadataResolverOptions,
-} from "./client-metadata.js";
+  OAuthClientResolver,
+  OAuthClientResolutionError,
+} from "./client-resolver.js";
 import { IdentityStore } from "../identity/store.js";
 
 export class OAuthServerError extends Error {
@@ -28,7 +28,7 @@ export class OAuthServerError extends Error {
 export interface OAuthServiceOptions {
   publicOrigin: string;
   workspaceId: string;
-  clientMetadataResolverOptions?: ClientMetadataResolverOptions;
+  clientResolver: OAuthClientResolver;
   authCodeTtlMs?: number; // default 5m
   authRequestTtlMs?: number; // default 10m
   accessTokenTtlMs?: number; // default 1h
@@ -76,7 +76,7 @@ export class OAuthService {
   readonly workspaceId: string;
   private readonly store: OAuthStore;
   private readonly identityStore: IdentityStore;
-  private readonly clientMetadataResolverOptions?: ClientMetadataResolverOptions;
+  private readonly clientResolver: OAuthClientResolver;
   private readonly authCodeTtlMs: number;
   private readonly authRequestTtlMs: number;
   private readonly accessTokenTtlMs: number;
@@ -92,7 +92,7 @@ export class OAuthService {
     this.publicOrigin = options.publicOrigin.replace(/\/+$/, "");
     this.canonicalResource = `${this.publicOrigin}/mcp`;
     this.workspaceId = options.workspaceId;
-    this.clientMetadataResolverOptions = options.clientMetadataResolverOptions;
+    this.clientResolver = options.clientResolver;
     this.authCodeTtlMs = options.authCodeTtlMs ?? DEFAULT_AUTH_CODE_TTL_MS;
     this.authRequestTtlMs = options.authRequestTtlMs ?? DEFAULT_AUTH_REQUEST_TTL_MS;
     this.accessTokenTtlMs = options.accessTokenTtlMs ?? DEFAULT_ACCESS_TOKEN_TTL_MS;
@@ -148,19 +148,21 @@ export class OAuthService {
     // Resource validation (mandatory explicit resource binding)
     const targetResource = validateCanonicalResource(input.resource, this.canonicalResource);
 
-    // Resolve client metadata via CIMD
     let clientMetadata: ClientMetadata;
     try {
-      clientMetadata = await resolveClientMetadata(
-        input.clientId,
-        this.clientMetadataResolverOptions
-      );
-    } catch (err: any) {
-      throw new OAuthServerError(
-        "invalid_client",
-        `Failed to resolve client metadata: ${err.message}`,
-        400
-      );
+      clientMetadata = await this.clientResolver.resolve(input.clientId);
+    } catch (err) {
+      if (err instanceof OAuthClientResolutionError) {
+        if (err.errorCode === "unavailable") {
+          throw new OAuthServerError("server_error", err.message, 503);
+        }
+        throw new OAuthServerError(
+          "invalid_client",
+          `Failed to resolve client metadata: ${err.message}`,
+          400,
+        );
+      }
+      throw err;
     }
 
     // Validate redirect_uri matches client metadata

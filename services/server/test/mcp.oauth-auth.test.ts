@@ -14,6 +14,7 @@ import {
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
 import { OAuthService } from "../src/oauth/service.js";
+import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 import { createMcpAuthMiddleware, createIdentityAuthMiddleware } from "../src/auth.js";
 
 const cleanupDirs: string[] = [];
@@ -58,6 +59,7 @@ async function setupMcpAuthTestApp() {
   const oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
     publicOrigin,
     workspaceId: ident.workspace_id,
+    clientResolver: createCimdOnlyClientResolver(),
   });
 
   const app = express();
