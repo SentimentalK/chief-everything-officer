@@ -3,20 +3,12 @@ import fs from "node:fs";
 
 export interface Config {
   dataRoot: string;
-  repoDir: string;
-  txnDir: string;
-  stateDir: string;
-  branch: string;
-  remoteUrl: string;
   port: number;
   bindHost: string;
   gitAuthorName: string;
   gitAuthorEmail: string;
   gitCommitterName: string;
   gitCommitterEmail: string;
-  sshKeyPath?: string;
-  knownHostsPath?: string;
-  mcpApiKey: string;
   allowedHosts: string[];
   allowedOrigins: string[];
   protocolAllowedOrigins: string[];
@@ -58,23 +50,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("CEO_REDIS_URL must be a redis:// or rediss:// URL");
   }
   const redisUrl = redisUrlRaw || undefined;
-
-  const mcpApiKey = env.MCP_API_KEY;
-  if (mcpApiKey === undefined) {
-    throw new Error("MCP_API_KEY is required");
-  }
-  if (mcpApiKey.length === 0) {
-    throw new Error("MCP_API_KEY must not be empty");
-  }
-  if (mcpApiKey !== mcpApiKey.trim()) {
-    // Reject leading/trailing whitespace rather than silently altering the key.
-    throw new Error("MCP_API_KEY must not contain leading or trailing whitespace");
-  }
-
-  const remoteUrl = env.CEO_REMOTE?.trim();
-  if (!remoteUrl) {
-    throw new Error("CEO_REMOTE is required");
-  }
 
   const allowedHosts = env.ALLOWED_HOSTS ? env.ALLOWED_HOSTS.split(",").map(s => s.trim()).filter(Boolean) : ["localhost", "127.0.0.1"];
   const allowedOrigins = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : [];
@@ -167,20 +142,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return {
     dataRoot,
-    repoDir: path.join(dataRoot, "repo"),
-    txnDir: path.join(dataRoot, "txns"),
-    stateDir: path.join(dataRoot, "state"),
-    branch: env.CEO_BRANCH ?? "main",
-    remoteUrl,
     port,
     bindHost,
     gitAuthorName,
     gitAuthorEmail,
     gitCommitterName,
     gitCommitterEmail,
-    ...(env.CEO_SSH_KEY_PATH ? { sshKeyPath: env.CEO_SSH_KEY_PATH } : {}),
-    ...(env.CEO_KNOWN_HOSTS_PATH ? { knownHostsPath: env.CEO_KNOWN_HOSTS_PATH } : {}),
-    mcpApiKey,
     allowedHosts,
     allowedOrigins,
     protocolAllowedOrigins,

@@ -1,69 +1,41 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 
-const KEY = "test-mcp-key";
-
 function baseEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return { MCP_API_KEY: KEY, ...extra };
+  return { ...extra };
 }
 
 describe("Config Validation", () => {
-  it("throws when MCP_API_KEY is missing", () => {
-    expect(() => loadConfig({} as any)).toThrow("MCP_API_KEY is required");
-  });
-
-  it("throws when MCP_API_KEY is empty", () => {
-    expect(() => loadConfig(baseEnv({ MCP_API_KEY: "" }))).toThrow("MCP_API_KEY must not be empty");
-  });
-
-  it("rejects MCP_API_KEY with leading/trailing whitespace", () => {
-    expect(() => loadConfig(baseEnv({ MCP_API_KEY: "  padded  " }))).toThrow(
-      "MCP_API_KEY must not contain leading or trailing whitespace",
-    );
-  });
-
-  it("throws when CEO_REMOTE is missing", () => {
-    expect(() => loadConfig(baseEnv({ MCP_API_KEY: KEY }) as any)).toThrow("CEO_REMOTE is required");
-  });
-
-  it("throws when CEO_REMOTE is empty string", () => {
-    expect(() => loadConfig(baseEnv({ CEO_REMOTE: "" }))).toThrow("CEO_REMOTE is required");
-  });
-
-  it("throws when CEO_REMOTE is whitespace only", () => {
-    expect(() => loadConfig(baseEnv({ CEO_REMOTE: "   \t\n " }))).toThrow("CEO_REMOTE is required");
-  });
-
-  it("accepts valid CEO_REMOTE and trims whitespace", () => {
-    const config = loadConfig(baseEnv({ CEO_REMOTE: "  git@github.com:SentimentalK/LifeOS.git  " }));
-    expect(config.remoteUrl).toBe("git@github.com:SentimentalK/LifeOS.git");
-    expect(config.branch).toBe("main");
+  it("does not require MCP_API_KEY, CEO_REMOTE, or CEO_BRANCH", () => {
+    const config = loadConfig({});
+    expect(config.dataRoot).toBe("/data");
+    expect((config as any).mcpApiKey).toBeUndefined();
+    expect((config as any).remoteUrl).toBeUndefined();
+    expect((config as any).branch).toBeUndefined();
+    expect((config as any).repoDir).toBeUndefined();
+    expect((config as any).txnDir).toBeUndefined();
+    expect((config as any).stateDir).toBeUndefined();
   });
 
   it("validates PORT boundaries", () => {
-    expect(() => loadConfig(baseEnv({ CEO_REMOTE: "repo.git", PORT: "0" }))).toThrow(
+    expect(() => loadConfig({ PORT: "0" })).toThrow(
       "PORT must be an integer from 1 to 65535",
     );
-    expect(() => loadConfig(baseEnv({ CEO_REMOTE: "repo.git", PORT: "70000" }))).toThrow(
+    expect(() => loadConfig({ PORT: "70000" })).toThrow(
       "PORT must be an integer from 1 to 65535",
     );
-    expect(() => loadConfig(baseEnv({ CEO_REMOTE: "repo.git", PORT: "abc" }))).toThrow(
+    expect(() => loadConfig({ PORT: "abc" })).toThrow(
       "PORT must be an integer from 1 to 65535",
     );
   });
 
-  it("requires MCP_API_KEY regardless of bind host (loopback included)", () => {
-    // Loopback without a key is still rejected.
-    expect(() => loadConfig({ CEO_REMOTE: "repo.git", BIND_HOST: "127.0.0.1" })).toThrow(
-      "MCP_API_KEY is required",
-    );
-    const ok = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", BIND_HOST: "0.0.0.0" }));
+  it("sets bind host appropriately", () => {
+    const ok = loadConfig({ BIND_HOST: "0.0.0.0" });
     expect(ok.bindHost).toBe("0.0.0.0");
-    expect(ok.mcpApiKey).toBe(KEY);
   });
 
   it("computes default identityDbPath under CEO_DATA_ROOT", () => {
-    const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_DATA_ROOT: "/custom/data" }));
+    const config = loadConfig({ CEO_DATA_ROOT: "/custom/data" });
     expect(config.identityDbPath).toBe("/custom/data/identity/identity.sqlite");
     expect(config.dataRoot).toBe("/custom/data");
   });
