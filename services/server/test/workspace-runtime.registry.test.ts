@@ -577,10 +577,10 @@ describe("WorkspaceRuntimeRegistry", () => {
       });
     });
 
-    it("rejects invalid branch containing control characters or empty", async () => {
+    it("rejects invalid branch containing control characters", async () => {
       seedWorkspaceFixture({
         workspaceId: "ws_bad_branch",
-        branch: "main\0extra",
+        branch: "main\nextra",
       });
 
       const registry = new WorkspaceRuntimeRegistry({
@@ -592,6 +592,26 @@ describe("WorkspaceRuntimeRegistry", () => {
       });
 
       await expect(registry.get("ws_bad_branch")).rejects.toMatchObject({
+        name: "WorkspaceRuntimeResolutionError",
+        code: "INVALID_REPOSITORY_DATA",
+      });
+    });
+
+    it("rejects empty branch", async () => {
+      seedWorkspaceFixture({
+        workspaceId: "ws_empty_branch",
+        branch: "   ",
+      });
+
+      const registry = new WorkspaceRuntimeRegistry({
+        store,
+        dataRoot: tempDir,
+        gitConfig: defaultGitConfig,
+        appClient: mockAppClient,
+        workspaceFactory: createMockWorkspace,
+      });
+
+      await expect(registry.get("ws_empty_branch")).rejects.toMatchObject({
         name: "WorkspaceRuntimeResolutionError",
         code: "INVALID_REPOSITORY_DATA",
       });
