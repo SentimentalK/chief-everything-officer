@@ -3,14 +3,27 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
-import type { IdentityService, AuthIdentity } from "./identity/service.js";
+import {
+  type IdentityService,
+  type AuthIdentity,
+  WorkspaceAccessDeniedError,
+  WorkspaceSelectionRequiredError,
+} from "./identity/service.js";
 import {
   IdentityDbUnavailable,
   IdentityDbContextClosed,
   IdentityStructureError,
 } from "./identity/store.js";
 
+export class AuditSchemaIncompatibleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuditSchemaIncompatibleError";
+  }
+}
+
 export interface TraceRecordInput {
+  workspace_id: string;
   timestamp_ms: number;
   tool_name: string;
   status: "success" | "error";
@@ -26,6 +39,7 @@ export interface TraceRecordInput {
 
 export interface TraceSummary {
   id: number;
+  workspace_id: string;
   timestamp_ms: number;
   tool_name: string;
   status: string;
@@ -75,9 +89,24 @@ export class AuditStore {
       this.db.exec("PRAGMA journal_mode = WAL;");
       this.db.exec("PRAGMA busy_timeout = 100;");
 
+      const tableExists = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='traces';",
+      ).get() as { name: string } | undefined;
+
+      if (tableExists) {
+        const columns = this.db.prepare("PRAGMA table_info(traces);").all() as Array<{ name: string }>;
+        const columnNames = new Set(columns.map((c) => c.name));
+        if (!columnNames.has("workspace_id")) {
+          throw new AuditSchemaIncompatibleError(
+            "Audit database schema incompatible: traces table lacks 'workspace_id'. Delete local audit database to allow fresh initialization.",
+          );
+        }
+      }
+
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS traces (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id TEXT NOT NULL,
           timestamp_ms INTEGER NOT NULL,
           tool_name TEXT NOT NULL,
           status TEXT NOT NULL,
@@ -100,8 +129,8 @@ export class AuditStore {
           resulting_commit TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_traces_timestamp
-        ON traces(timestamp_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_traces_workspace_time
+        ON traces(workspace_id, timestamp_ms DESC);
       `);
 
       const columns = this.db.prepare("PRAGMA table_info(traces)").all() as Array<{ name: string }>;
@@ -117,6 +146,7 @@ export class AuditStore {
         this.db.exec("ALTER TABLE traces ADD COLUMN semantic_output_tokens_est INTEGER;");
       }
     } catch (error) {
+      if (error instanceof AuditSchemaIncompatibleError) throw error;
       process.stderr.write(`audit: failed to initialize database at ${this.dbPath}: ${error}\n`);
       this.db = null;
     }
@@ -153,13 +183,13 @@ export class AuditStore {
 
       const insert = this.db.prepare(`
         INSERT INTO traces (
-          timestamp_ms, tool_name, status, error_message, operation_request_id,
+          workspace_id, timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_json, output_json, input_bytes, output_bytes,
           input_chars, output_chars, input_tokens_est, output_tokens_est,
           total_tokens_est, semantic_output_bytes, semantic_output_chars,
           semantic_output_tokens_est, latency_ms, affected_paths_json, resulting_commit
         ) VALUES (
-          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
           ?, ?, ?,
@@ -168,6 +198,7 @@ export class AuditStore {
       `);
 
       insert.run(
+        record.workspace_id,
         record.timestamp_ms,
         record.tool_name,
         record.status,
@@ -194,22 +225,22 @@ export class AuditStore {
     }
   }
 
-  public listSummaries(options: { from?: number; to?: number; limit?: number } = {}): TraceSummary[] {
+  public listSummaries(workspaceId: string, options: { from?: number; to?: number; limit?: number } = {}): TraceSummary[] {
     if (!this.db) return [];
 
     try {
       const limit = Math.min(Math.max(Number(options.limit ?? 200), 1), 200);
       let query = `
         SELECT
-          id, timestamp_ms, tool_name, status, error_message, operation_request_id,
+          id, workspace_id, timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_bytes, output_bytes, input_chars, output_chars,
           input_tokens_est, output_tokens_est, total_tokens_est,
           semantic_output_bytes, semantic_output_chars, semantic_output_tokens_est,
           latency_ms, affected_paths_json, resulting_commit
         FROM traces
       `;
-      const conditions: string[] = [];
-      const params: (number | string)[] = [];
+      const conditions: string[] = ["workspace_id = ?"];
+      const params: (number | string)[] = [workspaceId];
 
       if (options.from !== undefined && !Number.isNaN(options.from)) {
         conditions.push("timestamp_ms >= ?");
@@ -220,10 +251,7 @@ export class AuditStore {
         params.push(options.to);
       }
 
-      if (conditions.length > 0) {
-        query += ` WHERE ${conditions.join(" AND ")}`;
-      }
-
+      query += ` WHERE ${conditions.join(" AND ")}`;
       query += " ORDER BY timestamp_ms DESC LIMIT ?";
       params.push(limit);
 
@@ -232,6 +260,7 @@ export class AuditStore {
 
       return rows.map((row) => ({
         id: Number(row.id),
+        workspace_id: String(row.workspace_id),
         timestamp_ms: Number(row.timestamp_ms),
         tool_name: String(row.tool_name),
         status: String(row.status),
@@ -257,25 +286,26 @@ export class AuditStore {
     }
   }
 
-  public getDetail(id: number): TraceDetail | null {
+  public getDetail(workspaceId: string, id: number): TraceDetail | null {
     if (!this.db) return null;
 
     try {
       const stmt = this.db.prepare(`
         SELECT
-          id, timestamp_ms, tool_name, status, error_message, operation_request_id,
+          id, workspace_id, timestamp_ms, tool_name, status, error_message, operation_request_id,
           input_json, output_json, input_bytes, output_bytes, input_chars, output_chars,
           input_tokens_est, output_tokens_est, total_tokens_est,
           semantic_output_bytes, semantic_output_chars, semantic_output_tokens_est,
           latency_ms, affected_paths_json, resulting_commit
         FROM traces
-        WHERE id = ?
+        WHERE workspace_id = ? AND id = ?
       `);
-      const row = stmt.get(id) as Record<string, unknown> | undefined;
+      const row = stmt.get(workspaceId, id) as Record<string, unknown> | undefined;
       if (!row) return null;
 
       return {
         id: Number(row.id),
+        workspace_id: String(row.workspace_id),
         timestamp_ms: Number(row.timestamp_ms),
         tool_name: String(row.tool_name),
         status: String(row.status),
@@ -370,7 +400,6 @@ export function createAuditRouter(options: {
   identityService: IdentityService;
 }): Router {
   const { auditStore, identityService } = options;
-  const servedWorkspaceId = identityService.workspaceIdentityValue.workspace_id;
   const router = express.Router();
   router.use(express.json());
 
@@ -378,10 +407,10 @@ export function createAuditRouter(options: {
 
   /**
    * Re-derives the identity for a cookie session from the current DB (not the
-   * cached value). Returns the fresh identity when the bound key is valid and
-   * the owning workspace resolves; returns null and deletes the session only on
-   * a genuine expiry/revocation/disablement. Throws an identity-unavailable
-   * error when the DB cannot be read, in which case the session is preserved.
+   * cached value). Revalidates that the underlying credential is still active
+   * and unrevoked, user is enabled, and user maintains access to the workspace.
+   * Returns null and deletes session on expiry/revocation/loss of access.
+   * Throws on DB faults so the session is preserved during transient outages.
    */
   function sessionIdentityOrNull(sessionId: string | null): AuthIdentity | null {
     if (!sessionId) return null;
@@ -391,17 +420,26 @@ export function createAuditRouter(options: {
       sessions.delete(sessionId);
       return null;
     }
-    const pseudo: AuthIdentity = {
+
+    // 1. Re-verify credential still valid and active in DB (revocation/disablement check)
+    const cred = identityService.storeInstance.resolveCredentialByKey(session.api_key_id, session.user_id);
+    if (!cred) {
+      sessions.delete(sessionId);
+      return null;
+    }
+
+    // 2. Re-verify user still has access to the session workspace
+    const hasAccess = identityService.storeInstance.hasWorkspaceAccess(session.workspace_id, session.user_id);
+    if (!hasAccess) {
+      sessions.delete(sessionId);
+      return null;
+    }
+
+    return {
       user_id: session.user_id,
       api_key_id: session.api_key_id,
       workspace_id: session.workspace_id,
     };
-    const resolved = identityService.revalidateAndOwnership(pseudo);
-    if (!resolved) {
-      sessions.delete(sessionId);
-      return null;
-    }
-    return resolved;
   }
 
   function respondUnauthorized(res: Response): void {
@@ -410,8 +448,8 @@ export function createAuditRouter(options: {
 
   /**
    * Requires a valid bound session cookie OR a valid Bearer credential. Both
-   * paths share the same ownership/error mapping but keep their own credential
-   * source. DB faults are surfaced as 503 without deleting cookie sessions.
+   * paths resolve the request-scoped AuthIdentity and attach it to res.locals.identity.
+   * DB faults are surfaced as 503 without deleting cookie sessions.
    */
   function auditAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
     // Cookie-first.
@@ -423,10 +461,7 @@ export function createAuditRouter(options: {
           respondUnauthorized(res);
           return;
         }
-        if (!identityService.holdsWorkspace(ident)) {
-          res.status(403).json({ error: "Forbidden: workspace access denied" });
-          return;
-        }
+        res.locals.identity = ident;
         next();
         return;
       } catch (error) {
@@ -445,19 +480,21 @@ export function createAuditRouter(options: {
       return;
     }
     try {
-      const identity = identityService.authenticateApiKey(token);
-      if (!identity) {
+      const credential = identityService.authenticateApiKey(token);
+      if (!credential) {
         respondUnauthorized(res);
         return;
       }
-      if (!identityService.holdsWorkspace(identity)) {
-        res.status(403).json({ error: "Forbidden: workspace access denied" });
-        return;
-      }
+      const identity = identityService.resolveRequestIdentity(credential);
+      res.locals.identity = identity;
       next();
     } catch (error) {
       if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
+        return;
+      }
+      if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
+        res.status(403).json({ error: error.message });
         return;
       }
       throw error;
@@ -478,14 +515,14 @@ export function createAuditRouter(options: {
         res.status(401).json({ error: "Invalid access token" });
         return;
       }
-      if (!identityService.holdsWorkspace(result)) {
-        res.status(403).json({ error: "Forbidden: workspace access denied" });
-        return;
-      }
-      identity = identityService.assertWorkspaceAccess(result);
+      identity = identityService.resolveRequestIdentity(result);
     } catch (error) {
       if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
+        return;
+      }
+      if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
+        res.status(403).json({ error: error.message });
         return;
       }
       throw error;
@@ -518,8 +555,7 @@ export function createAuditRouter(options: {
     const sessionId = getSessionCookie(req);
     try {
       const ident = sessionId ? sessionIdentityOrNull(sessionId) : null;
-      const authenticated = ident ? identityService.holdsWorkspace(ident) : false;
-      res.status(200).json({ authenticated });
+      res.status(200).json({ authenticated: ident !== null });
     } catch (error) {
       if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
@@ -543,8 +579,9 @@ export function createAuditRouter(options: {
     const from = req.query.from ? Number(req.query.from) : undefined;
     const to = req.query.to ? Number(req.query.to) : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 200;
+    const workspaceId = res.locals.identity!.workspace_id;
 
-    const traces = auditStore.listSummaries({ from, to, limit });
+    const traces = auditStore.listSummaries(workspaceId, { from, to, limit });
     res.status(200).json({ ok: true, traces });
   });
 
@@ -554,8 +591,9 @@ export function createAuditRouter(options: {
       res.status(400).json({ error: "Invalid trace ID" });
       return;
     }
+    const workspaceId = res.locals.identity!.workspace_id;
 
-    const trace = auditStore.getDetail(id);
+    const trace = auditStore.getDetail(workspaceId, id);
     if (!trace) {
       res.status(404).json({ error: "Trace not found" });
       return;

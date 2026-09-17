@@ -8,7 +8,7 @@ import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import express from "express";
 import { DatabaseSync } from "node:sqlite";
-import { AuditStore, createAuditRouter } from "../src/audit.js";
+import { AuditStore, AuditSchemaIncompatibleError, createAuditRouter } from "../src/audit.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
@@ -77,6 +77,7 @@ describe("AuditStore & Boundary Tracing", () => {
     const outputJson = JSON.stringify({ content: [{ type: "text", text: "policy markdown" }] });
 
     store.recordTrace({
+      workspace_id: "ws_test",
       timestamp_ms: now,
       tool_name: "policy_read",
       status: "success",
@@ -85,10 +86,11 @@ describe("AuditStore & Boundary Tracing", () => {
       latency_ms: 12,
     });
 
-    const summaries = store.listSummaries();
+    const summaries = store.listSummaries("ws_test");
     expect(summaries.length).toBe(1);
     const s = summaries[0]!;
     expect(s.tool_name).toBe("policy_read");
+    expect(s.workspace_id).toBe("ws_test");
     expect(s.status).toBe("success");
     expect(s.input_chars).toBe(inputJson.length);
     expect(s.output_chars).toBe(outputJson.length);
@@ -101,10 +103,15 @@ describe("AuditStore & Boundary Tracing", () => {
     expect((s as any).output_json).toBeUndefined();
 
     // Check detail
-    const detail = store.getDetail(s.id);
+    const detail = store.getDetail("ws_test", s.id);
     expect(detail).not.toBeNull();
+    expect(detail!.workspace_id).toBe("ws_test");
     expect(detail!.input_json).toBe(inputJson);
     expect(detail!.output_json).toBe(outputJson);
+
+    // Cross-workspace lookup returns nothing
+    expect(store.listSummaries("other_ws")).toEqual([]);
+    expect(store.getDetail("other_ws", s.id)).toBeNull();
   });
 
   it("fails open when database write fails without throwing", async () => {
@@ -118,6 +125,7 @@ describe("AuditStore & Boundary Tracing", () => {
     // Must not throw
     expect(() => {
       store.recordTrace({
+        workspace_id: "ws_test",
         timestamp_ms: Date.now(),
         tool_name: "test_tool",
         status: "success",
@@ -126,6 +134,36 @@ describe("AuditStore & Boundary Tracing", () => {
         latency_ms: 5,
       });
     }).not.toThrow();
+  });
+
+  it("fails fast at AuditStore initialization if traces table lacks workspace_id", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "ceo-audit-incompat-test-"));
+    cleanupDirs.push(tmpDir);
+    const dbPath = path.join(tmpDir, "incompat-trace.sqlite");
+
+    // Create legacy table without workspace_id
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_ms INTEGER NOT NULL,
+        tool_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        output_json TEXT NOT NULL,
+        input_bytes INTEGER NOT NULL,
+        output_bytes INTEGER NOT NULL,
+        input_chars INTEGER NOT NULL,
+        output_chars INTEGER NOT NULL,
+        input_tokens_est INTEGER NOT NULL,
+        output_tokens_est INTEGER NOT NULL,
+        total_tokens_est INTEGER NOT NULL,
+        latency_ms INTEGER NOT NULL
+      );
+    `);
+    legacyDb.close();
+
+    expect(() => new AuditStore(dbPath)).toThrow(AuditSchemaIncompatibleError);
   });
 
   it("captures tool invocations at MCP handler boundary", async () => {
@@ -140,7 +178,11 @@ describe("AuditStore & Boundary Tracing", () => {
     const auditStore = new AuditStore(path.join(auditTmpDir, "ceo-trace.sqlite"));
     cleanupStores.push(auditStore);
 
-    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, { auditStore }), { legacy: "reject" });
+    const mcpIdentity = { user_id: "usr_test", workspace_id: "ws_mcp_test" };
+    const mcpHandler = createMcpHandler(
+      () => createMcpServer(workspace, policy, { auditStore, identity: mcpIdentity }),
+      { legacy: "reject" },
+    );
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => mcpHandler.fetch(new Request(url, init)),
     });
@@ -177,11 +219,12 @@ describe("AuditStore & Boundary Tracing", () => {
     });
     expect(applyRes.isError).toBeFalsy();
 
-    const traces = auditStore.listSummaries();
+    const traces = auditStore.listSummaries("ws_mcp_test");
     expect(traces.length).toBe(3);
 
     const writeTrace = traces.find((t) => t.tool_name === "apply_change_set");
     expect(writeTrace).toBeDefined();
+    expect(writeTrace!.workspace_id).toBe("ws_mcp_test");
     expect(writeTrace!.status).toBe("success");
     expect(writeTrace!.operation_request_id).toBe(requestId);
     expect(writeTrace!.affected_paths).toEqual(["tasks/AUDIT-TEST.md"]);
@@ -192,15 +235,21 @@ describe("AuditStore & Boundary Tracing", () => {
 
     const policyTrace = traces.find((t) => t.tool_name === "policy_read");
     expect(policyTrace).toBeDefined();
+    expect(policyTrace!.workspace_id).toBe("ws_mcp_test");
     expect(policyTrace!.status).toBe("success");
     expect(policyTrace!.semantic_output_bytes).not.toBeNull();
     expect(policyTrace!.semantic_output_bytes!).toBeLessThan(policyTrace!.output_bytes);
 
-    const policyDetail = auditStore.getDetail(policyTrace!.id);
+    const policyDetail = auditStore.getDetail("ws_mcp_test", policyTrace!.id);
     expect(policyDetail).toBeDefined();
+    expect(policyDetail!.workspace_id).toBe("ws_mcp_test");
     expect(JSON.parse(policyDetail!.input_json)).toEqual({ name: "tasks" });
     const parsedOutput = JSON.parse(policyDetail!.output_json);
     expect(parsedOutput.structuredContent.name).toBe("tasks");
+
+    // Other workspace has no traces
+    expect(auditStore.listSummaries("other_ws")).toEqual([]);
+    expect(auditStore.getDetail("other_ws", policyTrace!.id)).toBeNull();
   });
 
   it("migrates pre-existing database without semantic columns and preserves null for legacy traces", async () => {
@@ -208,11 +257,12 @@ describe("AuditStore & Boundary Tracing", () => {
     cleanupDirs.push(tmpDir);
     const dbPath = path.join(tmpDir, "legacy-trace.sqlite");
 
-    // Create legacy table without semantic_output_* columns
+    // Create legacy table with workspace_id but without semantic_output_* columns
     const legacyDb = new DatabaseSync(dbPath);
     legacyDb.exec(`
       CREATE TABLE traces (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL,
         timestamp_ms INTEGER NOT NULL,
         tool_name TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -234,12 +284,12 @@ describe("AuditStore & Boundary Tracing", () => {
     `);
     legacyDb.prepare(`
       INSERT INTO traces (
-        timestamp_ms, tool_name, status, input_json, output_json,
+        workspace_id, timestamp_ms, tool_name, status, input_json, output_json,
         input_bytes, output_bytes, input_chars, output_chars,
         input_tokens_est, output_tokens_est, total_tokens_est, latency_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      Date.now(), "list_files", "success", "{}", "{}",
+      "ws_legacy", Date.now(), "list_files", "success", "{}", "{}",
       2, 2, 2, 2,
       1, 1, 2, 5
     );
@@ -259,7 +309,7 @@ describe("AuditStore & Boundary Tracing", () => {
     expect(colNames.has("semantic_output_tokens_est")).toBe(true);
 
     // Verify legacy summary preserves null (strictly null, not 0)
-    const summaries = store.listSummaries();
+    const summaries = store.listSummaries("ws_legacy");
     expect(summaries.length).toBe(1);
     const legacySummary = summaries[0]!;
     expect(legacySummary.semantic_output_bytes).toBeNull();
@@ -267,7 +317,7 @@ describe("AuditStore & Boundary Tracing", () => {
     expect(legacySummary.semantic_output_tokens_est).toBeNull();
 
     // Verify legacy detail preserves null
-    const legacyDetail = store.getDetail(legacySummary.id);
+    const legacyDetail = store.getDetail("ws_legacy", legacySummary.id);
     expect(legacyDetail).not.toBeNull();
     expect(legacyDetail!.semantic_output_bytes).toBeNull();
     expect(legacyDetail!.semantic_output_chars).toBeNull();
@@ -275,6 +325,7 @@ describe("AuditStore & Boundary Tracing", () => {
 
     // Record new trace with semantic output and verify it's populated
     store.recordTrace({
+      workspace_id: "ws_legacy",
       timestamp_ms: Date.now(),
       tool_name: "read_files",
       status: "success",
@@ -284,7 +335,7 @@ describe("AuditStore & Boundary Tracing", () => {
       latency_ms: 10,
     });
 
-    const updatedSummaries = store.listSummaries();
+    const updatedSummaries = store.listSummaries("ws_legacy");
     expect(updatedSummaries.length).toBe(2);
     const newSummary = updatedSummaries[0]!;
     expect(newSummary.semantic_output_bytes).not.toBeNull();
@@ -307,7 +358,11 @@ describe("AuditStore & Boundary Tracing", () => {
     cleanupStores.push(auditStore);
 
     const testApiKey = "secret-mcp-api-key-test-999";
-    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, policy, { auditStore }), { legacy: "reject" });
+    const mcpIdentity = { user_id: "usr_test", workspace_id: "ws_test" };
+    const mcpHandler = createMcpHandler(
+      () => createMcpServer(workspace, policy, { auditStore, identity: mcpIdentity }),
+      { legacy: "reject" },
+    );
     const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
       fetch: (url, init) => {
         const headers = new Headers(init?.headers);
@@ -392,7 +447,7 @@ describe("Audit HTTP API & Session Management", () => {
       headers: { Authorization: "Bearer bob-key" },
     });
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "Forbidden: workspace access denied" });
+    expect((await res.json() as any).error).toContain("workspace access denied");
   });
 
   it("enforces authentication on /api/audit/traces", async () => {
@@ -439,16 +494,29 @@ describe("Audit HTTP API & Session Management", () => {
   });
 
   it("handles login, session status, authenticated query, detail, and logout lifecycle", async () => {
-    const { baseUrl, auditStore, apiKey } = await setupTestApp();
+    const { baseUrl, auditStore, apiKey, service } = await setupTestApp();
+    const myWorkspaceId = service.workspaceIdentityValue.workspace_id;
 
-    // Seed a trace
+    // Seed a trace for my workspace
     auditStore.recordTrace({
+      workspace_id: myWorkspaceId,
       timestamp_ms: Date.now(),
       tool_name: "list_files",
       status: "success",
       input_json: JSON.stringify({ pattern: "tasks/*.md" }),
       output_json: JSON.stringify({ files: ["tasks/001.md"] }),
       latency_ms: 8,
+    });
+
+    // Seed a trace for another workspace (must not be visible to this session)
+    auditStore.recordTrace({
+      workspace_id: "ws_other_tenant",
+      timestamp_ms: Date.now(),
+      tool_name: "policy_read",
+      status: "success",
+      input_json: "{}",
+      output_json: "{}",
+      latency_ms: 5,
     });
 
     // 1. Initially unauthenticated

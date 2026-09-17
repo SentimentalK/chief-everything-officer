@@ -51,6 +51,7 @@ function sanitizeForAudit(obj: unknown): unknown {
 
 function tracedHandler<T>(
   auditStore: AuditStore | undefined,
+  workspaceId: string,
   toolName: string,
   operation: (input: T) => Promise<Record<string, unknown>>,
 ) {
@@ -110,6 +111,7 @@ function tracedHandler<T>(
         }
 
         auditStore.recordTrace({
+          workspace_id: workspaceId,
           timestamp_ms,
           tool_name: toolName,
           status,
@@ -240,6 +242,10 @@ export function createMcpServer(
   } = {},
 ): McpServer {
   const { auditStore, identity, jobs } = options;
+  const workspaceId = identity?.workspace_id ?? "unknown";
+  const trace = <T>(toolName: string, op: (input: T) => Promise<Record<string, unknown>>) =>
+    tracedHandler(auditStore, workspaceId, toolName, op);
+
   const resolverClient =
     options.resolverClient ??
     ("contentResolverUrl" in (workspace.config as unknown as Record<string, unknown>)
@@ -263,7 +269,7 @@ export function createMcpServer(
     description: "Use this to verify that the CEO Git workspace is clean, synchronized, and ready before a workflow.",
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "workspace_status", async () => {
+  }, trace("workspace_status", async () => {
     const status = await workspace.workspaceStatus();
     return {
       version: BUILD_INFO.version,
@@ -290,7 +296,7 @@ export function createMcpServer(
       limit: z.number().int().min(1).max(500).optional().default(LIMITS.maxSearchResults),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "list_files", async ({ prefix, recursive, limit }: { prefix: string; recursive: boolean; limit: number }) =>
+  }, trace("list_files", async ({ prefix, recursive, limit }: { prefix: string; recursive: boolean; limit: number }) =>
     await workspace.listFiles(prefix, recursive, limit)));
 
   // 3. read_files
@@ -301,7 +307,7 @@ export function createMcpServer(
       "缺失的 `tasks/<filename>.md` 会尝试匹配唯一的 `archive/<year>/<filename>.md`。返回的 `path` 是实际路径，后续写入使用该路径和对应 blob OID。批量读取失败时没有返回任何正文；修正失败路径后重新读取完整批次。",
     inputSchema: { paths: z.array(z.string()).min(1).max(LIMITS.maxFilesPerRead) },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "read_files", async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
+  }, trace("read_files", async ({ paths }: { paths: string[] }) => await workspace.readFiles(paths)));
 
   // 4. search_text
   server.registerTool("search_text", {
@@ -314,7 +320,7 @@ export function createMcpServer(
       limit: z.number().int().min(1).max(200).optional().default(100),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "search_text", async ({ query, prefixes, limit }: { query: string; prefixes: string[]; limit: number }) =>
+  }, trace("search_text", async ({ query, prefixes, limit }: { query: string; prefixes: string[]; limit: number }) =>
     await workspace.searchText(query, prefixes, limit)));
 
   // 5. apply_change_set
@@ -329,7 +335,7 @@ export function createMcpServer(
       operations: z.array(changeOperationSchema).min(1).max(LIMITS.maxOperationsPerTransaction),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, tracedHandler(auditStore, "apply_change_set", async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
+  }, trace("apply_change_set", async (input: { request_id?: string; base_commit: string; summary: string; operations: ChangeOperation[] }) =>
     await workspace.applyChangeSet(input)));
 
   // 6. policy_read
@@ -340,7 +346,7 @@ export function createMcpServer(
       name: z.string().min(1).max(64).describe("Policy document name to look up in runtime defaults, e.g. 'tasks', 'personal', 'journal', 'resources'"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
+  }, trace("policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
 
   // 7. resource_capture
   server.registerTool("resource_capture", {
@@ -362,7 +368,7 @@ export function createMcpServer(
       summary: z.string().max(120).optional().describe("Git commit summary for the save transaction"),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, tracedHandler(auditStore, "resource_capture", async (input: ResourceCaptureInput) =>
+  }, trace("resource_capture", async (input: ResourceCaptureInput) =>
     await resourceService.capture(input)));
 
   // 8. resource_apply
@@ -379,7 +385,7 @@ export function createMcpServer(
       state_changes: z.array(changeOperationSchema).max(LIMITS.maxOperationsPerTransaction).optional().describe("Justified State consequences (Personal, Tasks, Journal) to commit atomically in the same transaction"),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, tracedHandler(auditStore, "resource_apply", async (input: ResourceApplyInput) =>
+  }, trace("resource_apply", async (input: ResourceApplyInput) =>
     await resourceService.apply(input)));
 
   // 9. resource_search
@@ -401,7 +407,7 @@ export function createMcpServer(
       limit: z.number().int().min(1).max(100).optional().default(20),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "resource_search", async (input: ResourceSearchInput) =>
+  }, trace("resource_search", async (input: ResourceSearchInput) =>
     await resourceRetrieval.search(input)));
 
   // 10. resource_get
@@ -417,7 +423,7 @@ export function createMcpServer(
       line_count: z.number().int().min(1).max(500).optional().default(200).describe("Number of lines to read"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, tracedHandler(auditStore, "resource_get", async (input: ResourceGetInput) =>
+  }, trace("resource_get", async (input: ResourceGetInput) =>
     await resourceRetrieval.get(input)));
 
   // Register MCP Resource endpoint for source document binary retrieval

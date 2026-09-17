@@ -264,7 +264,8 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     const auditStore = new AuditStore(item.config.auditDbPath);
     closeables.push(auditStore);
 
-    const server = createMcpServer(workspace, policy, { auditStore });
+    const mcpIdentity = { user_id: "usr_test", workspace_id: "ws_resource_test" };
+    const server = createMcpServer(workspace, policy, { auditStore, identity: mcpIdentity });
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     closeables.push(client, server);
@@ -291,7 +292,7 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     expect(commit).toBeDefined();
 
     // Query audit trace
-    const traces = auditStore.listSummaries({ limit: 10 });
+    const traces = auditStore.listSummaries("ws_resource_test", { limit: 10 });
     const captureTrace = traces.find((t) => t.tool_name === "resource_capture");
     expect(captureTrace).toBeDefined();
 
@@ -301,7 +302,7 @@ describe("Resource State Isolation, Policy, and Audit Sanitization", () => {
     expect(captureTrace!.affected_paths!.some((p: string) => p.includes("source/original.pdf"))).toBe(true);
 
     // Verify secretBase64 is NEVER in audit input_json
-    const detail = auditStore.getDetail(captureTrace!.id);
+    const detail = auditStore.getDetail("ws_resource_test", captureTrace!.id);
     expect(detail!.input_json).not.toContain(secretBase64);
     expect(detail!.input_json).toContain("[omitted base64 payload:");
   });

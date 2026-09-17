@@ -56,6 +56,7 @@ function logTrace(ctx: ToolContext, toolName: string, status: "success" | "error
   const sanitizedJobId = sanitizeJobId(safe.job_id);
 
   ctx.auditStore.recordTrace({
+    workspace_id: ctx.scope.workspace_id,
     timestamp_ms: Date.now(),
     tool_name: toolName,
     status,
