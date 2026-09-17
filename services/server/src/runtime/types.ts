@@ -31,14 +31,7 @@ export interface WorkspaceRuntime {
   };
 }
 
-export interface GitCredential {
-  username: string;
-  token: string;
-}
-
-export interface GitCredentialProvider {
-  getCredential(): Promise<GitCredential>;
-}
+export type { GitCredential, GitCredentialProvider } from "../git.js";
 
 export class WorkspaceRuntimeResolutionError extends Error {
   readonly code: string;

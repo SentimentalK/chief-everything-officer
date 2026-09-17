@@ -555,12 +555,34 @@ describe("WorkspaceRuntimeRegistry", () => {
       });
     });
 
-    it("rejects full_name containing path traversal or scheme", async () => {
+    it("allows repository names with consecutive dots (e.g. foo..bar)", async () => {
+      seedWorkspaceFixture({
+        workspaceId: "ws_dots",
+        ownerLogin: "test-owner",
+        repositoryName: "foo..bar",
+        fullName: "test-owner/foo..bar",
+        githubRepositoryId: "998877",
+      });
+
+      const registry = new WorkspaceRuntimeRegistry({
+        store,
+        dataRoot: tempDir,
+        gitConfig: defaultGitConfig,
+        appClient: mockAppClient,
+        workspaceFactory: createMockWorkspace,
+      });
+
+      const runtime = await registry.get("ws_dots");
+      expect(runtime.descriptor.repositoryName).toBe("foo..bar");
+      expect(runtime.descriptor.fullName).toBe("test-owner/foo..bar");
+    });
+
+    it("rejects full_name containing backslash, query, fragment, or scheme", async () => {
       seedWorkspaceFixture({
         workspaceId: "ws_traversal",
         ownerLogin: "test-owner",
         repositoryName: "repo",
-        fullName: "test-owner/repo/../bad",
+        fullName: "test-owner/repo?ref=bad",
       });
 
       const registry = new WorkspaceRuntimeRegistry({

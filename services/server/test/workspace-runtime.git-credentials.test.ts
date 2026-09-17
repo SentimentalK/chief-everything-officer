@@ -29,17 +29,21 @@ describe("WorkspaceRuntime Git Credentials & Redaction", () => {
     });
   });
 
-  it("throws error when sshKeyPath and credentialProvider are both configured (mutually exclusive)", async () => {
+  it("throws error when sshKeyPath and credentialProvider are both configured (mutually exclusive) without calling credentialProvider", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
 
+    let credentialCalled = false;
     const mockProvider: GitCredentialProvider = {
-      getCredential: async () => ({
-        username: "x-access-token",
-        token: "secret-token",
-      }),
+      getCredential: async () => {
+        credentialCalled = true;
+        return {
+          username: "x-access-token",
+          token: "secret-token",
+        };
+      },
     };
 
     const config = {
@@ -51,19 +55,24 @@ describe("WorkspaceRuntime Git Credentials & Redaction", () => {
     await expect(runGit(config, item.config.repoDir, ["status"])).rejects.toThrow(
       /sshKeyPath and credentialProvider are mutually exclusive/,
     );
+    expect(credentialCalled).toBe(false);
   });
 
-  it("throws error when knownHostsPath and credentialProvider are both configured (mutually exclusive)", async () => {
+  it("throws error when knownHostsPath and credentialProvider are both configured without calling credentialProvider", async () => {
     const item = await fixture();
     cleanupDirs.push(item.root);
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
 
+    let credentialCalled = false;
     const mockProvider: GitCredentialProvider = {
-      getCredential: async () => ({
-        username: "x-access-token",
-        token: "secret-token",
-      }),
+      getCredential: async () => {
+        credentialCalled = true;
+        return {
+          username: "x-access-token",
+          token: "secret-token",
+        };
+      },
     };
 
     const config = {
@@ -74,6 +83,43 @@ describe("WorkspaceRuntime Git Credentials & Redaction", () => {
 
     await expect(runGit(config, item.config.repoDir, ["status"])).rejects.toThrow(
       /sshKeyPath and credentialProvider are mutually exclusive/,
+    );
+    expect(credentialCalled).toBe(false);
+  });
+
+  it("fails closed when only sshKeyPath is provided without knownHostsPath", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const config = {
+      ...item.config,
+      sshKeyPath: "/path/to/id_rsa",
+      knownHostsPath: undefined,
+      credentialProvider: undefined,
+    };
+
+    await expect(runGit(config, item.config.repoDir, ["status"])).rejects.toThrow(
+      /sshKeyPath and knownHostsPath must both be provided/,
+    );
+  });
+
+  it("fails closed when only knownHostsPath is provided without sshKeyPath", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const config = {
+      ...item.config,
+      sshKeyPath: undefined,
+      knownHostsPath: "/path/to/known_hosts",
+      credentialProvider: undefined,
+    };
+
+    await expect(runGit(config, item.config.repoDir, ["status"])).rejects.toThrow(
+      /sshKeyPath and knownHostsPath must both be provided/,
     );
   });
 

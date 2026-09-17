@@ -65,8 +65,7 @@ export class WorkspaceRuntimeRegistry {
   }
 
   private async initRuntime(workspaceId: string): Promise<WorkspaceRuntime> {
-    const descriptor = this.resolveDescriptor(workspaceId);
-    const binding = this.options.store.findRepositoryBindingByWorkspaceId(workspaceId)!;
+    const { descriptor, binding } = this.resolveRuntimeRecord(workspaceId);
 
     const workspaceDir = path.join(this.options.dataRoot, "workspaces", workspaceId);
     const repoDir = path.join(workspaceDir, "repo");
@@ -119,7 +118,10 @@ export class WorkspaceRuntimeRegistry {
     };
   }
 
-  private resolveDescriptor(workspaceId: string): WorkspaceRuntimeDescriptor {
+  private resolveRuntimeRecord(workspaceId: string): {
+    descriptor: WorkspaceRuntimeDescriptor;
+    binding: GitHubRepositoryBindingRecord;
+  } {
     // 1. Workspace
     const workspace = this.options.store.findWorkspaceById(workspaceId);
     if (!workspace) {
@@ -200,7 +202,7 @@ export class WorkspaceRuntimeRegistry {
       );
     }
 
-    // Strict fullName validation: exactly owner/repo, no scheme, query, fragment, backslash, or path traversal
+    // Strict fullName validation: exactly owner/repo, no scheme, query, fragment, backslash
     const expectedFullName = `${ownerLogin}/${repositoryName}`;
     if (fullName !== expectedFullName) {
       throw new WorkspaceRuntimeResolutionError(
@@ -212,8 +214,7 @@ export class WorkspaceRuntimeRegistry {
       fullName.includes("\\") ||
       fullName.includes("?") ||
       fullName.includes("#") ||
-      fullName.includes("://") ||
-      fullName.includes("..")
+      fullName.includes("://")
     ) {
       throw new WorkspaceRuntimeResolutionError(
         "INVALID_REPOSITORY_DATA",
@@ -231,13 +232,16 @@ export class WorkspaceRuntimeRegistry {
     }
 
     return {
-      workspaceId,
-      repositoryId: binding.github_repository_id,
-      installationId: installation.github_installation_id,
-      ownerLogin,
-      repositoryName,
-      fullName,
-      branch,
+      descriptor: {
+        workspaceId,
+        repositoryId: binding.github_repository_id,
+        installationId: installation.github_installation_id,
+        ownerLogin,
+        repositoryName,
+        fullName,
+        branch,
+      },
+      binding,
     };
   }
 }

@@ -50,17 +50,27 @@ export function redactSecrets(text: string, secrets: Array<string | undefined | 
   return cleaned;
 }
 
-function gitPrefix(config: GitExecutionConfig, credential?: GitCredential): string[] {
-  const prefix = ["-c", "core.quotepath=false"];
-
-  const hasSsh = Boolean(config.sshKeyPath || config.knownHostsPath);
+export function validateGitAuthMode(config: GitExecutionConfig): void {
+  const hasSshKey = Boolean(config.sshKeyPath);
+  const hasKnownHosts = Boolean(config.knownHostsPath);
+  const hasSsh = hasSshKey || hasKnownHosts;
   const hasCredentialProvider = Boolean(config.credentialProvider);
+
   if (hasSsh && hasCredentialProvider) {
     throw new Error("Git configuration error: sshKeyPath and credentialProvider are mutually exclusive.");
   }
 
-  if (hasSsh) {
-    if (!config.sshKeyPath || !config.knownHostsPath) return prefix;
+  if ((hasSshKey && !hasKnownHosts) || (!hasSshKey && hasKnownHosts)) {
+    throw new Error(
+      "Git configuration error: sshKeyPath and knownHostsPath must both be provided for SSH authentication.",
+    );
+  }
+}
+
+function gitPrefix(config: GitExecutionConfig, credential?: GitCredential): string[] {
+  const prefix = ["-c", "core.quotepath=false"];
+
+  if (config.sshKeyPath && config.knownHostsPath) {
     const command = [
       "ssh",
       "-i", config.sshKeyPath,
@@ -90,6 +100,8 @@ export async function runGit(
   args: string[],
   allowFailure = false,
 ): Promise<CommandResult> {
+  validateGitAuthMode(config);
+
   let credential: GitCredential | undefined;
   if (config.credentialProvider) {
     credential = await config.credentialProvider.getCredential();
