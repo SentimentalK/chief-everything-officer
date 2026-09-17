@@ -6,9 +6,9 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
-import { CeoWorkspace } from "./workspace.js";
 import { createProtocolCorsMiddleware } from "./http/protocol-cors.js";
 import { attachMcpProtocolLog } from "./http/mcp-observability.js";
+import { createJobResultHandler } from "./jobs/result-service.js";
 import {
   createHostGuard,
   createOriginGuard,
@@ -58,40 +58,33 @@ const config = loadConfig();
 
 // ---- Identity layer (authoritative, required, fail-fast) ----
 // Identity DB must already exist (created by `dist/identity/cli.js init`).
-// The service selects the configured runtime workspace and performs optional
-// scoped key rotation; any mismatch, corrupt DB, or disabled owner aborts startup.
 let identityService: IdentityService;
 try {
-  identityService = IdentityService.open(
-    {
-      remoteUrl: config.remoteUrl,
-      branch: config.branch,
-      envApiKey: config.mcpApiKey,
-    },
-    config.identityDbPath,
-  );
+  identityService = IdentityService.open(config.identityDbPath);
 } catch (error) {
   fatal("identity", error);
 }
 
-// ---- GitHub App Client (hoisted for both WorkspaceRuntimeRegistry and GitHub App routes) ----
-let gitHubAppClient: GitHubAppClient | undefined;
-if (config.githubAppEnabled) {
-  let privateKey: string;
-  try {
-    privateKey = fs.readFileSync(config.githubAppPrivateKeyPath!, "utf8");
-  } catch (error) {
-    fatal("github-app", error);
-  }
+// ---- GitHub App Client (mandatory server capability) ----
+if (!config.githubAppEnabled) {
+  fatal("github-app", new Error("CEO_GITHUB_APP_ENABLED=true is required to start CEO Server"));
+}
 
-  try {
-    gitHubAppClient = new GitHubAppClient({
-      clientId: config.githubAppClientId!,
-      privateKey,
-    });
-  } catch (error) {
-    fatal("github-app", error);
-  }
+let privateKey: string;
+try {
+  privateKey = fs.readFileSync(config.githubAppPrivateKeyPath!, "utf8");
+} catch (error) {
+  fatal("github-app", error);
+}
+
+let gitHubAppClient: GitHubAppClient;
+try {
+  gitHubAppClient = new GitHubAppClient({
+    clientId: config.githubAppClientId!,
+    privateKey,
+  });
+} catch (error) {
+  fatal("github-app", error);
 }
 
 // Multi-workspace runtime registry
@@ -107,22 +100,8 @@ const runtimeRegistry = new WorkspaceRuntimeRegistry({
   appClient: gitHubAppClient,
 });
 
-// ---- Git workspace (deployment global workspace during transition) ----
-const workspace = new CeoWorkspace(config);
 const productPolicy = await loadProductPolicy();
-await workspace.initialize();
-
-import { ResourceService } from "./resource/service.js";
-import { createJobResultHandler } from "./jobs/result-service.js";
-
 const auditStore = new AuditStore(config.auditDbPath);
-
-// Shared single ResourceService instance for transitional global paths
-const resourceService = new ResourceService(workspace, config);
-
-// Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
-// enforced at the /mcp boundary by the identity middleware per request.
-const workspaceIdentity = identityService.workspaceIdentityValue;
 
 // CEO Product User provisioner and session manager (independent from Audit auth)
 const userProvisioner = new IdentityAccountProvisioner(identityService.storeInstance);
@@ -139,13 +118,9 @@ const jobBridge = openJobBridge({
   bridgeEnabled: config.bridgeEnabled,
   redisUrl: config.redisUrl,
 }, async (scope, resourceId) => {
-  try {
-    const runtime = await runtimeRegistry.get(scope.workspace_id);
-    const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
-    return loc !== null;
-  } catch (_error) {
-    return false;
-  }
+  const runtime = await runtimeRegistry.get(scope.workspace_id);
+  const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
+  return loc !== null;
 });
 
 const app = createMcpExpressApp({ host: config.bindHost });
@@ -182,10 +157,12 @@ app.get("/healthz", (_req, res) => {
   res.status(200).json({ ok: true, version: BUILD_INFO.version, build: BUILD_INFO.build });
 });
 app.get("/readyz", (_req, res) => {
-  const ready = workspace.readiness === "READY";
+  const dbOk = identityService.storeInstance.ping();
+  const gitHubAppOk = Boolean(gitHubAppClient);
+  const ready = dbOk && gitHubAppOk;
   res.status(ready ? 200 : 503).json({
     ok: ready,
-    state: workspace.readiness,
+    state: ready ? "READY" : "NOT_READY",
     version: BUILD_INFO.version,
     build: BUILD_INFO.build,
   });

@@ -228,7 +228,7 @@ describe("POST /api/worker/jobs/:job_id/result route", () => {
       createHostGuard(item.config.allowedHosts) as RequestHandler,
       createOriginGuard(item.config.allowedOrigins) as RequestHandler,
       createIdentityAuthMiddleware(identityService) as RequestHandler,
-      createJobResultHandler(fakeJobService, resourceService, audit),
+      createJobResultHandler(fakeJobService, async () => resourceService),
     );
 
     const server = await new Promise<HttpServer>((resolve) => {

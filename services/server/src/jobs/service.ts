@@ -341,8 +341,17 @@ export class JobService {
 
     // New task: validate optional resource exists in this user's workspace.
     if (input.resource_id && this.deps.resourceExists) {
-      const okRes = await this.deps.resourceExists(scope, input.resource_id);
-      if (!okRes) throw new JobError("RESOURCE_NOT_FOUND", "Referenced resource not found in this workspace.");
+      try {
+        const okRes = await this.deps.resourceExists(scope, input.resource_id);
+        if (!okRes) throw new JobError("RESOURCE_NOT_FOUND", "Referenced resource not found in this workspace.");
+      } catch (error) {
+        if (error instanceof JobError) throw error;
+        throw new JobError(
+          "QUEUE_UNAVAILABLE",
+          "Workspace runtime unavailable for resource validation.",
+          { reason: "RUNTIME_UNAVAILABLE" },
+        );
+      }
     }
 
     const now = Date.now();

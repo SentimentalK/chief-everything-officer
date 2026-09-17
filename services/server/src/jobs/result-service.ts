@@ -77,7 +77,7 @@ export async function handleWorkerResult(
   scope: JobAuthScope,
   jobId: string,
   rawBody: unknown,
-  deps: { store: RedisJobStore; resourceService: ResourceService | ResourceServiceResolver },
+  deps: { store: RedisJobStore; resourceResolver: ResourceServiceResolver },
 ): Promise<ResultSuccess> {
   const parsed = parseResultRequest(rawBody);
   if (!parsed.ok) {
@@ -120,10 +120,7 @@ export async function handleWorkerResult(
   // Resolve ResourceService for this request/scope
   let resolvedResourceService: ResourceService;
   try {
-    resolvedResourceService =
-      typeof deps.resourceService === "function"
-        ? await deps.resourceService(scope)
-        : deps.resourceService;
+    resolvedResourceService = await deps.resourceResolver(scope);
   } catch (error) {
     throw new JobError("QUEUE_UNAVAILABLE", "Workspace runtime unavailable for result recording.", {
       reason: "RUNTIME_UNAVAILABLE",
@@ -196,7 +193,7 @@ const RESULT_STATUS: Record<string, number> = {
 
 export function createJobResultHandler(
   jobService: JobService | null,
-  resourceService: ResourceService | ResourceServiceResolver,
+  resourceResolver: ResourceServiceResolver,
 ) {
   return async (req: Request, res: Response, _next: NextFunction): Promise<void> => {
     res.setHeader("Cache-Control", "no-store");
@@ -248,7 +245,7 @@ export function createJobResultHandler(
     try {
       const result = await handleWorkerResult(scope, jobId, req.body, {
         store: jobService.store,
-        resourceService,
+        resourceResolver,
       });
 
       logResultLine({

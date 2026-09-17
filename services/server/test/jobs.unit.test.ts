@@ -21,7 +21,7 @@ import {
   StoreError,
 } from "../src/jobs/redis-store.js";
 import { registerJobTools, sanitizeRequestId, sanitizeJobId } from "../src/jobs/tools.js";
-import type { JobService } from "../src/jobs/service.js";
+import { JobService, JobError } from "../src/jobs/service.js";
 import type { AuditStore, TraceRecordInput } from "../src/audit.js";
 
 const uuid = "123e4567-e89b-12d3-a456-426614174000";
@@ -525,5 +525,68 @@ describe("MCP protocol layer enforcement and audit tracing", () => {
     await client.close();
     await server.close();
   });
+
+  describe("JobService submit resource validation error mapping", () => {
+    it("throws RESOURCE_NOT_FOUND when resourceExists returns false", async () => {
+      const service = new JobService(
+        {
+          store: {
+            isReady: () => true,
+            getPlaceholder: async () => null,
+          } as any,
+          resourceExists: async () => false,
+        },
+        () => true,
+      );
+
+      await expect(
+        service.submit(
+          { user_id: "usr_1", workspace_id: "ws_1" },
+          {
+            request_id: uuid,
+            workspace_ref: "repo",
+            prompt: "do something",
+            acceptance: "it works",
+            resource_id: "res-00000000-0000-0000-0000-000000000001",
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: "RESOURCE_NOT_FOUND",
+      });
+    });
+
+    it("maps unexpected runtime failure to QUEUE_UNAVAILABLE with RUNTIME_UNAVAILABLE reason", async () => {
+      const service = new JobService(
+        {
+          store: {
+            isReady: () => true,
+            getPlaceholder: async () => null,
+          } as any,
+          resourceExists: async () => {
+            throw new Error("Git runtime unavailable: failed to resolve repo");
+          },
+        },
+        () => true,
+      );
+
+      await expect(
+        service.submit(
+          { user_id: "usr_1", workspace_id: "ws_1" },
+          {
+            request_id: uuid,
+            workspace_ref: "repo",
+            prompt: "do something",
+            acceptance: "it works",
+            resource_id: "res-00000000-0000-0000-0000-000000000001",
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: "QUEUE_UNAVAILABLE",
+        message: "Workspace runtime unavailable for resource validation.",
+        details: { reason: "RUNTIME_UNAVAILABLE" },
+      });
+    });
+  });
 });
+
 
