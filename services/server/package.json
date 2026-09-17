@@ -10,8 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test": "vitest run --dir test",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "migrate:existing-workspace": "node dist/migrate-existing-workspace.js"
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
