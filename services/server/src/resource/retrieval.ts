@@ -22,10 +22,14 @@ import {
 } from "./locator.js";
 
 export class ResourceRetrievalService {
+  private readonly repoDir: string;
+
   constructor(
     private readonly workspace: CeoWorkspace,
-    private readonly config: Config,
-  ) {}
+    config?: { repoDir?: string },
+  ) {
+    this.repoDir = config?.repoDir ?? workspace.config.repoDir;
+  }
 
   async search(input: ResourceSearchInput = {}): Promise<Record<string, unknown>> {
     // Validate date-range params before entering the workspace (mirrors how
@@ -44,7 +48,8 @@ export class ResourceRetrievalService {
     }
 
     return await this.workspace.withReadyWorkspace(async (base) => {
-      const all = await enumerateResources(this.config.repoDir);
+      const repoDir = this.repoDir;
+      const all = await enumerateResources(repoDir);
 
       const entries: Array<{ card: ResourceCard; capturedMs: number }> = [];
 
@@ -69,7 +74,7 @@ export class ResourceRetrievalService {
         if (fromMs !== undefined && capturedMs < fromMs) continue;
         if (toMs !== undefined && capturedMs > toMs) continue;
 
-        const resDir = path.join(this.config.repoDir, location.relative_path);
+        const resDir = path.join(this.repoDir, location.relative_path);
 
         // Check artifact existence
         const dirFiles: string[] = await readdir(resDir).catch(() => []);
@@ -174,14 +179,14 @@ export class ResourceRetrievalService {
 
   async get(input: ResourceGetInput): Promise<Record<string, unknown>> {
     return await this.workspace.withReadyWorkspace(async (base) => {
-      const location = await resolveResourceLocation(this.config.repoDir, input.resource_id);
+      const location = await resolveResourceLocation(this.repoDir, input.resource_id);
       if (!location) {
         throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
           resource_id: input.resource_id,
         });
       }
 
-      const resDir = path.join(this.config.repoDir, location.relative_path);
+      const resDir = path.join(this.repoDir, location.relative_path);
       const metaPath = path.join(resDir, "meta.md");
 
       const metaContent = await readFile(metaPath, "utf8").catch(() => null);

@@ -6,7 +6,6 @@ import {
   type CeoWorkspace,
   assertNoResourceMutations,
 } from "../workspace.js";
-import type { Config } from "../config.js";
 import { CeoError } from "../errors.js";
 import { resolveRef } from "../git.js";
 import type {
@@ -54,6 +53,7 @@ import {
 } from "./naming.js";
 import {
   type UrlMetadataResolver,
+  type ContentResolverConfig,
   createContentResolverClient,
 } from "./resolver-client.js";
 import {
@@ -191,15 +191,22 @@ export function validateResourceOperations(
   }
 }
 
+export interface SharedResourceDependencies extends ContentResolverConfig {
+  resolverClient?: UrlMetadataResolver;
+}
+
 export class ResourceService {
   private readonly resolverClient: UrlMetadataResolver;
 
   constructor(
     private readonly workspace: CeoWorkspace,
-    private readonly config: Config,
+    dependencies: SharedResourceDependencies = {},
     resolverClient?: UrlMetadataResolver,
   ) {
-    this.resolverClient = resolverClient ?? createContentResolverClient(config);
+    this.resolverClient =
+      resolverClient ??
+      dependencies.resolverClient ??
+      createContentResolverClient(dependencies);
   }
 
   async capture(input: ResourceCaptureInput): Promise<Record<string, unknown>> {

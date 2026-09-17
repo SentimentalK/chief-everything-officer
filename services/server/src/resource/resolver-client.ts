@@ -237,7 +237,13 @@ export class DisabledContentResolverClient implements UrlMetadataResolver {
   }
 }
 
-export function createContentResolverClient(config: Config): UrlMetadataResolver {
+export interface ContentResolverConfig {
+  contentResolverUrl?: string;
+  contentResolverToken?: string;
+  contentResolverTimeoutMs?: number;
+}
+
+export function createContentResolverClient(config: ContentResolverConfig = {}): UrlMetadataResolver {
   if (config.contentResolverUrl && config.contentResolverToken) {
     return new HttpContentResolverClient(
       config.contentResolverUrl,

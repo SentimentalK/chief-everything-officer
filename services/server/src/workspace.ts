@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
-import type { Config } from "./config.js";
+import type { WorkspaceConfig } from "./git.js";
 import { CeoError } from "./errors.js";
 import { assertExpectedBlob, blobOid, resolveRef, runGit } from "./git.js";
 import { type CeoIgnoreMatcher, isPathIgnored, parseCeoIgnore } from "./ignore.js";
@@ -165,7 +165,7 @@ export class CeoWorkspace {
   private readonly pendingPath: string;
   private readonly completedDir: string;
 
-  constructor(public readonly config: Config) {
+  constructor(public readonly config: WorkspaceConfig) {
     this.lockDir = path.join(config.stateDir, "write.lock");
     this.pendingPath = path.join(config.stateDir, "pending.json");
     this.completedDir = path.join(config.stateDir, "completed");

@@ -15,6 +15,7 @@ import { parseMetaMarkdown } from "./resource/meta.js";
 import { resolveResourceLocation } from "./resource/locator.js";
 import {
   type UrlMetadataResolver,
+  type ContentResolverConfig,
   createContentResolverClient,
 } from "./resource/resolver-client.js";
 import type {
@@ -238,14 +239,15 @@ export function createMcpServer(
     resourceService?: ResourceService;
   } = {},
 ): McpServer {
-  const { auditStore, resolverClient, identity, jobs } = options;
+  const { auditStore, identity, jobs } = options;
+  const resolverClient =
+    options.resolverClient ??
+    ("contentResolverUrl" in (workspace.config as unknown as Record<string, unknown>)
+      ? createContentResolverClient(workspace.config as unknown as ContentResolverConfig)
+      : createContentResolverClient());
   const resourceService =
     options.resourceService ??
-    new ResourceService(
-      workspace,
-      workspace.config,
-      resolverClient ?? createContentResolverClient(workspace.config),
-    );
+    new ResourceService(workspace, { resolverClient });
   const resourceRetrieval = new ResourceRetrievalService(workspace, workspace.config);
 
   const server = new McpServer(
