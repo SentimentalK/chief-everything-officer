@@ -14,28 +14,27 @@
 # Environment (all required unless noted):
 #   CEO_ACCEPTANCE_REDIS    redis:// URL (password auth)
 #   CEO_ACCEPTANCE_KEY      the API key provisioned into the identity DB
-#   CEO_ACCEPTANCE_REMOTE   absolute path of a bare git remote (repo of record)
 #   CEO_ACCEPTANCE_ROOT     temp root dir (created/cleaned by the script)
 #   CEO_ACCEPTANCE_SERVER   directory of services/server (built dist present)
 #   CEO_ACCEPTANCE_WORKER   path to the compiled ceo-worker binary
 #   CEO_ACCEPTANCE_PORT     local port for the test Server
-#   CEO_ACCEPTANCE_BRANCH   branch (default main)
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=acceptance/lib.sh
+source "$SCRIPT_DIR/acceptance/lib.sh"
 
 : "${CEO_ACCEPTANCE_REDIS:?missing}"
 : "${CEO_ACCEPTANCE_KEY:?missing}"
-: "${CEO_ACCEPTANCE_REMOTE:?missing}"
 : "${CEO_ACCEPTANCE_ROOT:?missing}"
 : "${CEO_ACCEPTANCE_SERVER:?missing}"
 : "${CEO_ACCEPTANCE_WORKER:?missing}"
 : "${CEO_ACCEPTANCE_PORT:?missing}"
-BRANCH="${CEO_ACCEPTANCE_BRANCH:-main}"
 
 E="$CEO_ACCEPTANCE_ROOT"
 KEY="$CEO_ACCEPTANCE_KEY"
 REDIS="$CEO_ACCEPTANCE_REDIS"
 PORT="$CEO_ACCEPTANCE_PORT"
-REMOTE="$CEO_ACCEPTANCE_REMOTE"
 SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 
@@ -44,27 +43,14 @@ rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/l
 # A local "ceo-agent-runtime" worktree for the alias (content does not matter for read-only
 # discovery; it must simply exist and be a directory).
 cd "$E/workspace/ceo-agent-runtime"
-git init -q -b "$BRANCH" 2>/dev/null || git init -q
+git init -q -b main 2>/dev/null || git init -q
 echo "local ceo-agent-runtime" > README.md
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm init 2>/dev/null || true
 
-# 1) Provision the identity DB binding the API key to the remote/branch and
-#    capture the single deployment user/workspace ids.
-SRV="$SRV" DB="$E/data/identity/identity.sqlite" REMOTE="$REMOTE" BRANCH="$BRANCH" KEY="$KEY" IDS="$E/ids.json" \
-node --input-type=module -e '
-import { writeFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import path from "node:path";
-const base = process.env.SRV;
-const store = await import(pathToFileURL(path.join(base, "dist/identity/store.js")).href);
-const id = store.provisionEmptyIdentityDatabase(process.env.DB, {
-  remoteUrl: process.env.REMOTE, branch: process.env.BRANCH,
-  apiKeyDigest: store.sha256Hex(process.env.KEY),
-});
-writeFileSync(process.env.IDS, JSON.stringify(id));
-console.log("provisioned", id.user_id, id.workspace_id);
-'
+# 1) Provision an empty control-plane DB, seed one test identity, write GitHub App PEM.
+SRV="$SRV" DB="$E/data/identity/identity.sqlite" KEY="$KEY" IDS="$E/ids.json" PEM="$E/github-app.pem" \
+  node "$SCRIPT_DIR/acceptance/seed-identity.mjs"
 
 # 2) Submit a real task via the Server JobService owned by that identity, then
 #    persist the EXACT submitted result (job_id, request_id, user_id,
@@ -91,7 +77,8 @@ const wait = (ms=8000) => new Promise((res, rej) => { const s=Date.now();
 await wait();
 const request_id = "123e4567-e89b-12d3-a456-4266141740ff";
 const res = await svc.submit(scope, { request_id,
-  workspace_ref: "ceo-agent-runtime", prompt: "connectivity acceptance", acceptance: "done", timeout_seconds: 120 });
+  workspace_ref: "ceo-agent-runtime", prompt: "connectivity acceptance", acceptance: "done",
+  result_target: "none", timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
 const jobId = res.view.job_id;
 const rec = await store.getJob(jobId);
@@ -149,17 +136,8 @@ snapshot() { # $1 = output snapshot file
 }
 
 # 3) Start the real Server.
-cd "$SRV"
-CEO_DATA_ROOT="$E/data" CEO_REMOTE="$REMOTE" MCP_API_KEY="$KEY" CEO_BRIDGE_ENABLED=true \
-  CEO_REDIS_URL="$REDIS" PORT="$PORT" BIND_HOST=127.0.0.1 \
-  nohup node dist/server.js > "$E/logs/server.log" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-
-for i in $(seq 1 40); do
-  if curl -s -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/api/identity" >/dev/null 2>&1; then break; fi
-  sleep 0.3
-done
+acceptance_start_server
+trap 'acceptance_stop_server' EXIT
 
 # 4) Bridge config + key file.
 echo -n "$KEY" > "$E/key"; chmod 600 "$E/key"

@@ -7,6 +7,11 @@ on:
       - "worker/**"
       - "services/server/src/jobs/**"
       - "services/server/test/jobs.*.test.ts"
+      - "services/server/src/server.ts"
+      - "services/server/src/config.ts"
+      - "services/server/src/auth.ts"
+      - "services/server/src/identity/**"
+      - "services/server/src/github/app-client.ts"
       - ".github/workflows/worker.yaml"
   push:
     branches: [main]
@@ -14,6 +19,11 @@ on:
       - "worker/**"
       - "services/server/src/jobs/**"
       - "services/server/test/jobs.*.test.ts"
+      - "services/server/src/server.ts"
+      - "services/server/src/config.ts"
+      - "services/server/src/auth.ts"
+      - "services/server/src/identity/**"
+      - "services/server/src/github/app-client.ts"
       - ".github/workflows/worker.yaml"
   workflow_dispatch:
 
@@ -79,26 +89,12 @@ jobs:
           cd worker
           cargo build --locked
 
-      - name: Prepare repository-of-record (bare remote)
-        run: |
-          mkdir -p .tmp/acceptance
-          git init -q --bare -b main ".tmp/acceptance/remote.git"
-          mkdir -p .tmp/acceptance/seed
-          cd .tmp/acceptance/seed
-          git init -q -b main
-          echo "seed" > seed.txt
-          git add -A
-          git -c user.email=t@ci -c user.name=t commit -qm seed
-          git remote add origin "../../acceptance/remote.git"
-          git push -q origin main
-
       - name: Cross-language connectivity acceptance (must NOT skip)
         run: |
           bash worker/scripts/connectivity-acceptance.sh
         env:
           CEO_ACCEPTANCE_REDIS: redis://:ceo-worker-test-pass@127.0.0.1:6379
           CEO_ACCEPTANCE_KEY: ceo-worker-acceptance-key
-          CEO_ACCEPTANCE_REMOTE: ${{ github.workspace }}/.tmp/acceptance/remote.git
           CEO_ACCEPTANCE_ROOT: ${{ github.workspace }}/.tmp/acceptance/run
           CEO_ACCEPTANCE_SERVER: ${{ github.workspace }}/services/server
           CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker
@@ -110,7 +106,6 @@ jobs:
         env:
           CEO_ACCEPTANCE_REDIS: redis://:ceo-worker-test-pass@127.0.0.1:6379
           CEO_ACCEPTANCE_KEY: ceo-worker-acceptance-key
-          CEO_ACCEPTANCE_REMOTE: ${{ github.workspace }}/.tmp/acceptance/remote.git
           CEO_ACCEPTANCE_ROOT: ${{ github.workspace }}/.tmp/acceptance/execrun
           CEO_ACCEPTANCE_SERVER: ${{ github.workspace }}/services/server
           CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker
@@ -123,7 +118,6 @@ jobs:
         env:
           CEO_ACCEPTANCE_REDIS: redis://:ceo-worker-test-pass@127.0.0.1:6379
           CEO_ACCEPTANCE_KEY: ceo-worker-acceptance-key
-          CEO_ACCEPTANCE_REMOTE: ${{ github.workspace }}/.tmp/acceptance/remote.git
           CEO_ACCEPTANCE_ROOT: ${{ github.workspace }}/.tmp/acceptance/deliveryrun
           CEO_ACCEPTANCE_SERVER: ${{ github.workspace }}/services/server
           CEO_ACCEPTANCE_WORKER: ${{ github.workspace }}/worker/target/debug/ceo-worker

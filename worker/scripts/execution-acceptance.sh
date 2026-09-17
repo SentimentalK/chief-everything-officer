@@ -11,30 +11,29 @@
 # Environment (all required unless noted):
 #   CEO_ACCEPTANCE_REDIS    redis:// URL (password auth)
 #   CEO_ACCEPTANCE_KEY      the API key provisioned into the identity DB
-#   CEO_ACCEPTANCE_REMOTE   absolute path of a bare git remote (repo of record)
 #   CEO_ACCEPTANCE_ROOT     temp root dir (created/cleaned by the script)
 #   CEO_ACCEPTANCE_SERVER   directory of services/server (built dist present)
 #   CEO_ACCEPTANCE_WORKER   path to the compiled ceo-worker binary
 #   CEO_ACCEPTANCE_STUB     path to tests/fixtures/test_stub.sh (hermetic agent)
 #   CEO_ACCEPTANCE_PORT     local port for the test Server
-#   CEO_ACCEPTANCE_BRANCH   branch (default main)
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=acceptance/lib.sh
+source "$SCRIPT_DIR/acceptance/lib.sh"
 
 : "${CEO_ACCEPTANCE_REDIS:?missing}"
 : "${CEO_ACCEPTANCE_KEY:?missing}"
-: "${CEO_ACCEPTANCE_REMOTE:?missing}"
 : "${CEO_ACCEPTANCE_ROOT:?missing}"
 : "${CEO_ACCEPTANCE_SERVER:?missing}"
 : "${CEO_ACCEPTANCE_WORKER:?missing}"
 : "${CEO_ACCEPTANCE_STUB:?missing}"
 : "${CEO_ACCEPTANCE_PORT:?missing}"
-BRANCH="${CEO_ACCEPTANCE_BRANCH:-main}"
 
 E="$CEO_ACCEPTANCE_ROOT"
 KEY="$CEO_ACCEPTANCE_KEY"
 REDIS="$CEO_ACCEPTANCE_REDIS"
 PORT="$CEO_ACCEPTANCE_PORT"
-REMOTE="$CEO_ACCEPTANCE_REMOTE"
 SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 STUB="$CEO_ACCEPTANCE_STUB"
@@ -44,7 +43,7 @@ rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/l
 # A doctor-passing workspace for the test_stub executor (AGENTS.md marker +
 # stub mode file), matching what the generic/doctor-caching tests use.
 cd "$E/workspace/ceo-agent-runtime"
-git init -q -b "$BRANCH" 2>/dev/null || git init -q
+git init -q -b main 2>/dev/null || git init -q
 cat > AGENTS.md <<EOF
 # Guidelines
 
@@ -56,21 +55,9 @@ echo -n "normal" > .stub_mode
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm init 2>/dev/null || true
 
-# 1) Provision the identity DB binding the key to the remote/branch.
-SRV="$SRV" DB="$E/data/identity/identity.sqlite" REMOTE="$REMOTE" BRANCH="$BRANCH" KEY="$KEY" IDS="$E/ids.json" \
-node --input-type=module -e '
-import { writeFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import path from "node:path";
-const base = process.env.SRV;
-const store = await import(pathToFileURL(path.join(base, "dist/identity/store.js")).href);
-const id = store.provisionEmptyIdentityDatabase(process.env.DB, {
-  remoteUrl: process.env.REMOTE, branch: process.env.BRANCH,
-  apiKeyDigest: store.sha256Hex(process.env.KEY),
-});
-writeFileSync(process.env.IDS, JSON.stringify(id));
-console.log("provisioned", id.user_id, id.workspace_id);
-'
+# 1) Provision an empty control-plane DB, seed one test identity, write GitHub App PEM.
+SRV="$SRV" DB="$E/data/identity/identity.sqlite" KEY="$KEY" IDS="$E/ids.json" PEM="$E/github-app.pem" \
+  node "$SCRIPT_DIR/acceptance/seed-identity.mjs"
 
 # 2) Submit a deterministic task via the real Server JobService.
 cd "$SRV"
@@ -114,17 +101,8 @@ await runner.dispose();
 '
 
 # 3) Start the real Server.
-cd "$SRV"
-CEO_DATA_ROOT="$E/data" CEO_REMOTE="$REMOTE" MCP_API_KEY="$KEY" CEO_BRIDGE_ENABLED=true \
-  CEO_REDIS_URL="$REDIS" PORT="$PORT" BIND_HOST=127.0.0.1 \
-  nohup node dist/server.js > "$E/logs/server.log" 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-
-for i in $(seq 1 60); do
-  if curl -s -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/api/identity" >/dev/null 2>&1; then break; fi
-  sleep 0.3
-done
+acceptance_start_server
+trap 'acceptance_stop_server' EXIT
 
 # 4) Bridge config + key file pointing at the workspace.
 echo -n "$KEY" > "$E/key"; chmod 600 "$E/key"
@@ -145,7 +123,7 @@ env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
   "$WRK" bridge run --config "$E/bridge.json" --workspace-ref ceo-agent-runtime \
   > "$E/worker.stdout.log" 2> "$E/worker.stderr.log" &
 WORKER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
+trap 'acceptance_stop_server; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
 # Wait up to 60s for local completion plus automatic report ACK.
 RECEIPT=""

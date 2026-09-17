@@ -5,21 +5,22 @@
 # Server returns → pending report delivered → one attempt.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=acceptance/lib.sh
+source "$SCRIPT_DIR/acceptance/lib.sh"
+
 : "${CEO_ACCEPTANCE_REDIS:?missing}"
 : "${CEO_ACCEPTANCE_KEY:?missing}"
-: "${CEO_ACCEPTANCE_REMOTE:?missing}"
 : "${CEO_ACCEPTANCE_ROOT:?missing}"
 : "${CEO_ACCEPTANCE_SERVER:?missing}"
 : "${CEO_ACCEPTANCE_WORKER:?missing}"
 : "${CEO_ACCEPTANCE_STUB:?missing}"
 : "${CEO_ACCEPTANCE_PORT:?missing}"
-BRANCH="${CEO_ACCEPTANCE_BRANCH:-main}"
 
 E="$CEO_ACCEPTANCE_ROOT"
 KEY="$CEO_ACCEPTANCE_KEY"
 REDIS="$CEO_ACCEPTANCE_REDIS"
 PORT="$CEO_ACCEPTANCE_PORT"
-REMOTE="$CEO_ACCEPTANCE_REMOTE"
 SRV="$CEO_ACCEPTANCE_SERVER"
 WRK="$CEO_ACCEPTANCE_WORKER"
 STUB="$CEO_ACCEPTANCE_STUB"
@@ -27,7 +28,7 @@ STUB="$CEO_ACCEPTANCE_STUB"
 rm -rf "$E"; mkdir -p "$E"/workspace/ceo-agent-runtime "$E"/data/identity "$E"/logs
 
 cd "$E/workspace/ceo-agent-runtime"
-git init -q -b "$BRANCH" 2>/dev/null || git init -q
+git init -q -b main 2>/dev/null || git init -q
 cat > AGENTS.md <<EOF
 # Guidelines
 
@@ -39,20 +40,8 @@ echo -n "hold_for_delivery" > .stub_mode
 git add -A
 git -c user.email=t@e -c user.name=t commit -qm init 2>/dev/null || true
 
-SRV="$SRV" DB="$E/data/identity/identity.sqlite" REMOTE="$REMOTE" BRANCH="$BRANCH" KEY="$KEY" IDS="$E/ids.json" \
-node --input-type=module -e '
-import { writeFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import path from "node:path";
-const base = process.env.SRV;
-const store = await import(pathToFileURL(path.join(base, "dist/identity/store.js")).href);
-const id = store.provisionEmptyIdentityDatabase(process.env.DB, {
-  remoteUrl: process.env.REMOTE, branch: process.env.BRANCH,
-  apiKeyDigest: store.sha256Hex(process.env.KEY),
-});
-writeFileSync(process.env.IDS, JSON.stringify(id));
-console.log("provisioned", id.user_id, id.workspace_id);
-'
+SRV="$SRV" DB="$E/data/identity/identity.sqlite" KEY="$KEY" IDS="$E/ids.json" PEM="$E/github-app.pem" \
+  node "$SCRIPT_DIR/acceptance/seed-identity.mjs"
 
 cd "$SRV"
 REDIS="$REDIS" IDS="$E/ids.json" SRV="$SRV" JOB="$E/job.json" \
@@ -77,39 +66,12 @@ await wait();
 const res = await svc.submit(scope, { request_id: "123e4567-e89b-12d3-a456-4266141740aa",
   workspace_ref: "ceo-agent-runtime",
   prompt: "[Step 3 - Fully Autonomous Execution: Task Execution]\nCreate output_artifact.txt with the exact bytes: delivery-nonce-4242",
-  acceptance: "output_artifact.txt must contain delivery-nonce-4242", timeout_seconds: 120 });
+  acceptance: "output_artifact.txt must contain delivery-nonce-4242",
+  result_target: "none", timeout_seconds: 120 });
 if (!res.ok) throw new Error("submit failed " + JSON.stringify(res));
 writeFileSync(process.env.JOB, JSON.stringify({ job_id: res.view.job_id }));
 await runner.dispose();
 '
-
-start_server() {
-  cd "$SRV"
-  CEO_DATA_ROOT="$E/data" CEO_REMOTE="$REMOTE" MCP_API_KEY="$KEY" CEO_BRIDGE_ENABLED=true \
-    CEO_REDIS_URL="$REDIS" PORT="$PORT" BIND_HOST=127.0.0.1 \
-    nohup node dist/server.js > "$E/logs/server.log" 2>&1 &
-  SERVER_PID=$!
-  for i in $(seq 1 60); do
-    if curl -s -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/api/identity" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.3
-  done
-  echo "result delivery acceptance: server did not start"
-  return 1
-}
-
-stop_server() {
-  if [ -n "${SERVER_PID:-}" ]; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    for i in $(seq 1 40); do
-      if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
-      sleep 0.1
-    done
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-  fi
-}
 
 identity_reachable() {
   curl -s -m 1 -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/api/identity" >/dev/null 2>&1
@@ -122,7 +84,7 @@ wait_identity_down() {
     fi
     sleep 0.1
   done
-  echo "result delivery acceptance: identity still reachable after stop_server"
+  echo "result delivery acceptance: identity still reachable after acceptance_stop_server"
   return 1
 }
 
@@ -130,7 +92,7 @@ attempt_count() {
   find "$WS/.ceo/jobs/$JOB_ID/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
 }
 
-start_server
+acceptance_start_server
 echo -n "$KEY" > "$E/key"; chmod 600 "$E/key"
 node -e 'const fs=require("fs"); const id=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
   const cfg={schema_version:1,server_url:"http://127.0.0.1:"+process.argv[3],
@@ -147,7 +109,7 @@ env CEO_EXECUTOR_TYPE=test_stub CEO_AGENT_BIN="$STUB" CEO_WORKSPACE_DIR="$WS" \
   "$WRK" bridge run --config "$E/bridge.json" --workspace-ref ceo-agent-runtime \
   > "$E/worker.stdout.log" 2> "$E/worker.stderr.log" &
 WORKER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
+trap 'acceptance_stop_server; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
 for i in $(seq 1 200); do
   if [ -f "$WS/.delivery-entered" ]; then
@@ -162,7 +124,7 @@ if [ ! -f "$WS/.delivery-entered" ]; then
   exit 1
 fi
 
-stop_server
+acceptance_stop_server
 wait_identity_down
 
 : > "$WS/.delivery-release"
@@ -268,8 +230,8 @@ if [ "$(attempt_count)" != "1" ]; then
   exit 1
 fi
 
-start_server
-trap 'kill "$SERVER_PID" 2>/dev/null || true; kill "$WORKER_PID" 2>/dev/null || true' EXIT
+acceptance_start_server
+trap 'acceptance_stop_server; kill "$WORKER_PID" 2>/dev/null || true' EXIT
 
 for i in $(seq 1 200); do
   if [ ! -f "$WS/.ceo/bridge/outbox/${JOB_ID}.${ATTEMPT}.json" ] \
