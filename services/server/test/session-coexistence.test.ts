@@ -4,12 +4,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import type { Server as HttpServer } from "node:http";
-import {
-  IdentityStore,
-  provisionEmptyIdentityDatabase,
-  sha256Hex,
-} from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
+import { seedIdentity } from "./helpers.js";
 import { AuditStore, createAuditRouter } from "../src/audit.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
 import { createUserRouter } from "../src/auth/user-router.js";
@@ -38,16 +34,9 @@ async function setupCoexistenceApp() {
   const auditDbPath = path.join(dir, "audit.sqlite");
   const apiKey = "mcp-secret-key-123";
 
-  const ident = provisionEmptyIdentityDatabase(dbPath, {
-    remoteUrl: "git@example.com:test/repo.git",
-    branch: "main",
-    apiKeyDigest: sha256Hex(apiKey),
-  });
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, apiKey);
 
-  const identityService = IdentityService.open(
-    { remoteUrl: "git@example.com:test/repo.git", branch: "main", envApiKey: apiKey },
-    dbPath,
-  );
+  const identityService = IdentityService.open(dbPath);
   cleanupServices.push(identityService);
 
   const auditStore = new AuditStore(auditDbPath);

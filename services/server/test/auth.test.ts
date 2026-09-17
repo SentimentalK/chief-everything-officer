@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises";
 import http from "node:http";
 import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { fixture, createIdentityService } from "./helpers.js";
+import { fixture, createIdentityService, requestIdentity } from "./helpers.js";
 import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
 import type { IdentityService } from "../src/identity/service.js";
 
@@ -86,7 +86,7 @@ describe("createIdentityAuthMiddleware", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { identity: { user_id: string; workspace_id: string; api_key_id: string } };
     expect(body.identity.user_id).toMatch(/^usr_/);
-    expect(body.identity.workspace_id).toBe(service.workspaceIdentityValue.workspace_id);
+    expect(body.identity.workspace_id).toBe(requestIdentity(service, apiKey).workspace_id);
     expect(body.identity.api_key_id).toMatch(/^ak_/);
   });
 });

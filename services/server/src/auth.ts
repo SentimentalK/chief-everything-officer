@@ -84,7 +84,7 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
 /**
  * Dual-bearer authentication middleware for the /mcp endpoint:
  * Accepts either:
- * 1. Legacy MCP_API_KEY verified against IdentityService.
+ * 1. DB-backed API key verified against IdentityService.
  * 2. OAuth 2.1 Bearer access token verified against OAuthService (with scope 'mcp'
  *    and matching canonical resource `${publicOrigin}/mcp`).
  *
@@ -116,7 +116,7 @@ export function createMcpAuthMiddleware(
       return;
     }
 
-    // 1. Try legacy MCP_API_KEY
+    // 1. Try DB-backed API key
     try {
       const apiKeyResult = identityService.authenticateApiKey(token);
       if (apiKeyResult !== null) {

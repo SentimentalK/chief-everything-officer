@@ -8,9 +8,8 @@ import {
 } from "../src/oauth/store.js";
 import {
   IdentityStore,
-  provisionEmptyIdentityDatabase,
-  sha256Hex,
 } from "../src/identity/store.js";
+import { seedIdentity } from "./helpers.js";
 import { OAuthService, OAuthServerError } from "../src/oauth/service.js";
 import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 
@@ -29,11 +28,7 @@ async function setupTestEnv() {
   cleanupDirs.push(dir);
 
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = provisionEmptyIdentityDatabase(identDbPath, {
-    remoteUrl: "git@example.com:test/repo.git",
-    branch: "main",
-    apiKeyDigest: sha256Hex("test-key"),
-  });
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
   const identStore = IdentityStore.open(identDbPath);
   cleanupIdentStores.push(identStore);
 

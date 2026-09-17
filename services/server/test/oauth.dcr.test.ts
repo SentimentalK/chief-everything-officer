@@ -7,10 +7,7 @@ import {
   OAuthStore,
   sha256Base64Url,
 } from "../src/oauth/store.js";
-import {
-  provisionEmptyIdentityDatabase,
-  sha256Hex,
-} from "../src/identity/store.js";
+import { seedIdentity } from "./helpers.js";
 import { IdentityService } from "../src/identity/service.js";
 import { OAuthService } from "../src/oauth/service.js";
 import { createOAuthRouter } from "../src/oauth/router.js";
@@ -45,19 +42,8 @@ async function setupDcrEnv() {
   cleanupDirs.push(dir);
 
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = provisionEmptyIdentityDatabase(identDbPath, {
-    remoteUrl: "git@example.com:test/repo.git",
-    branch: "main",
-    apiKeyDigest: sha256Hex("test-key"),
-  });
-  const identityService = IdentityService.open(
-    {
-      remoteUrl: "git@example.com:test/repo.git",
-      branch: "main",
-      envApiKey: "test-key",
-    },
-    identDbPath,
-  );
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const identityService = IdentityService.open(identDbPath);
   cleanupIdentServices.push(identityService);
   const identStore = identityService.storeInstance;
 

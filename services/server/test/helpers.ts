@@ -2,9 +2,16 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import type { Config } from "../src/config.js";
 import type { WorkspaceConfig } from "../src/git.js";
-import { provisionEmptyIdentityDatabase, sha256Hex } from "../src/identity/store.js";
+import type { AuthIdentity } from "../src/identity/store.js";
+import {
+  IdentityStore,
+  newId,
+  provisionEmptyControlPlaneDatabase,
+  sha256Hex,
+} from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
 
 export type TestConfig = Config & WorkspaceConfig & { mcpApiKey: string };
@@ -82,21 +89,72 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
 }
 
 /**
- * Provisions a brand-new identity database for a config (first-time setup).
- * If an API key is given it overrides config.mcpApiKey for the digest.
- * Records the seeded (stable, single-user) ids.
+ * Test fixture: empty control-plane schema plus one production-valid
+ * user / workspace / owner membership / API key. Inserts via a raw
+ * `node:sqlite` connection, then validates with IdentityStore.open.
  */
-export function seedIdentity(config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string }, apiKey = config.mcpApiKey ?? "test-mcp-api-key"): SeededIdentity {
-  return provisionEmptyIdentityDatabase(config.identityDbPath, {
-    remoteUrl: config.remoteUrl ?? "dummy-remote",
-    branch: config.branch ?? "main",
-    apiKeyDigest: sha256Hex(apiKey),
-  });
+export function seedIdentity(
+  config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string },
+  apiKey = config.mcpApiKey ?? "test-mcp-api-key",
+): SeededIdentity {
+  const dbPath = config.identityDbPath;
+  provisionEmptyControlPlaneDatabase(dbPath);
+
+  const userId = newId("usr");
+  const workspaceId = newId("ws");
+  const membershipId = newId("wsm");
+  const apiKeyId = newId("ak");
+  const nowMs = Date.now();
+  const remoteUrl = config.remoteUrl ?? "dummy-remote";
+  const branch = config.branch ?? "main";
+
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("PRAGMA foreign_keys = ON;");
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(userId, nowMs);
+      db.prepare(
+        "INSERT INTO workspaces (id, owner_user_id, remote_url, branch, created_at) VALUES (?, ?, ?, ?, ?);",
+      ).run(workspaceId, userId, remoteUrl, branch, nowMs);
+      db.prepare(
+        "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
+      ).run(membershipId, workspaceId, userId, nowMs);
+      db.prepare(
+        "INSERT INTO api_keys (id, user_id, key_digest, created_at, revoked_at) VALUES (?, ?, ?, ?, NULL);",
+      ).run(apiKeyId, userId, sha256Hex(apiKey), nowMs);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+
+  const store = IdentityStore.open(dbPath);
+  store.close();
+  return { user_id: userId, workspace_id: workspaceId };
 }
 
 /** Seeds an identity DB and opens a runtime IdentityService for it. */
-export function createIdentityService(config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string }, apiKey = config.mcpApiKey ?? "test-mcp-api-key"): IdentityService {
+export function createIdentityService(
+  config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string },
+  apiKey = config.mcpApiKey ?? "test-mcp-api-key",
+): IdentityService {
   seedIdentity(config, apiKey);
   return IdentityService.open(config.identityDbPath);
 }
 
+/** Resolve request-scoped identity for a seeded API key. */
+export function requestIdentity(service: IdentityService, apiKey: string): AuthIdentity {
+  const credential = service.authenticateApiKey(apiKey);
+  if (!credential) {
+    throw new Error("test fixture: API key did not authenticate");
+  }
+  return service.resolveRequestIdentity(credential);
+}

@@ -11,7 +11,7 @@ import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { CeoWorkspace } from "../src/workspace.js";
-import { fixture, createIdentityService } from "./helpers.js";
+import { fixture, createIdentityService, requestIdentity } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
 const API_KEY = "http-boundary-key";
@@ -39,7 +39,7 @@ async function buildServer() {
 
   const identityService = createIdentityService(item.config, API_KEY);
   cleanupServices.push(identityService);
-  const workspaceIdentity = identityService.workspaceIdentityValue;
+  const workspaceIdentity = requestIdentity(identityService, API_KEY);
 
   const app = createMcpExpressApp({ host: item.config.bindHost });
   app.use(express.json());
@@ -50,10 +50,11 @@ async function buildServer() {
     createOriginGuard(item.config.allowedOrigins),
     createIdentityAuthMiddleware(identityService),
     (_req, res) => {
+      const identity = res.locals.identity!;
       res.status(200).json({
-        user_id: identityService.workspaceIdentityValue.user_id,
-        workspace_id: identityService.workspaceIdentityValue.workspace_id,
-        deployment_mode: "single_workspace_runtime",
+        user_id: identity.user_id,
+        workspace_id: identity.workspace_id,
+        deployment_mode: "request_scoped_workspace",
       });
     },
   );
@@ -79,7 +80,7 @@ async function buildServer() {
 }
 
 describe("GET /api/identity", () => {
-  it("returns stable user/workspace and single_workspace_runtime mode for a valid key", async () => {
+  it("returns stable user/workspace and request_scoped_workspace mode for a valid key", async () => {
     const { baseUrl, workspaceIdentity } = await buildServer();
     const res = await fetch(`${baseUrl}/api/identity`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
@@ -89,7 +90,7 @@ describe("GET /api/identity", () => {
     expect(body.user_id).toBe(workspaceIdentity.user_id);
     expect(body.user_id).toMatch(/^usr_/);
     expect(body.workspace_id).toBe(workspaceIdentity.workspace_id);
-    expect(body.deployment_mode).toBe("single_workspace_runtime");
+    expect(body.deployment_mode).toBe("request_scoped_workspace");
     // Sensitive info must never be exposed.
     expect(JSON.stringify(body)).not.toContain("key_digest");
   });

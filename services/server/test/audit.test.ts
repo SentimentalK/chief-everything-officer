@@ -12,7 +12,7 @@ import { AuditStore, AuditSchemaIncompatibleError, createAuditRouter } from "../
 import { CeoWorkspace } from "../src/workspace.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
-import { fixture, seedIdentity, createIdentityService } from "./helpers.js";
+import { fixture, seedIdentity, createIdentityService, requestIdentity } from "./helpers.js";
 import { IdentityService } from "../src/identity/service.js";
 import { sha256Hex } from "../src/identity/store.js";
 import type { Config } from "../src/config.js";
@@ -470,12 +470,12 @@ describe("Audit HTTP API & Session Management", () => {
     const cookieHeader = login.headers.get("set-cookie");
     const sessionCookie = cookieHeader!.split(";")[0]!;
 
-    // Revoke the key by rotating it (opens a second service on the same DB).
-    const rotator = IdentityService.open(
-      { remoteUrl: config.remoteUrl, branch: config.branch, envApiKey: "replacement-key" },
-      config.identityDbPath,
-    );
-    cleanupServices.push(rotator);
+    // Revoke the bound API key in the identity DB (cookie must not survive).
+    const cred = service.authenticateApiKey(apiKey);
+    expect(cred).not.toBeNull();
+    const raw = new DatabaseSync(config.identityDbPath);
+    raw.prepare("UPDATE api_keys SET revoked_at = ? WHERE id = ?;").run(Date.now(), cred!.api_key_id);
+    raw.close();
 
     // The previously valid session now points at a revoked key -> rejected.
     const traces = await fetch(`${baseUrl}/api/audit/traces`, { headers: { Cookie: sessionCookie } });
@@ -488,14 +488,12 @@ describe("Audit HTTP API & Session Management", () => {
       body: JSON.stringify({ token: apiKey }),
     });
     expect(auth.status).toBe(401);
-
-    // The session router still serves the deployment (its own identity is open).
-    expect(service.workspaceIdentityValue.user_id).toMatch(/^usr_/);
+    expect(service.storeInstance.ping()).toBe(true);
   });
 
   it("handles login, session status, authenticated query, detail, and logout lifecycle", async () => {
     const { baseUrl, auditStore, apiKey, service } = await setupTestApp();
-    const myWorkspaceId = service.workspaceIdentityValue.workspace_id;
+    const myWorkspaceId = requestIdentity(service, apiKey).workspace_id;
 
     // Seed a trace for my workspace
     auditStore.recordTrace({

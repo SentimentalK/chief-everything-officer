@@ -4,9 +4,8 @@ import os from "node:os";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
   IdentityStore,
-  provisionEmptyIdentityDatabase,
-  sha256Hex,
 } from "../src/identity/store.js";
+import { seedIdentity } from "./helpers.js";
 import {
   WorkspaceRuntimeRegistry,
 } from "../src/runtime/registry.js";
@@ -52,11 +51,7 @@ describe("WorkspaceRuntimeRegistry", () => {
     cleanupDirs.push(tempDir);
     dbPath = path.join(tempDir, "identity.sqlite");
 
-    provisionEmptyIdentityDatabase(dbPath, {
-      remoteUrl: "git@github.com:test-owner/test-repo.git",
-      branch: "main",
-      apiKeyDigest: sha256Hex("test-key"),
-    });
+    seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@github.com:test-owner/test-repo.git", branch: "main" }, "test-key");
 
     store = IdentityStore.open(dbPath);
     cleanupStores.push(store);

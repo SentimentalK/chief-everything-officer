@@ -9,13 +9,16 @@ import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import {
   IdentityStore,
-  IdentityStructureError,
   IdentityDbUnavailable,
   sha256Hex,
   IDENTITY_DDL,
   IDENTITY_DB_USER_VERSION,
 } from "../src/identity/store.js";
-import { IdentityService, WorkspaceAccessDeniedError } from "../src/identity/service.js";
+import {
+  IdentityService,
+  WorkspaceAccessDeniedError,
+  WorkspaceSelectionRequiredError,
+} from "../src/identity/service.js";
 import { createIdentityAuthMiddleware } from "../src/auth.js";
 
 const cleanupDirs: string[] = [];
@@ -76,7 +79,6 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
   db.exec(`PRAGMA user_version = ${IDENTITY_DB_USER_VERSION};`);
 
   const nowMs = 1000000;
-  // User A and Workspace A and Key A
   db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(ctx.userA, nowMs);
   db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
     ctx.workspaceA,
@@ -99,7 +101,6 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     nowMs,
   );
 
-  // User B and Workspace B and Key B
   db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(ctx.userB, nowMs + 1);
   db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
     ctx.workspaceB,
@@ -126,241 +127,10 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
   return ctx;
 }
 
-describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
-  it("A. A v2 DB with User A/Workspace A/Key A plus User B/Workspace B/Key B opens and IdentityService configured for A starts successfully", async () => {
-    const ctx = await createMultiRowCtx();
-
-    // Store opens without error
-    const store = IdentityStore.open(ctx.dbPath);
-    cleanupStores.push(store);
-
-    // IdentityService configured for A starts successfully
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
-
-    expect(serviceA.workspaceIdentityValue).toEqual({
-      user_id: ctx.userA,
-      workspace_id: ctx.workspaceA,
-    });
-  });
-
-  it("B. Extra active keys belonging to B do not cause A startup to fail and are never mutated by A startup/rotation", async () => {
-    const ctx = await createMultiRowCtx();
-
-    // Add extra active keys for Bob
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_bob_2",
-      ctx.userB,
-      sha256Hex("secret-key-bob-extra"),
-      2000000,
-    );
-    const bobKeysBefore = raw
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    raw.close();
-
-    // Startup for Alice with rotation
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: "new-alice-key" },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
-
-    // Bob's key rows must remain byte-for-byte and logically identical
-    const rawAfter = new DatabaseSync(ctx.dbPath);
-    const bobKeysAfter = rawAfter
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    rawAfter.close();
-
-    expect(bobKeysAfter).toEqual(bobKeysBefore);
-  });
-
-  it("C. If A env key is already active, A startup succeeds even while unrelated credentials exist", async () => {
-    const ctx = await createMultiRowCtx();
-
-    // Bob has extra keys, revoked keys, etc.
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
-      "ak_bob_revoked",
-      ctx.userB,
-      sha256Hex("bob-revoked"),
-      500000,
-      600000,
-    );
-    raw.close();
-
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
-
-    expect(serviceA.workspaceIdentityValue.user_id).toBe(ctx.userA);
-    const cred = serviceA.authenticateApiKey(ctx.keyA);
-    expect(cred).not.toBeNull();
-    expect(cred!.user_id).toBe(ctx.userA);
-  });
-
-  it("D. If A env key changes and A has exactly one active key, only A's key rotates; B key rows remain byte-for-byte/logically unchanged", async () => {
-    const ctx = await createMultiRowCtx();
-
-    const rawBefore = new DatabaseSync(ctx.dbPath);
-    const bobRowsBefore = rawBefore
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    rawBefore.close();
-
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: "rotated-alice-key" },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
-
-    const rawAfter = new DatabaseSync(ctx.dbPath);
-    const aliceRows = rawAfter
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY created_at ASC;")
-      .all(ctx.userA) as Array<{ id: string; user_id: string; key_digest: string; revoked_at: number | null }>;
-    const bobRowsAfter = rawAfter
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    rawAfter.close();
-
-    expect(bobRowsAfter).toEqual(bobRowsBefore);
-    expect(aliceRows).toHaveLength(2);
-    expect(aliceRows[0].id).toBe("ak_alice_1");
-    expect(aliceRows[0].revoked_at).not.toBeNull();
-    expect(aliceRows[1].key_digest).toBe(sha256Hex("rotated-alice-key"));
-    expect(aliceRows[1].revoked_at).toBeNull();
-  });
-
-  it("E. If configured env key is active for B while runtime config selects A, startup fails and neither user's key state changes", async () => {
-    const ctx = await createMultiRowCtx();
-
-    const rawBefore = new DatabaseSync(ctx.dbPath);
-    const allKeysBefore = rawBefore.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawBefore.close();
-
-    // Alice configuration presenting Bob's key
-    expect(() =>
-      IdentityService.open(
-        { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyB },
-        ctx.dbPath,
-      ),
-    ).toThrow(IdentityStructureError);
-
-    const rawAfter = new DatabaseSync(ctx.dbPath);
-    const allKeysAfter = rawAfter.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawAfter.close();
-
-    expect(allKeysAfter).toEqual(allKeysBefore);
-  });
-
-  it("F. If A env digest is unknown and A has >1 active keys, startup fails as ambiguous with no mutation", async () => {
-    const ctx = await createMultiRowCtx();
-
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_alice_2",
-      ctx.userA,
-      sha256Hex("another-alice-key"),
-      2000000,
-    );
-    const keysBefore = raw.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    raw.close();
-
-    expect(() =>
-      IdentityService.open(
-        { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: "completely-new-key" },
-        ctx.dbPath,
-      ),
-    ).toThrow(/multiple active keys/);
-
-    const rawAfter = new DatabaseSync(ctx.dbPath);
-    const keysAfter = rawAfter.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawAfter.close();
-
-    expect(keysAfter).toEqual(keysBefore);
-  });
-
-  it("G. Zero configured remote/branch matches fails; duplicate configured remote/branch matches fails instead of selecting arbitrary row", async () => {
-    const ctx = await createMultiRowCtx();
-
-    // Zero matches
-    expect(() =>
-      IdentityService.open(
-        { remoteUrl: "git@example.com:org/nonexistent.git", branch: "main", envApiKey: ctx.keyA },
-        ctx.dbPath,
-      ),
-    ).toThrow(/No workspace found/);
-
-    // Duplicate matches
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
-      "ws_duplicate",
-      ctx.userA,
-      ctx.remoteA,
-      ctx.branchA,
-      3000000,
-    );
-    raw.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
-      "wsm_dup",
-      "ws_duplicate",
-      ctx.userA,
-      "owner",
-      3000000,
-    );
-    raw.close();
-
-    expect(() =>
-      IdentityService.open(
-        { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-        ctx.dbPath,
-      ),
-    ).toThrow(/Ambiguous runtime target/);
-  });
-
-  it("H. Disabled unrelated User B does not block A startup; disabled selected owner A does block startup/auth", async () => {
-    const ctx = await createMultiRowCtx();
-
-    // Disable Bob
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("UPDATE users SET disabled_at = ? WHERE id = ?;").run(Date.now(), ctx.userB);
-    raw.close();
-
-    // Alice startup succeeds despite Bob being disabled
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
-    expect(serviceA.workspaceIdentityValue.user_id).toBe(ctx.userA);
-
-    // Now disable Alice
-    const raw2 = new DatabaseSync(ctx.dbPath);
-    raw2.prepare("UPDATE users SET disabled_at = ? WHERE id = ?;").run(Date.now(), ctx.userA);
-    raw2.close();
-
-    // Alice startup now fails
-    expect(() =>
-      IdentityService.open(
-        { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-        ctx.dbPath,
-      ),
-    ).toThrow(/disabled/);
-
-    // Already open service refuses authentication for disabled Alice
-    expect(serviceA.authenticateApiKey(ctx.keyA)).toBeNull();
-  });
-
+describe("Identity request-scoped cardinality", () => {
   it("I. API key A and B resolve request-scoped workspace identities; user with 0 workspaces rejected 403; unknown/revoked key remains 401", async () => {
     const ctx = await createMultiRowCtx();
 
-    // Add a user Charlie with a valid key but 0 workspace memberships
     const userC = "usr_charlie";
     const keyC = "secret-key-charlie";
     const raw = new DatabaseSync(ctx.dbPath);
@@ -371,8 +141,6 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
       sha256Hex(keyC),
       1000,
     );
-
-    // Add a revoked key for Alice
     raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
       "ak_alice_revoked",
       ctx.userA,
@@ -382,16 +150,12 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     );
     raw.close();
 
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
+    const service = IdentityService.open(ctx.dbPath);
+    cleanupServices.push(service);
 
-    // Express app using createIdentityAuthMiddleware
     const app = express();
     app.use(express.json());
-    app.get("/test", createIdentityAuthMiddleware(serviceA), (_req, res) => {
+    app.get("/test", createIdentityAuthMiddleware(service), (_req, res) => {
       res.status(200).json({ identity: res.locals.identity });
     });
 
@@ -402,7 +166,6 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     const port = (server.address() as AddressInfo).port;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    // 1. Key A succeeds -> 200 with Alice & Workspace A
     const resA = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${ctx.keyA}` },
     });
@@ -411,7 +174,6 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(bodyA.identity.user_id).toBe(ctx.userA);
     expect(bodyA.identity.workspace_id).toBe(ctx.workspaceA);
 
-    // 2. Key B is valid credential for Bob -> succeeds 200 with request-scoped Workspace B
     const resB = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${ctx.keyB}` },
     });
@@ -420,24 +182,25 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(bodyB.identity.user_id).toBe(ctx.userB);
     expect(bodyB.identity.workspace_id).toBe(ctx.workspaceB);
 
-    // Bob attempting to assert access to Runtime A's workspace fails with 403
-    const credB = serviceA.authenticateApiKey(ctx.keyB);
+    const credB = service.authenticateApiKey(ctx.keyB);
     expect(credB).not.toBeNull();
-    expect(() => serviceA.assertWorkspaceAccess(credB!)).toThrow(WorkspaceAccessDeniedError);
+    expect(service.resolveRequestIdentity(credB!).workspace_id).toBe(ctx.workspaceB);
+    expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userB)).toBe(false);
 
-    // 3. Key C has valid credential but 0 workspace memberships -> 403
     const resC = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${keyC}` },
     });
     expect(resC.status).toBe(403);
 
-    // 4. Unknown key -> 401
+    const credC = service.authenticateApiKey(keyC);
+    expect(credC).not.toBeNull();
+    expect(() => service.resolveRequestIdentity(credC!)).toThrow(WorkspaceAccessDeniedError);
+
     const resUnknown = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer not-a-real-key` },
     });
     expect(resUnknown.status).toBe(401);
 
-    // 5. Revoked key -> 401
     const resRevoked = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer revoked-alice-key` },
     });
@@ -447,7 +210,6 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
   it("I2. DB failure during workspace-authorization phase returns 503, while access denial returns 403 and unexpected errors return 500", async () => {
     const ctx = await createMultiRowCtx();
 
-    // Add a user Charlie with 0 workspace memberships
     const userC = "usr_charlie_i2";
     const keyC = "secret-key-charlie-i2";
     const raw = new DatabaseSync(ctx.dbPath);
@@ -460,15 +222,12 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     );
     raw.close();
 
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
+    const service = IdentityService.open(ctx.dbPath);
+    cleanupServices.push(service);
 
     const app = express();
     app.use(express.json());
-    app.get("/test", createIdentityAuthMiddleware(serviceA), (_req, res) => {
+    app.get("/test", createIdentityAuthMiddleware(service), (_req, res) => {
       res.status(200).json({ identity: res.locals.identity });
     });
 
@@ -479,22 +238,18 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     const port = (server.address() as AddressInfo).port;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    // Verify key A succeeds normally
     const normalRes = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${ctx.keyA}` },
     });
     expect(normalRes.status).toBe(200);
 
-    // Verify key C (0 memberships) is 403 (ordinary access denial)
     const resC = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${keyC}` },
     });
     expect(resC.status).toBe(403);
 
-    // Simulate DB failure during workspace-authorization phase:
-    // credential authentication succeeds, but listWorkspaceMembershipsForUser throws IdentityDbUnavailable.
-    const origMethod = serviceA.store.listWorkspaceMembershipsForUser.bind(serviceA.store);
-    serviceA.store.listWorkspaceMembershipsForUser = () => {
+    const origMethod = service.storeInstance.listWorkspaceMembershipsForUser.bind(service.storeInstance);
+    service.storeInstance.listWorkspaceMembershipsForUser = () => {
       throw new IdentityDbUnavailable("Simulated DB connection lost during workspace check");
     };
 
@@ -510,11 +265,10 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.listWorkspaceMembershipsForUser = origMethod;
+      service.storeInstance.listWorkspaceMembershipsForUser = origMethod;
     }
 
-    // Verify that unrelated unexpected programming errors return 500 (not mislabeled as 503)
-    serviceA.store.listWorkspaceMembershipsForUser = () => {
+    service.storeInstance.listWorkspaceMembershipsForUser = () => {
       throw new TypeError("Unrelated unexpected programming error");
     };
 
@@ -530,14 +284,13 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.listWorkspaceMembershipsForUser = origMethod;
+      service.storeInstance.listWorkspaceMembershipsForUser = origMethod;
     }
   });
 
-  it("J. Revalidation/session path does not infer a workspace with LIMIT 1 and preserves revoke semantics", async () => {
+  it("J. Revalidation does not infer a workspace with LIMIT 1 and preserves revoke semantics", async () => {
     const ctx = await createMultiRowCtx();
 
-    // Alice owns a second workspace ws_alpha_2
     const raw = new DatabaseSync(ctx.dbPath);
     raw.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_alpha_2",
@@ -555,132 +308,23 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     );
     raw.close();
 
-    const serviceA = IdentityService.open(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    cleanupServices.push(serviceA);
+    const service = IdentityService.open(ctx.dbPath);
+    cleanupServices.push(service);
 
-    // Revalidation for Alice's key resolves explicitly to serviceA's served workspace, never ws_alpha_2
-    const resolved = serviceA.revalidateAndOwnership({ api_key_id: "ak_alice_1", user_id: ctx.userA });
-    expect(resolved).not.toBeNull();
-    expect(resolved!.workspace_id).toBe(ctx.workspaceA);
-    expect(resolved!.user_id).toBe(ctx.userA);
+    const credA = service.storeInstance.resolveCredentialByKey("ak_alice_1", ctx.userA);
+    expect(credA).not.toBeNull();
+    expect(() => service.resolveRequestIdentity(credA!)).toThrow(WorkspaceSelectionRequiredError);
+    expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userA)).toBe(true);
+    expect(service.hasWorkspaceAccess("ws_alpha_2", ctx.userA)).toBe(true);
 
-    // Revalidation for Bob's key against serviceA returns null (not authorized for workspaceA)
-    const bobResolved = serviceA.revalidateAndOwnership({ api_key_id: "ak_bob_1", user_id: ctx.userB });
-    expect(bobResolved).toBeNull();
+    const credB = service.storeInstance.resolveCredentialByKey("ak_bob_1", ctx.userB);
+    expect(credB).not.toBeNull();
+    expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userB)).toBe(false);
 
-    // Revoking Alice's key causes revalidation to return null
     const raw2 = new DatabaseSync(ctx.dbPath);
     raw2.prepare("UPDATE api_keys SET revoked_at = ? WHERE id = 'ak_alice_1';").run(Date.now());
     raw2.close();
 
-    const revokedResolved = serviceA.revalidateAndOwnership({ api_key_id: "ak_alice_1", user_id: ctx.userA });
-    expect(revokedResolved).toBeNull();
-  });
-
-  it("K. initialize() against an existing multi-row DB validates the selected A binding/key and never rotates it", async () => {
-    const ctx = await createMultiRowCtx();
-
-    const rawBefore = new DatabaseSync(ctx.dbPath);
-    const keysBefore = rawBefore.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawBefore.close();
-
-    // Matching key: succeeds and reports unchanged
-    const initResult = IdentityService.initialize(
-      { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
-      ctx.dbPath,
-    );
-    expect(initResult).toEqual({
-      userId: ctx.userA,
-      workspaceId: ctx.workspaceA,
-      created: false,
-    });
-
-    const rawAfter = new DatabaseSync(ctx.dbPath);
-    const keysAfter = rawAfter.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawAfter.close();
-    expect(keysAfter).toEqual(keysBefore);
-
-    // Non-matching key: fails and never rotates
-    expect(() =>
-      IdentityService.initialize(
-        { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: "different-key" },
-        ctx.dbPath,
-      ),
-    ).toThrow(/different active key/);
-
-    const rawAfterFail = new DatabaseSync(ctx.dbPath);
-    const keysAfterFail = rawAfterFail.prepare("SELECT * FROM api_keys ORDER BY id ASC;").all();
-    rawAfterFail.close();
-    expect(keysAfterFail).toEqual(keysBefore);
-  });
-
-  it("L. Key-substitution invariant: stale expected key id fails safely without rotating a newer/different active key or mutating unrelated credentials", async () => {
-    const ctx = await createMultiRowCtx();
-    const store = IdentityStore.open(ctx.dbPath);
-    cleanupStores.push(store);
-
-    const rawBefore = new DatabaseSync(ctx.dbPath);
-    const aliceKeysBefore = rawBefore
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userA);
-    const bobKeysBefore = rawBefore
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    rawBefore.close();
-
-    // 1. Calling rotateUserKeyToDigest with a stale/non-existent expectedActiveKeyId fails safely
-    expect(() =>
-      store.rotateUserKeyToDigest(ctx.userA, "ak_alice_stale", sha256Hex("new-key-1")),
-    ).toThrow(IdentityStructureError);
-
-    // Verify no mutation occurred for either user
-    const rawMid = new DatabaseSync(ctx.dbPath);
-    expect(
-      rawMid.prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;").all(ctx.userA),
-    ).toEqual(aliceKeysBefore);
-    expect(
-      rawMid.prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;").all(ctx.userB),
-    ).toEqual(bobKeysBefore);
-    rawMid.close();
-
-    // 2. Calling rotateUserKeyToDigest with Bob's key ID for Alice fails safely
-    expect(() =>
-      store.rotateUserKeyToDigest(ctx.userA, "ak_bob_1", sha256Hex("new-key-2")),
-    ).toThrow(IdentityStructureError);
-
-    // 3. Simulate TOCTOU: suppose Alice's key was successfully rotated from ak_alice_1 to a new key.
-    // A concurrent / stale caller still presenting ak_alice_1 must fail and cannot rotate the new active key.
-    store.rotateUserKeyToDigest(ctx.userA, "ak_alice_1", sha256Hex("alice-key-v2"));
-
-    const rawAfterFirst = new DatabaseSync(ctx.dbPath);
-    const aliceKeysAfterFirst = rawAfterFirst
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userA) as Array<{ id: string; user_id: string; key_digest: string; revoked_at: number | null }>;
-    rawAfterFirst.close();
-
-    const activeKeyAfterFirst = aliceKeysAfterFirst.find((k) => k.revoked_at === null)!;
-    expect(activeKeyAfterFirst.key_digest).toBe(sha256Hex("alice-key-v2"));
-    expect(activeKeyAfterFirst.id).not.toBe("ak_alice_1");
-
-    // Stale rotation attempt using the now-revoked ak_alice_1
-    expect(() =>
-      store.rotateUserKeyToDigest(ctx.userA, "ak_alice_1", sha256Hex("alice-key-v3")),
-    ).toThrow(IdentityStructureError);
-
-    // Verify the newer active key was NOT rotated and Bob's keys remain untouched
-    const rawFinal = new DatabaseSync(ctx.dbPath);
-    const aliceKeysFinal = rawFinal
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userA);
-    const bobKeysFinal = rawFinal
-      .prepare("SELECT id, user_id, key_digest, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY id ASC;")
-      .all(ctx.userB);
-    rawFinal.close();
-
-    expect(aliceKeysFinal).toEqual(aliceKeysAfterFirst);
-    expect(bobKeysFinal).toEqual(bobKeysBefore);
+    expect(service.storeInstance.resolveCredentialByKey("ak_alice_1", ctx.userA)).toBeNull();
   });
 });

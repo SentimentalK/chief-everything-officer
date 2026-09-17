@@ -42,7 +42,7 @@ describe("Config Validation", () => {
 
   describe("Git Identity Attribution", () => {
     it("defaults author and committer to CEO State MCP when unconfigured", () => {
-      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));
+      const config = loadConfig(baseEnv({}));
       expect(config.gitCommitterName).toBe("CEO State MCP");
       expect(config.gitCommitterEmail).toBe("ceo-mcp@users.noreply.github.com");
       expect(config.gitAuthorName).toBe("CEO State MCP");
@@ -52,7 +52,6 @@ describe("Config Validation", () => {
     it("credits user as author while keeping CEO runtime as committer", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_GIT_AUTHOR_NAME: "Xinghan Xu",
           CEO_GIT_AUTHOR_EMAIL: "kevinxu.senti@gmail.com",
         }),
@@ -66,7 +65,6 @@ describe("Config Validation", () => {
     it("allows independent customization of all four identity fields", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_GIT_AUTHOR_NAME: "Author Name",
           CEO_GIT_AUTHOR_EMAIL: "author@example.com",
           CEO_GIT_COMMITTER_NAME: "Custom Committer",
@@ -82,7 +80,7 @@ describe("Config Validation", () => {
 
   describe("Content Resolver Configuration", () => {
     it("disables resolver when both URL and token are omitted", () => {
-      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));
+      const config = loadConfig(baseEnv({}));
       expect(config.contentResolverUrl).toBeUndefined();
       expect(config.contentResolverToken).toBeUndefined();
       expect(config.contentResolverTimeoutMs).toBe(5000);
@@ -91,7 +89,6 @@ describe("Config Validation", () => {
     it("enables resolver when both URL and token are provided", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CONTENT_RESOLVER_URL: "http://content-resolver.local:8000",
           CONTENT_RESOLVER_TOKEN: "internal-secret-token",
           CONTENT_RESOLVER_TIMEOUT_MS: "3000",
@@ -105,7 +102,7 @@ describe("Config Validation", () => {
     it("throws when only URL is provided", () => {
       expect(() =>
         loadConfig(
-          baseEnv({ CEO_REMOTE: "repo.git", CONTENT_RESOLVER_URL: "http://content-resolver.local:8000" }),
+          baseEnv({ CONTENT_RESOLVER_URL: "http://content-resolver.local:8000" }),
         ),
       ).toThrow(
         "Invalid configuration: CONTENT_RESOLVER_URL and CONTENT_RESOLVER_TOKEN must both be set or both be omitted.",
@@ -114,7 +111,7 @@ describe("Config Validation", () => {
 
     it("throws when only token is provided", () => {
       expect(() =>
-        loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CONTENT_RESOLVER_TOKEN: "internal-secret-token" })),
+        loadConfig(baseEnv({ CONTENT_RESOLVER_TOKEN: "internal-secret-token" })),
       ).toThrow(
         "Invalid configuration: CONTENT_RESOLVER_URL and CONTENT_RESOLVER_TOKEN must both be set or both be omitted.",
       );
@@ -124,7 +121,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CONTENT_RESOLVER_URL: "http://content-resolver.local:8000",
             CONTENT_RESOLVER_TOKEN: "token",
             CONTENT_RESOLVER_TIMEOUT_MS: "-50",
@@ -136,12 +132,12 @@ describe("Config Validation", () => {
 
   describe("OAuth Configuration & CEO_PUBLIC_ORIGIN Validation", () => {
     it("allows missing or non-https publicOrigin when OAuth is disabled", () => {
-      const config1 = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "false" }));
+      const config1 = loadConfig(baseEnv({ CEO_OAUTH_ENABLED: "false" }));
       expect(config1.oauthEnabled).toBe(false);
       expect(config1.publicOrigin).toBeUndefined();
 
       const config2 = loadConfig(
-        baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "false", CEO_PUBLIC_ORIGIN: "http://insecure.local" }),
+        baseEnv({ CEO_OAUTH_ENABLED: "false", CEO_PUBLIC_ORIGIN: "http://insecure.local" }),
       );
       expect(config2.oauthEnabled).toBe(false);
       expect(config2.publicOrigin).toBe("http://insecure.local");
@@ -149,13 +145,13 @@ describe("Config Validation", () => {
 
     it("throws when CEO_OAUTH_ENABLED is true but CEO_PUBLIC_ORIGIN is missing", () => {
       expect(() =>
-        loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "true" })),
+        loadConfig(baseEnv({ CEO_OAUTH_ENABLED: "true" })),
       ).toThrow("CEO_PUBLIC_ORIGIN is required when CEO_OAUTH_ENABLED is true");
     });
 
     it("throws when CEO_PUBLIC_ORIGIN is not a valid URL", () => {
       expect(() =>
-        loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_OAUTH_ENABLED: "true", CEO_PUBLIC_ORIGIN: "not-a-url" })),
+        loadConfig(baseEnv({ CEO_OAUTH_ENABLED: "true", CEO_PUBLIC_ORIGIN: "not-a-url" })),
       ).toThrow("CEO_PUBLIC_ORIGIN must be a valid URL");
     });
 
@@ -163,7 +159,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_ENABLED: "true",
             CEO_PUBLIC_ORIGIN: "http://ceo.sentimentalk.com",
           }),
@@ -175,7 +170,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_ENABLED: "true",
             CEO_PUBLIC_ORIGIN: "https://user:pass@ceo.sentimentalk.com",
           }),
@@ -187,7 +181,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_ENABLED: "true",
             CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com/subpath",
           }),
@@ -199,7 +192,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_ENABLED: "true",
             CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com?query=1",
           }),
@@ -209,7 +201,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_ENABLED: "true",
             CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com#fragment",
           }),
@@ -220,7 +211,6 @@ describe("Config Validation", () => {
     it("accepts valid https origin and normalizes trailing slash", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_OAUTH_ENABLED: "true",
           CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com/",
         }),
@@ -232,7 +222,6 @@ describe("Config Validation", () => {
     it("accepts valid https origin with custom port", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_OAUTH_ENABLED: "true",
           CEO_PUBLIC_ORIGIN: "https://localhost:8443",
         }),
@@ -244,7 +233,7 @@ describe("Config Validation", () => {
 
   describe("OAuth DCR Configuration", () => {
     it("defaults DCR to disabled with oauth-dcr.sqlite under identity/", () => {
-      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git", CEO_DATA_ROOT: "/custom/data" }));
+      const config = loadConfig(baseEnv({ CEO_DATA_ROOT: "/custom/data" }));
       expect(config.oauthDcrEnabled).toBe(false);
       expect(config.oauthDcrDbPath).toBe("/custom/data/identity/oauth-dcr.sqlite");
     });
@@ -253,7 +242,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_OAUTH_DCR_ENABLED: "true",
           }),
         ),
@@ -263,7 +251,6 @@ describe("Config Validation", () => {
     it("accepts DCR when OAuth is enabled", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_OAUTH_ENABLED: "true",
           CEO_OAUTH_DCR_ENABLED: "true",
           CEO_PUBLIC_ORIGIN: "https://ceo.sentimentalk.com",
@@ -277,7 +264,6 @@ describe("Config Validation", () => {
     it("defaults protocol origins to empty and independent of ALLOWED_ORIGINS", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           ALLOWED_ORIGINS: "https://ceo-web.example",
         }),
       );
@@ -288,7 +274,6 @@ describe("Config Validation", () => {
     it("parses CEO_PROTOCOL_ALLOWED_ORIGINS without changing product origins", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           ALLOWED_ORIGINS: "https://ceo-web.example",
           CEO_PROTOCOL_ALLOWED_ORIGINS: "https://gemini.google.com, https://future-host.example",
         }),
@@ -303,7 +288,7 @@ describe("Config Validation", () => {
 
   describe("GitHub App Configuration", () => {
     it("defaults to disabled when omitted and preserves old deployment config", () => {
-      const config = loadConfig(baseEnv({ CEO_REMOTE: "repo.git" }));
+      const config = loadConfig(baseEnv({}));
       expect(config.githubAppEnabled).toBe(false);
       expect(config.githubAppClientId).toBeUndefined();
     });
@@ -312,7 +297,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_GITHUB_APP_ENABLED: "true",
           }),
         ),
@@ -323,7 +307,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_GITHUB_APP_ENABLED: "true",
             CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
           }),
@@ -335,7 +318,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_GITHUB_APP_ENABLED: "true",
             CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
             CEO_GITHUB_APP_CLIENT_SECRET: "secret",
@@ -348,7 +330,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_GITHUB_APP_ENABLED: "true",
             CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
             CEO_GITHUB_APP_CLIENT_SECRET: "secret",
@@ -362,7 +343,6 @@ describe("Config Validation", () => {
       expect(() =>
         loadConfig(
           baseEnv({
-            CEO_REMOTE: "repo.git",
             CEO_GITHUB_APP_ENABLED: "true",
             CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
             CEO_GITHUB_APP_CLIENT_SECRET: "secret",
@@ -377,7 +357,6 @@ describe("Config Validation", () => {
       // package.json exists and can be used as a stand-in existing file
       const config = loadConfig(
         baseEnv({
-          CEO_REMOTE: "repo.git",
           CEO_GITHUB_APP_ENABLED: "true",
           CEO_GITHUB_APP_CLIENT_ID: "Iv1.test",
           CEO_GITHUB_APP_CLIENT_SECRET: "secret123",

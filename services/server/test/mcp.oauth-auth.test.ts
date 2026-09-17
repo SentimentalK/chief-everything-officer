@@ -9,10 +9,10 @@ import {
 } from "../src/oauth/store.js";
 import {
   IdentityStore,
-  provisionEmptyIdentityDatabase,
   sha256Hex,
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
+import { seedIdentity } from "./helpers.js";
 import { OAuthService } from "../src/oauth/service.js";
 import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
 import { createMcpAuthMiddleware, createIdentityAuthMiddleware } from "../src/auth.js";
@@ -32,23 +32,11 @@ async function setupMcpAuthTestApp() {
   cleanupDirs.push(dir);
 
   const rawApiKey = "test-legacy-mcp-api-key";
-  const apiKeyDigest = sha256Hex(rawApiKey);
 
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = provisionEmptyIdentityDatabase(identDbPath, {
-    remoteUrl: "git@example.com:test/repo.git",
-    branch: "main",
-    apiKeyDigest,
-  });
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, rawApiKey);
 
-  const identityService = IdentityService.open(
-    {
-      remoteUrl: "git@example.com:test/repo.git",
-      branch: "main",
-      envApiKey: rawApiKey,
-    },
-    identDbPath
-  );
+  const identityService = IdentityService.open(identDbPath);
   cleanupIdentServices.push(identityService);
 
   const oauthDbPath = path.join(dir, "oauth.sqlite");
@@ -382,17 +370,9 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-no-oauth-test-"));
     cleanupDirs.push(dir);
     const rawApiKey = "legacy-only-key";
-    const apiKeyDigest = sha256Hex(rawApiKey);
     const identDbPath = path.join(dir, "identity.sqlite");
-    provisionEmptyIdentityDatabase(identDbPath, {
-      remoteUrl: "git@example.com:test/repo.git",
-      branch: "main",
-      apiKeyDigest,
-    });
-    const identityService = IdentityService.open(
-      { remoteUrl: "git@example.com:test/repo.git", branch: "main", envApiKey: rawApiKey },
-      identDbPath
-    );
+    seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, rawApiKey);
+    const identityService = IdentityService.open(identDbPath);
     cleanupIdentServices.push(identityService);
 
     const app = express();

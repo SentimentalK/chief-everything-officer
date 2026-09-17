@@ -148,20 +148,13 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     oauthDb.exec(`PRAGMA user_version = ${OAUTH_DB_USER_VERSION};`);
     oauthDb.close();
 
-    const identityService = IdentityService.open(
-      {
-        remoteUrl: "git@github.com:org/deploy.git",
-        branch: "main",
-        envApiKey: "key_deploy",
-      },
-      dbPath,
-    );
+    const identityService = IdentityService.open(dbPath);
     cleanupServices.push(identityService);
 
     const oauthStore = new OAuthStore(oauthDbPath);
     cleanupOAuthStores.push(oauthStore);
 
-    const oauthService = new OAuthService(oauthStore, identityService.store, {
+    const oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
       publicOrigin: "http://localhost:3000",
       clientResolver: {
         getClient: async () => ({
@@ -248,8 +241,8 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     expect(bodyMulti.error.message).toBe("Forbidden: workspace selection required");
 
     // 4. DB failure in listWorkspaceMembershipsForUser returns 503
-    const origList = identityService.store.listWorkspaceMembershipsForUser.bind(identityService.store);
-    identityService.store.listWorkspaceMembershipsForUser = () => {
+    const origList = identityService.storeInstance.listWorkspaceMembershipsForUser.bind(identityService.storeInstance);
+    identityService.storeInstance.listWorkspaceMembershipsForUser = () => {
       throw new IdentityDbUnavailable("DB disconnected");
     };
 
@@ -260,7 +253,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
       expect(body503.error.code).toBe(-32050);
       expect(body503.error.message).toBe("Identity service unavailable");
     } finally {
-      identityService.store.listWorkspaceMembershipsForUser = origList;
+      identityService.storeInstance.listWorkspaceMembershipsForUser = origList;
     }
   });
 

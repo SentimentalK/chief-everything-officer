@@ -7,10 +7,9 @@ import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import {
   IdentityStore,
-  provisionEmptyIdentityDatabase,
-  sha256Hex,
   IdentityConflictError,
 } from "../src/identity/store.js";
+import { seedIdentity } from "./helpers.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
 import { GitHubAppClient, GitHubAppError } from "../src/github/app-client.js";
 import {
@@ -66,11 +65,7 @@ async function createTestContext(options?: { withoutInitialWorkspace?: boolean }
   cleanupDirs.push(dir);
   const dbPath = path.join(dir, "identity.sqlite");
 
-  const ident = provisionEmptyIdentityDatabase(dbPath, {
-    remoteUrl: "git@example.com:test/repo.git",
-    branch: "main",
-    apiKeyDigest: sha256Hex("test-key"),
-  });
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
 
   const store = IdentityStore.open(dbPath);
   cleanupStores.push(store);

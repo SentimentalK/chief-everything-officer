@@ -12,7 +12,7 @@ import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { BUILD_INFO } from "../src/build-info.js";
-import { fixture, createIdentityService } from "./helpers.js";
+import { fixture, createIdentityService, requestIdentity } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
 const cleanupDirs: string[] = [];
@@ -129,7 +129,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     // remote/branch/key tuple that this real HTTP server will validate requests against.
     const identityService = createIdentityService(config, "secret-test-token-123");
     cleanupServices.push(identityService);
-    const workspaceIdentity = identityService.workspaceIdentityValue;
+    const workspaceIdentity = requestIdentity(identityService, "secret-test-token-123");
 
     const app = createMcpExpressApp({ host: config.bindHost });
     const handler = createMcpHandler(() => createMcpServer(workspace, policy, { identity: workspaceIdentity }), { legacy: "reject" });

@@ -183,14 +183,7 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
 
     db.close();
 
-    const identityService = IdentityService.open(
-      {
-        remoteUrl: upstream1,
-        branch: "main",
-        envApiKey: "key_alice",
-      },
-      dbPath,
-    );
+    const identityService = IdentityService.open(dbPath);
     cleanupServices.push(identityService);
 
     // Workspace factory using local file:// URLs for the upstream bare repos

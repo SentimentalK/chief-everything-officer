@@ -19,7 +19,7 @@ import {
   requestKey,
   KEY_STREAM,
 } from "../src/jobs/schema.js";
-import { fixture, createIdentityService } from "./helpers.js";
+import { fixture, createIdentityService, requestIdentity } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
 const URL = process.env.CEO_REDIS_URL;
@@ -131,7 +131,7 @@ async function buildServer(
   });
   cleanupServers.push(server);
   const port = (server.address() as AddressInfo).port;
-  return { baseUrl: `http://127.0.0.1:${port}`, identity: identityService.workspaceIdentityValue };
+  return { baseUrl: `http://127.0.0.1:${port}`, identity: requestIdentity(identityService, API_KEY) };
 }
 
 async function captureStderr(fn: () => Promise<void>): Promise<string[]> {
