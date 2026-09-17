@@ -1880,6 +1880,21 @@ export class IdentityStore {
     });
   }
 
+  listWorkspaceMembershipsForUser(userId: string): Array<{
+    id: string;
+    workspace_id: string;
+    user_id: string;
+    role: string;
+    created_at: number;
+  }> {
+    return this.withDb((db) => {
+      const rows = db.prepare(
+        "SELECT id, workspace_id, user_id, role, created_at FROM workspace_memberships WHERE user_id = ? ORDER BY created_at ASC, workspace_id ASC;",
+      ).all(userId) as Array<{ id: string; workspace_id: string; user_id: string; role: string; created_at: number }>;
+      return rows;
+    });
+  }
+
   getOwnerMembershipForWorkspace(workspaceId: string): {
     id: string;
     workspace_id: string;

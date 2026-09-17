@@ -27,7 +27,7 @@ export class OAuthServerError extends Error {
 
 export interface OAuthServiceOptions {
   publicOrigin: string;
-  workspaceId: string;
+  workspaceId?: string; // Optional during transition, ignored
   clientResolver: OAuthClientResolver;
   registrationEndpoint?: string;
   authCodeTtlMs?: number; // default 5m
@@ -74,7 +74,6 @@ export function validateCanonicalResource(uri: unknown, canonicalResource: strin
 export class OAuthService {
   readonly publicOrigin: string;
   readonly canonicalResource: string;
-  readonly workspaceId: string;
   private readonly store: OAuthStore;
   private readonly identityStore: IdentityStore;
   private readonly clientResolver: OAuthClientResolver;
@@ -93,7 +92,6 @@ export class OAuthService {
     this.identityStore = identityStore;
     this.publicOrigin = options.publicOrigin.replace(/\/+$/, "");
     this.canonicalResource = `${this.publicOrigin}/mcp`;
-    this.workspaceId = options.workspaceId;
     this.clientResolver = options.clientResolver;
     this.registrationEndpoint = options.registrationEndpoint;
     this.authCodeTtlMs = options.authCodeTtlMs ?? DEFAULT_AUTH_CODE_TTL_MS;
@@ -253,9 +251,14 @@ export class OAuthService {
     if (!this.identityStore.isUserActive(userId)) {
       throw new OAuthServerError("access_denied", "User is disabled or inactive", 403);
     }
-    if (!this.identityStore.hasWorkspaceAccess(this.workspaceId, userId)) {
-      throw new OAuthServerError("access_denied", "User does not have access to deployment workspace", 403);
+    const memberships = this.identityStore.listWorkspaceMembershipsForUser(userId);
+    if (memberships.length === 0) {
+      throw new OAuthServerError("access_denied", "User has no accessible workspaces", 403);
     }
+    if (memberships.length > 1) {
+      throw new OAuthServerError("access_denied", "Workspace selection required", 403);
+    }
+    const workspaceId = memberships[0]!.workspace_id;
 
     const nonceDigest = sha256Hex(nonce);
     const now = Date.now();
@@ -267,7 +270,7 @@ export class OAuthService {
       requestId,
       nonceDigest,
       userId,
-      workspaceId: this.workspaceId,
+      workspaceId,
       codeId,
       codeDigest,
       nowMs: now,
@@ -423,9 +426,7 @@ export class OAuthService {
 
     // Identity validation: user still active & has workspace access
     const userActive = this.identityStore.isUserActive(existing.user_id);
-    const workspaceValid =
-      existing.workspace_id === this.workspaceId &&
-      this.identityStore.hasWorkspaceAccess(existing.workspace_id, existing.user_id);
+    const workspaceValid = this.identityStore.hasWorkspaceAccess(existing.workspace_id, existing.user_id);
 
     if (!userActive || !workspaceValid) {
       // Invalidate the token family
@@ -527,11 +528,8 @@ export class OAuthService {
       return { valid: false, error: "invalid_token", description: "User is disabled or inactive" };
     }
 
-    if (
-      record.workspace_id !== this.workspaceId ||
-      !this.identityStore.hasWorkspaceAccess(record.workspace_id, record.user_id)
-    ) {
-      return { valid: false, error: "invalid_token", description: "Workspace mismatch or access denied" };
+    if (!this.identityStore.hasWorkspaceAccess(record.workspace_id, record.user_id)) {
+      return { valid: false, error: "invalid_token", description: "Workspace access denied" };
     }
 
     return {

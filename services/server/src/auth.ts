@@ -1,6 +1,9 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import type { IdentityService, AuthIdentity } from "./identity/service.js";
-import { WorkspaceAccessDeniedError } from "./identity/service.js";
+import {
+  WorkspaceAccessDeniedError,
+  WorkspaceSelectionRequiredError,
+} from "./identity/service.js";
 import { IdentityDbUnavailable } from "./identity/store.js";
 
 declare global {
@@ -15,9 +18,9 @@ declare global {
  * Single unified bearer credential entry point. Every protected route (/mcp,
  * /api/audit/traces bearer, /api/identity) resolves identity here.
  *
- * Status contract (single deployment workspace):
+ * Status contract:
  *   - missing / wrong / revoked key, or disabled user  -> 401
- *   - authenticated but lacks workspace access -> 403
+ *   - authenticated but lacks workspace access or requires selection -> 403
  *   - identity database unavailable on a live request  -> 503
  *
  * Identity is never taken from the body, query, or X-User-ID.
@@ -37,13 +40,18 @@ export function createIdentityAuthMiddleware(identityService: IdentityService): 
         return;
       }
       try {
-        identity = identityService.assertWorkspaceAccess(credential);
+        identity = identityService.resolveRequestIdentity(credential);
       } catch (error) {
-        if (error instanceof WorkspaceAccessDeniedError) {
-          process.stderr.write(`auth: rejected workspace binding\n`);
+        if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
+          process.stderr.write(`auth: rejected workspace binding: ${error.message}\n`);
           res.status(403).json({
             jsonrpc: "2.0",
-            error: { code: -32003, message: "Forbidden: workspace access denied" },
+            error: {
+              code: -32003,
+              message: error instanceof WorkspaceSelectionRequiredError
+                ? "Forbidden: workspace selection required"
+                : "Forbidden: workspace access denied",
+            },
             id: null,
           });
           return;
@@ -113,15 +121,20 @@ export function createMcpAuthMiddleware(
       const apiKeyResult = identityService.authenticateApiKey(token);
       if (apiKeyResult !== null) {
         try {
-          const authIdentity = identityService.assertWorkspaceAccess(apiKeyResult);
+          const authIdentity = identityService.resolveRequestIdentity(apiKeyResult);
           res.locals.identity = authIdentity;
           next();
           return;
         } catch (error) {
-          if (error instanceof WorkspaceAccessDeniedError) {
+          if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
             res.status(403).json({
               jsonrpc: "2.0",
-              error: { code: -32003, message: "Forbidden: workspace access denied" },
+              error: {
+                code: -32003,
+                message: error instanceof WorkspaceSelectionRequiredError
+                  ? "Forbidden: workspace selection required"
+                  : "Forbidden: workspace access denied",
+              },
               id: null,
             });
             return;

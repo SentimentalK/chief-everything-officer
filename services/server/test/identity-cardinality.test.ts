@@ -357,11 +357,22 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(serviceA.authenticateApiKey(ctx.keyA)).toBeNull();
   });
 
-  it("I. API key A reaches current runtime; valid key B is recognized as authenticated but rejected 403 for runtime A; unknown/revoked key remains 401", async () => {
+  it("I. API key A and B resolve request-scoped workspace identities; user with 0 workspaces rejected 403; unknown/revoked key remains 401", async () => {
     const ctx = await createMultiRowCtx();
 
-    // Add a revoked key for Alice
+    // Add a user Charlie with a valid key but 0 workspace memberships
+    const userC = "usr_charlie";
+    const keyC = "secret-key-charlie";
     const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(userC, 1000);
+    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
+      "ak_charlie_1",
+      userC,
+      sha256Hex(keyC),
+      1000,
+    );
+
+    // Add a revoked key for Alice
     raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
       "ak_alice_revoked",
       ctx.userA,
@@ -391,7 +402,7 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     const port = (server.address() as AddressInfo).port;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    // 1. Key A succeeds -> 200
+    // 1. Key A succeeds -> 200 with Alice & Workspace A
     const resA = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${ctx.keyA}` },
     });
@@ -400,19 +411,33 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     expect(bodyA.identity.user_id).toBe(ctx.userA);
     expect(bodyA.identity.workspace_id).toBe(ctx.workspaceA);
 
-    // 2. Key B is valid credential for Bob but not authorized for runtime A -> 403
+    // 2. Key B is valid credential for Bob -> succeeds 200 with request-scoped Workspace B
     const resB = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer ${ctx.keyB}` },
     });
-    expect(resB.status).toBe(403);
+    expect(resB.status).toBe(200);
+    const bodyB = (await resB.json()) as { identity: { user_id: string; workspace_id: string } };
+    expect(bodyB.identity.user_id).toBe(ctx.userB);
+    expect(bodyB.identity.workspace_id).toBe(ctx.workspaceB);
 
-    // 3. Unknown key -> 401
+    // Bob attempting to assert access to Runtime A's workspace fails with 403
+    const credB = serviceA.authenticateApiKey(ctx.keyB);
+    expect(credB).not.toBeNull();
+    expect(() => serviceA.assertWorkspaceAccess(credB!)).toThrow(WorkspaceAccessDeniedError);
+
+    // 3. Key C has valid credential but 0 workspace memberships -> 403
+    const resC = await fetch(`${baseUrl}/test`, {
+      headers: { Authorization: `Bearer ${keyC}` },
+    });
+    expect(resC.status).toBe(403);
+
+    // 4. Unknown key -> 401
     const resUnknown = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer not-a-real-key` },
     });
     expect(resUnknown.status).toBe(401);
 
-    // 4. Revoked key -> 401
+    // 5. Revoked key -> 401
     const resRevoked = await fetch(`${baseUrl}/test`, {
       headers: { Authorization: `Bearer revoked-alice-key` },
     });
@@ -421,6 +446,19 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
 
   it("I2. DB failure during workspace-authorization phase returns 503, while access denial returns 403 and unexpected errors return 500", async () => {
     const ctx = await createMultiRowCtx();
+
+    // Add a user Charlie with 0 workspace memberships
+    const userC = "usr_charlie_i2";
+    const keyC = "secret-key-charlie-i2";
+    const raw = new DatabaseSync(ctx.dbPath);
+    raw.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(userC, 1000);
+    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
+      "ak_charlie_i2",
+      userC,
+      sha256Hex(keyC),
+      1000,
+    );
+    raw.close();
 
     const serviceA = IdentityService.open(
       { remoteUrl: ctx.remoteA, branch: ctx.branchA, envApiKey: ctx.keyA },
@@ -447,16 +485,16 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
     });
     expect(normalRes.status).toBe(200);
 
-    // Verify key B is 403 (ordinary access denial)
-    const resB = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${ctx.keyB}` },
+    // Verify key C (0 memberships) is 403 (ordinary access denial)
+    const resC = await fetch(`${baseUrl}/test`, {
+      headers: { Authorization: `Bearer ${keyC}` },
     });
-    expect(resB.status).toBe(403);
+    expect(resC.status).toBe(403);
 
     // Simulate DB failure during workspace-authorization phase:
-    // credential authentication succeeds (authenticateApiKey works), but hasWorkspaceAccess throws IdentityDbUnavailable.
-    const origMethod = serviceA.store.hasWorkspaceAccess.bind(serviceA.store);
-    serviceA.store.hasWorkspaceAccess = () => {
+    // credential authentication succeeds, but listWorkspaceMembershipsForUser throws IdentityDbUnavailable.
+    const origMethod = serviceA.store.listWorkspaceMembershipsForUser.bind(serviceA.store);
+    serviceA.store.listWorkspaceMembershipsForUser = () => {
       throw new IdentityDbUnavailable("Simulated DB connection lost during workspace check");
     };
 
@@ -472,11 +510,11 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.hasWorkspaceAccess = origMethod;
+      serviceA.store.listWorkspaceMembershipsForUser = origMethod;
     }
 
     // Verify that unrelated unexpected programming errors return 500 (not mislabeled as 503)
-    serviceA.store.hasWorkspaceAccess = () => {
+    serviceA.store.listWorkspaceMembershipsForUser = () => {
       throw new TypeError("Unrelated unexpected programming error");
     };
 
@@ -492,7 +530,7 @@ describe("CEO Step 3.1: Identity database cardinality decoupling", () => {
         id: null,
       });
     } finally {
-      serviceA.store.hasWorkspaceAccess = origMethod;
+      serviceA.store.listWorkspaceMembershipsForUser = origMethod;
     }
   });
 

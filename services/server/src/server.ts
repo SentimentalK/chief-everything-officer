@@ -144,10 +144,11 @@ app.get(
   createOriginGuard(config.allowedOrigins),
   createIdentityAuthMiddleware(identityService),
   (_req: Request, res: Response) => {
+    const identity = res.locals.identity!;
     res.status(200).json({
-      user_id: identityService.workspaceIdentityValue.user_id,
-      workspace_id: identityService.workspaceIdentityValue.workspace_id,
-      deployment_mode: "single_workspace_runtime",
+      user_id: identity.user_id,
+      workspace_id: identity.workspace_id,
+      deployment_mode: "request_scoped_workspace",
     });
   },
 );
