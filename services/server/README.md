@@ -1,6 +1,6 @@
 # CEO Server (@sentimentalk/ceo-server)
 
-A narrow, Git-backed MCP and state server for the user's durable personal state workspace. It exposes MCP tools for safe state interaction, runtime policy queries, and audit trace persistence. The audit web console is maintained separately in `web/`.
+A Git-backed MCP and state server for durable personal workspaces. It exposes MCP tools for safe state interaction, runtime policy queries, and audit trace persistence. Each authenticated request resolves a workspace from DB-backed credentials; the process no longer clones or serves a single deployment repository at startup. The audit web console is maintained separately in `web/`.
 
 ## Tools
 
@@ -21,84 +21,103 @@ Some hosts may expose stale MCP tool-discovery metadata even after the server ru
 
 Requires Node.js 22+ and Git.
 
+## Data layout
+
+```
+CEO_DATA_ROOT
+├── identity/          # control-plane SQLite (users, workspaces, keys)
+├── audit/             # workspace-scoped trace database
+└── workspaces/
+    └── <workspace_id>/
+        ├── repo/
+        ├── txns/
+        └── state/
+```
+
+Git repositories are created per workspace under `workspaces/<workspace_id>/` when a request-scoped runtime is resolved. The server does not keep a process-global `repo/`, `txns/`, or `state/` directory.
+
 ## Runtime configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CEO_DATA_ROOT` | `/data` | Parent of `repo/`, `txns/`, `state/`, `audit/`, and `identity/` |
-| `CEO_REMOTE` | **(required)** | Fixed Git origin URL (startup fails if missing) |
-| `CEO_BRANCH` | `main` | Fixed writable branch |
-| `CEO_SSH_KEY_PATH` | unset | Read/write deploy key path |
+| `CEO_DATA_ROOT` | `/data` | Parent of `identity/`, `audit/`, and `workspaces/` |
+| `CEO_GITHUB_APP_ENABLED` | **required `true` at startup** | GitHub App is a mandatory server capability |
+| `CEO_GITHUB_APP_CLIENT_ID` | (required when enabled) | GitHub App client id |
+| `CEO_GITHUB_APP_CLIENT_SECRET` | (required when enabled) | GitHub App client secret |
+| `CEO_GITHUB_APP_SLUG` | (required when enabled) | GitHub App slug |
+| `CEO_GITHUB_APP_PRIVATE_KEY_PATH` | (required when enabled) | PEM private key path; file must exist. Constructor parses the key; GitHub network calls happen later on workspace git operations |
+| `CEO_GITHUB_APP_CALLBACK_URL` | derived | Optional App callback URL |
 | `CEO_GIT_AUTHOR_NAME` | `CEO_GIT_COMMITTER_NAME` | Author name (credited as author of user-directed canonical changes) |
-| `CEO_GIT_AUTHOR_EMAIL` | `CEO_GIT_COMMITTER_EMAIL` | Author email (associated with user GitHub account for contribution credit) |
+| `CEO_GIT_AUTHOR_EMAIL` | `CEO_GIT_COMMITTER_EMAIL` | Author email |
 | `CEO_GIT_COMMITTER_NAME` | `CEO State MCP` | Runtime identity committing on behalf of the user |
 | `CEO_GIT_COMMITTER_EMAIL` | `ceo-mcp@users.noreply.github.com` | Service identity email |
 | `BIND_HOST` | `127.0.0.1` | HTTP bind host; use `0.0.0.0` for K3s Ingress |
-| `PORT` | `3000` | MCP HTTP port |
-| `MCP_API_KEY` | **(required, all binds)** | Static Bearer token; leading/trailing whitespace is rejected |
+| `PORT` | `3000` | HTTP port |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames accepted by the Host guard |
 | `ALLOWED_ORIGINS` | (empty) | Comma-separated Origins for CEO product/API Origin guard; absent Origin is always allowed |
 | `CEO_PROTOCOL_ALLOWED_ORIGINS` | (empty) | Comma-separated Origins allowed as browser MCP/OAuth protocol clients; independent of `ALLOWED_ORIGINS` |
+| `CEO_BRIDGE_ENABLED` | `false` | Enable Worker job bridge (Redis) |
+| `CEO_REDIS_URL` | unset | Redis URL when the bridge is enabled. Redis is not a `/readyz` blocker |
+| `CEO_OAUTH_ENABLED` | `false` | Enable OAuth 2.1; requires `CEO_PUBLIC_ORIGIN` (https origin) |
+
+`CEO_REMOTE`, `CEO_BRANCH`, `CEO_SSH_KEY_PATH`, and `MCP_API_KEY` are not server configuration. Authentication is DB-backed; workspace git uses GitHub App installation credentials.
 
 ## Authentication
 
-Requests authenticate against the stored identity, not against a raw env value.
+Requests authenticate against the stored identity, not against a process env token.
 
-- `Authorization: Bearer <MCP_API_KEY>` is verified by digest against the active
-  stored key; the owning user and workspace must be enabled and bound to the
-  deployment's `CEO_REMOTE`/`CEO_BRANCH`.
-- Success stores the resolved `AuthIdentity` in `res.locals.identity` per
-  request. Identity is never taken from request bodies, query strings,
-  `X-User-ID`, or a global current user.
-- Status: missing / wrong / revoked key, or disabled user → `401`;
-  authenticated but bound to a different workspace → `403`; identity database
-  unavailable on a live request → `503`.
-- `/healthz` and `/readyz` are unauthenticated and structurally outside the
-  protected middleware scope.
+1. Bearer token → credential (`api_key_id`, `user_id`) via digest lookup. Unknown, revoked, or disabled-user keys return `401`.
+2. Credential → membership. Exactly one accessible workspace is selected as the request workspace. Zero memberships or more than one membership return `403`.
+3. Success stores `AuthIdentity` (`user_id`, `workspace_id`, `api_key_id`) in `res.locals.identity`. Identity is never taken from request bodies, query strings, `X-User-ID`, or a global current user.
+
+Identity database unavailable on a live request → `503`. `/healthz` and `/readyz` are unauthenticated.
 
 `GET /api/identity` (Bearer-authenticated) returns who this key connects to:
-`{ user_id, workspace_id, deployment_mode: "single_workspace_runtime" }`.
 
-The audit console keeps its login endpoint and session cookie but binds
-sessions to the same identity. Audit queries accept either a valid Bearer key
-or the bound session cookie, both identity-checked.
+`{ user_id, workspace_id, deployment_mode: "request_scoped_workspace" }`.
+
+The audit console keeps its login endpoint and session cookie but binds sessions to the same identity. Every Audit request re-verifies that the API key still exists and is not revoked, and that the user still has membership in the session workspace.
+
+Audit traces are stored with `workspace_id NOT NULL` and queried only for the authenticated request workspace. An old Audit SQLite that lacks `workspace_id` is **fail-incompatible, not migrated**. The audit database is disposable: delete the local file and allow a fresh workspace-scoped schema.
 
 ### Persistent identity database
 
-CEO keeps a durable identity in a dedicated SQLite database at
-`<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`).
-The schema supports multiple users, workspaces, and credentials, while the current
-server process explicitly serves one transitional workspace configured via `CEO_REMOTE`
-and `CEO_BRANCH`. The original `MCP_API_KEY` is injected via Kubernetes/Infisical Secret;
-only its SHA-256 digest is stored.
+CEO keeps a durable control-plane identity in `<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`). The schema supports multiple users, workspaces, memberships, and API keys.
 
-This database is **created only by** `node dist/identity/cli.js init`; the
-service never creates one silently. On missing/corrupt/structurally-mismatched
-identity the server fails to start and instructs to initialize.
+This database is **created only by** `node dist/identity/cli.js init`; the service never creates one silently. On missing/corrupt/structurally-mismatched identity the server fails to start and instructs to initialize.
 
-### First-deploy / upgrade runbook
+`init` provisions an empty control-plane database: **0 users, 0 workspaces, 0 API keys**. It does not seed a deployment key or a repository binding. Re-running `init` is idempotent and will not overwrite an existing valid database.
+
+The server boots with that empty (or later populated) database and a constructable GitHub App client. It does not clone git at startup. Workspaces appear after product onboarding (GitHub App install → workspace provisioning).
+
+### Readiness
+
+`GET /readyz` checks local control-plane dependencies only:
+
+- `IdentityStore.ping()` (`SELECT 1`)
+- GitHub App client constructed (RSA key parsed)
+
+It does not run git commands, does not call GitHub, and does not require Redis.
+
+### First-deploy runbook
 
 1. Land code + tests and publish the container image.
-2. Stop the old server, keeping the existing `/data` volume and Secrets.
-3. With the new image on the same volume + environment variables, run the
-   one-time initializer:
+2. Configure GitHub App env (`CEO_GITHUB_APP_ENABLED=true` plus client id/secret/slug/private key path) and `CEO_DATA_ROOT`.
+3. Initialize the empty control plane:
    ```bash
    node dist/identity/cli.js init
    ```
-   It reads `MCP_API_KEY`/`CEO_REMOTE`/`CEO_BRANCH`/`CEO_DATA_ROOT` and prints
-   only `user_id`/`workspace_id` (never the key/digest).
-4. Start the new server only after a successful `init`.
-5. With the existing key, verify MCP, Audit, and `GET /api/identity`, then
-   restart to confirm `user_id`/`workspace_id` stay unchanged.
+   Output reports `deployment_mode: multi_workspace_runtime` and the database path. It does not print `user_id`/`workspace_id`.
+4. Start the server. `/readyz` should be `READY` with zero users.
+5. Complete GitHub App install and workspace provisioning so a user, membership, and API key exist. Then verify MCP, Audit, and `GET /api/identity`.
 
-Backups must include `identity/`; it is not a throwaway/log cache and must not
-be cleaned up alongside trace logs. `init` is idempotent: re-running returns the
-existing ids, refuses to rebind to a different repository/branch, and will not
-revive a disabled user or a revoked key.
+If an existing dogfood volume still has a pre-workspace-scoped Audit SQLite, delete `audit/` and let the server create a fresh file. Do not treat that fail-fast as a server regression.
+
+Backups must include `identity/`; it is not a throwaway/log cache. Audit traces may be discarded.
 
 ## Transaction and recovery model
 
-`apply_change_set` requires the base commit and expected blob OIDs returned by a read. It holds a single-writer lock, fetches `origin/main`, creates a detached temporary worktree, validates the actual diff, commits, fetches again, and performs a normal push. A stable `request_id` makes retries idempotent.
+`apply_change_set` requires the base commit and expected blob OIDs returned by a read. It holds a single-writer lock, fetches the workspace remote, creates a detached temporary worktree, validates the actual diff, commits, fetches again, and performs a normal push. A stable `request_id` makes retries idempotent.
 
 If a commit exists but push cannot be verified, `state/pending.json` and its worktree survive Pod restarts. The server retries only when the remote is still at the original base. It finalizes if the remote already contains the commit, and blocks for operator repair if history diverged. It never merges, rebases, resets remote history, or force-pushes.
 
