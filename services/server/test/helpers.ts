@@ -3,8 +3,11 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import type { Config } from "../src/config.js";
+import type { WorkspaceConfig } from "../src/git.js";
 import { provisionEmptyIdentityDatabase, sha256Hex } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
+
+export type TestConfig = Config & WorkspaceConfig & { mcpApiKey: string };
 
 export interface SeededIdentity {
   user_id: string;
@@ -25,7 +28,7 @@ export function git(cwd: string, ...args: string[]): string {
   }).trim();
 }
 
-export async function fixture(options: { tempRoot?: string } = {}): Promise<{ root: string; remote: string; config: Config }> {
+export async function fixture(options: { tempRoot?: string } = {}): Promise<{ root: string; remote: string; config: TestConfig }> {
   const base = options.tempRoot ?? os.tmpdir();
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(path.join(base, "ceo-mcp-test-"));
@@ -47,7 +50,7 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
   git(seed, "commit", "-m", "seed");
   git(seed, "remote", "add", "origin", remote);
   git(seed, "push", "-u", "origin", "main");
-  const config: Config = {
+  const config: TestConfig = {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
     txnDir: path.join(dataRoot, "txns"),
@@ -63,9 +66,17 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
     mcpApiKey: "test-mcp-api-key",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
+    protocolAllowedOrigins: [],
     auditDir: path.join(dataRoot, "audit"),
     auditDbPath: path.join(dataRoot, "audit", "ceo-trace.sqlite"),
     identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
+    contentResolverTimeoutMs: 5000,
+    bridgeEnabled: false,
+    oauthEnabled: false,
+    oauthDbPath: path.join(dataRoot, "identity", "oauth.sqlite"),
+    oauthDcrEnabled: false,
+    oauthDcrDbPath: path.join(dataRoot, "identity", "oauth-dcr.sqlite"),
+    githubAppEnabled: false,
   };
   return { root, remote, config };
 }
@@ -75,20 +86,17 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
  * If an API key is given it overrides config.mcpApiKey for the digest.
  * Records the seeded (stable, single-user) ids.
  */
-export function seedIdentity(config: Config, apiKey = config.mcpApiKey): SeededIdentity {
+export function seedIdentity(config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string }, apiKey = config.mcpApiKey ?? "test-mcp-api-key"): SeededIdentity {
   return provisionEmptyIdentityDatabase(config.identityDbPath, {
-    remoteUrl: config.remoteUrl,
-    branch: config.branch,
+    remoteUrl: config.remoteUrl ?? "dummy-remote",
+    branch: config.branch ?? "main",
     apiKeyDigest: sha256Hex(apiKey),
   });
 }
 
 /** Seeds an identity DB and opens a runtime IdentityService for it. */
-export function createIdentityService(config: Config, apiKey = config.mcpApiKey): IdentityService {
+export function createIdentityService(config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string }, apiKey = config.mcpApiKey ?? "test-mcp-api-key"): IdentityService {
   seedIdentity(config, apiKey);
-  return IdentityService.open(
-    { remoteUrl: config.remoteUrl, branch: config.branch, envApiKey: apiKey },
-    config.identityDbPath,
-  );
+  return IdentityService.open(config.identityDbPath);
 }
 

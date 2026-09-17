@@ -379,6 +379,97 @@ function unlinkDbFiles(dbPath: string): void {
 }
 
 /**
+ * Creates a brand-new, empty control-plane identity database that publishes atomically.
+ * Contains 0 users, 0 workspaces, and 0 API keys with the latest schema.
+ * If the database already exists, it validates the existing database without clobbering.
+ */
+export function provisionEmptyControlPlaneDatabase(dbPath: string): void {
+  const dir = path.dirname(dbPath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const dbPathResolved = path.resolve(dbPath);
+  const dirResolved = path.dirname(dbPathResolved);
+
+  if (fs.existsSync(dbPathResolved)) {
+    const existing = IdentityStore.open(dbPathResolved);
+    existing.close();
+    return;
+  }
+
+  const tmpName = path.join(dirResolved, `.identity-init-${crypto.randomBytes(8).toString("hex")}.sqlite`);
+  let fd: number;
+  try {
+    fd = fs.openSync(tmpName, "wx", 0o600);
+  } catch (error) {
+    throw new IdentityDbUnavailable(`Unable to create provisioning temp file: ${error}`);
+  }
+  try {
+    fs.closeSync(fd);
+  } catch {
+    /* still writable below */
+  }
+
+  try {
+    const db = new DatabaseSync(tmpName);
+    try {
+      db.exec("PRAGMA foreign_keys = ON;");
+      db.exec("PRAGMA journal_mode = DELETE;");
+      db.exec("PRAGMA busy_timeout = 100;");
+
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        db.exec(IDENTITY_DDL);
+        db.exec(`PRAGMA user_version = ${IDENTITY_DB_USER_VERSION};`);
+        db.exec("COMMIT;");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        throw error;
+      }
+      db.close();
+    } catch (error) {
+      try {
+        db.close();
+      } catch {
+        /* ignore */
+      }
+      unlinkDbFiles(tmpName);
+      throw new IdentityStructureError(
+        `Identity database provisioning failed; no database was published: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    try {
+      fs.linkSync(tmpName, dbPathResolved);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") {
+        unlinkDbFiles(tmpName);
+        const existing = IdentityStore.open(dbPathResolved);
+        existing.close();
+        return;
+      }
+      unlinkDbFiles(tmpName);
+      throw new IdentityStructureError(
+        `Identity database could not be published: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    unlinkDbFiles(tmpName);
+  } catch (error) {
+    unlinkDbFiles(tmpName);
+    throw error;
+  }
+}
+
+/**
  * Creates a brand-new identity database that publishes atomically. The DDL,
  * user_version, and initial data all execute inside ONE transaction on a
  * private temp file in the target directory, then the finished file is
@@ -581,6 +672,16 @@ export class IdentityStore {
 
   get path(): string {
     return this.dbPath;
+  }
+
+  ping(): boolean {
+    if (!this.db) return false;
+    try {
+      this.db.prepare("SELECT 1;").get();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private requireDb(): DatabaseSync {

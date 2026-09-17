@@ -1,5 +1,5 @@
 import { loadConfig } from "../config.js";
-import { IdentityService } from "./service.js";
+import { provisionEmptyControlPlaneDatabase } from "./store.js";
 
 const USAGE = `Usage: node dist/identity/cli.js init`;
 
@@ -21,16 +21,11 @@ function main(): void {
   }
 
   try {
-    const result = IdentityService.initialize(
-      { remoteUrl: config.remoteUrl, branch: config.branch, envApiKey: config.mcpApiKey },
-      config.identityDbPath,
-    );
+    provisionEmptyControlPlaneDatabase(config.identityDbPath);
     process.stdout.write(
       [
-        `identity: initialization ${result.created ? "completed" : "already-initialized, unchanged"}`,
-        `  user_id:      ${result.userId}`,
-        `  workspace_id: ${result.workspaceId}`,
-        `  deployment_mode: single_workspace_runtime`,
+        `identity: control-plane database initialized at ${config.identityDbPath}`,
+        `  deployment_mode: multi_workspace_runtime`,
         ``,
       ].join("\n"),
     );
