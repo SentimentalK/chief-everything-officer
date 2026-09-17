@@ -25,7 +25,7 @@ export interface WorkspaceRuntimeRegistryOptions {
     gitCommitterName: string;
     gitCommitterEmail: string;
   };
-  appClient: GitHubAppClient;
+  appClient?: GitHubAppClient;
   credentialProviderFactory?: (descriptor: WorkspaceRuntimeDescriptor) => GitCredentialProvider;
   sharedResourceDependencies?: SharedResourceDependencies;
   workspaceFactory?: (config: WorkspaceRuntimeConfig) => CeoWorkspace;
@@ -73,9 +73,17 @@ export class WorkspaceRuntimeRegistry {
     const stateDir = path.join(workspaceDir, "state");
     const remoteUrl = `https://github.com/${descriptor.fullName}.git`;
 
-    const credentialProvider = this.options.credentialProviderFactory
-      ? this.options.credentialProviderFactory(descriptor)
-      : new GitHubAppGitCredentialProvider(this.options.appClient, descriptor.installationId);
+    let credentialProvider: GitCredentialProvider;
+    if (this.options.credentialProviderFactory) {
+      credentialProvider = this.options.credentialProviderFactory(descriptor);
+    } else if (this.options.appClient) {
+      credentialProvider = new GitHubAppGitCredentialProvider(this.options.appClient, descriptor.installationId);
+    } else {
+      throw new WorkspaceRuntimeResolutionError(
+        "INVALID_WORKSPACE_STATE",
+        "GitHub App is not configured on this server to authenticate workspace repository.",
+      );
+    }
 
     const runtimeConfig: WorkspaceRuntimeConfig = {
       workspaceId,

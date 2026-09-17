@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import express, { type Request, type Response } from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
@@ -34,7 +34,18 @@ import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
 import { createJobAssignmentRouter } from "./jobs/router.js";
+import type { JobAuthScope } from "./jobs/service.js";
 import { resolveResourceLocation } from "./resource/locator.js";
+import { WorkspaceRuntimeRegistry } from "./runtime/registry.js";
+import type { WorkspaceRuntime } from "./runtime/types.js";
+
+declare global {
+  namespace Express {
+    interface Locals {
+      workspaceRuntime?: WorkspaceRuntime;
+    }
+  }
+}
 
 function fatal(prefix: string, error: unknown): never {
   const message = error instanceof Error ? error.message : String(error);
@@ -63,7 +74,40 @@ try {
   fatal("identity", error);
 }
 
-// ---- Git workspace ----
+// ---- GitHub App Client (hoisted for both WorkspaceRuntimeRegistry and GitHub App routes) ----
+let gitHubAppClient: GitHubAppClient | undefined;
+if (config.githubAppEnabled) {
+  let privateKey: string;
+  try {
+    privateKey = fs.readFileSync(config.githubAppPrivateKeyPath!, "utf8");
+  } catch (error) {
+    fatal("github-app", error);
+  }
+
+  try {
+    gitHubAppClient = new GitHubAppClient({
+      clientId: config.githubAppClientId!,
+      privateKey,
+    });
+  } catch (error) {
+    fatal("github-app", error);
+  }
+}
+
+// Multi-workspace runtime registry
+const runtimeRegistry = new WorkspaceRuntimeRegistry({
+  store: identityService.storeInstance,
+  dataRoot: config.dataRoot,
+  gitConfig: {
+    gitAuthorName: config.gitAuthorName,
+    gitAuthorEmail: config.gitAuthorEmail,
+    gitCommitterName: config.gitCommitterName,
+    gitCommitterEmail: config.gitCommitterEmail,
+  },
+  appClient: gitHubAppClient,
+});
+
+// ---- Git workspace (deployment global workspace during transition) ----
 const workspace = new CeoWorkspace(config);
 const productPolicy = await loadProductPolicy();
 await workspace.initialize();
@@ -73,7 +117,7 @@ import { createJobResultHandler } from "./jobs/result-service.js";
 
 const auditStore = new AuditStore(config.auditDbPath);
 
-// Shared single ResourceService instance for both MCP tools and Worker result ingress
+// Shared single ResourceService instance for transitional global paths
 const resourceService = new ResourceService(workspace, config);
 
 // Fixed workspace identity for the MCP tools (no api_key_id). Authentication is
@@ -90,13 +134,18 @@ const userSessionManager = new UserSessionManager({
 });
 
 // Optional worker-bridge job layer (disabled unless configured). Resource
-// existence for new tasks is checked against repo contents.
+// existence for new tasks is checked against repo contents of the requested workspace runtime.
 const jobBridge = openJobBridge({
   bridgeEnabled: config.bridgeEnabled,
   redisUrl: config.redisUrl,
-}, async (_scope, resourceId) => {
-  const loc = await resolveResourceLocation(workspace.config.repoDir, resourceId);
-  return loc !== null;
+}, async (scope, resourceId) => {
+  try {
+    const runtime = await runtimeRegistry.get(scope.workspace_id);
+    const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
+    return loc !== null;
+  } catch (_error) {
+    return false;
+  }
 });
 
 const app = createMcpExpressApp({ host: config.bindHost });
@@ -111,13 +160,18 @@ app.use("/token", protocolCors);
 
 // Managed result route FIRST with dedicated 9 MiB body limit:
 // Host -> Origin -> Identity -> 9mb parser -> resultHandler
+const resolveResourceServiceForScope = async (scope: JobAuthScope) => {
+  const runtime = await runtimeRegistry.get(scope.workspace_id);
+  return runtime.resourceService;
+};
+
 app.post(
   "/api/worker/jobs/:job_id/result",
   createHostGuard(config.allowedHosts),
   createOriginGuard(config.allowedOrigins),
   createIdentityAuthMiddleware(identityService),
   express.json({ limit: "9mb" }),
-  createJobResultHandler(jobBridge.service, resourceService),
+  createJobResultHandler(jobBridge.service, resolveResourceServiceForScope),
 );
 
 // Ordinary JSON body parser for subsequent routes (default 100 KiB)
@@ -190,31 +244,14 @@ if (config.githubClientId && config.githubClientSecret) {
 }
 
 // GitHub App authorization & installation capability (when enabled)
-if (config.githubAppEnabled) {
+if (config.githubAppEnabled && gitHubAppClient) {
   const defaultAppCallback = config.publicOrigin
     ? `${config.publicOrigin.replace(/\/+$/, "")}/auth/github-app/callback`
     : `http://${config.bindHost}:${config.port}/auth/github-app/callback`;
   const appCallbackUrl = config.githubAppCallbackUrl || defaultAppCallback;
 
-  let privateKey: string;
-  try {
-    privateKey = fs.readFileSync(config.githubAppPrivateKeyPath!, "utf8");
-  } catch (error) {
-    fatal("github-app", error);
-  }
-
-  let appClient: GitHubAppClient;
-  try {
-    appClient = new GitHubAppClient({
-      clientId: config.githubAppClientId!,
-      privateKey,
-    });
-  } catch (error) {
-    fatal("github-app", error);
-  }
-
   const installationService = new GitHubInstallationService({
-    appClient,
+    appClient: gitHubAppClient,
     store: identityService.storeInstance,
     clientId: config.githubAppClientId!,
     clientSecret: config.githubAppClientSecret!,
@@ -228,12 +265,12 @@ if (config.githubAppEnabled) {
   const repoCallbackUrl = defaultRepoCallback;
 
   const bootstrapService = new WorkspaceBootstrapService({
-    appClient,
+    appClient: gitHubAppClient,
     store: identityService.storeInstance,
   });
 
   const repositoryService = new GitHubRepositoryService({
-    appClient,
+    appClient: gitHubAppClient,
     store: identityService.storeInstance,
     clientId: config.githubAppClientId!,
     clientSecret: config.githubAppClientSecret!,
@@ -318,7 +355,6 @@ if (config.oauthEnabled) {
 
   oauthService = new OAuthService(oauthStore, identityService.storeInstance, {
     publicOrigin,
-    workspaceId: workspaceIdentity.workspace_id,
     clientResolver,
     ...(config.oauthDcrEnabled ? { registrationEndpoint: `${publicOrigin}/register` } : {}),
   });
@@ -341,18 +377,36 @@ app.use(
   createJobAssignmentRouter(jobBridge.service),
 );
 
-// MCP handler (dedicated to /mcp)
-const mcpHandler = createMcpHandler(
-  () => createMcpServer(workspace, productPolicy, {
-    auditStore,
-    identity: workspaceIdentity,
-    jobs: { service: jobBridge.service },
-    resourceService,
-  }),
-  // 2025-era hosts still send initialize; this is the SDK's standard fallback.
-  { legacy: "stateless" },
-);
-const nodeHandler = toNodeHandler(mcpHandler);
+// MCP workspace runtime resolution middleware (strictly request-scoped, zero fallback)
+const workspaceRuntimeMiddleware = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  const identity = res.locals.identity;
+  if (!identity || !identity.workspace_id) {
+    res.status(403).json({
+      jsonrpc: "2.0",
+      error: { code: -32003, message: "Forbidden: workspace access denied" },
+      id: null,
+    });
+    return;
+  }
+
+  try {
+    const runtime = await runtimeRegistry.get(identity.workspace_id);
+    res.locals.workspaceRuntime = runtime;
+    next();
+  } catch (error) {
+    process.stderr.write(`runtime: failed to resolve workspace runtime '${identity.workspace_id}': ${error}\n`);
+    res.status(503).json({
+      jsonrpc: "2.0",
+      error: { code: -32050, message: "Workspace runtime unavailable" },
+      id: null,
+    });
+    return;
+  }
+};
 
 app.all(
   "/mcp",
@@ -360,9 +414,28 @@ app.all(
   config.oauthEnabled && oauthService
     ? createMcpAuthMiddleware(identityService, oauthService)
     : createIdentityAuthMiddleware(identityService),
-  (req: Request, res: Response) => {
+  workspaceRuntimeMiddleware,
+  async (req: Request, res: Response) => {
     attachMcpProtocolLog(req, res);
-    void nodeHandler(req, res, req.body);
+    const runtime = res.locals.workspaceRuntime!;
+    const mcpIdentity = {
+      user_id: res.locals.identity!.user_id,
+      workspace_id: res.locals.identity!.workspace_id,
+    };
+    const handler = toNodeHandler(
+      createMcpHandler(
+        () =>
+          createMcpServer(runtime.workspace, productPolicy, {
+            auditStore,
+            identity: mcpIdentity,
+            jobs: { service: jobBridge.service },
+            resourceService: runtime.resourceService,
+          }),
+        // 2025-era hosts still send initialize; this is the SDK's standard fallback.
+        { legacy: "stateless" },
+      ),
+    );
+    await handler(req, res, req.body);
   },
 );
 

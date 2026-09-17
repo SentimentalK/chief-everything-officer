@@ -71,11 +71,13 @@ function jobIdFrom(req: Request): string | null {
   return typeof raw === "string" && JOB_ID_RE.test(raw) ? raw : null;
 }
 
+export type ResourceServiceResolver = (scope: JobAuthScope) => Promise<ResourceService>;
+
 export async function handleWorkerResult(
   scope: JobAuthScope,
   jobId: string,
   rawBody: unknown,
-  deps: { store: RedisJobStore; resourceService: ResourceService },
+  deps: { store: RedisJobStore; resourceService: ResourceService | ResourceServiceResolver },
 ): Promise<ResultSuccess> {
   const parsed = parseResultRequest(rawBody);
   if (!parsed.ok) {
@@ -115,8 +117,21 @@ export async function handleWorkerResult(
     throw new JobError("ASSIGNMENT_MISMATCH", "Assignment credentials mismatch.");
   }
 
+  // Resolve ResourceService for this request/scope
+  let resolvedResourceService: ResourceService;
+  try {
+    resolvedResourceService =
+      typeof deps.resourceService === "function"
+        ? await deps.resourceService(scope)
+        : deps.resourceService;
+  } catch (error) {
+    throw new JobError("QUEUE_UNAVAILABLE", "Workspace runtime unavailable for result recording.", {
+      reason: "RUNTIME_UNAVAILABLE",
+    });
+  }
+
   // 2. Canonical Git Resource commit FIRST
-  const gitReceipt = await deps.resourceService.applyWorkerResult({
+  const gitReceipt = await resolvedResourceService.applyWorkerResult({
     requestId: req.attempt_id,
     resourceId: job.resource_id,
     jobId,
@@ -181,7 +196,7 @@ const RESULT_STATUS: Record<string, number> = {
 
 export function createJobResultHandler(
   jobService: JobService | null,
-  resourceService: ResourceService,
+  resourceService: ResourceService | ResourceServiceResolver,
 ) {
   return async (req: Request, res: Response, _next: NextFunction): Promise<void> => {
     res.setHeader("Cache-Control", "no-store");

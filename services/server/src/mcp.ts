@@ -268,7 +268,7 @@ export function createMcpServer(
     return {
       version: BUILD_INFO.version,
       build: BUILD_INFO.build,
-      ...(identity ?? {}),
+      ...(identity ? { user_id: identity.user_id, workspace_id: identity.workspace_id } : {}),
       ...status,
     };
   }));
