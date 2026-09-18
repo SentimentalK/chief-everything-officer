@@ -19,11 +19,14 @@ import {
   WorkspaceBootstrapError,
 } from "./bootstrap-service.js";
 
+import type { OnboardingService } from "../onboarding/service.js";
+
 export interface GitHubAppAuthRouterOptions {
   installationService: GitHubInstallationService;
   repositoryService?: GitHubRepositoryService;
   sessionManager: UserSessionManager;
   store: IdentityStore;
+  onboardingService?: OnboardingService;
 }
 
 export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): Router {
@@ -147,12 +150,48 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
     }
 
     try {
-      await installationService.handleOAuthCallback({
+      const result = await installationService.handleOAuthCallback({
         state,
         code,
         currentUserId: session.userId,
         currentProviderSubject: session.providerSubject,
+        currentSessionId: session.sessionId,
+        onTokenVerified: options.repositoryService
+          ? async (ctx) => {
+              const grant = options.repositoryService!.createGrantFromLiveToken({
+                sessionId: ctx.sessionId,
+                userId: ctx.userId,
+                providerSubject: ctx.providerSubject,
+                installationRowId: ctx.installationRowId,
+                installationId: ctx.installationId,
+                installationAccountId: ctx.installationAccount.id,
+                installationAccountLogin: ctx.installationAccount.login,
+                installationAccountType: ctx.installationAccount.type,
+                userAccessToken: ctx.userAccessToken,
+              });
+              return { grantId: grant.grantId };
+            }
+          : undefined,
       });
+
+      if (result.onboardingFlowId && options.onboardingService && result.grantId) {
+        await options.onboardingService.provisionWorkspace(
+          result.onboardingFlowId,
+          {
+            sessionId: session.sessionId,
+            userId: session.userId,
+            providerSubject: session.providerSubject,
+          },
+          result.grantId,
+        );
+
+        const target = result.oauthRequest
+          ? `/onboarding/complete?flow=${encodeURIComponent(result.onboardingFlowId)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
+          : `/onboarding/complete?flow=${encodeURIComponent(result.onboardingFlowId)}`;
+        res.redirect(302, target);
+        return;
+      }
+
       if (req.headers.accept?.includes("application/json")) {
         res.status(200).json({ success: true });
         return;
@@ -229,6 +268,24 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           currentUserId: session.userId,
           currentProviderSubject: session.providerSubject,
         });
+
+        if (options.onboardingService) {
+          const activeFlow = options.onboardingService.storeInstance.findActiveFlowForUser(session.userId);
+          if (activeFlow && !activeFlow.workspace_id) {
+            await options.onboardingService.provisionWorkspace(
+              activeFlow.id,
+              {
+                sessionId: session.sessionId,
+                userId: session.userId,
+                providerSubject: session.providerSubject,
+              },
+              result.grant,
+            );
+            res.redirect(302, `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}`);
+            return;
+          }
+        }
+
         if (req.headers.accept?.includes("application/json")) {
           res.status(200).json(result);
           return;

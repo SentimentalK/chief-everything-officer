@@ -221,6 +221,13 @@ if (config.githubClientId && config.githubClientSecret) {
 }
 
 // GitHub App authorization & installation capability (when enabled)
+import { OnboardingStore } from "./onboarding/store.js";
+import { OnboardingService } from "./onboarding/service.js";
+import { createOnboardingRouter } from "./onboarding/router.js";
+
+let bootstrapService: WorkspaceBootstrapService | null = null;
+let onboardingService: OnboardingService | null = null;
+
 if (config.githubAppEnabled && gitHubAppClient) {
   const defaultAppCallback = config.publicOrigin
     ? `${config.publicOrigin.replace(/\/+$/, "")}/auth/github-app/callback`
@@ -241,7 +248,7 @@ if (config.githubAppEnabled && gitHubAppClient) {
     : `http://${config.bindHost}:${config.port}/auth/github-app/repository/callback`;
   const repoCallbackUrl = defaultRepoCallback;
 
-  const bootstrapService = new WorkspaceBootstrapService({
+  bootstrapService = new WorkspaceBootstrapService({
     appClient: gitHubAppClient,
     store: identityService.storeInstance,
   });
@@ -256,6 +263,16 @@ if (config.githubAppEnabled && gitHubAppClient) {
     bootstrapService,
   });
 
+  const onboardingStore = new OnboardingStore(identityService.storeInstance);
+  onboardingService = new OnboardingService({
+    store: onboardingStore,
+    identityStore: identityService.storeInstance,
+    installationService,
+    repositoryService,
+    bootstrapService,
+    appClient: gitHubAppClient,
+  });
+
   app.use(
     "/auth/github-app",
     createGitHubAppAuthRouter({
@@ -263,6 +280,7 @@ if (config.githubAppEnabled && gitHubAppClient) {
       repositoryService,
       sessionManager: userSessionManager,
       store: identityService.storeInstance,
+      onboardingService,
     }),
   );
 
@@ -290,6 +308,20 @@ if (config.githubAppEnabled && gitHubAppClient) {
       bootstrapService,
       sessionManager: userSessionManager,
       store: identityService.storeInstance,
+    }),
+  );
+
+  app.use(
+    "/onboarding",
+    createOnboardingRouter({
+      onboardingService,
+      sessionManager: userSessionManager,
+      identityStore: identityService.storeInstance,
+      installationService,
+      repositoryService,
+      get oauthService() {
+        return oauthService;
+      },
     }),
   );
 }
@@ -340,6 +372,8 @@ if (config.oauthEnabled) {
     createOAuthRouter({
       oauthService,
       sessionManager: userSessionManager,
+      identityStore: identityService.storeInstance,
+      bootstrapService: bootstrapService ?? undefined,
     }),
   );
 }

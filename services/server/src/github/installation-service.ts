@@ -22,6 +22,8 @@ export interface PendingInstallState {
   userId: string;
   providerSubject: string;
   expiresAt: number;
+  onboardingFlowId?: string;
+  oauthRequest?: string;
 }
 
 export interface PendingOAuthState {
@@ -30,6 +32,8 @@ export interface PendingOAuthState {
   providerSubject: string;
   candidateInstallationId: string;
   expiresAt: number;
+  onboardingFlowId?: string;
+  oauthRequest?: string;
 }
 
 export class GitHubInstallationError extends Error {
@@ -105,7 +109,11 @@ export class GitHubInstallationService {
    * Step 1: Creates opaque one-time install state bound to CEO user and returns
    * the GitHub App installation URL.
    */
-  createInstallRedirect(userId: string, providerSubject: string): string {
+  createInstallRedirect(
+    userId: string,
+    providerSubject: string,
+    options?: { onboardingFlowId?: string; oauthRequest?: string },
+  ): string {
     this.cleanupStates();
 
     const state = crypto.randomBytes(32).toString("hex");
@@ -113,6 +121,8 @@ export class GitHubInstallationService {
       userId,
       providerSubject,
       expiresAt: Date.now() + this.stateTtlMs,
+      onboardingFlowId: options?.onboardingFlowId,
+      oauthRequest: options?.oauthRequest,
     });
 
     const installUrl = new URL(`https://github.com/apps/${encodeURIComponent(this.slug)}/installations/new`);
@@ -164,6 +174,8 @@ export class GitHubInstallationService {
       providerSubject: pending.providerSubject,
       candidateInstallationId: input.installationId,
       expiresAt: Date.now() + this.stateTtlMs,
+      onboardingFlowId: pending.onboardingFlowId,
+      oauthRequest: pending.oauthRequest,
     });
 
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
@@ -189,7 +201,24 @@ export class GitHubInstallationService {
     code: string;
     currentUserId: string;
     currentProviderSubject: string;
-  }): Promise<{ installationId: string; accountLogin: string }> {
+    currentSessionId?: string;
+    onTokenVerified?: (context: {
+      sessionId: string;
+      userId: string;
+      providerSubject: string;
+      installationRowId: string;
+      installationId: string;
+      installationAccount: { id: string; login: string; type: "User" | "Organization" };
+      userAccessToken: string;
+    }) => Promise<{ grantId: string }> | { grantId: string };
+  }): Promise<{
+    installationId: string;
+    accountLogin: string;
+    installationRowId: string;
+    grantId?: string;
+    onboardingFlowId?: string;
+    oauthRequest?: string;
+  }> {
     this.cleanupStates();
 
     if (!input.currentUserId || !input.currentProviderSubject) {
@@ -404,7 +433,7 @@ export class GitHubInstallationService {
       }
 
       // 5. Atomically upsert installation metadata + user link
-      this.store.upsertGitHubInstallationWithUser({
+      const upsertResult = this.store.upsertGitHubInstallationWithUser({
         githubInstallationId: String(targetInst.id),
         githubAppId: String(targetInst.app_id),
         accountId: String(targetInst.account.id),
@@ -415,12 +444,34 @@ export class GitHubInstallationService {
         userId: pending.userId,
       });
 
+      let grantId: string | undefined;
+      if (input.onTokenVerified) {
+        const handoff = await input.onTokenVerified({
+          sessionId: input.currentSessionId ?? "",
+          userId: pending.userId,
+          providerSubject: pending.providerSubject,
+          installationRowId: upsertResult.installation.id,
+          installationId: String(targetInst.id),
+          installationAccount: {
+            id: String(targetInst.account.id),
+            login: targetInst.account.login.trim(),
+            type: accountType,
+          },
+          userAccessToken,
+        });
+        grantId = handoff.grantId;
+      }
+
       return {
         installationId: String(targetInst.id),
         accountLogin: targetInst.account.login.trim(),
+        installationRowId: upsertResult.installation.id,
+        grantId,
+        onboardingFlowId: pending.onboardingFlowId,
+        oauthRequest: pending.oauthRequest,
       };
     } finally {
-      // User access token discarded immediately. Never persisted or logged.
+      // The reference is dropped after the synchronous handoff and the token is never retained, returned, persisted, or logged.
     }
   }
 

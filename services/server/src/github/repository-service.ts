@@ -656,6 +656,42 @@ export class GitHubRepositoryService {
     };
   }
 
+  createGrantFromLiveToken(input: {
+    sessionId?: string;
+    userId: string;
+    providerSubject: string;
+    installationRowId: string;
+    installationId: string;
+    installationAccountId: string;
+    installationAccountLogin: string;
+    installationAccountType: "User" | "Organization";
+    userAccessToken: string;
+  }): { grantId: string; expiresAtMs: number } {
+    this.cleanup();
+
+    const grantId = crypto.randomBytes(32).toString("hex");
+    const expiresAtMs = Date.now() + this.grantTtlMs;
+
+    this.grants.set(grantId, {
+      id: grantId,
+      sessionId: input.sessionId ?? "",
+      userId: input.userId,
+      providerSubject: input.providerSubject,
+      installationRowId: input.installationRowId,
+      installationId: input.installationId,
+      installationAccountId: input.installationAccountId,
+      installationAccountLogin: input.installationAccountLogin,
+      installationAccountType: input.installationAccountType,
+      userAccessToken: input.userAccessToken,
+      expiresAtMs,
+    });
+
+    return {
+      grantId,
+      expiresAtMs,
+    };
+  }
+
   getValidGrant(
     grantId: string,
     currentSessionId: string,

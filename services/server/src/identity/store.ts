@@ -46,7 +46,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 6;
+export const IDENTITY_DB_USER_VERSION = 7;
 
 export type WorkspaceBootstrapState =
   | "PENDING"
@@ -255,6 +255,26 @@ CREATE TABLE workspace_bootstraps (
   FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
 );
 
+CREATE TABLE onboarding_flows (
+  id TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL,
+  provider_subject TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  desired_repository_name TEXT,
+  installation_row_id TEXT,
+  repository_id TEXT,
+  workspace_id TEXT,
+  state TEXT NOT NULL,
+  last_error_code TEXT,
+  last_error_message TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (installation_row_id) REFERENCES github_installations(id) ON DELETE SET NULL,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
+);
+
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
 CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
@@ -265,6 +285,17 @@ CREATE INDEX idx_github_installation_users_user ON github_installation_users(use
 CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
 CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
 CREATE INDEX idx_workspace_bootstraps_state ON workspace_bootstraps(state);
+CREATE INDEX idx_onboarding_flows_user ON onboarding_flows(user_id);
+CREATE INDEX idx_onboarding_flows_state ON onboarding_flows(state);
+CREATE UNIQUE INDEX idx_onboarding_one_active_per_user
+ON onboarding_flows(user_id)
+WHERE state IN (
+  'AWAITING_REPOSITORY_CHOICE',
+  'AWAITING_GITHUB_ACCESS',
+  'PROVISIONING',
+  'READY_TO_RESUME',
+  'RECOVERY_REQUIRED'
+);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
@@ -278,6 +309,7 @@ const EXPECTED_TABLES = [
   "github_installation_users",
   "github_repository_bindings",
   "workspace_bootstraps",
+  "onboarding_flows",
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
@@ -325,6 +357,16 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
     "created_at_ms",
     "updated_at_ms",
   ],
+  onboarding_flows: [
+    "id",
+    "user_id",
+    "provider_subject",
+    "mode",
+    "state",
+    "created_at_ms",
+    "updated_at_ms",
+    "expires_at_ms",
+  ],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -346,13 +388,18 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
   workspace_bootstraps: [
     { from: "workspace_id", to: "id", referencedTable: "workspaces" },
   ],
+  onboarding_flows: [
+    { from: "user_id", to: "id", referencedTable: "users" },
+    { from: "installation_row_id", to: "id", referencedTable: "github_installations" },
+    { from: "workspace_id", to: "id", referencedTable: "workspaces" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba"): string {
+export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba" | "onb"): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -549,7 +596,7 @@ export class IdentityStore {
     return this.db;
   }
 
-  private withDb<T>(operation: (db: DatabaseSync) => T): T {
+  withDb<T>(operation: (db: DatabaseSync) => T): T {
     const db = this.requireDb();
     try {
       return operation(db);
@@ -642,6 +689,12 @@ export class IdentityStore {
     this.requireUniqueIndex(db, "github_installation_users", ["github_installation_row_id", "user_id"]);
     this.requireUniqueIndex(db, "github_repository_bindings", ["workspace_id"]);
     this.requireUniqueIndex(db, "github_repository_bindings", ["github_repository_id"]);
+    this.requirePartialUniqueIndex(
+      db,
+      "onboarding_flows",
+      ["user_id"],
+      "state IN ('AWAITING_REPOSITORY_CHOICE', 'AWAITING_GITHUB_ACCESS', 'PROVISIONING', 'READY_TO_RESUME', 'RECOVERY_REQUIRED')",
+    );
 
     this.validateData();
   }
@@ -981,7 +1034,15 @@ export class IdentityStore {
     columns: string[],
     whereClause: string,
   ): void {
-    const normalizedWhere = whereClause.replace(/\s+/g, " ").trim().toLowerCase();
+    const normalizeSql = (s: string) =>
+      s
+        .replace(/\s+/g, " ")
+        .replace(/\s*\(\s*/g, "(")
+        .replace(/\s*\)\s*/g, ")")
+        .replace(/\s*,\s*/g, ",")
+        .trim()
+        .toLowerCase();
+    const normalizedWhere = normalizeSql(whereClause);
     const indexes = db.prepare(`PRAGMA index_list(${table});`).all() as Array<{
       seq: number;
       name: string;
@@ -1003,7 +1064,7 @@ export class IdentityStore {
       const master = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?;").get(idx.name) as
         | { sql: string | null }
         | undefined;
-      const sqlNorm = (master?.sql ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      const sqlNorm = normalizeSql(master?.sql ?? "");
       if (sqlNorm.includes(`where ${normalizedWhere}`)) {
         return;
       }
@@ -1091,6 +1152,9 @@ export class IdentityStore {
           break;
         case 5:
           IdentityStore.migrateV5ToV6(db);
+          break;
+        case 6:
+          IdentityStore.migrateV6ToV7(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -1414,6 +1478,80 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 5 to 6: ${error}`);
+    }
+  }
+
+  static migrateV6ToV7(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 6) {
+        throw new IdentityStructureError("migrateV6ToV7 requires user_version = 6.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+        "github_repository_bindings",
+        "workspace_bootstraps",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v7: missing required v6 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE onboarding_flows (
+          id TEXT PRIMARY KEY NOT NULL,
+          user_id TEXT NOT NULL,
+          provider_subject TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          desired_repository_name TEXT,
+          installation_row_id TEXT,
+          repository_id TEXT,
+          workspace_id TEXT,
+          state TEXT NOT NULL,
+          last_error_code TEXT,
+          last_error_message TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          expires_at_ms INTEGER NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (installation_row_id) REFERENCES github_installations(id) ON DELETE SET NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX idx_onboarding_flows_user ON onboarding_flows(user_id);
+        CREATE INDEX idx_onboarding_flows_state ON onboarding_flows(state);
+        CREATE UNIQUE INDEX idx_onboarding_one_active_per_user
+        ON onboarding_flows(user_id)
+        WHERE state IN (
+          'AWAITING_REPOSITORY_CHOICE',
+          'AWAITING_GITHUB_ACCESS',
+          'PROVISIONING',
+          'READY_TO_RESUME',
+          'RECOVERY_REQUIRED'
+        );
+
+        PRAGMA user_version = 7;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 6 to 7: ${error}`);
     }
   }
 

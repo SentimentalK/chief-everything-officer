@@ -100,6 +100,10 @@ export class OAuthService {
     this.refreshTokenTtlMs = options.refreshTokenTtlMs ?? DEFAULT_REFRESH_TOKEN_TTL_MS;
   }
 
+  get identityStoreInstance(): IdentityStore {
+    return this.identityStore;
+  }
+
   getAuthorizationServerMetadata(): Record<string, any> {
     return {
       issuer: this.publicOrigin,

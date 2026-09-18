@@ -9,9 +9,14 @@ import {
   writeOAuthFlowLog,
 } from "./observability.js";
 
+import type { IdentityStore } from "../identity/store.js";
+import type { WorkspaceBootstrapService } from "../github/bootstrap-service.js";
+
 export interface OAuthRouterOptions {
   oauthService: OAuthService;
   sessionManager: UserSessionManager;
+  identityStore?: IdentityStore;
+  bootstrapService?: WorkspaceBootstrapService;
 }
 
 export function escapeHtml(str: string): string {
@@ -196,7 +201,8 @@ function getProtectedResourceMetadata(oauthService: OAuthService): Record<string
 }
 
 export function createOAuthRouter(options: OAuthRouterOptions): Router {
-  const { oauthService, sessionManager } = options;
+  const { oauthService, sessionManager, bootstrapService } = options;
+  const identityStore = options.identityStore ?? oauthService.identityStoreInstance;
   const router = express.Router();
 
   // RFC 8414 Authorization Server Metadata (canonical for issuer origin)
@@ -252,6 +258,28 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         return;
       }
 
+      // Check user workspace memberships
+      const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
+      if (memberships.length === 0) {
+        res.redirect(302, `/onboarding?oauth_request=${encodeURIComponent(request.id)}`);
+        return;
+      }
+
+      if (memberships.length > 1) {
+        res.status(403).send(renderErrorHtml("Authorization Error", "Workspace selection required"));
+        return;
+      }
+
+      // Exactly 1 workspace: verify bootstrap status
+      const targetMembership = memberships[0];
+      if (bootstrapService && targetMembership) {
+        const bootStatus = await bootstrapService.getProvisioningStatus(targetMembership.workspace_id).catch(() => null);
+        if (bootStatus && bootStatus.status !== "READY") {
+          res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
+          return;
+        }
+      }
+
       // Logged in: generate consent nonce and render consent screen
       const nonce = oauthService.createConsentNonce(request.id);
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -268,7 +296,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
   });
 
   // 4. GET /authorize/resume
-  router.get("/authorize/resume", (req: Request, res: Response) => {
+  router.get("/authorize/resume", async (req: Request, res: Response) => {
     const requestId = typeof req.query.request === "string" ? req.query.request : "";
     if (!requestId) {
       res.status(400).send(renderErrorHtml("Invalid Request", "Missing request parameter"));
@@ -287,6 +315,28 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         renderErrorHtml("Request Expired", "The authorization request has expired or is invalid. Please start again.")
       );
       return;
+    }
+
+    // Check user workspace memberships
+    const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
+    if (memberships.length === 0) {
+      res.redirect(302, `/onboarding?oauth_request=${encodeURIComponent(requestId)}`);
+      return;
+    }
+
+    if (memberships.length > 1) {
+      res.status(403).send(renderErrorHtml("Authorization Error", "Workspace selection required"));
+      return;
+    }
+
+    // Exactly 1 workspace: verify bootstrap status
+    const targetMembership = memberships[0];
+    if (bootstrapService && targetMembership) {
+      const bootStatus = await bootstrapService.getProvisioningStatus(targetMembership.workspace_id).catch(() => null);
+      if (bootStatus && bootStatus.status !== "READY") {
+        res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
+        return;
+      }
     }
 
     const nonce = oauthService.createConsentNonce(request.id);

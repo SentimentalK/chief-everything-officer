@@ -2397,7 +2397,6 @@ describe("v6 workspace_bootstraps schema & lifecycle state machine (Step 3.6A)",
     raw.close();
 
     expect(Number(ver.user_version)).toBe(IDENTITY_DB_USER_VERSION);
-    expect(Number(ver.user_version)).toBe(6);
     expect(tables.length).toBe(1);
     expect(indexes.length).toBe(1);
 
@@ -2479,7 +2478,7 @@ describe("v6 workspace_bootstraps schema & lifecycle state machine (Step 3.6A)",
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(6);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(IDENTITY_DB_USER_VERSION);
     raw.close();
 
     // Verify all rows preserved
@@ -2542,7 +2541,7 @@ describe("v6 workspace_bootstraps schema & lifecycle state machine (Step 3.6A)",
     cleanupStores.push(store);
 
     const raw = new DatabaseSync(ctx.dbPath);
-    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(6);
+    expect(Number((raw.prepare("PRAGMA user_version;").get() as { user_version: number }).user_version)).toBe(IDENTITY_DB_USER_VERSION);
     raw.close();
 
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
