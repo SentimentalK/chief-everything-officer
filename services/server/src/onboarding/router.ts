@@ -13,6 +13,7 @@ export interface OnboardingRouterOptions {
   installationService: GitHubInstallationService;
   repositoryService: GitHubRepositoryService;
   oauthService?: OAuthService | null;
+  getOAuthService?: () => OAuthService | null | undefined;
 }
 
 function escapeHtml(str: string): string {
@@ -324,8 +325,14 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
     identityStore,
     installationService,
     repositoryService,
-    oauthService,
   } = options;
+
+  const resolveOAuthService = (): OAuthService | null | undefined => {
+    if (typeof options.getOAuthService === "function") {
+      return options.getOAuthService();
+    }
+    return options.oauthService;
+  };
 
   const router = express.Router();
   router.use(express.urlencoded({ extended: false }));
@@ -563,10 +570,10 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
   router.get("/complete", (req: Request, res: Response) => {
     const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
 
-    // Check if original Host request is still active
+    const oauth = resolveOAuthService();
     let validAuthRequest = false;
-    if (oauthRequest && oauthService) {
-      validAuthRequest = Boolean(oauthService.getAuthorizationRequest(oauthRequest));
+    if (oauthRequest && oauth) {
+      validAuthRequest = Boolean(oauth.getAuthorizationRequest(oauthRequest));
     }
 
     if (validAuthRequest && oauthRequest) {

@@ -224,7 +224,21 @@ if (config.githubClientId && config.githubClientSecret) {
 import { OnboardingStore } from "./onboarding/store.js";
 import { OnboardingService } from "./onboarding/service.js";
 import { createOnboardingRouter } from "./onboarding/router.js";
+import { OAuthStore } from "./oauth/store.js";
+import { OAuthService } from "./oauth/service.js";
+import { createOAuthRouter } from "./oauth/router.js";
+import {
+  CimdClientResolver,
+  CompositeClientResolver,
+  type OAuthClientResolver,
+} from "./oauth/client-resolver.js";
+import { DcrStore } from "./oauth/dcr/store.js";
+import { DcrClientResolver, DcrService } from "./oauth/dcr/service.js";
+import { createDcrRouter } from "./oauth/dcr/router.js";
 
+let oauthStore: OAuthStore | null = null;
+let oauthService: OAuthService | null = null;
+let dcrStore: DcrStore | null = null;
 let bootstrapService: WorkspaceBootstrapService | null = null;
 let onboardingService: OnboardingService | null = null;
 
@@ -319,30 +333,12 @@ if (config.githubAppEnabled && gitHubAppClient) {
       identityStore: identityService.storeInstance,
       installationService,
       repositoryService,
-      get oauthService() {
-        return oauthService;
-      },
+      getOAuthService: () => oauthService,
     }),
   );
 }
 
 // OAuth 2.1 Authorization Server (when enabled)
-import { OAuthStore } from "./oauth/store.js";
-import { OAuthService } from "./oauth/service.js";
-import { createOAuthRouter } from "./oauth/router.js";
-import {
-  CimdClientResolver,
-  CompositeClientResolver,
-  type OAuthClientResolver,
-} from "./oauth/client-resolver.js";
-import { DcrStore } from "./oauth/dcr/store.js";
-import { DcrClientResolver, DcrService } from "./oauth/dcr/service.js";
-import { createDcrRouter } from "./oauth/dcr/router.js";
-
-let oauthStore: OAuthStore | null = null;
-let oauthService: OAuthService | null = null;
-let dcrStore: DcrStore | null = null;
-
 if (config.oauthEnabled) {
   const publicOrigin = config.publicOrigin!;
   oauthStore = new OAuthStore(config.oauthDbPath);
