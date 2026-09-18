@@ -483,8 +483,8 @@ export class WorkspaceBootstrapService {
       },
     );
 
-    if (refRes.status === 404) {
-      // Bound branch ref not found: inspect whether repo is genuinely empty vs missing branch in populated repo
+    if (refRes.status === 404 || refRes.status === 409) {
+      // Bound branch ref not found or empty repo (HTTP 409): inspect whether repo is genuinely empty vs missing branch in populated repo
       return this.handleMissingBoundBranch(
         workspaceId,
         attemptId,
@@ -574,11 +574,11 @@ export class WorkspaceBootstrapService {
       );
     }
 
-    // Case 3: Ambiguous - no branches listed, but repository reports non-zero size
-    if (typeof repoMeta.size === "number" && repoMeta.size > 0) {
+    // Case 3: Positive verification - repo must report size === 0 to be initialized as empty
+    if (repoMeta.size !== 0) {
       throw new ManualRecoveryBootstrapError(
         "BRANCH_UNAVAILABLE",
-        `Repository reports non-zero size (${repoMeta.size} KB) but has no active branches`,
+        `Repository cannot be positively verified as empty (reported size: ${repoMeta.size})`,
         400,
       );
     }

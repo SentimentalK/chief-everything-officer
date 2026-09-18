@@ -84,7 +84,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(400).json({ error: "missing_state_or_installation_id" });
         return;
       }
-      res.redirect(302, "/settings/installations?error=missing_state_or_installation_id");
+      res.redirect(302, "/onboarding");
       return;
     }
 
@@ -102,7 +102,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(status).json({ error: msg });
         return;
       }
-      res.redirect(302, `/settings/installations?error=${encodeURIComponent(msg)}`);
+      res.redirect(302, "/onboarding");
     }
   });
 
@@ -133,7 +133,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(400).json({ error: errorMsg });
         return;
       }
-      res.redirect(302, `/settings/installations?error=${encodeURIComponent(errorMsg)}`);
+      res.redirect(302, "/onboarding");
       return;
     }
 
@@ -145,7 +145,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(400).json({ error: "missing_code_or_state" });
         return;
       }
-      res.redirect(302, "/settings/installations?error=missing_code_or_state");
+      res.redirect(302, "/onboarding");
       return;
     }
 
@@ -196,7 +196,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(200).json({ success: true });
         return;
       }
-      res.redirect(302, "/settings/installations?installed=true");
+      res.redirect(302, "/onboarding");
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       const status =
@@ -211,7 +211,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         res.status(status).json({ error: msg });
         return;
       }
-      res.redirect(302, `/settings/installations?error=${encodeURIComponent(msg)}`);
+      res.redirect(302, "/onboarding");
     }
   });
 
@@ -244,7 +244,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           res.status(400).json({ error: errorMsg });
           return;
         }
-        res.redirect(302, `/settings/workspaces/new?error=${encodeURIComponent(errorMsg)}`);
+        res.redirect(302, "/onboarding");
         return;
       }
 
@@ -256,7 +256,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           res.status(400).json({ error: "missing_code_or_state" });
           return;
         }
-        res.redirect(302, "/settings/workspaces/new?error=missing_code_or_state");
+        res.redirect(302, "/onboarding");
         return;
       }
 
@@ -269,8 +269,8 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           currentProviderSubject: session.providerSubject,
         });
 
-        if (options.onboardingService) {
-          const activeFlow = options.onboardingService.storeInstance.findActiveFlowForUser(session.userId);
+        if (result.onboardingFlowId && options.onboardingService) {
+          const activeFlow = options.onboardingService.storeInstance.getFlow(result.onboardingFlowId);
           if (activeFlow && !activeFlow.workspace_id) {
             await options.onboardingService.provisionWorkspace(
               activeFlow.id,
@@ -281,7 +281,10 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
               },
               result.grant,
             );
-            res.redirect(302, `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}`);
+            const target = result.oauthRequest
+              ? `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
+              : `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}`;
+            res.redirect(302, target);
             return;
           }
         }
@@ -290,7 +293,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           res.status(200).json(result);
           return;
         }
-        res.redirect(302, `/settings/workspaces/new?grant=${encodeURIComponent(result.grant)}`);
+        res.redirect(302, "/onboarding");
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         const status = error instanceof GitHubRepositoryError ? error.status : 500;
@@ -298,7 +301,7 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
           res.status(status).json({ error: msg });
           return;
         }
-        res.redirect(302, `/settings/workspaces/new?error=${encodeURIComponent(msg)}`);
+        res.redirect(302, "/onboarding");
       }
     });
   }

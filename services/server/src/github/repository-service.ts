@@ -34,6 +34,8 @@ export interface PendingRepoOAuthState {
   installationRowId: string;
   installationId: string;
   expiresAt: number;
+  onboardingFlowId?: string;
+  oauthRequest?: string;
 }
 
 export interface RepositoryAuthorizationGrant {
@@ -330,6 +332,8 @@ export class GitHubRepositoryService {
     userId: string;
     providerSubject: string;
     installationId: string;
+    onboardingFlowId?: string;
+    oauthRequest?: string;
   }): { authorizationUrl: string; state: string } {
     this.cleanup();
 
@@ -379,6 +383,8 @@ export class GitHubRepositoryService {
       installationRowId: inst.id,
       installationId: inst.github_installation_id,
       expiresAt: Date.now() + this.stateTtlMs,
+      onboardingFlowId: input.onboardingFlowId,
+      oauthRequest: input.oauthRequest,
     });
 
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
@@ -404,7 +410,12 @@ export class GitHubRepositoryService {
     currentSessionId: string;
     currentUserId: string;
     currentProviderSubject: string;
-  }): Promise<{ grant: string; expiresAtMs: number }> {
+  }): Promise<{
+    grant: string;
+    expiresAtMs: number;
+    onboardingFlowId?: string;
+    oauthRequest?: string;
+  }> {
     this.cleanup();
 
     if (!input.currentSessionId || typeof input.currentSessionId !== "string" || input.currentSessionId.trim().length === 0) {
@@ -653,6 +664,8 @@ export class GitHubRepositoryService {
     return {
       grant: grantId,
       expiresAtMs,
+      onboardingFlowId: pending.onboardingFlowId,
+      oauthRequest: pending.oauthRequest,
     };
   }
 

@@ -89,6 +89,7 @@ interface MockGitState {
   failRefUpdateStatus?: number;
   failRefCreateStatus?: number;
   failGetRefStatus?: number;
+  failEmptyRepoRefStatus?: number;
   failContentsStatus?: number;
   failBranchesStatus?: number;
   failPostWriteVerification?: boolean;
@@ -155,6 +156,9 @@ function createMockGitFetch(state: MockGitState) {
         return new Response(JSON.stringify({ message: "Error" }), { status: state.failGetRefStatus });
       }
       if (state.branchRefSha === null) {
+        if (state.failEmptyRepoRefStatus) {
+          return new Response(JSON.stringify({ message: "Git Repository is empty." }), { status: state.failEmptyRepoRefStatus });
+        }
         return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
       }
       return new Response(
@@ -1483,6 +1487,80 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(retryResult.status).toBe("READY");
     expect(retryResult.bootstrap.state).toBe("READY");
     expect(retryResult.bootstrap.ready_commit_sha).toBe(commitSha);
+  });
+
+  it("Y2a. empty repo branch ref returning HTTP 409 with size === 0 positively bootstraps empty repository", async () => {
+    const ctx = await createBootstrapTestContext();
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch,
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null,
+      branches: [], // empty repository
+      repoSize: 0,  // positively verified empty
+      failEmptyRepoRefStatus: 409, // GitHub Git Data API returns 409 on empty repo
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+    };
+
+    const fetchFn = createMockGitFetch(gitState);
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    const result = await service.bootstrapWorkspace(ctx.workspaceId);
+    expect(result.status).toBe("READY");
+    expect(result.bootstrap.state).toBe("READY");
+    expect(gitState.contentsPuts?.length ?? 0).toBe(1);
+    expect(gitState.contentsPuts![0].path).toBe("README.md");
+  });
+
+  it("Y2b. empty repo branch ref returning HTTP 409 with size !== 0 fails closed to MANUAL_RECOVERY (BRANCH_UNAVAILABLE)", async () => {
+    const ctx = await createBootstrapTestContext();
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch,
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null,
+      branches: [],
+      repoSize: 15, // Non-zero reported size cannot be positively verified as empty
+      failEmptyRepoRefStatus: 409,
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+    };
+
+    const fetchFn = createMockGitFetch(gitState);
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    const result = await service.bootstrapWorkspace(ctx.workspaceId);
+    expect(result.status).toBe("MANUAL_RECOVERY");
+    expect(result.bootstrap.state).toBe("MANUAL_RECOVERY");
+    expect(result.bootstrap.last_error_code).toBe("BRANCH_UNAVAILABLE");
+    expect(gitState.contentsPuts?.length ?? 0).toBe(0);
+    expect(gitState.treeCreations.length).toBe(0);
+    expect(gitState.commitCreations.length).toBe(0);
   });
 
   it("Y3. control-plane preflight failures persist durable MANUAL_RECOVERY using attempt CAS", async () => {

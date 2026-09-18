@@ -1035,4 +1035,307 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
       await testApp.close();
     }
   });
+
+  describe("Authoritative Continuation & Dead Redirect Cleanup", () => {
+    it("createAuthorizationRedirect binds onboardingFlowId and oauthRequest, handleOAuthCallback returns them", async () => {
+      const ctx = await createTestContext();
+
+      // Upsert installation for freshUser
+      const inst = ctx.store.upsertGitHubInstallationWithUser({
+        githubInstallationId: "554433",
+        githubAppId: "12345",
+        accountId: "654321",
+        accountLogin: "fresh-user",
+        accountType: "User",
+        repositorySelection: "all",
+        suspendedAtMs: null,
+        userId: ctx.freshUser.userId,
+      });
+
+      const session = ctx.sessionManager.createSession({
+        userId: ctx.freshUser.userId,
+        provider: "github",
+        providerSubject: ctx.freshUser.providerSubject,
+        providerLogin: "fresh-user",
+      });
+
+      const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject);
+      const oauthReq = "oar_authoritative_test";
+
+      const auth = ctx.repositoryService.createAuthorizationRedirect({
+        sessionId: session.sessionId,
+        userId: session.userId,
+        providerSubject: session.providerSubject,
+        installationId: inst.installation.github_installation_id,
+        onboardingFlowId: flow.id,
+        oauthRequest: oauthReq,
+      });
+
+      expect(auth.state).toBeDefined();
+
+      // Mock fetch for token exchange and user info
+      const origFetch = (ctx.repositoryService as any).fetchFn;
+      (ctx.repositoryService as any).fetchFn = async (urlStr: string) => {
+        const u = String(urlStr);
+        if (u.includes("oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ access_token: "ghu_repo_auth_test" }),
+          } as any;
+        }
+        if (u.includes("/user/installations")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              total_count: 1,
+              installations: [
+                {
+                  id: 554433,
+                  app_id: 12345,
+                  account: { id: 654321, login: "fresh-user", type: "User" },
+                  repository_selection: "all",
+                },
+              ],
+            }),
+          } as any;
+        }
+        if (u.includes("/user")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ id: 654321, login: "fresh-user" }),
+          } as any;
+        }
+        return { ok: false, status: 404 } as any;
+      };
+
+      const result = await ctx.repositoryService.handleOAuthCallback({
+        state: auth.state,
+        code: "test_oauth_code",
+        currentSessionId: session.sessionId,
+        currentUserId: session.userId,
+        currentProviderSubject: session.providerSubject,
+      });
+
+      expect(result.grant).toBeDefined();
+      expect(result.onboardingFlowId).toBe(flow.id);
+      expect(result.oauthRequest).toBe(oauthReq);
+    });
+
+    it("GET /auth/github-app/repository/callback authoritatively completes onboarding when state has onboardingFlowId", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const inst = ctx.store.upsertGitHubInstallationWithUser({
+          githubInstallationId: "554433",
+          githubAppId: "12345",
+          accountId: "654321",
+          accountLogin: "fresh-user",
+          accountType: "User",
+          repositorySelection: "all",
+          suspendedAtMs: null,
+          userId: ctx.freshUser.userId,
+        });
+
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject);
+        const oauthReq = "oar_preservation_test";
+
+        const auth = ctx.repositoryService.createAuthorizationRedirect({
+          sessionId: session.sessionId,
+          userId: session.userId,
+          providerSubject: session.providerSubject,
+          installationId: inst.installation.github_installation_id,
+          onboardingFlowId: flow.id,
+          oauthRequest: oauthReq,
+        });
+
+        (ctx.repositoryService as any).fetchFn = async (urlStr: string) => {
+          const u = String(urlStr);
+          if (u.includes("oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ access_token: "ghu_repo_auth_test" }),
+            } as any;
+          }
+          if (u.includes("/user/installations")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                total_count: 1,
+                installations: [
+                  {
+                    id: 554433,
+                    app_id: 12345,
+                    account: { id: 654321, login: "fresh-user", type: "User" },
+                    repository_selection: "all",
+                  },
+                ],
+              }),
+            } as any;
+          }
+          if (u.includes("/user")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ id: 654321, login: "fresh-user" }),
+            } as any;
+          }
+          return { ok: false, status: 404 } as any;
+        };
+
+        // Spy provisionWorkspace
+        const provisionSpy = vi.spyOn(ctx.onboardingService, "provisionWorkspace").mockResolvedValue({
+          id: "ws_authtest",
+          name: "ceo-data",
+        } as any);
+
+        const res = await fetch(`${testApp.baseUrl}/auth/github-app/repository/callback?state=${auth.state}&code=testcode`, {
+          headers: {
+            Cookie: `ceo_user_session=${session.sessionId}`,
+          },
+          redirect: "manual",
+        });
+
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe(
+          `/onboarding/complete?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthReq)}`,
+        );
+        expect(provisionSpy).toHaveBeenCalledWith(
+          flow.id,
+          expect.objectContaining({ userId: session.userId }),
+          expect.any(String),
+        );
+      } finally {
+        await testApp.close();
+      }
+    });
+
+    it("GET /auth/github-app/repository/callback without onboardingFlowId does NOT provision active flow", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const inst = ctx.store.upsertGitHubInstallationWithUser({
+          githubInstallationId: "554433",
+          githubAppId: "12345",
+          accountId: "654321",
+          accountLogin: "fresh-user",
+          accountType: "User",
+          repositorySelection: "all",
+          suspendedAtMs: null,
+          userId: ctx.freshUser.userId,
+        });
+
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        // User has an active flow in DB
+        const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject);
+
+        // Generic authorization created WITHOUT onboardingFlowId
+        const auth = ctx.repositoryService.createAuthorizationRedirect({
+          sessionId: session.sessionId,
+          userId: session.userId,
+          providerSubject: session.providerSubject,
+          installationId: inst.installation.github_installation_id,
+        });
+
+        (ctx.repositoryService as any).fetchFn = async (urlStr: string) => {
+          const u = String(urlStr);
+          if (u.includes("oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ access_token: "ghu_repo_auth_test" }),
+            } as any;
+          }
+          if (u.includes("/user/installations")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                total_count: 1,
+                installations: [
+                  {
+                    id: 554433,
+                    app_id: 12345,
+                    account: { id: 654321, login: "fresh-user", type: "User" },
+                    repository_selection: "all",
+                  },
+                ],
+              }),
+            } as any;
+          }
+          if (u.includes("/user")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ id: 654321, login: "fresh-user" }),
+            } as any;
+          }
+          return { ok: false, status: 404 } as any;
+        };
+
+        const provisionSpy = vi.spyOn(ctx.onboardingService, "provisionWorkspace");
+
+        const res = await fetch(`${testApp.baseUrl}/auth/github-app/repository/callback?state=${auth.state}&code=testcode`, {
+          headers: {
+            Cookie: `ceo_user_session=${session.sessionId}`,
+          },
+          redirect: "manual",
+        });
+
+        expect(res.status).toBe(302);
+        // Cleaned up dead /settings/ redirect: goes to /onboarding
+        expect(res.headers.get("location")).toBe("/onboarding");
+        // Crucial invariant: never guess or fallback to active onboarding flow
+        expect(provisionSpy).not.toHaveBeenCalled();
+      } finally {
+        await testApp.close();
+      }
+    });
+
+    it("GET /auth/github-app/repository/callback redirects errors to /onboarding instead of /settings/*", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        const res = await fetch(`${testApp.baseUrl}/auth/github-app/repository/callback?error=access_denied`, {
+          headers: {
+            Cookie: `ceo_user_session=${session.sessionId}`,
+          },
+          redirect: "manual",
+        });
+
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe("/onboarding");
+      } finally {
+        await testApp.close();
+      }
+    });
+  });
 });
+

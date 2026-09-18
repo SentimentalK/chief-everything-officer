@@ -433,6 +433,8 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
         userId: session.userId,
         providerSubject: session.providerSubject || "",
         installationId: instState.installation.github_installation_id,
+        onboardingFlowId: flowId,
+        oauthRequest,
       });
 
       res.redirect(302, authorizationUrl);
