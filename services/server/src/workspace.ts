@@ -55,6 +55,19 @@ interface CompletedTransaction {
   operation_result?: Record<string, unknown>;
 }
 
+export interface LockOwnerMetadata {
+  lockId: string;
+  instanceId: string;
+  pid: number;
+  at: string;
+  createdAtMs: number;
+}
+
+export const PROCESS_INSTANCE_ID = randomUUID();
+export const LOCK_SETUP_GRACE_MS = 5_000;
+export const ACTIVE_WORKSPACE_LOCKS = new Map<string, string>();
+export const STALE_RECOVERY_BY_LOCK_DIR = new Map<string, Promise<boolean>>();
+
 export function normalizeListPrefix(prefix: string): string {
   const trimmed = prefix.trim();
   if (!trimmed) return "";
@@ -852,27 +865,206 @@ export class CeoWorkspace {
     await rename(temporary, filePath);
   }
 
+  protected async createLockDir(): Promise<void> {
+    await mkdir(this.lockDir);
+  }
+
+  protected async writeOwnerJson(filePath: string, meta: LockOwnerMetadata): Promise<void> {
+    await writeFile(filePath, JSON.stringify(meta), { encoding: "utf8", mode: 0o600 });
+  }
+
   private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    return await this.acquireAndRunLock(operation, /* allowStaleRetry */ true);
+  }
+
+  private async acquireAndRunLock<T>(
+    operation: () => Promise<T>,
+    allowStaleRetry: boolean,
+  ): Promise<T> {
+    const lockId = randomUUID();
+    let acquired = false;
+    let ownerWritten = false;
+
     try {
-      await mkdir(this.lockDir);
-      await writeFile(path.join(this.lockDir, "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      await this.createLockDir();
+      acquired = true;
+
+      const ownerMeta: LockOwnerMetadata = {
+        lockId,
+        instanceId: PROCESS_INSTANCE_ID,
+        pid: process.pid,
+        at: new Date().toISOString(),
+        createdAtMs: Date.now(),
+      };
+      await this.writeOwnerJson(path.join(this.lockDir, "owner.json"), ownerMeta);
+      ownerWritten = true;
+      ACTIVE_WORKSPACE_LOCKS.set(this.lockDir, lockId);
+
+      return await operation();
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new CeoError("NOT_READY", "Another workspace operation currently holds the lock.");
+      if (acquired) {
+        // Error occurred inside writeFile or operation. Handled by finally.
+        throw error;
       }
+
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        if (allowStaleRetry) {
+          const recovered = await this.recoverStaleLockSerialized();
+          if (recovered) {
+            return await this.acquireAndRunLock(operation, /* allowStaleRetry */ false);
+          }
+        }
+
+        throw new CeoError(
+          "NOT_READY",
+          "Another workspace operation currently holds the lock.",
+          { reason: "WORKSPACE_BUSY" },
+        );
+      }
+
       throw error;
+    } finally {
+      if (acquired) {
+        if (!ownerWritten) {
+          // Setup failed before/during owner.json write.
+          // Clean up directory unconditionally since this acquisition created it.
+          await rm(this.lockDir, { recursive: true, force: true }).catch((err) => {
+            console.error(
+              `[CEO] workspace_lock_cleanup_failed lockId=${lockId} lockDir=${this.lockDir} error=${err?.message || err}`,
+            );
+          });
+        } else {
+          if (ACTIVE_WORKSPACE_LOCKS.get(this.lockDir) === lockId) {
+            ACTIVE_WORKSPACE_LOCKS.delete(this.lockDir);
+          }
+          await this.releaseOwnedLock(lockId);
+        }
+      }
     }
-    try { return await operation(); }
-    finally { await rm(this.lockDir, { recursive: true, force: true }); }
+  }
+
+  private async releaseOwnedLock(lockId: string): Promise<boolean> {
+    try {
+      const currentOwner = await this.readJson<LockOwnerMetadata>(path.join(this.lockDir, "owner.json"));
+      if (currentOwner?.lockId !== lockId) {
+        return false;
+      }
+      await rm(this.lockDir, { recursive: true, force: true });
+      return true;
+    } catch (err: any) {
+      console.error(
+        `[CEO] workspace_lock_release_failed lockId=${lockId} lockDir=${this.lockDir} error=${err?.message || err}`,
+      );
+      return false;
+    }
+  }
+
+  private async recoverStaleLockSerialized(): Promise<boolean> {
+    const existing = STALE_RECOVERY_BY_LOCK_DIR.get(this.lockDir);
+    if (existing) {
+      return await existing;
+    }
+
+    const task = (async () => {
+      try {
+        const inspection = await this.inspectStaleLock();
+        if (!inspection.isStale) {
+          return false;
+        }
+        const reclaimed = await this.reclaimStaleLock(inspection.expectedLockId);
+        if (reclaimed) {
+          console.warn(
+            `[CEO] workspace_lock_reclaimed lockDir=${this.lockDir} lockId=${inspection.expectedLockId ?? "unknown"} reason=${inspection.reason}`,
+          );
+        }
+        return reclaimed;
+      } finally {
+        STALE_RECOVERY_BY_LOCK_DIR.delete(this.lockDir);
+      }
+    })();
+
+    STALE_RECOVERY_BY_LOCK_DIR.set(this.lockDir, task);
+    return await task;
+  }
+
+  private async inspectStaleLock(): Promise<{
+    isStale: boolean;
+    expectedLockId: string | null;
+    reason?: string;
+  }> {
+    let owner: LockOwnerMetadata | null = null;
+    try {
+      owner = await this.readJson<LockOwnerMetadata>(path.join(this.lockDir, "owner.json"));
+    } catch {
+      owner = null;
+    }
+
+    // Case A: owner.json missing or invalid
+    if (!owner || typeof owner.lockId !== "string") {
+      try {
+        const lockStat = await stat(this.lockDir);
+        const ageMs = Date.now() - lockStat.mtimeMs;
+        if (ageMs < LOCK_SETUP_GRACE_MS) {
+          // Fresh directory (< 5s), setup may be in progress -> assume busy
+          return { isStale: false, expectedLockId: null };
+        }
+        // Older than setup grace -> orphan stale
+        return { isStale: true, expectedLockId: null, reason: "ownerless_orphan" };
+      } catch {
+        return { isStale: false, expectedLockId: null };
+      }
+    }
+
+    // Case B: owner belongs to current Node process instance
+    if (owner.instanceId === PROCESS_INSTANCE_ID) {
+      if (ACTIVE_WORKSPACE_LOCKS.get(this.lockDir) === owner.lockId) {
+        return { isStale: false, expectedLockId: owner.lockId };
+      }
+      // Same process instance, but not actively registered -> stale
+      return { isStale: true, expectedLockId: owner.lockId, reason: "same_instance_orphan" };
+    }
+
+    // Case C: foreign instance / process (best-effort local check)
+    if (typeof owner.pid === "number") {
+      try {
+        process.kill(owner.pid, 0);
+        return { isStale: false, expectedLockId: owner.lockId };
+      } catch (err: any) {
+        if (err?.code === "ESRCH") {
+          return { isStale: true, expectedLockId: owner.lockId, reason: "dead_foreign_pid" };
+        }
+        return { isStale: false, expectedLockId: owner.lockId };
+      }
+    }
+
+    return { isStale: false, expectedLockId: null };
+  }
+
+  private async reclaimStaleLock(expectedLockId: string | null): Promise<boolean> {
+    try {
+      if (expectedLockId !== null) {
+        const currentOwner = await this.readJson<LockOwnerMetadata>(path.join(this.lockDir, "owner.json"));
+        if (currentOwner?.lockId !== expectedLockId) {
+          return false;
+        }
+      } else {
+        const currentOwner = await this.readJson<LockOwnerMetadata>(path.join(this.lockDir, "owner.json"));
+        if (currentOwner && typeof currentOwner.lockId === "string") {
+          return false;
+        }
+      }
+
+      await rm(this.lockDir, { recursive: true, force: true });
+      return true;
+    } catch (err: any) {
+      console.error(
+        `[CEO] workspace_lock_reclaim_failed lockDir=${this.lockDir} expectedLockId=${expectedLockId} error=${err?.message || err}`,
+      );
+      return false;
+    }
   }
 
   private async removeStaleLock(): Promise<void> {
-    const owner = await this.readJson<{ pid?: number }>(path.join(this.lockDir, "owner.json"));
-    if (!owner?.pid) {
-      await rm(this.lockDir, { recursive: true, force: true });
-      return;
-    }
-    try { process.kill(owner.pid, 0); }
-    catch { await rm(this.lockDir, { recursive: true, force: true }); }
+    await this.recoverStaleLockSerialized();
   }
 }
