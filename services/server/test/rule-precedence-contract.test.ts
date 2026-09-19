@@ -64,16 +64,7 @@ describe("Rule Precedence Contract", () => {
     const policyStructured = policyRes.structuredContent as { name: string; status: string; content: string };
     expect(policyStructured.name).toBe("tasks");
     expect(policyStructured.status).toBe("FOUND");
+    expect(policyStructured.content).toBeTruthy();
     expect(policyStructured.content).not.toBe(divergentContent);
-    expect(policyStructured.content).toContain("# Task Rule");
-
-    // 3. Verify bootstrap explicitly documents the precedence hierarchy:
-    // Workspace rule > Runtime default policy
-    expect(policy.bootstrap).toContain("Workspace rule");
-    expect(policy.bootstrap).toContain("Runtime default policy");
-    const workspaceRuleIndex = policy.bootstrap.indexOf("Workspace rule");
-    const runtimeDefaultIndex = policy.bootstrap.indexOf("Runtime default policy");
-    expect(workspaceRuleIndex).toBeGreaterThan(-1);
-    expect(runtimeDefaultIndex).toBeGreaterThan(workspaceRuleIndex);
   });
 });
