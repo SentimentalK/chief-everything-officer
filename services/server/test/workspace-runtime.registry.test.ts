@@ -12,6 +12,10 @@ import {
 import type { GitHubAppClient } from "../src/github/app-client.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import type { WorkspaceRuntimeConfig } from "../src/runtime/types.js";
+import {
+  HttpContentResolverClient,
+  type UrlMetadataResolver,
+} from "../src/resource/resolver-client.js";
 
 describe("WorkspaceRuntimeRegistry", () => {
   let tempDir: string;
@@ -218,6 +222,54 @@ describe("WorkspaceRuntimeRegistry", () => {
     expect(capturedConfig!.credentialProvider).toBeDefined();
 
     expect(runtime.resourceService).toBeDefined();
+  });
+
+  it("passes sharedResourceDependencies resolverClient to ResourceService", async () => {
+    seedWorkspaceFixture({ workspaceId: "ws_alpha" });
+
+    const mockResolver: UrlMetadataResolver = {
+      resolve: async () => ({
+        status: "disabled",
+        attempted_at: new Date().toISOString(),
+      }),
+    };
+
+    const registry = new WorkspaceRuntimeRegistry({
+      store,
+      dataRoot: tempDir,
+      gitConfig: defaultGitConfig,
+      appClient: mockAppClient,
+      sharedResourceDependencies: {
+        resolverClient: mockResolver,
+      },
+      workspaceFactory: createMockWorkspace,
+    });
+
+    const runtime = await registry.get("ws_alpha");
+    expect(runtime.resourceService).toBeDefined();
+    expect((runtime.resourceService as unknown as { resolverClient: UrlMetadataResolver }).resolverClient).toBe(mockResolver);
+  });
+
+  it("initializes HttpContentResolverClient on ResourceService when resolver config is provided", async () => {
+    seedWorkspaceFixture({ workspaceId: "ws_alpha" });
+
+    const registry = new WorkspaceRuntimeRegistry({
+      store,
+      dataRoot: tempDir,
+      gitConfig: defaultGitConfig,
+      appClient: mockAppClient,
+      sharedResourceDependencies: {
+        contentResolverUrl: "http://ceo-resolver:8000",
+        contentResolverToken: "secret-token",
+        contentResolverTimeoutMs: 3000,
+      },
+      workspaceFactory: createMockWorkspace,
+    });
+
+    const runtime = await registry.get("ws_alpha");
+    expect(runtime.resourceService).toBeDefined();
+    const resolver = (runtime.resourceService as unknown as { resolverClient: UrlMetadataResolver }).resolverClient;
+    expect(resolver).toBeInstanceOf(HttpContentResolverClient);
   });
 
   it("caches and reuses runtime instance for the same workspace_id", async () => {

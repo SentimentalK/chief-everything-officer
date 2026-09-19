@@ -97,6 +97,11 @@ const runtimeRegistry = new WorkspaceRuntimeRegistry({
     gitCommitterEmail: config.gitCommitterEmail,
   },
   appClient: gitHubAppClient,
+  sharedResourceDependencies: {
+    contentResolverUrl: config.contentResolverUrl,
+    contentResolverToken: config.contentResolverToken,
+    contentResolverTimeoutMs: config.contentResolverTimeoutMs,
+  },
 });
 
 const productPolicy = await loadProductPolicy();

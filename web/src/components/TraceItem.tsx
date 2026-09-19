@@ -2,6 +2,7 @@ import React from "react";
 import { ChevronDown, ChevronRight, CheckCircle2, AlertCircle, Clock, GitCommit } from "lucide-react";
 import type { TraceSummary } from "../api";
 import { formatBytes, formatTime } from "../lib/utils";
+import { getToolBadgeClass } from "../lib/toolBadge";
 
 interface TraceItemProps {
   trace: TraceSummary;
@@ -18,21 +19,6 @@ export const TraceItem: React.FC<TraceItemProps> = ({
 }) => {
   const isError = trace.status === "error";
   const isWrite = trace.tool_name === "apply_change_set";
-
-  const getToolBadgeClass = (tool: string) => {
-    switch (tool) {
-      case "policy_read":
-        return "bg-purple-950/60 text-purple-300 border-purple-800/50";
-      case "apply_change_set":
-        return "bg-amber-950/60 text-amber-300 border-amber-800/50";
-      case "workspace_status":
-        return "bg-sky-950/60 text-sky-300 border-sky-800/50";
-      case "search_text":
-        return "bg-emerald-950/60 text-emerald-300 border-emerald-800/50";
-      default:
-        return "bg-neutral-800 text-neutral-300 border-neutral-700";
-    }
-  };
 
   return (
     <div
