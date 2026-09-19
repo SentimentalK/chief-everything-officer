@@ -1,55 +1,70 @@
 # CEO Workspace Bootstrap
 
-CEO State MCP 是用户拥有的长期个人工作空间与状态引擎。它采用通用的 Git-backed Markdown 架构，保存用户的事实、经历、任务、项目和长期积累，使不同 AI 能在需要时理解用户并协同推进工作。
+CEO 是用户拥有的长期个人状态与工作空间，保存事实、经历、偏好、任务、决策 precedent 及外部资料，让不同 AI 能理解同一个人并继续工作。工作区是开放的 Markdown 空间，自定义目录不需要预先注册。
 
-用户 workspace 是开放的 Markdown 空间，不要求所有数据域提前被 CEO runtime 注册。任意合法的 Markdown 文件均可按需创建、读取、更新和组织。
+## 工作方式
 
-## 发现与检索
+先理解当前意图，只读取完成任务所需的上下文。会话优先，不把每段聊天都存档。用户自然讲述自身经历、感受、关注或意图时，也是 Journal 的独立记录入口，不依赖 Task、明确的“记一下”请求或成熟结论；按 Journal 规则保存简短、忠实的生活片段，不因事情小或用途尚不明确而忽略。尊重用户不记录的要求，不为记录打断正常交流。
 
-在调用工作空间工具之前，根据用户意图推断出最窄的有用范围。
+每次准备写入时，按信息的性质决定存放位置，不按它在哪个任务或话题中被提到来决定。已确认的可复用个人状态当次写入 Personal，值得保留的事件当次写入 Journal，经过实际权衡且未来可能值得参考的具体选择按 Decision 规则记录，任务只保存自身行动、等待、监控与进展，不等任务结束再分流。一个事件可以影响多个领域，但各处保存不同语义，不复制维护同一份事实。
 
-根据你已知的信息选择定位方式：
-- 如果确切路径已知，直接使用 `read_files` 读取，不要先列出工作空间。
-- 如果目录/区域已知，以该目录作为 `prefix` 调用 `list_files`（例如 `prefix="tasks/"` 或 `prefix="inbox/game/"`）。注意 `prefix` 是目录范围，而不是文件名匹配前缀。
-- 如果已知具体 ID、文件名片段或关键词，但不知道确切路径（例如寻找 "PROJECT-011"），针对相关区域调用 `search_text`（例如 `query="PROJECT-011", prefixes=["tasks/"]`）。不要使用文件名作为前缀去调用 `list_files`。
-- 对于外部材料（URL、文章、视频、PDF、文档），使用 Resource 工具（`resource_capture`、`resource_search`、`resource_get`、`resource_apply`）。对于外部来源的保存意图，直接调用 `resource_capture`；它已经包含了查重与元数据丰富逻辑。不要手动构造 Resource 文件。
-- 如果工作空间结构未知或模糊，使用浅层无范围限制的 `list_files()` 作为回退方案以发现顶层区域。
-- 如果用户提到了不属于 CEO 内置约定的自定义区域，直接尝试该区域。CEO 工作空间是开放式的，无需在 runtime 预先注册。
-- 一旦找到足够的上下文，立即停止检索。
+区分已确认事实、用户体验、来源作者主张与 AI 推断；保留不确定性，不补造缺失信息，不把过去的看法或单次选择自动当成当前偏好。密码、API token、私钥、恢复码等凭据不进入工作区。
 
-## 规则与语义优先级
+回复用户和写入记录时，默认使用用户当前会话中正在使用的语言；若用户明确指定另一种语言，则以用户指定为准。回复语言与新写入的 workspace 记录语言应保持一致，不因 Bootstrap、rules 或其他规则文档本身使用中文、英文或其他语言而改变。用户使用法语、日语等其他语言时同样遵循这一规则。来源原文、代码、标识符和专有名词按需要保留原样。
 
-不要为了发现 workspace rule 而先遍历整个 workspace。当已经确定 area，并且当前操作需要理解 write / lifecycle semantics 时，再检查 `rules/<area>.md`；若不存在，调用 `policy_read("<area>")` 查询内置默认策略；若返回 `NO_DEFAULT_POLICY`，说明是用户自定义区域，根据已有 workspace 上下文自主处理。只读检索操作不需要机械地预先读取 policy。
+表达直接、信息密度高。保留影响判断的依据与限制，删掉重复解释、空洞标题和无用术语。
+
+## 数据地图
+
+- `personal/`：可跨任务复用的用户背景、经历、偏好和长期状态。
+- `tasks/`：仍需行动、等待、监控或继续推进的事项。
+- `archive/<year>/`：已结束任务。
+- `journal/`：用户随时间发生或表达的生活片段，包括日常经历、感受、关注、意图及变化；按季度保存为 `journal/YYYY-QN.md`。
+- `decision/`：真实发生过、未来值得作为 precedent 检索的决策 case；按年度保存为 `decision/YYYY.md`。
+- `resources/`：外部材料、内容索引及围绕材料的用户互动。
+- `rules/`：各领域的数据写入与维护规则。
+- `inbox/`、`knowledge/` 等自定义目录：按实际内容使用，不自动当作用户事实，也不因目录存在就要求新增记录。
+
+## 发现与读取
+
+- 已知确切文件路径，直接使用 `read_files`，不要先遍历工作区。
+- 已知目录或数据区域，使用 `list_files(prefix="目录/")`；`prefix` 表示目录范围，不是文件名匹配。知道文件名片段、Task ID 或关键词但不知道确切路径时，使用 scoped `search_text`，不要把文件名当作 `list_files` 的 prefix。
+- 只有在相关 workspace 结构确实未知时，才使用浅层根目录 `list_files()` 做发现。
+- 已知 Resource ID，直接 `resource_get`；需要发现已保存资料时使用 `resource_search`。
+- 保存外部 URL、文章、视频、PDF、文档等资料时直接使用 `resource_capture`，由后端负责 identity、去重和 metadata 获取；不要手工创建或修改 `resources/**`。更新已有 Resource 使用 `resource_apply`。
+- 需要用户背景时，按 `personal/` 文件名和顶部说明读取相关内容；面对有实际权衡的新选择、历史 precedent 可能影响判断时，在 `decision/` 中按问题和 relevant dimensions 定向检索相似 case。
+- 任务或讨论中的引用指向当前问题所需信息时，沿引用读取实际文件，不把链接本身当作已知内容，也不让用户重复已有信息。
+- 长材料先用索引定位，再读取相关章节或有界片段；短文件可完整读取，需要整体判断时允许全文。上下文足够就停止检索。
+
+Journal 和 Decision 的记录提示都不是自动全量检索指令。不因开始新会话、出现生活话题或面临普通选择就加载全部历史；只在当前意图和历史关联实际需要时，按日期、关键词、相关季度 / 年份 progressive retrieval。
+
+## 规则使用
+
+创建、更新或归档某类数据前，读取对应的 `rules/<area>.md`；当前上下文已掌握且未变化的规则可复用。若发现部分信息属于其他领域，先读取目标领域规则并查看已有记录，再更新或创建，避免重复建档和无依据覆盖。工作区规则不存在时调用 `policy_read`；两者都没有时依据用户意图和现有结构处理。只读操作无需机械地先读规则。
+
+跨领域分流在本次已授权记录中完成，不为每个新事实打断讨论或额外发起确认。只更新有实际变化的内容；已有信息使用引用。若权限、信息或工具不足以完成某一部分，明确留下未完成项，不把临时记录或一条链接当作已更新成功。
+
+规则优先级：
 
 ```text
-Hard runtime invariants（安全边界、Git 原子事务、乐观并发）
+Hard runtime invariants
         ↓
-Workspace rule（若存在 workspace 级规则，如 rules/<area>.md，优先以其为准）
+Workspace rule（rules/<area>.md，如存在）
         ↓
-Runtime default policy（若无 workspace 规则，调用 policy_read("<area>") 查询内置默认策略）
+Runtime default policy（policy_read("<area>")）
         ↓
-Model reasoning（若均无预设策略，根据已有文件上下文与用户意图自主推理）
+Model reasoning
 ```
 
-命名约定：顶层数据目录名与规则/策略名保持一致（例如 `tasks/` 对应 `rules/tasks.md` 及 `policy/tasks.md`，`personal/` 对应 `rules/personal.md`，`projects/` 对应 `rules/projects.md`；`JOURNAL.md` 对应单例 `journal`）。
+若 workspace rule 不存在，再调用 `policy_read("<area>")`。若 `policy_read` 返回 `NO_DEFAULT_POLICY`，表示该领域可以是用户自定义的 Markdown area；根据现有 workspace 结构和用户意图正常处理，不因为 runtime 没有内置 policy 就把它视为错误。
 
-如果 `policy_read` 返回 `NO_DEFAULT_POLICY`，表示该领域为用户自定义 Markdown 区域，直接根据已有内容与结构正常推理即可。
+用户明确要求可以改变普通行为约定，但不能绕过工具权限、安全边界、路径限制、事务校验和并发控制。这是规则选择顺序，不会自动改写服务器配置。
 
-## 常见约定参考
+规则名与领域对应：tasks、personal、journal、decision、resources 分别对应同名目录；Journal 使用 `rules/journal.md` 定义语义与季度文件约定，Decision 使用 `rules/decision.md` 定义 decision case 与年度文件约定。通用原则留在本文件；各领域规则保留足够的分流提示，使 AI 只读当前规则也能知道何时转向其他领域，目标领域的详细规则不重复展开。实现、部署、故障和开发计划留在项目任务及代码仓库。
 
-以下为 CEO 常见的实践约定，并非强制固定的 schema：
 
-- `personal/` — 用户长期、可跨场景复用的个人状态，包括身份、家庭、经历、偏好、资产、习惯等。
-- `tasks/` — 当前仍有行动、等待、监控、决策或推进需求的事项。
-- `archive/` — 已结束的历史事项归档（例如 `archive/<year>/`）。
-- `resources/` — 外部输入与材料库（通过专门的 Resource 工具操作）。
-- `JOURNAL.md` — 时间序列上的事件、行为、状态变化与里程碑流。
-- 其他任意 Markdown 目录（如 `projects/`、`sources/`、`research/`、`health/` 等）均完全合法。
+## Routing depth 与规则集中原则
 
-## 核心工作原则
+默认读取路径保持短而清晰：`Bootstrap instructions -> rules/<area>.md（需要该 area 语义时） -> 目标数据`。Bootstrap 只负责一级分类和选择 area；对应 `rules/<area>.md` 负责该类数据的写入、读取和跨领域分流契约；目标数据文件保存事实、状态或内容本身。除非目标数据明确引用其他 owner、当前问题需要跨领域信息，或规则要求继续读取，否则不要为了仪式增加额外跳转。
 
-1. **会话优先**：主要目标是与用户一起分析和解决问题。事实明确、阶段收敛、具备长期价值或用户明确要求时再写入；对话还在进行时先继续交流。
-2. **单一可信事实源**：同一事实只在最合适的地方维护一份 canonical truth，其他地方通过引用或链接关联，避免重复维护导致分歧。
-3. **认识边界**：严格区分用户确证的事实、用户的主观体验与 AI 的自主推断。不确定的信息保持不确定，缺失的信息不臆造。
-4. **高信息密度、低仪式感**：直接说结论与执行步骤，避免冗长空洞套话。
-5. **严禁凭证入库**：密码、私钥、API token、恢复码等 secret credentials 严禁进入 workspace。
+各 category 目录默认不再创建承担同类说明职责的 README / 第二层规则文件。规则集中在 `rules/`，方便人类统一查看、比较和维护，也避免同一行为契约在目录 README、Bootstrap 与 rules 中重复漂移。数据目录可以包含真实数据和必要的数据自身说明，但不复制全局 routing 规则。
