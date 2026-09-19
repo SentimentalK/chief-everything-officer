@@ -1308,4 +1308,183 @@ export class GitHubRepositoryService {
       this.activeCreations.delete(currentUserId);
     }
   }
+
+  /**
+   * Creates a private repository on GitHub and binds it to a local Workspace + Binding + PENDING Bootstrap,
+   * without executing bootstrap or minting broad installation tokens.
+   * Consumes the UAT grant immediately upon binding.
+   */
+  async createRepositoryAndBind(
+    grantId: string,
+    currentSessionId: string,
+    currentUserId: string,
+    currentProviderSubject: string,
+    input: { name: string; description?: string },
+  ): Promise<{
+    workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+    membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+    binding: GitHubRepositoryBindingRecord;
+    bootstrap: WorkspaceBootstrapRecord;
+    status: ProductProvisioningStatus;
+  }> {
+    if (this.activeCreations.has(currentUserId)) {
+      throw new GitHubRepositoryError("Repository creation already in progress for this user", 409);
+    }
+    this.activeCreations.add(currentUserId);
+
+    try {
+      if (!input.name || typeof input.name !== "string" || input.name.trim().length === 0) {
+        throw new GitHubRepositoryError("Repository name is required", 400);
+      }
+      const repoName = input.name.trim();
+      if (!/^[a-zA-Z0-9._-]+$/.test(repoName) || repoName === "." || repoName === ".." || repoName.length > 100) {
+        throw new GitHubRepositoryError("Invalid repository name", 400);
+      }
+
+      const grant = this.getValidGrant(grantId, currentSessionId, currentUserId, currentProviderSubject);
+
+      if (this.store.countOwnedWorkspacesForUser(currentUserId) > 0) {
+        throw new GitHubRepositoryError("USER_ALREADY_OWNS_WORKSPACE: User already owns a workspace", 409);
+      }
+
+      // Live installation capability check BEFORE external side effect
+      const instDetails = await this.appClient.getInstallation(grant.installationId);
+      if (instDetails.permissions?.administration !== "write") {
+        throw new GitHubAppPermissionUpgradeRequiredError(
+          "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED: GitHub App requires Administration: write permission for repository creation",
+        );
+      }
+      if (instDetails.permissions?.contents !== "write") {
+        throw new GitHubAppPermissionUpgradeRequiredError(
+          "GITHUB_APP_PERMISSION_UPGRADE_REQUIRED: GitHub App requires Contents: write permission",
+        );
+      }
+
+      let createUrl: string;
+      if (grant.installationAccountType === "User") {
+        if (grant.installationAccountId !== grant.providerSubject) {
+          throw new GitHubRepositoryError("User installation account does not match authenticated user", 403);
+        }
+        createUrl = "https://api.github.com/user/repos";
+      } else {
+        createUrl = `https://api.github.com/orgs/${encodeURIComponent(grant.installationAccountLogin)}/repos`;
+      }
+
+      const createRes = await this.fetchFn(createUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${grant.userAccessToken}`,
+          Accept: "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+          "User-Agent": "CEO-Server",
+        },
+        body: JSON.stringify({
+          name: repoName,
+          description: input.description?.trim() || undefined,
+          private: true,
+          auto_init: false,
+        }),
+      });
+
+      if (!createRes.ok) {
+        const errJson = (await createRes.json().catch(() => ({}))) as { message?: string };
+        const msg = errJson.message || `GitHub repository creation failed with HTTP ${createRes.status}`;
+        throw new GitHubRepositoryError(msg, createRes.status >= 400 && createRes.status < 500 ? createRes.status : 400);
+      }
+
+      let safeRecoveryRepo: SafeRepositoryMetadata | undefined;
+      let created: {
+        workspace: { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number };
+        membership: { id: string; workspace_id: string; user_id: string; role: string; created_at: number };
+        binding: GitHubRepositoryBindingRecord;
+        bootstrap: WorkspaceBootstrapRecord;
+      };
+
+      try {
+        let createdRaw: unknown;
+        try {
+          createdRaw = await createRes.json();
+        } catch {
+          throw new Error("Creation response body was not valid JSON");
+        }
+
+        const createdRepo = parseStrictRepositoryPayload(createdRaw);
+        if (!createdRepo.private) {
+          throw new Error("Created repository is not private");
+        }
+        if (createdRepo.archived) {
+          throw new Error("Created repository is archived");
+        }
+        if (createdRepo.disabled) {
+          throw new Error("Created repository is disabled");
+        }
+        if (createdRepo.owner.id !== grant.installationAccountId) {
+          throw new Error(`Created repository owner '${createdRepo.owner.id}' does not match installation account '${grant.installationAccountId}'`);
+        }
+        if (createdRepo.name !== repoName) {
+          throw new Error(`Created repository name '${createdRepo.name}' does not match requested name '${repoName}'`);
+        }
+
+        safeRecoveryRepo = createdRepo;
+
+        // Verify exact created repository using the UAT itself (no broad installation token!)
+        const verifyRes = await this.fetchFn(
+          `https://api.github.com/repos/${encodeURIComponent(createdRepo.owner.login)}/${encodeURIComponent(createdRepo.name)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${grant.userAccessToken}`,
+              Accept: "application/vnd.github.v3+json",
+              "User-Agent": "CEO-Server",
+            },
+          },
+        );
+
+        if (!verifyRes.ok) {
+          throw new Error(`User access token failed to verify created repository with HTTP ${verifyRes.status}`);
+        }
+
+        const verifyDataRaw = await verifyRes.json();
+        const verifiedRepo = parseStrictRepositoryPayload(verifyDataRaw);
+
+        if (verifiedRepo.id !== createdRepo.id) {
+          throw new Error("Verified repository id mismatch");
+        }
+
+        // Atomically bind in DB
+        created = this.store.createWorkspaceWithRepositoryBinding({
+          userId: currentUserId,
+          installationRowId: grant.installationRowId,
+          githubRepositoryId: verifiedRepo.id,
+          ownerAccountId: verifiedRepo.owner.id,
+          ownerLogin: verifiedRepo.owner.login,
+          repositoryName: verifiedRepo.name,
+          fullName: verifiedRepo.full_name,
+          branch: verifiedRepo.default_branch || "main",
+        });
+
+        // Immediately consume and delete the UAT grant
+        this.grants.delete(grantId);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (safeRecoveryRepo) {
+          throw new GitHubPartialCreationError(
+            `Repository '${safeRecoveryRepo.full_name}' was created on GitHub, but workspace binding failed: ${detail}. Please import this repository.`,
+            safeRecoveryRepo,
+          );
+        } else {
+          throw new GitHubPartialCreationError(
+            `An external repository may have been created on GitHub, but response payload was malformed and local workspace was not created: ${detail}. Local workspace was not created.`,
+            undefined,
+          );
+        }
+      }
+
+      return {
+        ...created,
+        status: deriveProductProvisioningStatus(created.bootstrap.state),
+      };
+    } finally {
+      this.activeCreations.delete(currentUserId);
+    }
+  }
 }

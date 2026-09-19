@@ -46,7 +46,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 7;
+export const IDENTITY_DB_USER_VERSION = 8;
 
 export type WorkspaceBootstrapState =
   | "PENDING"
@@ -267,6 +267,7 @@ CREATE TABLE onboarding_flows (
   state TEXT NOT NULL,
   last_error_code TEXT,
   last_error_message TEXT,
+  host_oauth_request_id TEXT,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL,
@@ -293,6 +294,7 @@ WHERE state IN (
   'AWAITING_REPOSITORY_CHOICE',
   'AWAITING_GITHUB_ACCESS',
   'PROVISIONING',
+  'AWAITING_REPOSITORY_RESTRICTION',
   'READY_TO_RESUME',
   'RECOVERY_REQUIRED'
 );
@@ -693,7 +695,7 @@ export class IdentityStore {
       db,
       "onboarding_flows",
       ["user_id"],
-      "state IN ('AWAITING_REPOSITORY_CHOICE', 'AWAITING_GITHUB_ACCESS', 'PROVISIONING', 'READY_TO_RESUME', 'RECOVERY_REQUIRED')",
+      "state IN ('AWAITING_REPOSITORY_CHOICE', 'AWAITING_GITHUB_ACCESS', 'PROVISIONING', 'AWAITING_REPOSITORY_RESTRICTION', 'READY_TO_RESUME', 'RECOVERY_REQUIRED')",
     );
 
     this.validateData();
@@ -1156,6 +1158,9 @@ export class IdentityStore {
         case 6:
           IdentityStore.migrateV6ToV7(db);
           break;
+        case 7:
+          IdentityStore.migrateV7ToV8(db);
+          break;
         default:
           throw new IdentityStructureError(
             `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
@@ -1552,6 +1557,51 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 6 to 7: ${error}`);
+    }
+  }
+
+  static migrateV7ToV8(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 7) {
+        throw new IdentityStructureError("migrateV7ToV8 requires user_version = 7.");
+      }
+
+      const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'onboarding_flows';",
+      ).get() as { name: string } | undefined;
+      if (!row) {
+        throw new IdentityStructureError("Cannot migrate to v8: missing required v7 table 'onboarding_flows'.");
+      }
+
+      db.exec(`
+        ALTER TABLE onboarding_flows ADD COLUMN host_oauth_request_id TEXT;
+
+        DROP INDEX IF EXISTS idx_onboarding_one_active_per_user;
+
+        CREATE UNIQUE INDEX idx_onboarding_one_active_per_user
+        ON onboarding_flows(user_id)
+        WHERE state IN (
+          'AWAITING_REPOSITORY_CHOICE',
+          'AWAITING_GITHUB_ACCESS',
+          'PROVISIONING',
+          'AWAITING_REPOSITORY_RESTRICTION',
+          'READY_TO_RESUME',
+          'RECOVERY_REQUIRED'
+        );
+
+        PRAGMA user_version = 8;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 7 to 8: ${error}`);
     }
   }
 
@@ -1977,6 +2027,123 @@ export class IdentityStore {
         LIMIT 1;
       `).get(id);
       return (row as unknown as GitHubRepositoryBindingRecord) ?? null;
+    });
+  }
+
+  updateRepositoryBindingMetadata(
+    githubRepositoryId: string,
+    metadata: {
+      ownerLogin?: string;
+      repositoryName?: string;
+      fullName?: string;
+      branch?: string;
+    },
+  ): boolean {
+    return this.withDb((db) => {
+      const nowMs = Date.now();
+      const existing = this.findRepositoryBindingByGitHubRepoId(githubRepositoryId);
+      if (!existing) return false;
+
+      const ownerLogin = metadata.ownerLogin ?? existing.owner_login;
+      const repositoryName = metadata.repositoryName ?? existing.repository_name;
+      const fullName = metadata.fullName ?? existing.full_name;
+      const branch = metadata.branch ?? existing.branch;
+
+      const res = db.prepare(`
+        UPDATE github_repository_bindings
+        SET owner_login = ?,
+            repository_name = ?,
+            full_name = ?,
+            branch = ?,
+            updated_at_ms = ?
+        WHERE github_repository_id = ?;
+      `).run(ownerLogin, repositoryName, fullName, branch, nowMs, githubRepositoryId);
+
+      return Number(res.changes) > 0;
+    });
+  }
+
+  /**
+   * Atomically reconciles repository metadata in both github_repository_bindings
+   * and workspaces (remote_url) within a single immediate transaction.
+   */
+  reconcileRepositoryMetadataById(params: {
+    githubRepositoryId: string;
+    ownerLogin: string;
+    repositoryName: string;
+    fullName: string;
+    nowMs?: number;
+  }): { binding: GitHubRepositoryBindingRecord; workspaceRemoteUrl: string } {
+    const now = params.nowMs ?? Date.now();
+    return this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const bindingRow = db.prepare(
+          "SELECT * FROM github_repository_bindings WHERE github_repository_id = ? LIMIT 1;",
+        ).get(params.githubRepositoryId) as any;
+        if (!bindingRow) {
+          throw new IdentityError(
+            `Cannot reconcile repository metadata: repository binding for github repo id '${params.githubRepositoryId}' not found`,
+          );
+        }
+
+        const newRemoteUrl = `https://github.com/${params.fullName}.git`;
+
+        db.prepare(`
+          UPDATE github_repository_bindings
+          SET owner_login = ?,
+              repository_name = ?,
+              full_name = ?,
+              updated_at_ms = ?
+          WHERE github_repository_id = ?;
+        `).run(
+          params.ownerLogin,
+          params.repositoryName,
+          params.fullName,
+          now,
+          params.githubRepositoryId,
+        );
+
+        db.prepare(`
+          UPDATE workspaces
+          SET remote_url = ?
+          WHERE id = ?;
+        `).run(newRemoteUrl, bindingRow.workspace_id);
+
+        db.exec("COMMIT;");
+
+        const updatedBinding = this.findRepositoryBindingByGitHubRepoId(params.githubRepositoryId)!;
+        return { binding: updatedBinding, workspaceRemoteUrl: newRemoteUrl };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Authoritative helper for checking whether a workspace is ready for Host access.
+   * If the workspace is GitHub-managed or has a bootstrap record, it is ready if and only if
+   * its bootstrap record exists and is in READY state.
+   */
+  isWorkspaceReadyForHost(workspaceId: string): boolean {
+    return this.withDb((db) => {
+      const bindingRow = db.prepare(
+        "SELECT id FROM github_repository_bindings WHERE workspace_id = ? LIMIT 1;",
+      ).get(workspaceId);
+      const bootstrapRow = db.prepare(
+        "SELECT state FROM workspace_bootstraps WHERE workspace_id = ? LIMIT 1;",
+      ).get(workspaceId) as { state: string } | undefined;
+
+      if (bindingRow || bootstrapRow) {
+        return bootstrapRow !== undefined && bootstrapRow.state === "READY";
+      }
+      const wsRow = db.prepare("SELECT id FROM workspaces WHERE id = ? LIMIT 1;").get(workspaceId);
+      return Boolean(wsRow);
     });
   }
 

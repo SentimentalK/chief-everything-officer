@@ -11,12 +11,14 @@ import {
 
 import type { IdentityStore } from "../identity/store.js";
 import type { WorkspaceBootstrapService } from "../github/bootstrap-service.js";
+import { OnboardingStore } from "../onboarding/store.js";
 
 export interface OAuthRouterOptions {
   oauthService: OAuthService;
   sessionManager: UserSessionManager;
   identityStore?: IdentityStore;
   bootstrapService?: WorkspaceBootstrapService;
+  onboardingStore?: OnboardingStore;
 }
 
 export function escapeHtml(str: string): string {
@@ -203,6 +205,7 @@ function getProtectedResourceMetadata(oauthService: OAuthService): Record<string
 export function createOAuthRouter(options: OAuthRouterOptions): Router {
   const { oauthService, sessionManager, bootstrapService } = options;
   const identityStore = options.identityStore ?? oauthService.identityStoreInstance;
+  const onboardingStore = options.onboardingStore ?? (identityStore ? new OnboardingStore(identityStore) : undefined);
   const router = express.Router();
 
   // RFC 8414 Authorization Server Metadata (canonical for issuer origin)
@@ -258,9 +261,38 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         return;
       }
 
+      // Flow-first routing: inspect active onboarding flow before workspace memberships
+      if (onboardingStore) {
+        const activeFlow = onboardingStore.findActiveFlowForUser(session.userId);
+        if (activeFlow) {
+          if (request.id && activeFlow.host_oauth_request_id !== request.id) {
+            onboardingStore.updateFlow(activeFlow.id, { host_oauth_request_id: request.id });
+          }
+          if (activeFlow.state === "AWAITING_REPOSITORY_RESTRICTION" || activeFlow.state === "PROVISIONING") {
+            res.redirect(302, `/onboarding/security?flow=${encodeURIComponent(activeFlow.id)}`);
+            return;
+          }
+          if (activeFlow.state === "AWAITING_GITHUB_ACCESS" || activeFlow.state === "AWAITING_REPOSITORY_CHOICE") {
+            res.redirect(302, `/onboarding?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(request.id)}`);
+            return;
+          }
+          if (activeFlow.state === "RECOVERY_REQUIRED") {
+            if (activeFlow.workspace_id) {
+              res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(activeFlow.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
+            } else {
+              res.redirect(302, `/onboarding?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(request.id)}`);
+            }
+            return;
+          }
+        }
+      }
+
       // Check user workspace memberships
       const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
       if (memberships.length === 0) {
+        if (onboardingStore) {
+          onboardingStore.getOrCreateActiveFlowInTx(session.userId, session.providerSubject || "", undefined, request.id);
+        }
         res.redirect(302, `/onboarding?oauth_request=${encodeURIComponent(request.id)}`);
         return;
       }
@@ -270,14 +302,11 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         return;
       }
 
-      // Exactly 1 workspace: verify bootstrap status
+      // Exactly 1 workspace: verify bootstrap status using authoritative helper
       const targetMembership = memberships[0];
-      if (bootstrapService && targetMembership) {
-        const bootStatus = await bootstrapService.getProvisioningStatus(targetMembership.workspace_id).catch(() => null);
-        if (bootStatus && bootStatus.status !== "READY") {
-          res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
-          return;
-        }
+      if (targetMembership && !identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
+        res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
+        return;
       }
 
       // Logged in: generate consent nonce and render consent screen
@@ -317,9 +346,38 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       return;
     }
 
+    // Flow-first routing: inspect active onboarding flow before workspace memberships
+    if (onboardingStore) {
+      const activeFlow = onboardingStore.findActiveFlowForUser(session.userId);
+      if (activeFlow) {
+        if (requestId && activeFlow.host_oauth_request_id !== requestId) {
+          onboardingStore.updateFlow(activeFlow.id, { host_oauth_request_id: requestId });
+        }
+        if (activeFlow.state === "AWAITING_REPOSITORY_RESTRICTION" || activeFlow.state === "PROVISIONING") {
+          res.redirect(302, `/onboarding/security?flow=${encodeURIComponent(activeFlow.id)}`);
+          return;
+        }
+        if (activeFlow.state === "AWAITING_GITHUB_ACCESS" || activeFlow.state === "AWAITING_REPOSITORY_CHOICE") {
+          res.redirect(302, `/onboarding?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(requestId)}`);
+          return;
+        }
+        if (activeFlow.state === "RECOVERY_REQUIRED") {
+          if (activeFlow.workspace_id) {
+            res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(activeFlow.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
+          } else {
+            res.redirect(302, `/onboarding?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(requestId)}`);
+          }
+          return;
+        }
+      }
+    }
+
     // Check user workspace memberships
     const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
     if (memberships.length === 0) {
+      if (onboardingStore) {
+        onboardingStore.getOrCreateActiveFlowInTx(session.userId, session.providerSubject || "", undefined, requestId);
+      }
       res.redirect(302, `/onboarding?oauth_request=${encodeURIComponent(requestId)}`);
       return;
     }
@@ -329,14 +387,11 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       return;
     }
 
-    // Exactly 1 workspace: verify bootstrap status
+    // Exactly 1 workspace: verify bootstrap status using authoritative helper
     const targetMembership = memberships[0];
-    if (bootstrapService && targetMembership) {
-      const bootStatus = await bootstrapService.getProvisioningStatus(targetMembership.workspace_id).catch(() => null);
-      if (bootStatus && bootStatus.status !== "READY") {
-        res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
-        return;
-      }
+    if (targetMembership && !identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
+      res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
+      return;
     }
 
     const nonce = oauthService.createConsentNonce(request.id);

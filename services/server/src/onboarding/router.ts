@@ -136,6 +136,150 @@ function renderOnboardingPage(input: {
 </html>`;
 }
 
+function renderSecurityRestrictionPage(input: {
+  flowId: string;
+  repositoryFullName?: string;
+  installationSettingsUrl?: string;
+  oauthRequest?: string;
+  errorMessage?: string;
+}): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Restrict GitHub Access - Chief Everything Officer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #000000;
+      color: #ededed;
+      display: flex;
+      min-height: 100vh;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .card {
+      width: 100%;
+      max-width: 480px;
+      background-color: #121212;
+      border: 1px solid #262626;
+      border-radius: 12px;
+      padding: 28px 24px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+    }
+    .header { text-align: center; margin-bottom: 20px; }
+    .header h1 { font-size: 20px; font-weight: 600; margin-bottom: 8px; color: #ffffff; }
+    .header p { font-size: 13px; color: #a1a1a1; line-height: 1.5; }
+    .repo-badge {
+      background: #1a1a1a;
+      border: 1px solid #333333;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 20px;
+      font-size: 13px;
+    }
+    .repo-badge .label { color: #888888; font-size: 12px; margin-bottom: 4px; }
+    .repo-badge .name { font-family: monospace; color: #34d399; font-weight: 600; }
+    .security-box {
+      background: #181c24;
+      border: 1px solid #2a3b5c;
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #cbd5e1;
+    }
+    .security-box strong { color: #ffffff; }
+    .security-box ol { margin-left: 18px; margin-top: 8px; margin-bottom: 8px; }
+    .security-box li { margin-bottom: 4px; }
+    .error-box {
+      background: #3b1818;
+      border: 1px solid #782020;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 12px;
+      color: #fca5a5;
+      margin-bottom: 20px;
+      line-height: 1.4;
+    }
+    a.btn-secondary {
+      display: block;
+      width: 100%;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 500;
+      text-align: center;
+      border-radius: 6px;
+      text-decoration: none;
+      background-color: #262626;
+      color: #ffffff;
+      margin-bottom: 12px;
+      transition: background-color 0.15s ease;
+    }
+    a.btn-secondary:hover { background-color: #333333; }
+    button.btn-primary {
+      width: 100%;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 500;
+      border-radius: 6px;
+      cursor: pointer;
+      border: none;
+      background-color: #ededed;
+      color: #000000;
+      transition: background-color 0.15s ease;
+    }
+    button.btn-primary:hover { background-color: #ffffff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <h1>Your CEO repository is ready</h1>
+      <p>A private GitHub repository was created for your personal CEO workspace.</p>
+    </div>
+
+    ${input.repositoryFullName ? `
+      <div class="repo-badge">
+        <div class="label">Repository created:</div>
+        <div class="name">${escapeHtml(input.repositoryFullName)}</div>
+      </div>
+    ` : ""}
+
+    <div class="security-box">
+      <strong>Security step required:</strong>
+      <p style="margin-top: 6px;">GitHub temporarily granted CEO access to all repositories so CEO could create your workspace repository.</p>
+      <p style="margin-top: 6px;">Before continuing, you must restrict CEO's access to only this new repository:</p>
+      <ol>
+        <li>Click <strong>Open GitHub Access Settings</strong> below</li>
+        <li>Select <strong>Only select repositories</strong></li>
+        <li>Choose <strong>${input.repositoryFullName ? escapeHtml(input.repositoryFullName.split("/")[1] || "ceo-data") : "ceo-data"}</strong></li>
+        <li>Click <strong>Save</strong> and return here</li>
+      </ol>
+    </div>
+
+    ${input.errorMessage ? `<div class="error-box">${escapeHtml(input.errorMessage)}</div>` : ""}
+
+    ${input.installationSettingsUrl ? `
+      <a href="${escapeHtml(input.installationSettingsUrl)}" target="_blank" rel="noopener noreferrer" class="btn-secondary">
+        Open GitHub Access Settings ↗
+      </a>
+    ` : ""}
+
+    <form method="POST" action="/onboarding/verify-repository-access">
+      <input type="hidden" name="flow_id" value="${escapeHtml(input.flowId)}" />
+      ${input.oauthRequest ? `<input type="hidden" name="oauth_request" value="${escapeHtml(input.oauthRequest)}" />` : ""}
+      <button type="submit" class="btn-primary">Check access & continue</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
 function renderCompletionPage(input: {
   title: string;
   message: string;
@@ -356,18 +500,16 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       return;
     }
 
-    // If user already owns a workspace, check its status
-    const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
-    if (memberships.length > 0) {
-      // User already has a workspace! Complete onboarding immediately.
+    // Invariant: Flow-first routing! Always inspect active flow BEFORE checking memberships.
+    const flow = onboardingService.getOrCreateActiveFlow(session.userId, session.providerSubject);
+
+    if (flow.state === "AWAITING_REPOSITORY_RESTRICTION") {
       const target = oauthRequest
-        ? `/onboarding/complete?oauth_request=${encodeURIComponent(oauthRequest)}`
-        : "/onboarding/complete";
+        ? `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+        : `/onboarding/security?flow=${encodeURIComponent(flow.id)}`;
       res.redirect(302, target);
       return;
     }
-
-    const flow = onboardingService.getOrCreateActiveFlow(session.userId, session.providerSubject);
 
     if (flow.state === "READY_TO_RESUME") {
       const target = oauthRequest
@@ -385,17 +527,153 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       return;
     }
 
+    // Only if flow is NOT active or completed, check existing memberships
+    const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
+    if (memberships.length > 0 && (flow.state as string) === "COMPLETED") {
+      const target = oauthRequest
+        ? `/onboarding/complete?oauth_request=${encodeURIComponent(oauthRequest)}`
+        : "/onboarding/complete";
+      res.redirect(302, target);
+      return;
+    }
+
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.status(200).send(
       renderOnboardingPage({
         title: "Set up your CEO workspace",
-        subtitle: "CEO stores your personal data in a private GitHub repository that you own.",
+        subtitle: "CEO will create a private GitHub repository named `ceo-data`. GitHub temporarily requires broad repository access before creating it, after which CEO will require restricting access.",
         flowId: flow.id,
         defaultRepoName: flow.desired_repository_name || "ceo-data",
         oauthRequest,
         errorMessage: flow.last_error_message || undefined,
       }),
     );
+  });
+
+function buildInstallationSettingsUrl(accountType: string, accountLogin: string, githubInstallationId: string): string {
+  if (accountType && accountType.toLowerCase() === "organization") {
+    return `https://github.com/organizations/${encodeURIComponent(accountLogin)}/settings/installations/${encodeURIComponent(githubInstallationId)}`;
+  }
+  return `https://github.com/settings/installations/${encodeURIComponent(githubInstallationId)}`;
+}
+
+  // GET /onboarding/security
+  router.get("/security", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    const flowId = typeof req.query.flow === "string" ? req.query.flow : "";
+    const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
+
+    if (!session || !identityStore.isUserActive(session.userId)) {
+      res.redirect(302, "/login");
+      return;
+    }
+
+    const flow = onboardingService.storeInstance.getFlow(flowId);
+    if (!flow || flow.user_id !== session.userId) {
+      res.redirect(302, "/onboarding");
+      return;
+    }
+
+    if (flow.state !== "AWAITING_REPOSITORY_RESTRICTION") {
+      res.redirect(302, `/onboarding${oauthRequest ? `?oauth_request=${encodeURIComponent(oauthRequest)}` : ""}`);
+      return;
+    }
+
+    let repoFullName: string | undefined;
+    if (flow.repository_id) {
+      const binding = identityStore.findRepositoryBindingByGitHubRepoId(flow.repository_id);
+      if (binding) {
+        repoFullName = binding.full_name;
+      }
+    }
+
+    let installationSettingsUrl: string | undefined;
+    if (flow.installation_row_id) {
+      const inst = identityStore.findGitHubInstallationByRowId(flow.installation_row_id);
+      if (inst) {
+        installationSettingsUrl = buildInstallationSettingsUrl(
+          inst.account_type,
+          inst.account_login,
+          inst.github_installation_id,
+        );
+      }
+    }
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.status(200).send(
+      renderSecurityRestrictionPage({
+        flowId: flow.id,
+        repositoryFullName: repoFullName,
+        installationSettingsUrl,
+        oauthRequest: flow.host_oauth_request_id || oauthRequest,
+        errorMessage: flow.last_error_message || undefined,
+      }),
+    );
+  });
+
+  // POST /onboarding/verify-repository-access
+  router.post("/verify-repository-access", async (req: Request, res: Response) => {
+    const session = sessionManager.getSession(req);
+    const body = req.body || {};
+    const flowId = typeof body.flow_id === "string" ? body.flow_id : "";
+    const oauthRequest = typeof body.oauth_request === "string" ? body.oauth_request : undefined;
+
+    if (!session || !identityStore.isUserActive(session.userId)) {
+      res.status(401).redirect("/login");
+      return;
+    }
+
+    try {
+      const result = await onboardingService.verifyRepositoryAccessAndBootstrap(flowId, session.userId);
+      if (result.success && result.status === "READY") {
+        res.redirect(302, `/onboarding/complete?flow=${encodeURIComponent(flowId)}`);
+        return;
+      }
+
+      if (!result.success) {
+        const flow = onboardingService.storeInstance.getFlow(flowId);
+        let repoFullName: string | undefined;
+        let installationSettingsUrl: string | undefined;
+        if (flow?.repository_id) {
+          const binding = identityStore.findRepositoryBindingByGitHubRepoId(flow.repository_id);
+          repoFullName = binding?.full_name;
+        }
+        if (flow?.installation_row_id) {
+          const inst = identityStore.findGitHubInstallationByRowId(flow.installation_row_id);
+          if (inst) {
+            installationSettingsUrl = buildInstallationSettingsUrl(
+              inst.account_type,
+              inst.account_login,
+              inst.github_installation_id,
+            );
+          }
+        }
+
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.status(400).send(
+          renderSecurityRestrictionPage({
+            flowId,
+            repositoryFullName: repoFullName,
+            installationSettingsUrl,
+            oauthRequest: flow?.host_oauth_request_id || oauthRequest,
+            errorMessage: result.message,
+          }),
+        );
+        return;
+      }
+
+      // If bootstrap succeeded but ended up in recovery
+      res.redirect(302, `/onboarding/recovery?flow=${encodeURIComponent(flowId)}${oauthRequest ? `&oauth_request=${encodeURIComponent(oauthRequest)}` : ""}`);
+    } catch (error: any) {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.status(400).send(
+        renderSecurityRestrictionPage({
+          flowId,
+          oauthRequest,
+          errorMessage: error?.message || String(error),
+        }),
+      );
+    }
   });
 
   // 2. POST /onboarding/repository-choice
@@ -570,17 +848,28 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
 
   // 5. GET /onboarding/complete
   router.get("/complete", (req: Request, res: Response) => {
-    const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
+    const session = sessionManager.getSession(req);
+    const flowId = typeof req.query.flow === "string" ? req.query.flow : undefined;
+    let flow = flowId ? onboardingService.storeInstance.getFlow(flowId) : null;
+
+    if (flow && session && flow.user_id === session.userId && flow.state === "READY_TO_RESUME") {
+      flow = onboardingService.storeInstance.updateFlow(flowId!, {
+        state: "COMPLETED",
+      });
+    }
+
+    // Authoritative OAuth request resolution: server-side flow binding takes precedence over query
+    const effectiveOauthRequestId = flow?.host_oauth_request_id || (typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined);
 
     const oauth = resolveOAuthService();
     let validAuthRequest = false;
-    if (oauthRequest && oauth) {
-      validAuthRequest = Boolean(oauth.getAuthorizationRequest(oauthRequest));
+    if (effectiveOauthRequestId && oauth) {
+      validAuthRequest = Boolean(oauth.getAuthorizationRequest(effectiveOauthRequestId));
     }
 
-    if (validAuthRequest && oauthRequest) {
+    if (validAuthRequest && effectiveOauthRequestId) {
       // Resume Host OAuth immediately
-      res.redirect(302, `/authorize/resume?request=${encodeURIComponent(oauthRequest)}`);
+      res.redirect(302, `/authorize/resume?request=${encodeURIComponent(effectiveOauthRequestId)}`);
       return;
     }
 
@@ -588,7 +877,7 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
     res.status(200).send(
       renderCompletionPage({
         title: "Your CEO workspace is ready!",
-        message: oauthRequest
+        message: effectiveOauthRequestId
           ? "Your workspace is ready. The original Host authorization request has expired. Please return to your Host application (ChatGPT, Gemini, Grok) and connect CEO again."
           : "Your workspace has been successfully created and configured.",
       }),

@@ -11,21 +11,6 @@ This repository contains your personal Chief Everything Officer (CEO) canonical 
 Content stored here is user-owned and tracked by Git.
 `,
   },
-  {
-    path: "SYSTEM.md",
-    content: `# System Directives
-
-This file contains user-level directives and system context for your Chief Everything Officer workspace.
-Domain policies are managed by the CEO runtime.
-`,
-  },
-  {
-    path: "JOURNAL.md",
-    content: `# Journal
-
-Chronological log of CEO operations and reflections.
-`,
-  },
 ] as const;
 
 export type ProductProvisioningStatus =
@@ -430,10 +415,13 @@ export class WorkspaceBootstrapService {
       );
     }
 
-    // 2. Mint or reuse installation access token
+    // 2. Mint or reuse installation access token (strictly scoped to this repository)
     let token: string;
     try {
-      token = await this.appClient.getInstallationToken(githubInstallationId);
+      token = await this.appClient.getScopedInstallationToken({
+        githubInstallationId,
+        repositoryIds: [binding.github_repository_id],
+      });
     } catch (err) {
       const status = (err as any)?.status;
       if (status === 404 || status === 401 || status === 403) {

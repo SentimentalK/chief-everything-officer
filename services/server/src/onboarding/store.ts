@@ -20,6 +20,7 @@ export class OnboardingStore {
       state: row.state as OnboardingState,
       last_error_code: row.last_error_code ?? null,
       last_error_message: row.last_error_message ?? null,
+      host_oauth_request_id: row.host_oauth_request_id ?? null,
       created_at_ms: Number(row.created_at_ms),
       updated_at_ms: Number(row.updated_at_ms),
       expires_at_ms: Number(row.expires_at_ms),
@@ -30,6 +31,7 @@ export class OnboardingStore {
     userId: string,
     providerSubject: string,
     ttlMs: number = DEFAULT_ONBOARDING_TTL_MS,
+    hostOAuthRequestId?: string,
   ): OnboardingFlow {
     return this.identityStore.withDb((db: DatabaseSync) => {
       db.exec("BEGIN IMMEDIATE;");
@@ -44,6 +46,7 @@ export class OnboardingStore {
                'AWAITING_REPOSITORY_CHOICE',
                'AWAITING_GITHUB_ACCESS',
                'PROVISIONING',
+               'AWAITING_REPOSITORY_RESTRICTION',
                'READY_TO_RESUME',
                'RECOVERY_REQUIRED'
              )
@@ -65,10 +68,26 @@ export class OnboardingStore {
             } else {
               // Side effect occurred (partial creation or workspace created).
               // Never prune; keep active and return for recovery.
+              if (hostOAuthRequestId && flow.host_oauth_request_id !== hostOAuthRequestId) {
+                db.prepare(
+                  `UPDATE onboarding_flows
+                   SET host_oauth_request_id = ?, updated_at_ms = ?
+                   WHERE id = ?;`,
+                ).run(hostOAuthRequestId, nowMs, flow.id);
+                flow.host_oauth_request_id = hostOAuthRequestId;
+              }
               db.exec("COMMIT;");
               return flow;
             }
           } else {
+            if (hostOAuthRequestId && flow.host_oauth_request_id !== hostOAuthRequestId) {
+              db.prepare(
+                `UPDATE onboarding_flows
+                 SET host_oauth_request_id = ?, updated_at_ms = ?
+                 WHERE id = ?;`,
+              ).run(hostOAuthRequestId, nowMs, flow.id);
+              flow.host_oauth_request_id = hostOAuthRequestId;
+            }
             db.exec("COMMIT;");
             return flow;
           }
@@ -83,13 +102,15 @@ export class OnboardingStore {
           `INSERT INTO onboarding_flows (
              id, user_id, provider_subject, mode, desired_repository_name,
              installation_row_id, repository_id, workspace_id, state,
-             last_error_code, last_error_message, created_at_ms, updated_at_ms, expires_at_ms
-           ) VALUES (?, ?, ?, 'create', ?, NULL, NULL, NULL, 'AWAITING_REPOSITORY_CHOICE', NULL, NULL, ?, ?, ?);`,
+             last_error_code, last_error_message, host_oauth_request_id,
+             created_at_ms, updated_at_ms, expires_at_ms
+           ) VALUES (?, ?, ?, 'create', ?, NULL, NULL, NULL, 'AWAITING_GITHUB_ACCESS', NULL, NULL, ?, ?, ?, ?);`,
         ).run(
           flowId,
           userId,
           providerSubject,
           defaultRepoName,
+          hostOAuthRequestId ?? null,
           nowMs,
           nowMs,
           expiresAtMs,
@@ -106,9 +127,10 @@ export class OnboardingStore {
           installation_row_id: null,
           repository_id: null,
           workspace_id: null,
-          state: "AWAITING_REPOSITORY_CHOICE",
+          state: "AWAITING_GITHUB_ACCESS",
           last_error_code: null,
           last_error_message: null,
+          host_oauth_request_id: hostOAuthRequestId ?? null,
           created_at_ms: nowMs,
           updated_at_ms: nowMs,
           expires_at_ms: expiresAtMs,
@@ -140,6 +162,7 @@ export class OnboardingStore {
              'AWAITING_REPOSITORY_CHOICE',
              'AWAITING_GITHUB_ACCESS',
              'PROVISIONING',
+             'AWAITING_REPOSITORY_RESTRICTION',
              'READY_TO_RESUME',
              'RECOVERY_REQUIRED'
            )
@@ -170,6 +193,7 @@ export class OnboardingStore {
           state: patch.state !== undefined ? patch.state : current.state,
           last_error_code: patch.last_error_code !== undefined ? patch.last_error_code : current.last_error_code,
           last_error_message: patch.last_error_message !== undefined ? patch.last_error_message : current.last_error_message,
+          host_oauth_request_id: patch.host_oauth_request_id !== undefined ? patch.host_oauth_request_id : current.host_oauth_request_id,
           updated_at_ms: nowMs,
           expires_at_ms: patch.expires_at_ms !== undefined ? patch.expires_at_ms : current.expires_at_ms,
         };
@@ -183,6 +207,7 @@ export class OnboardingStore {
                state = ?,
                last_error_code = ?,
                last_error_message = ?,
+               host_oauth_request_id = ?,
                updated_at_ms = ?,
                expires_at_ms = ?
            WHERE id = ?;`,
@@ -194,6 +219,7 @@ export class OnboardingStore {
           updated.state,
           updated.last_error_code,
           updated.last_error_message,
+          updated.host_oauth_request_id,
           updated.updated_at_ms,
           updated.expires_at_ms,
           id,

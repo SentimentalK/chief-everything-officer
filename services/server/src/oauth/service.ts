@@ -264,6 +264,11 @@ export class OAuthService {
     }
     const workspaceId = memberships[0]!.workspace_id;
 
+    // Fail-closed security invariant: workspace must be authoritative ready before Host consent can be approved
+    if (!this.identityStore.isWorkspaceReadyForHost(workspaceId)) {
+      throw new OAuthServerError("access_denied", "Workspace is not ready for access", 403);
+    }
+
     const nonceDigest = sha256Hex(nonce);
     const now = Date.now();
     const rawCode = `oac_${crypto.randomBytes(32).toString("hex")}`;

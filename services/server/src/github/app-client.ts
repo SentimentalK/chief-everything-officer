@@ -81,28 +81,50 @@ export class GitHubAppClient {
   }
 
   /**
-   * Retrieves an installation access token, reusing cached tokens while expiry
-   * remains safely beyond a 5-minute skew. Otherwise mints a new token.
-   * Never logs or persists tokens.
+   * Retrieves an installation access token, optionally scoped by repositoryIds and permissions,
+   * reusing cached tokens while expiry remains safely beyond a 5-minute skew.
+   * Otherwise mints a new token. Never logs or persists tokens.
    */
-  async getInstallationToken(githubInstallationId: string, nowMs = Date.now()): Promise<string> {
+  async getScopedInstallationToken(
+    options: {
+      githubInstallationId: string;
+      repositoryIds?: string[];
+      permissions?: Record<string, string>;
+    },
+    nowMs = Date.now(),
+  ): Promise<string> {
     const SKEW_MS = 5 * 60 * 1000; // 5-minute skew
-    const cached = this.tokenCache.get(githubInstallationId);
+    const cacheKey = this.buildCacheKey(
+      options.githubInstallationId,
+      options.repositoryIds,
+      options.permissions,
+    );
+    const cached = this.tokenCache.get(cacheKey);
 
     if (cached && cached.expiresAtMs - nowMs > SKEW_MS) {
       return cached.token;
     }
 
     const jwt = this.createAppJwt(nowMs);
+    const bodyPayload: Record<string, unknown> = {};
+    if (options.repositoryIds && options.repositoryIds.length > 0) {
+      bodyPayload.repository_ids = options.repositoryIds.map((id) => Number(id));
+    }
+    if (options.permissions && Object.keys(options.permissions).length > 0) {
+      bodyPayload.permissions = options.permissions;
+    }
+
     const res = await this.fetchFn(
-      `https://api.github.com/app/installations/${encodeURIComponent(githubInstallationId)}/access_tokens`,
+      `https://api.github.com/app/installations/${encodeURIComponent(options.githubInstallationId)}/access_tokens`,
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${jwt}`,
           Accept: "application/vnd.github.v3+json",
           "User-Agent": "CEO-Server",
+          "Content-Type": "application/json",
         },
+        body: Object.keys(bodyPayload).length > 0 ? JSON.stringify(bodyPayload) : undefined,
       },
     );
 
@@ -131,7 +153,7 @@ export class GitHubAppClient {
       );
     }
 
-    this.tokenCache.set(githubInstallationId, {
+    this.tokenCache.set(cacheKey, {
       token: data.token,
       expiresAtMs,
     });
@@ -139,8 +161,79 @@ export class GitHubAppClient {
     return data.token;
   }
 
-  getCachedToken(githubInstallationId: string): CachedInstallationToken | undefined {
-    return this.tokenCache.get(githubInstallationId);
+  async getInstallationToken(githubInstallationId: string, nowMs = Date.now()): Promise<string> {
+    return this.getScopedInstallationToken({ githubInstallationId }, nowMs);
+  }
+
+  /**
+   * Invalidates cached tokens specifically for this installation, without affecting other installations.
+   */
+  invalidateInstallationTokens(githubInstallationId: string): void {
+    const prefix = `${githubInstallationId}|`;
+    for (const key of this.tokenCache.keys()) {
+      if (key === githubInstallationId || key.startsWith(prefix)) {
+        this.tokenCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Mints an ephemeral, uncached installation verification token strictly for onboarding restriction checks.
+   * Does NOT enter the general cache.
+   */
+  async mintInstallationVerificationToken(githubInstallationId: string, nowMs = Date.now()): Promise<string> {
+    const jwt = this.createAppJwt(nowMs);
+    const res = await this.fetchFn(
+      `https://api.github.com/app/installations/${encodeURIComponent(githubInstallationId)}/access_tokens`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: "application/vnd.github.v3+json",
+          "User-Agent": "CEO-Server",
+        },
+      },
+    );
+
+    if (!res.ok) {
+      throw new GitHubAppError(
+        `GitHub App installation token request failed with HTTP ${res.status}`,
+        res.status,
+      );
+    }
+
+    const data = (await res.json()) as { token?: string };
+    if (!data || typeof data.token !== "string" || data.token.trim().length === 0) {
+      throw new GitHubAppError("Invalid installation token response from GitHub");
+    }
+
+    return data.token;
+  }
+
+  private buildCacheKey(
+    installationId: string,
+    repositoryIds?: string[],
+    permissions?: Record<string, string>,
+  ): string {
+    const sortedRepoIds = repositoryIds && repositoryIds.length > 0
+      ? [...repositoryIds].sort().join(",")
+      : "*";
+    const sortedPermissions = permissions
+      ? Object.entries(permissions)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, v]) => `${k}:${v}`)
+          .join(",")
+      : "*";
+    return `${installationId}|repos:${sortedRepoIds}|perms:${sortedPermissions}`;
+  }
+
+  getCachedToken(
+    githubInstallationId: string,
+    repositoryIds?: string[],
+    permissions?: Record<string, string>,
+  ): CachedInstallationToken | undefined {
+    const key = this.buildCacheKey(githubInstallationId, repositoryIds, permissions);
+    return this.tokenCache.get(key);
   }
 
   clearTokenCache(): void {

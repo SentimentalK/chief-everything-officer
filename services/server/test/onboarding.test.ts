@@ -225,7 +225,7 @@ describe("Component 1 & 2: Onboarding Store & Concurrency", () => {
     expect(flow1).toBeDefined();
     expect(flow1.id).toMatch(/^onb_/);
     expect(flow1.user_id).toBe(ctx.freshUser.userId);
-    expect(flow1.state).toBe("AWAITING_REPOSITORY_CHOICE");
+    expect(flow1.state).toBe("AWAITING_GITHUB_ACCESS");
     expect(flow1.desired_repository_name).toBe("ceo-data");
 
     // Repeated call should return exact same active flow
@@ -243,7 +243,7 @@ describe("Component 1 & 2: Onboarding Store & Concurrency", () => {
       db.prepare(`
         INSERT INTO onboarding_flows (
           id, user_id, provider_subject, mode, desired_repository_name, state, created_at_ms, updated_at_ms, expires_at_ms
-        ) VALUES ('onb_duplicate', ?, ?, 'create_new', 'ceo-data', 'AWAITING_REPOSITORY_CHOICE', 1000, 1000, 2000);
+        ) VALUES ('onb_duplicate', ?, ?, 'create', 'ceo-data', 'AWAITING_GITHUB_ACCESS', 1000, 1000, 2000);
       `).run(ctx.freshUser.userId, ctx.freshUser.providerSubject);
     }).toThrow(/UNIQUE constraint failed/);
     db.close();
@@ -252,7 +252,7 @@ describe("Component 1 & 2: Onboarding Store & Concurrency", () => {
     ctx.onboardingStore.updateFlow(flow1.id, { state: "COMPLETED" });
     const flow3 = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject);
     expect(flow3.id).not.toBe(flow1.id);
-    expect(flow3.state).toBe("AWAITING_REPOSITORY_CHOICE");
+    expect(flow3.state).toBe("AWAITING_GITHUB_ACCESS");
   });
 
   it("cleanupExpired only cleans flows with NO repository and NO workspace", async () => {
@@ -417,8 +417,8 @@ describe("Component 2: Onboarding Service Logic", () => {
       userId: ctx.freshUser.userId,
     });
 
-    // Mock createRepository on repositoryService
-    vi.spyOn(ctx.repositoryService, "createRepository").mockImplementation(async () => {
+    // Mock createRepositoryAndBind on repositoryService
+    vi.spyOn(ctx.repositoryService, "createRepositoryAndBind").mockImplementation(async () => {
       const bound = ctx.store.createWorkspaceWithRepositoryBinding({
         userId: ctx.freshUser.userId,
         installationRowId: freshInst.installation.id,
@@ -460,8 +460,34 @@ describe("Component 2: Onboarding Service Logic", () => {
     expect(result.workspaceId).toBeDefined();
 
     const updatedFlow = ctx.onboardingStore.getFlow(flow.id)!;
-    expect(updatedFlow.state).toBe("READY_TO_RESUME");
+    expect(updatedFlow.state).toBe("AWAITING_REPOSITORY_RESTRICTION");
     expect(updatedFlow.workspace_id).toBe(result.workspaceId);
+
+    // Mock appClient methods for live restriction verification
+    vi.spyOn(ctx.appClient, "getInstallation").mockResolvedValue({
+      id: 6666,
+      repository_selection: "selected",
+      suspended_at: null,
+    } as any);
+    vi.spyOn(ctx.appClient, "mintInstallationVerificationToken").mockResolvedValue("verify_token_123");
+
+    // Mock fetchFn on onboardingService to return exactly repo 999888
+    (ctx.onboardingService as any).fetchFn = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        repositories: [
+          { id: 999888, name: "my-ceo-repo", full_name: "fresh-user/my-ceo-repo" },
+        ],
+      }),
+    });
+
+    const verifyResult = await ctx.onboardingService.verifyRepositoryAccessAndBootstrap(flow.id, ctx.freshUser.userId);
+    expect(verifyResult.success).toBe(true);
+    expect(verifyResult.status).toBe("READY");
+
+    const finalFlow = ctx.onboardingStore.getFlow(flow.id)!;
+    expect(finalFlow.state).toBe("READY_TO_RESUME");
   });
 
   it("handles GitHubPartialCreationError and recovers via recoverPartialCreation", async () => {
@@ -478,8 +504,8 @@ describe("Component 2: Onboarding Service Logic", () => {
       userId: ctx.freshUser.userId,
     });
 
-    // Mock createRepository throwing GitHubPartialCreationError
-    vi.spyOn(ctx.repositoryService, "createRepository").mockRejectedValueOnce(
+    // Mock createRepositoryAndBind throwing GitHubPartialCreationError
+    vi.spyOn(ctx.repositoryService, "createRepositoryAndBind").mockRejectedValueOnce(
       new GitHubPartialCreationError("DB commit failed after repo creation", {
         id: "999889",
         owner: "dev-user",
@@ -521,11 +547,15 @@ describe("Component 2: Onboarding Service Logic", () => {
       };
     });
 
-    const recResult = await ctx.onboardingService.recoverPartialCreation(flow.id, {
-      sessionId: "sess_1",
-      userId: ctx.freshUser.userId,
-      providerSubject: ctx.freshUser.providerSubject,
-    });
+    const recResult = await ctx.onboardingService.recoverPartialCreation(
+      flow.id,
+      {
+        sessionId: "sess_1",
+        userId: ctx.freshUser.userId,
+        providerSubject: ctx.freshUser.providerSubject,
+      },
+      "grant_123",
+    );
 
     expect(recResult.success).toBe(true);
     const recoveredFlow = ctx.onboardingStore.getFlow(flow.id)!;
@@ -1210,7 +1240,7 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
 
         expect(res.status).toBe(302);
         expect(res.headers.get("location")).toBe(
-          `/onboarding/complete?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthReq)}`,
+          `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthReq)}`,
         );
         expect(provisionSpy).toHaveBeenCalledWith(
           flow.id,
@@ -1332,6 +1362,186 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
 
         expect(res.status).toBe(302);
         expect(res.headers.get("location")).toBe("/onboarding");
+      } finally {
+        await testApp.close();
+      }
+    });
+  });
+
+  describe("Component 6: Least-Privilege Repository Restriction & Durable OAuth Continuation", () => {
+    it("GET /onboarding/security renders organization-aware settings URL and handles restriction check", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        const inst = ctx.store.upsertGitHubInstallationWithUser({
+          githubAppId: "10",
+          githubInstallationId: "8888",
+          accountId: ctx.freshUser.providerSubject,
+          accountLogin: "acme-corp",
+          accountType: "Organization",
+          repositorySelection: "selected",
+          userId: ctx.freshUser.userId,
+        });
+
+        const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject, undefined, "oar_durable_999");
+        const bound = ctx.store.createWorkspaceWithRepositoryBinding({
+          userId: ctx.freshUser.userId,
+          installationRowId: inst.installation.id,
+          githubRepositoryId: "777888",
+          ownerAccountId: ctx.freshUser.providerSubject,
+          ownerLogin: "acme-corp",
+          repositoryName: "ceo-data",
+          fullName: "acme-corp/ceo-data",
+          branch: "main",
+        });
+
+        ctx.onboardingStore.updateFlow(flow.id, {
+          installation_row_id: inst.installation.id,
+          repository_id: "777888",
+          workspace_id: bound.workspace.id,
+          state: "AWAITING_REPOSITORY_RESTRICTION",
+        });
+
+        const res = await fetch(`${testApp.baseUrl}/onboarding/security?flow=${encodeURIComponent(flow.id)}`, {
+          headers: { Cookie: `ceo_user_session=${session.sessionId}` },
+        });
+
+        expect(res.status).toBe(200);
+        const html = await res.text();
+        expect(html).toContain("Restrict GitHub Access");
+        expect(html).toContain("acme-corp/ceo-data");
+        // Organization URL
+        expect(html).toContain("https://github.com/organizations/acme-corp/settings/installations/8888");
+      } finally {
+        await testApp.close();
+      }
+    });
+
+    it("POST /onboarding/verify-repository-access rejects STILL_ALL and SCOPE_MISMATCH", async () => {
+      const ctx = await createTestContext();
+      const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject, undefined, "oar_durable_888");
+
+      const inst = ctx.store.upsertGitHubInstallationWithUser({
+        githubAppId: "10",
+        githubInstallationId: "9999",
+        accountId: ctx.freshUser.providerSubject,
+        accountLogin: "fresh-user",
+        accountType: "User",
+        repositorySelection: "all",
+        userId: ctx.freshUser.userId,
+      });
+
+      const bound = ctx.store.createWorkspaceWithRepositoryBinding({
+        userId: ctx.freshUser.userId,
+        installationRowId: inst.installation.id,
+        githubRepositoryId: "123456",
+        ownerAccountId: ctx.freshUser.providerSubject,
+        ownerLogin: "fresh-user",
+        repositoryName: "ceo-data",
+        fullName: "fresh-user/ceo-data",
+        branch: "main",
+      });
+
+      ctx.onboardingStore.updateFlow(flow.id, {
+        installation_row_id: inst.installation.id,
+        repository_id: "123456",
+        workspace_id: bound.workspace.id,
+        state: "AWAITING_REPOSITORY_RESTRICTION",
+      });
+
+      // 1. STILL_ALL: live installation still reports 'all'
+      vi.spyOn(ctx.appClient, "getInstallation").mockResolvedValueOnce({
+        id: 9999,
+        repository_selection: "all",
+        suspended_at: null,
+      } as any);
+
+      const stillAllResult = await ctx.onboardingService.verifyRepositoryAccessAndBootstrap(flow.id, ctx.freshUser.userId);
+      expect(stillAllResult.success).toBe(false);
+      expect((stillAllResult as any).reason).toBe("STILL_ALL");
+
+      // 2. SCOPE_MISMATCH: live installation has multiple repos including unrelated
+      vi.spyOn(ctx.appClient, "getInstallation").mockResolvedValueOnce({
+        id: 9999,
+        repository_selection: "selected",
+        suspended_at: null,
+      } as any);
+      vi.spyOn(ctx.appClient, "mintInstallationVerificationToken").mockResolvedValueOnce("ephemeral_token");
+      (ctx.onboardingService as any).fetchFn = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          repositories: [
+            { id: 123456, name: "ceo-data", full_name: "fresh-user/ceo-data" },
+            { id: 999999, name: "my-secret-repo", full_name: "fresh-user/my-secret-repo" },
+          ],
+        }),
+      });
+
+      const mismatchResult = await ctx.onboardingService.verifyRepositoryAccessAndBootstrap(flow.id, ctx.freshUser.userId);
+      expect(mismatchResult.success).toBe(false);
+      expect((mismatchResult as any).reason).toBe("SCOPE_MISMATCH");
+    });
+
+    it("Durable host_oauth_request_id continuation: resumes OAuth without query parameter", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        // Register valid authorization request in OAuthStore
+        const reqId = "oar_durable_continuation_test";
+        ctx.oauthStore.createAuthorizationRequest({
+          id: reqId,
+          client_id: "test_client",
+          client_name: "Test Client",
+          redirect_uri: "https://chatgpt.com/callback",
+          resource: "https://ceo.sentimentalk.com/mcp",
+          scope: "openid",
+          state: "xyz_state",
+          code_challenge: "E9Melhoa2OwvFrGMTJguCH5rtx64Znqmqddqk3xqkL0",
+          code_challenge_method: "S256",
+          created_at_ms: Date.now(),
+          expires_at_ms: Date.now() + 600000,
+        });
+
+        const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(
+          ctx.freshUser.userId,
+          ctx.freshUser.providerSubject,
+          undefined,
+          reqId,
+        );
+
+        ctx.onboardingStore.updateFlow(flow.id, {
+          state: "READY_TO_RESUME",
+        });
+
+        // Request /onboarding/complete with ONLY flowId, NO oauth_request in query
+        const res = await fetch(`${testApp.baseUrl}/onboarding/complete?flow=${encodeURIComponent(flow.id)}`, {
+          headers: { Cookie: `ceo_user_session=${session.sessionId}` },
+          redirect: "manual",
+        });
+
+        expect(res.status).toBe(302);
+        // Server-side durable binding redirects to resume with reqId
+        expect(res.headers.get("location")).toBe(`/authorize/resume?request=${encodeURIComponent(reqId)}`);
+
+        const updatedFlow = ctx.onboardingStore.getFlow(flow.id)!;
+        expect(updatedFlow.state).toBe("COMPLETED");
       } finally {
         await testApp.close();
       }

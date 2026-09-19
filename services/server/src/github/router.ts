@@ -186,8 +186,8 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
         );
 
         const target = result.oauthRequest
-          ? `/onboarding/complete?flow=${encodeURIComponent(result.onboardingFlowId)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
-          : `/onboarding/complete?flow=${encodeURIComponent(result.onboardingFlowId)}`;
+          ? `/onboarding/security?flow=${encodeURIComponent(result.onboardingFlowId)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
+          : `/onboarding/security?flow=${encodeURIComponent(result.onboardingFlowId)}`;
         res.redirect(302, target);
         return;
       }
@@ -282,8 +282,8 @@ export function createGitHubAppAuthRouter(options: GitHubAppAuthRouterOptions): 
               result.grant,
             );
             const target = result.oauthRequest
-              ? `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
-              : `/onboarding/complete?flow=${encodeURIComponent(activeFlow.id)}`;
+              ? `/onboarding/security?flow=${encodeURIComponent(activeFlow.id)}&oauth_request=${encodeURIComponent(result.oauthRequest)}`
+              : `/onboarding/security?flow=${encodeURIComponent(activeFlow.id)}`;
             res.redirect(302, target);
             return;
           }

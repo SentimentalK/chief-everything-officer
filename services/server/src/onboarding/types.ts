@@ -2,6 +2,7 @@ export type OnboardingState =
   | "AWAITING_REPOSITORY_CHOICE"
   | "AWAITING_GITHUB_ACCESS"
   | "PROVISIONING"
+  | "AWAITING_REPOSITORY_RESTRICTION"
   | "READY_TO_RESUME"
   | "RECOVERY_REQUIRED"
   | "COMPLETED";
@@ -18,6 +19,7 @@ export interface OnboardingFlow {
   state: OnboardingState;
   last_error_code: string | null;
   last_error_message: string | null;
+  host_oauth_request_id: string | null;
   created_at_ms: number;
   updated_at_ms: number;
   expires_at_ms: number;
@@ -30,6 +32,8 @@ export type OnboardingErrorCode =
   | "USER_AUTHORIZATION_REQUIRED"
   | "REPOSITORY_NAME_CONFLICT"
   | "PARTIAL_REPOSITORY_CREATION"
+  | "RESTRICTION_REQUIRED"
+  | "RESTRICTION_SCOPE_MISMATCH"
   | "BOOTSTRAP_RETRYABLE"
   | "BOOTSTRAP_MANUAL_RECOVERY"
   | "HOST_AUTHORIZATION_EXPIRED";

@@ -107,10 +107,10 @@ describe("Identity DB v6 -> v7 migration (onboarding_flows)", () => {
     const store = IdentityStore.open(dbPath);
     cleanupStores.push(store);
 
-    // Verify user_version is 7
+    // Verify user_version is migrated to latest version
     const raw = new DatabaseSync(dbPath);
     const ver = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(ver.user_version)).toBe(7);
+    expect(Number(ver.user_version)).toBe(IDENTITY_DB_USER_VERSION);
 
     // Verify onboarding_flows table exists
     const table = raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='onboarding_flows';").all();

@@ -537,18 +537,13 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(gitState.contentsPuts?.[0].path).toBe("README.md");
     // 2. POST /git/refs was NOT called as the first-ref mechanism
     expect(gitState.refCreations.length).toBe(0);
-    // 3. Normal reconciliation added the remaining 2 anchors (JOURNAL.md, SYSTEM.md) via additive base_tree
-    expect(gitState.treeCreations.length).toBe(1);
-    expect(gitState.treeCreations[0].tree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "SYSTEM.md"]);
-    expect(gitState.commitCreations.length).toBe(1);
-    expect(gitState.commitCreations[0].parents.length).toBe(1);
-    expect(gitState.refUpdates.length).toBe(1);
-    expect(gitState.refUpdates[0].force).toBe(false);
+    // 3. Normal reconciliation requires no extra tree creations since README.md is the sole anchor
+    expect(gitState.treeCreations.length).toBe(0);
 
-    // 4. Resulting tree contains all 3 anchors
+    // 4. Resulting tree contains README anchor
     const readyCommit = gitState.commits.get(result.bootstrap.ready_commit_sha!)!;
     const readyTree = gitState.trees.get(readyCommit.tree)!;
-    expect(readyTree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "README.md", "SYSTEM.md"]);
+    expect(readyTree.map((x) => x.path).sort()).toEqual(["README.md"]);
   });
 
   it("J. additive bootstrap preserving existing user repository content", async () => {
@@ -620,11 +615,11 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       branch: ctx.branch,
       appPermissions: { contents: "write" },
       appSuspended: false,
-      commits: new Map([[existingCommitSha, { tree: existingTreeSha, parents: [], message: "Custom readme" }]]),
+      commits: new Map([[existingCommitSha, { tree: existingTreeSha, parents: [], message: "Initial code" }]]),
       trees: new Map([
         [
           existingTreeSha,
-          [{ path: "README.md", mode: "100644", type: "blob", sha: "5".repeat(40), content: customReadmeContent }],
+          [{ path: "src/index.ts", mode: "100644", type: "blob", sha: "5".repeat(40), content: "console.log('hello');" }],
         ],
       ]),
       branchRefSha: existingCommitSha,
@@ -641,13 +636,15 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     const result = await service.bootstrapWorkspace(ctx.workspaceId);
 
     expect(result.status).toBe("READY");
-    // Only SYSTEM.md and JOURNAL.md were missing and added
+    // Only README.md was missing and added
     expect(gitState.treeCreations.length).toBe(1);
-    expect(gitState.treeCreations[0].tree.map((x) => x.path).sort()).toEqual(["JOURNAL.md", "SYSTEM.md"]);
+    expect(gitState.treeCreations[0].tree.map((x) => x.path).sort()).toEqual(["README.md"]);
 
     const finalTree = gitState.trees.get(gitState.commits.get(result.bootstrap.ready_commit_sha!)!.tree)!;
+    const codeEntry = finalTree.find((x) => x.path === "src/index.ts");
+    expect(codeEntry?.content).toBe("console.log('hello');");
     const readmeEntry = finalTree.find((x) => x.path === "README.md");
-    expect(readmeEntry?.content).toBe(customReadmeContent);
+    expect(readmeEntry).toBeDefined();
   });
 
   it("L. idempotent no-op when all 3 canonical anchors are already present", async () => {
@@ -929,7 +926,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       commitCreations: [],
       refUpdates: [],
       refCreations: [],
-      failTreeCreateStatus: 429,
+      failContentsStatus: 429,
     };
 
     const fetchFn = createMockGitFetch(gitState);
@@ -1288,7 +1285,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       commitCreations: [],
       refUpdates: [],
       refCreations: [],
-      failTreeCreateStatus: 429, // bootstrap will fail with RETRYABLE_FAILURE
+      failContentsStatus: 429, // bootstrap will fail with RETRYABLE_FAILURE
     };
 
     const fetchFn = createMockGitFetch(gitState);
