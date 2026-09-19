@@ -55,6 +55,7 @@ decision/2027.md
 
 - `decision/`：保存一次具体选择在当时条件下如何权衡，以及当前/最终选择。
 - `personal/`：保存跨 case 稳定、可复用的偏好或长期判断。单个 decision 不足以证明长期 preference；多个 case 稳定显示同一 pattern 时，才按 Personal 规则考虑抽象。
+- `well-being/`：保存睡眠、精力、压力、时间使用、训练、症状等纵向 observation。它们可以成为某次 Decision 的 evidence / dimension，但 raw observation 的 canonical owner 仍在 Well-being，不复制进 Decision。
 - `journal/`：保存值得保留的生活事件、体验和变化；如果一次 decision 本身也是有时间意义的生活片段，Journal 可以记录“发生了这次选择”，但不复制完整 dimensions/reasoning。
 - `tasks/`：保存仍需执行、等待、监控或继续推进的事项。Decision record 不替代 task tracking；一个选择产生后续行动时，由 Task 维护执行状态。
 

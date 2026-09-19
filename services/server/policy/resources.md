@@ -116,9 +116,9 @@ capture 后或用户要求继续命名时，已有 metadata/上下文足够则�
 
 ## 与个人状态的关系
 
-每次保存或更新 Resource 时，判断讨论是否已经形成跨材料复用的个人状态、明确行动、值得保留的个人事件，或经过实际权衡且未来值得作为 precedent 的具体选择。若已形成，在本次记录中读取目标领域规则及已有记录，分别更新 Personal、Task、Journal 或 Decision，不等材料读完或讨论结束才处理。
+每次保存或更新 Resource 时，判断讨论是否已经形成跨材料复用的个人状态、用户自己的真实 Well-being observation、明确行动、值得保留的个人 episode，或经过实际权衡且未来值得作为 precedent 的具体选择。若已形成，在本次记录中读取目标领域规则及已有记录，分别更新 Personal、Well-being、Task、Journal 或 Decision，不等材料读完或讨论结束才处理。
 
-Resource 讨论不会仅因为“聊过”就自动修改 State。只有确实形成对应语义时才提升；工具支持 `state_changes` 时，优先与本次 Resource capture / update 在同一原子事务中提交，避免 Resource 已更新但对应 State consequence 丢失。
+Resource 讨论不会仅因为“聊过”就自动修改 State。只有确实形成对应语义时才提升；尤其不能从文章、视频、报告作者的描述推断用户本人存在某种 Well-being 状态。只有用户实际报告、可靠个人测量/文档明确属于该用户，且语义确实需要进入纵向记录时，才更新 Well-being。工具支持 `state_changes` 时，优先与本次 Resource capture / update 在同一原子事务中提交，避免 Resource 已更新但对应 State consequence 丢失。
 
 围绕当前材料的联想和用途假设留在 interactions；不能仅因用户觉得可能有用就创建任务、形成 Decision 或归纳长期偏好。已确认成为用户状态的结果由对应文件维护，interactions 保留形成过程和具体引用，不复制维护同一结论。需要既有个人背景帮助理解材料时，读取实际被引用文件；不把出处观点当作用户事实。
 

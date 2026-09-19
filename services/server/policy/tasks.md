@@ -123,11 +123,12 @@ Type 是辅助索引。Task 同时具有多种性质时，选择最有助于理�
 不同信息类型由对应 owner 保存：
 
 - 长期事实、偏好、约束 → Personal
-- 有时间语境的个人事件 → Journal
+- 重复性身心状态、daily adherence、routine observation → Well-being
+- 有时间语境且值得保留的个人 episode → Journal
 - 可复用 decision evidence → Decision
 - 当前工作范围、状态、执行与验证 → Task
 
-Task 保留这些信息对当前 scope 的影响和必要引用。
+Task 保留这些信息对当前 scope 的影响和必要引用。MONITORING / treatment / habit Task 可以维护趋势结论、阈值、策略和下一动作，但不应继续堆积每次 daily observation；原始纵向记录由 Well-being 等对应 owner 保存。
 
 一旦拆 child，详细 ownership 下沉：
 
@@ -225,3 +226,12 @@ Task 达到目标、明确停止或不再需要作为独立工作存在时，应
 - **Semantic preservation**：cleanup 是否保持已有 decision、evidence、option 和 preference 语义？
 
 出现问题时优先修正 ownership、scope、lifecycle 和 routing，再考虑增加新的结构化字段。
+
+
+## 11. Current-state consistency
+
+Task 的 current state、next action、milestone / trend summary、last updated 与 Status 必须和最新已知 evidence 保持一致。
+
+当新的 completed evidence 出现，或详细信息由 Well-being、child Task、Resource 等其他 canonical owner 维护时，Task 只保留足够支持当前 scope 的 roll-up 与引用，但必须同步更新自己的派生状态。
+
+已经执行的动作不得继续作为 next action；已经失效的 blocker / trigger 不得继续冒充当前状态；也不能因为 detail 下沉到其他 owner，就让新的已执行事实从 Task roll-up 中消失。
