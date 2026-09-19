@@ -147,7 +147,7 @@ export class OnboardingService {
     this.store.updateFlow(flowId, { state: "PROVISIONING" });
 
     try {
-      const repoName = flow.desired_repository_name || "ceo-data";
+      const repoName = flow.desired_repository_name || "personal-vault";
       const created = await this.repositoryService.createRepositoryAndBind(
         grantId,
         session.sessionId,

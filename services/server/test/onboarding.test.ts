@@ -226,7 +226,7 @@ describe("Component 1 & 2: Onboarding Store & Concurrency", () => {
     expect(flow1.id).toMatch(/^onb_/);
     expect(flow1.user_id).toBe(ctx.freshUser.userId);
     expect(flow1.state).toBe("AWAITING_GITHUB_ACCESS");
-    expect(flow1.desired_repository_name).toBe("ceo-data");
+    expect(flow1.desired_repository_name).toBe("personal-vault");
 
     // Repeated call should return exact same active flow
     const flow2 = ctx.onboardingStore.getOrCreateActiveFlowInTx(ctx.freshUser.userId, ctx.freshUser.providerSubject);
@@ -820,7 +820,7 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("Set up your CEO workspace");
-      expect(html).toContain('value="ceo-data"');
+      expect(html).toContain('value="personal-vault"');
       expect(html).toContain('value="auth_req_123"');
     } finally {
       await testApp.close();
@@ -980,7 +980,7 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
       const html = await res.text();
       expect(html).toContain("Setup Notice");
       expect(html).toContain("already exists on GitHub");
-      expect(html).toContain('value="ceo-data-2"');
+      expect(html).toContain('value="personal-vault-2"');
     } finally {
       await testApp.close();
     }

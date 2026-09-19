@@ -257,7 +257,7 @@ function renderSecurityRestrictionPage(input: {
       <ol>
         <li>Click <strong>Open GitHub Access Settings</strong> below</li>
         <li>Select <strong>Only select repositories</strong></li>
-        <li>Choose <strong>${input.repositoryFullName ? escapeHtml(input.repositoryFullName.split("/")[1] || "ceo-data") : "ceo-data"}</strong></li>
+        <li>Choose <strong>${input.repositoryFullName ? escapeHtml(input.repositoryFullName.split("/")[1] || "personal-vault") : "personal-vault"}</strong></li>
         <li>Click <strong>Save</strong> and return here</li>
       </ol>
     </div>
@@ -265,8 +265,8 @@ function renderSecurityRestrictionPage(input: {
     ${input.errorMessage ? `<div class="error-box">${escapeHtml(input.errorMessage)}</div>` : ""}
 
     ${input.installationSettingsUrl ? `
-      <a href="${escapeHtml(input.installationSettingsUrl)}" target="_blank" rel="noopener noreferrer" class="btn-secondary">
-        Open GitHub Access Settings ↗
+      <a href="${escapeHtml(input.installationSettingsUrl)}" class="btn-secondary">
+        Open GitHub Access Settings
       </a>
     ` : ""}
 
@@ -443,7 +443,7 @@ function renderRecoveryPage(input: {
                  type="text"
                  id="repo_name"
                  name="repository_name"
-                 value="${escapeHtml(input.defaultRepoName || "ceo-data-2")}"
+                 value="${escapeHtml(input.defaultRepoName || "personal-vault-2")}"
                  required
                  autofocus
                />
@@ -541,9 +541,9 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
     res.status(200).send(
       renderOnboardingPage({
         title: "Set up your CEO workspace",
-        subtitle: "CEO will create a private GitHub repository named `ceo-data`. GitHub temporarily requires broad repository access before creating it, after which CEO will require restricting access.",
+        subtitle: "CEO will create a private GitHub repository named `personal-vault`. GitHub temporarily requires broad repository access before creating it, after which CEO will require restricting access.",
         flowId: flow.id,
-        defaultRepoName: flow.desired_repository_name || "ceo-data",
+        defaultRepoName: flow.desired_repository_name || "personal-vault",
         oauthRequest,
         errorMessage: flow.last_error_message || undefined,
       }),
@@ -723,7 +723,7 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
           title: "Set up your CEO workspace",
           subtitle: "CEO stores your personal data in a private GitHub repository that you own.",
           flowId,
-          defaultRepoName: repositoryName || "ceo-data",
+          defaultRepoName: repositoryName || "personal-vault",
           oauthRequest,
           errorMessage: error?.message || String(error),
         }),
@@ -775,7 +775,7 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
         errorCode: flow.last_error_code || "RECOVERY_REQUIRED",
         errorMessage: flow.last_error_message || "An error occurred during workspace setup.",
         oauthRequest,
-        defaultRepoName: flow.desired_repository_name ? `${flow.desired_repository_name}-2` : "ceo-data-2",
+        defaultRepoName: flow.desired_repository_name ? `${flow.desired_repository_name}-2` : "personal-vault-2",
       }),
     );
   });

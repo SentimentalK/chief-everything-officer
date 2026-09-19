@@ -95,7 +95,7 @@ export class OnboardingStore {
 
         // Insert new active onboarding flow
         const flowId = newId("onb");
-        const defaultRepoName = "ceo-data";
+        const defaultRepoName = "personal-vault";
         const expiresAtMs = nowMs + ttlMs;
 
         db.prepare(
