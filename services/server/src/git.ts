@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { CeoError } from "./errors.js";
+import { LIMITS } from "./limits.js";
 
 export interface CommandResult { stdout: string; stderr: string; }
 
@@ -187,3 +188,181 @@ export async function assertExpectedBlob(
     });
   }
 }
+
+export interface CommandResultBuffer {
+  stdout: Buffer;
+  stderr: string;
+}
+
+export async function runGitBuffer(
+  config: GitExecutionConfig,
+  cwd: string,
+  args: string[],
+  allowFailure = false,
+): Promise<CommandResultBuffer> {
+  validateGitAuthMode(config);
+
+  let credential: GitCredential | undefined;
+  if (config.credentialProvider) {
+    credential = await config.credentialProvider.getCredential();
+  }
+
+  const prefix = gitPrefix(config, credential);
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_AUTHOR_NAME: config.gitAuthorName,
+    GIT_AUTHOR_EMAIL: config.gitAuthorEmail,
+    GIT_COMMITTER_NAME: config.gitCommitterName,
+    GIT_COMMITTER_EMAIL: config.gitCommitterEmail,
+  };
+
+  if (credential?.token) {
+    env.CEO_GIT_TOKEN = credential.token;
+  }
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn("git", [...prefix, ...args], {
+      cwd,
+      shell: false,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks: Buffer[] = [];
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", (err) => {
+      const sanitized = redactSecrets(err.message, [credential?.token]);
+      reject(new Error(sanitized));
+    });
+    child.on("close", (code) => {
+      const stdoutBuf = Buffer.concat(stdoutChunks);
+      const safeStderr = redactSecrets(stderr.trimEnd(), [credential?.token]);
+      if (code === 0 || allowFailure) {
+        resolve({ stdout: stdoutBuf, stderr: safeStderr });
+      } else {
+        const commandName = redactSecrets(args[0] ?? "command", [credential?.token]);
+        const details = safeStderr || redactSecrets(stdoutBuf.toString("utf8", 0, 1000).trimEnd(), [credential?.token]);
+        const rawErrorMsg = details
+          ? `git ${commandName} failed with exit code ${code}: ${details}`
+          : `git ${commandName} failed with exit code ${code}`;
+        const errorMsg = redactSecrets(rawErrorMsg, [credential?.token]);
+        reject(new Error(errorMsg));
+      }
+    });
+  });
+}
+
+export interface GitTreeEntry {
+  mode: string;
+  type: "blob" | "tree" | "commit";
+  oid: string;
+  bytes?: number;
+  path: string;
+}
+
+export function parseLsTreeLine(line: string): GitTreeEntry | null {
+  const match = line.match(/^([0-7]+)\s+(blob|tree|commit)\s+([0-9a-f]{40,64})\s+([0-9]+|-)\t([\s\S]+)$/);
+  if (!match) return null;
+  return {
+    mode: match[1]!,
+    type: match[2] as "blob" | "tree" | "commit",
+    oid: match[3]!,
+    bytes: match[4] !== "-" ? Number(match[4]) : undefined,
+    path: match[5]!,
+  };
+}
+
+export async function getTreeEntry(
+  config: GitExecutionConfig,
+  cwd: string,
+  commit: string,
+  relativePath: string,
+): Promise<GitTreeEntry | null> {
+  const result = await runGit(config, cwd, ["ls-tree", "-l", "-z", commit, "--", relativePath], true);
+  if (!result.stdout) return null;
+  for (const part of result.stdout.split("\0")) {
+    if (!part) continue;
+    const entry = parseLsTreeLine(part);
+    if (entry && entry.path === relativePath) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+export async function listTreeEntries(
+  config: GitExecutionConfig,
+  cwd: string,
+  commit: string,
+  prefix?: string,
+): Promise<GitTreeEntry[]> {
+  const args = ["ls-tree", "-r", "-l", "-z", commit];
+  if (prefix) {
+    args.push("--", prefix);
+  }
+  const result = await runGit(config, cwd, args, true);
+  if (!result.stdout) return [];
+  const entries: GitTreeEntry[] = [];
+  for (const part of result.stdout.split("\0")) {
+    if (!part) continue;
+    const entry = parseLsTreeLine(part);
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+export async function readBlobUtf8(
+  config: GitExecutionConfig,
+  cwd: string,
+  oid: string,
+  displayPath?: string,
+): Promise<string> {
+  const result = await runGitBuffer(config, cwd, ["cat-file", "blob", oid]);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+  } catch {
+    throw new CeoError("VALIDATION_FAILED", "CEO content must be valid UTF-8.", {
+      path: displayPath ?? oid,
+    });
+  }
+}
+
+export async function readFileAtCommit(
+  config: GitExecutionConfig,
+  cwd: string,
+  commit: string,
+  relativePath: string,
+): Promise<{ path: string; blob_oid: string; bytes: number; content: string } | null> {
+  const entry = await getTreeEntry(config, cwd, commit, relativePath);
+  if (!entry) return null;
+  if (entry.mode === "120000") {
+    throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: relativePath });
+  }
+  if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) {
+    throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: relativePath });
+  }
+  if (entry.bytes !== undefined && entry.bytes > LIMITS.maxFileWriteBytes) {
+    throw new CeoError(
+      "VALIDATION_FAILED",
+      `File size (${Math.round(entry.bytes / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`,
+      { path: relativePath },
+    );
+  }
+  const content = await readBlobUtf8(config, cwd, entry.oid, relativePath);
+  return {
+    path: relativePath,
+    blob_oid: entry.oid,
+    bytes: entry.bytes ?? Buffer.byteLength(content, "utf8"),
+    content,
+  };
+}
+

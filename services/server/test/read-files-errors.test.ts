@@ -4,30 +4,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CeoWorkspace, mapReadFsError } from "../src/workspace.js";
 import { fixture, git } from "./helpers.js";
 
-// Injects a filesystem error on the stat() of the ORIGINAL tasks path so the
-// fallback decision (only ENOENT may consult archive) is exercised for real.
-const fsFault = vi.hoisted(() => ({
-  nextOriginalStat: null as { code: string; syscall: string } | null,
-}));
-vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs/promises")>();
-  const faultStat: typeof actual.stat = (async (target, options) => {
-    const failure = fsFault.nextOriginalStat;
-    if (failure) {
-      const pathText = String(target);
-      if (pathText.includes("/tasks/") && !pathText.includes("/archive/")) {
-        fsFault.nextOriginalStat = null; // fire once
-        const error = new Error(`injected ${failure.code}`) as NodeJS.ErrnoException;
-        error.code = failure.code;
-        error.syscall = failure.syscall;
-        throw error;
-      }
-    }
-    return actual.stat(target, options);
-  }) as typeof actual.stat;
-  return { ...actual, stat: faultStat };
-});
-
 // Counts full-tree listings (`git ls-tree -r`) so tests can prove whether the
 // archive was enumerated at all.
 const fullTree = vi.hoisted(() => ({ listings: 0 }));
@@ -49,8 +25,24 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function openWorkspace(item: Fixture): Promise<CeoWorkspace> {
-  const workspace = new CeoWorkspace(item.config);
+class FaultInjectionWorkspace extends CeoWorkspace {
+  nextOriginalStat: { code: string; syscall: string } | null = null;
+
+  protected override async getSnapshotTreeEntry(commit: string, entryPath: string) {
+    const failure = this.nextOriginalStat;
+    if (failure && entryPath.startsWith("tasks/") && !entryPath.startsWith("archive/")) {
+      this.nextOriginalStat = null;
+      const error = new Error(`injected ${failure.code}`) as NodeJS.ErrnoException;
+      error.code = failure.code;
+      error.syscall = failure.syscall;
+      throw error;
+    }
+    return super.getSnapshotTreeEntry(commit, entryPath);
+  }
+}
+
+async function openWorkspace(item: Fixture): Promise<FaultInjectionWorkspace> {
+  const workspace = new FaultInjectionWorkspace(item.config);
   await workspace.initialize();
   return workspace;
 }
@@ -64,16 +56,16 @@ async function readError(promise: Promise<unknown>): Promise<{ code: string; det
   }
 }
 
-/** readUtf8 throws a raw EACCES when asked to read the archived target. */
+/** readBlob throws a raw EACCES when asked to read the archived target. */
 class ArchiveReadFaultWorkspace extends CeoWorkspace {
-  async readUtf8(filePath: string, displayPath: string): Promise<string> {
-    if (displayPath === "archive/2026/TEST-001.md") {
+  protected override async readBlob(oid: string, filePath: string): Promise<string> {
+    if (filePath === "archive/2026/TEST-001.md") {
       const error = new Error("injected read EACCES") as NodeJS.ErrnoException;
       error.code = "EACCES";
       error.syscall = "read";
       throw error;
     }
-    return super.readUtf8(filePath, displayPath);
+    return super.readBlob(oid, filePath);
   }
 }
 
@@ -121,7 +113,7 @@ describe("read_files filesystem-error handling (no archive fallback)", () => {
     // path must surface instead of falling back to it.
     await writeArchivedCopy(item, "# ARCHIVED\n");
 
-    fsFault.nextOriginalStat = { code: "EACCES", syscall: "stat" };
+    workspace.nextOriginalStat = { code: "EACCES", syscall: "stat" };
     const before = fullTree.listings;
     const error = await readError(workspace.readFiles(["tasks/TEST-001.md"]));
     expect(fullTree.listings - before).toBe(0); // archive never enumerated
@@ -139,7 +131,7 @@ describe("read_files filesystem-error handling (no archive fallback)", () => {
     const workspace = await openWorkspace(item);
     await writeArchivedCopy(item, "# ARCHIVED\n");
 
-    fsFault.nextOriginalStat = { code: "EIO", syscall: "stat" };
+    workspace.nextOriginalStat = { code: "EIO", syscall: "stat" };
     const before = fullTree.listings;
     const error = await readError(workspace.readFiles(["tasks/TEST-001.md"]));
     expect(fullTree.listings - before).toBe(0);

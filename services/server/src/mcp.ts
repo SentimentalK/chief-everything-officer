@@ -1,5 +1,4 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as z from "zod/v4";
 import { CeoError, safeError } from "./errors.js";
@@ -13,7 +12,9 @@ import { BUILD_INFO } from "./build-info.js";
 import { ResourceService } from "./resource/service.js";
 import { ResourceRetrievalService } from "./resource/retrieval.js";
 import { parseMetaMarkdown } from "./resource/meta.js";
-import { resolveResourceLocation } from "./resource/locator.js";
+import { resolveResourceLocationAtSnapshot } from "./resource/locator.js";
+import { isAllowedResourceSourcePath } from "./resource/security.js";
+import { getTreeEntry, readBlobUtf8, runGitBuffer } from "./git.js";
 import {
   type UrlMetadataResolver,
   type ContentResolverConfig,
@@ -448,22 +449,54 @@ export function createMcpServer(
       if (!/^res-[0-9a-f-]{36}$/i.test(resId)) {
         throw new Error(`Invalid resource_id format: ${resId}`);
       }
-      const location = await resolveResourceLocation(workspace.config.repoDir, resId);
+      const snapshot = await workspace.captureReadSnapshot();
+      const location = await resolveResourceLocationAtSnapshot(
+        workspace.config,
+        workspace.config.repoDir,
+        snapshot,
+        resId,
+      );
       if (!location) {
         throw new Error(`Resource '${resId}' not found.`);
       }
-      const resDir = path.join(workspace.config.repoDir, location.relative_path);
-      const metaPath = path.join(resDir, "meta.md");
-      const metaContent = await readFile(metaPath, "utf8").catch(() => null);
-      if (!metaContent) {
+      const metaPath = path.posix.join(location.location.relative_path, "meta.md");
+      const metaEntry = await getTreeEntry(
+        workspace.config,
+        workspace.config.repoDir,
+        snapshot.commit,
+        metaPath,
+      );
+      if (!metaEntry || metaEntry.type !== "blob") {
         throw new Error(`Resource '${resId}' meta.md not found.`);
       }
+      const metaContent = await readBlobUtf8(
+        workspace.config,
+        workspace.config.repoDir,
+        metaEntry.oid,
+        metaPath,
+      );
       const { meta } = parseMetaMarkdown(metaContent);
       if (!meta.asset_ref) {
         throw new Error(`Resource '${resId}' does not have a stored source asset.`);
       }
-      const sourceFilePath = path.join(resDir, meta.asset_ref);
-      const data = await readFile(sourceFilePath);
+      if (!isAllowedResourceSourcePath(meta.asset_ref)) {
+        throw new Error(`Resource '${resId}' source asset path is invalid.`);
+      }
+      const sourceFilePath = path.posix.join(location.location.relative_path, meta.asset_ref);
+      const assetEntry = await getTreeEntry(
+        workspace.config,
+        workspace.config.repoDir,
+        snapshot.commit,
+        sourceFilePath,
+      );
+      if (!assetEntry || assetEntry.type !== "blob") {
+        throw new Error(`Resource '${resId}' source asset not found.`);
+      }
+      const { stdout: data } = await runGitBuffer(
+        workspace.config,
+        workspace.config.repoDir,
+        ["cat-file", "blob", assetEntry.oid],
+      );
       return {
         contents: [
           {

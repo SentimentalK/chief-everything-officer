@@ -87,7 +87,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     };
 
     try {
-      await expect(testWs.withLock(async () => "ok")).rejects.toThrow("Disk quota exceeded during owner.json write");
+      await expect(testWs.withExclusiveWorkspaceMutation(async () => "ok")).rejects.toThrow("Disk quota exceeded during owner.json write");
     } finally {
       testWs.writeOwnerJson = originalWriteOwnerJson;
     }
@@ -96,8 +96,8 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     const lockExistsAfter = await stat(lockDir).then(() => true).catch(() => false);
     expect(lockExistsAfter).toBe(false);
 
-    // Subsequent withLock must immediately succeed without NOT_READY!
-    const result = await testWs.withLock(async () => "succeeded_immediately");
+    // Subsequent withExclusiveWorkspaceMutation must immediately succeed without NOT_READY!
+    const result = await testWs.withExclusiveWorkspaceMutation(async () => "succeeded_immediately");
     expect(result).toBe("succeeded_immediately");
   });
 
@@ -107,7 +107,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
 
     const testWs = ws as any;
     await expect(
-      testWs.withLock(async () => {
+      testWs.withExclusiveWorkspaceMutation(async () => {
         throw new Error("Business logic crashed inside lock");
       }),
     ).rejects.toThrow("Business logic crashed inside lock");
@@ -117,7 +117,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     expect(ACTIVE_WORKSPACE_LOCKS.has(lockDir)).toBe(false);
 
     // Next lock succeeds
-    const ok = await testWs.withLock(async () => "clean");
+    const ok = await testWs.withExclusiveWorkspaceMutation(async () => "clean");
     expect(ok).toBe("clean");
   });
 
@@ -129,7 +129,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     await mkdir(lockDir, { recursive: true });
 
     const testWs = ws as any;
-    await expect(testWs.withLock(async () => "should_not_run")).rejects.toMatchObject({
+    await expect(testWs.withExclusiveWorkspaceMutation(async () => "should_not_run")).rejects.toMatchObject({
       name: "CeoError",
       code: "NOT_READY",
       details: { reason: "WORKSPACE_BUSY" },
@@ -154,7 +154,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
 
     const testWs = ws as any;
     // Should detect orphan stale (>5s), remove it, and successfully acquire on retry!
-    const result = await testWs.withLock(async () => "reclaimed_and_executed");
+    const result = await testWs.withExclusiveWorkspaceMutation(async () => "reclaimed_and_executed");
     expect(result).toBe("reclaimed_and_executed");
 
     // Lock is released after operation finishes
@@ -179,7 +179,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     });
 
     // Start operation 1 which holds the lock
-    const op1 = testWs.withLock(async () => {
+    const op1 = testWs.withExclusiveWorkspaceMutation(async () => {
       holdLockStartedResolve();
       await lockHeldPromise;
       return "op1_done";
@@ -188,7 +188,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     await holdLockStarted;
 
     // Operation 2 attempts to acquire lock while op1 is still actively running in the same process
-    await expect(testWs.withLock(async () => "op2")).rejects.toMatchObject({
+    await expect(testWs.withExclusiveWorkspaceMutation(async () => "op2")).rejects.toMatchObject({
       name: "CeoError",
       code: "NOT_READY",
       details: { reason: "WORKSPACE_BUSY" },
@@ -227,7 +227,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
 
     const testWs = ws as any;
     // Must recognize as same_instance_orphan, reclaim, and succeed!
-    const result = await testWs.withLock(async () => "healed_same_instance_orphan");
+    const result = await testWs.withExclusiveWorkspaceMutation(async () => "healed_same_instance_orphan");
     expect(result).toBe("healed_same_instance_orphan");
 
     const lockExists = await stat(lockDir).then(() => true).catch(() => false);
@@ -249,7 +249,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     await writeFile(path.join(lockDir, "owner.json"), JSON.stringify(deadPidMeta));
 
     const testWs = ws as any;
-    const result = await testWs.withLock(async () => "healed_dead_pid");
+    const result = await testWs.withExclusiveWorkspaceMutation(async () => "healed_dead_pid");
     expect(result).toBe("healed_dead_pid");
 
     const lockExists = await stat(lockDir).then(() => true).catch(() => false);
@@ -271,7 +271,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
     await writeFile(path.join(lockDir, "owner.json"), JSON.stringify(livingPidMeta));
 
     const testWs = ws as any;
-    await expect(testWs.withLock(async () => "should_fail")).rejects.toMatchObject({
+    await expect(testWs.withExclusiveWorkspaceMutation(async () => "should_fail")).rejects.toMatchObject({
       name: "CeoError",
       code: "NOT_READY",
       details: { reason: "WORKSPACE_BUSY" },
@@ -375,7 +375,7 @@ describe("CeoWorkspace Lock Resilience & Stale Lock Auto-Healing", () => {
 
     try {
       // Must fail closed with NOT_READY on second EEXIST without looping infinitely
-      await expect(testWs.withLock(async () => "should_not_succeed")).rejects.toMatchObject({
+      await expect(testWs.withExclusiveWorkspaceMutation(async () => "should_not_succeed")).rejects.toMatchObject({
         name: "CeoError",
         code: "NOT_READY",
       });

@@ -13,7 +13,16 @@ import {
 import { constants, type Stats } from "node:fs";
 import type { WorkspaceConfig } from "./git.js";
 import { CeoError } from "./errors.js";
-import { assertExpectedBlob, blobOid, resolveRef, runGit } from "./git.js";
+import {
+  assertExpectedBlob,
+  blobOid,
+  getTreeEntry,
+  listTreeEntries,
+  readBlobUtf8,
+  resolveRef,
+  runGit,
+  type GitTreeEntry,
+} from "./git.js";
 import { type CeoIgnoreMatcher, isPathIgnored, parseCeoIgnore } from "./ignore.js";
 import { LIMITS } from "./limits.js";
 import {
@@ -23,6 +32,11 @@ import {
   validatePath,
 } from "./policy.js";
 import { isAllowedResourceSourcePath } from "./resource/security.js";
+
+export interface WorkspaceSnapshot {
+  commit: string;
+  ignoreMatcher: CeoIgnoreMatcher;
+}
 
 export type WorkspaceState = "RECOVERING" | "READY" | "PUSH_PENDING" | "BLOCKED" | "NOT_READY";
 
@@ -193,7 +207,7 @@ export class CeoWorkspace {
     await mkdir(this.config.stateDir, { recursive: true });
     await mkdir(this.completedDir, { recursive: true });
     await this.removeStaleLock();
-    await this.withLock(async () => {
+    await this.withExclusiveWorkspaceMutation(async () => {
       await this.ensureRepository();
       await this.recoverPending();
       await this.syncCleanWorkspace();
@@ -202,7 +216,7 @@ export class CeoWorkspace {
   }
 
   async workspaceStatus(): Promise<Record<string, unknown>> {
-    return await this.withLock(async () => {
+    return await this.withExclusiveWorkspaceMutation(async () => {
       await this.recoverPending();
       if (this.state === "BLOCKED") throw new CeoError("WORKSPACE_DIVERGED", "Pending commit diverged from origin/main.");
       await this.syncCleanWorkspace();
@@ -223,6 +237,58 @@ export class CeoWorkspace {
         last_push_at: this.lastPushAt,
       };
     });
+  }
+
+  async captureReadSnapshot(): Promise<WorkspaceSnapshot> {
+    if (this.state === "BLOCKED") {
+      throw new CeoError("WORKSPACE_DIVERGED", "Workspace requires operator repair.");
+    }
+    if (this.state !== "READY") {
+      throw new CeoError("NOT_READY", `Workspace is in ${this.state} state and not ready for reads.`);
+    }
+    const gitDir = path.join(this.config.repoDir, ".git");
+    const exists = await access(gitDir, constants.F_OK).then(() => true).catch(() => false);
+    if (!exists) {
+      throw new CeoError("NOT_READY", "Workspace repository is not initialized.");
+    }
+    const commit = await resolveRef(this.config, this.config.repoDir, "HEAD");
+    const ignoreMatcher = await this.loadIgnoreMatcherAtCommit(commit);
+    return { commit, ignoreMatcher };
+  }
+
+  async loadIgnoreMatcherAtCommit(commit: string): Promise<CeoIgnoreMatcher> {
+    try {
+      const entry = await this.getSnapshotTreeEntry(commit, ".ceoignore");
+      if (!entry) {
+        return { exactFiles: new Set(), directoryPrefixes: [] };
+      }
+      if (entry.type === "tree") {
+        throw Object.assign(new Error("EISDIR: illegal operation on a directory, read"), { code: "EISDIR" });
+      }
+      const content = await this.readBlob(entry.oid, ".ceoignore");
+      return parseCeoIgnore(content);
+    } catch (error: unknown) {
+      if (error instanceof CeoError && error.code === "VALIDATION_FAILED") {
+        throw error;
+      }
+      throw new CeoError(
+        "NOT_READY",
+        "Failed to read .ceoignore access boundary file.",
+        { code: (error as NodeJS.ErrnoException).code ?? "UNKNOWN" },
+      );
+    }
+  }
+
+  protected async getSnapshotTreeEntry(commit: string, entryPath: string): Promise<GitTreeEntry | null> {
+    return await getTreeEntry(this.config, this.config.repoDir, commit, entryPath);
+  }
+
+  protected async readBlob(oid: string, filePath: string): Promise<string> {
+    return await readBlobUtf8(this.config, this.config.repoDir, oid, filePath);
+  }
+
+  protected async listSnapshotTreeEntries(commit: string): Promise<GitTreeEntry[]> {
+    return await listTreeEntries(this.config, this.config.repoDir, commit);
   }
 
   private async loadIgnoreMatcher(dir: string = this.config.repoDir): Promise<CeoIgnoreMatcher> {
@@ -246,132 +312,124 @@ export class CeoWorkspace {
     recursive = false,
     limit = 200,
   ): Promise<Record<string, unknown>> {
-    return await this.withReadyWorkspace(async (base) => {
-      if (prefix && (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix))) {
-        throw new CeoError("INVALID_PATH", "Prefix must be a safe repository-relative path.", { prefix });
+    if (prefix && (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix))) {
+      throw new CeoError("INVALID_PATH", "Prefix must be a safe repository-relative path.", { prefix });
+    }
+    const normalizedPrefix = normalizeListPrefix(prefix);
+    const snapshot = await this.captureReadSnapshot();
+    const treeEntries = await this.listSnapshotTreeEntries(snapshot.commit);
+
+    type UnifiedEntry =
+      | { kind: "directory"; path: string }
+      | { kind: "file"; path: string; blob_oid: string; bytes: number };
+
+    const directoryPaths = new Set<string>();
+    const rawFiles: Array<{ path: string; blob_oid: string; bytes: number }> = [];
+
+    for (const entry of treeEntries) {
+      const filePath = entry.path;
+      if (!isAllowedTrackedPath(filePath) || isPathIgnored(snapshot.ignoreMatcher, filePath)) {
+        continue;
       }
-      const normalizedPrefix = normalizeListPrefix(prefix);
-      const matcher = await this.loadIgnoreMatcher();
-      const result = await runGit(this.config, this.config.repoDir, ["ls-tree", "-r", "-l", base]);
 
-      type UnifiedEntry =
-        | { kind: "directory"; path: string }
-        | { kind: "file"; path: string; blob_oid: string; bytes: number };
+      if (normalizedPrefix && !filePath.startsWith(normalizedPrefix)) {
+        continue;
+      }
 
-      const directoryPaths = new Set<string>();
-      const rawFiles: Array<{ path: string; blob_oid: string; bytes: number }> = [];
-
-      for (const line of result.stdout.split("\n")) {
-        if (!line) continue;
-        const match = line.match(/^\d+\s+blob\s+([0-9a-f]{40,64})\s+(\d+)\t(.+)$/);
-        if (!match) continue;
-        const [, oid, bytesStr, filePath] = match;
-        if (!oid || !bytesStr || !filePath || !isAllowedTrackedPath(filePath) || isPathIgnored(matcher, filePath)) {
-          continue;
-        }
-
-        if (normalizedPrefix && !filePath.startsWith(normalizedPrefix)) {
-          continue;
-        }
-
-        if (recursive) {
-          rawFiles.push({ path: filePath, blob_oid: oid, bytes: Number(bytesStr) });
+      if (recursive) {
+        rawFiles.push({ path: filePath, blob_oid: entry.oid, bytes: entry.bytes ?? 0 });
+      } else {
+        const remainder = filePath.slice(normalizedPrefix.length);
+        const slashIdx = remainder.indexOf("/");
+        if (slashIdx === -1) {
+          rawFiles.push({ path: filePath, blob_oid: entry.oid, bytes: entry.bytes ?? 0 });
         } else {
-          const remainder = filePath.slice(normalizedPrefix.length);
-          const slashIdx = remainder.indexOf("/");
-          if (slashIdx === -1) {
-            rawFiles.push({ path: filePath, blob_oid: oid, bytes: Number(bytesStr) });
-          } else {
-            const subDir = remainder.slice(0, slashIdx);
-            const dirPath = `${normalizedPrefix}${subDir}/`;
-            directoryPaths.add(dirPath);
-          }
+          const subDir = remainder.slice(0, slashIdx);
+          const dirPath = `${normalizedPrefix}${subDir}/`;
+          directoryPaths.add(dirPath);
         }
       }
+    }
 
-      const unifiedEntries: UnifiedEntry[] = [
-        ...Array.from(directoryPaths).map((p) => ({ kind: "directory" as const, path: p })),
-        ...rawFiles.map((f) => ({ kind: "file" as const, ...f })),
-      ];
+    const unifiedEntries: UnifiedEntry[] = [
+      ...Array.from(directoryPaths).map((p) => ({ kind: "directory" as const, path: p })),
+      ...rawFiles.map((f) => ({ kind: "file" as const, ...f })),
+    ];
 
-      unifiedEntries.sort((a, b) => a.path.localeCompare(b.path));
+    unifiedEntries.sort((a, b) => a.path.localeCompare(b.path));
 
-      const truncated = unifiedEntries.length > limit;
-      const sliced = truncated ? unifiedEntries.slice(0, limit) : unifiedEntries;
+    const truncated = unifiedEntries.length > limit;
+    const sliced = truncated ? unifiedEntries.slice(0, limit) : unifiedEntries;
 
-      const directories: string[] = [];
-      const files: Array<{ path: string; blob_oid: string; bytes: number }> = [];
+    const directories: string[] = [];
+    const files: Array<{ path: string; blob_oid: string; bytes: number }> = [];
 
-      for (const entry of sliced) {
-        if (entry.kind === "directory") {
-          directories.push(entry.path);
-        } else {
-          files.push({ path: entry.path, blob_oid: entry.blob_oid, bytes: entry.bytes });
-        }
+    for (const entry of sliced) {
+      if (entry.kind === "directory") {
+        directories.push(entry.path);
+      } else {
+        files.push({ path: entry.path, blob_oid: entry.blob_oid, bytes: entry.bytes });
       }
+    }
 
-      return {
-        ok: true,
-        request_id: randomUUID(),
-        workspace_state: "READY",
-        base_commit: base,
-        directories,
-        files,
-        truncated,
-      };
-    });
+    return {
+      ok: true,
+      request_id: randomUUID(),
+      workspace_state: "READY",
+      base_commit: snapshot.commit,
+      directories,
+      files,
+      truncated,
+    };
   }
 
   async readFiles(paths: string[]): Promise<Record<string, unknown>> {
     if (paths.length === 0 || paths.length > LIMITS.maxFilesPerRead) {
       throw new CeoError("VALIDATION_FAILED", `Read between 1 and ${LIMITS.maxFilesPerRead} files.`);
     }
-    return await this.withReadyWorkspace(async (base) => {
-      const matcher = await this.loadIgnoreMatcher();
-      let archiveIndex: Map<string, string[]> | null = null;
-      const getArchiveIndex = async (): Promise<Map<string, string[]>> => {
-        if (archiveIndex) return archiveIndex;
-        const index = new Map<string, string[]>();
-        // listTrackedFiles already excludes .ceoignore'd entries, so restricted
-        // archive candidates never reach the index or any error message. This
-        // scans the tracked file list at most once per batch.
-        for (const entry of await this.listTrackedFiles(base, matcher)) {
-          const basename = archiveEntryBasename(entry);
-          if (!basename) continue;
-          const list = index.get(basename);
-          if (list) list.push(entry);
-          else index.set(basename, [entry]);
-        }
-        archiveIndex = index;
-        return index;
-      };
-
-      let total = 0;
-      const files = [];
-      for (const requestedPath of paths) {
-        // Tracks the path a raw filesystem error was raised against: the
-        // original requested path until resolution succeeds, the resolved
-        // (possibly archived) path afterwards. Never a host absolute path.
-        let displayPath = requestedPath;
-        try {
-          const resolved = await this.resolveReadTarget(base, matcher, requestedPath, getArchiveIndex);
-          displayPath = resolved.path;
-          if (resolved.size > LIMITS.maxFileWriteBytes) {
-            throw new CeoError("VALIDATION_FAILED", `File size (${Math.round(resolved.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`, { path: resolved.path });
-          }
-          total += resolved.size;
-          if (total > LIMITS.maxReadResponseBytes) {
-            throw new CeoError("VALIDATION_FAILED", `Total response size exceeds response budget of ${Math.round(LIMITS.maxReadResponseBytes / (1024 * 1024))} MiB.`);
-          }
-          const content = await this.readUtf8(path.join(this.config.repoDir, resolved.path), resolved.path);
-          const oid = await blobOid(this.config, this.config.repoDir, base, resolved.path);
-          files.push({ requested_path: requestedPath, path: resolved.path, blob_oid: oid, content });
-        } catch (error) {
-          throw this.withReadErrorContext(error, paths, requestedPath, displayPath);
-        }
+    const snapshot = await this.captureReadSnapshot();
+    let archiveIndex: Map<string, string[]> | null = null;
+    const getArchiveIndex = async (): Promise<Map<string, string[]>> => {
+      if (archiveIndex) return archiveIndex;
+      const index = new Map<string, string[]>();
+      // listTrackedFiles already excludes .ceoignore'd entries, so restricted
+      // archive candidates never reach the index or any error message. This
+      // scans the tracked file list at most once per batch.
+      for (const entry of await this.listTrackedFiles(snapshot.commit, snapshot.ignoreMatcher)) {
+        const basename = archiveEntryBasename(entry);
+        if (!basename) continue;
+        const list = index.get(basename);
+        if (list) list.push(entry);
+        else index.set(basename, [entry]);
       }
-      return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: base, files };
-    });
+      archiveIndex = index;
+      return index;
+    };
+
+    let total = 0;
+    const files = [];
+    for (const requestedPath of paths) {
+      // Tracks the path a raw filesystem or git error was raised against: the
+      // original requested path until resolution succeeds, the resolved
+      // (possibly archived) path afterwards. Never a host absolute path.
+      let displayPath = requestedPath;
+      try {
+        const resolved = await this.resolveSnapshotReadTarget(snapshot, requestedPath, getArchiveIndex);
+        displayPath = resolved.path;
+        if (resolved.size > LIMITS.maxFileWriteBytes) {
+          throw new CeoError("VALIDATION_FAILED", `File size (${Math.round(resolved.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`, { path: resolved.path });
+        }
+        total += resolved.size;
+        if (total > LIMITS.maxReadResponseBytes) {
+          throw new CeoError("VALIDATION_FAILED", `Total response size exceeds response budget of ${Math.round(LIMITS.maxReadResponseBytes / (1024 * 1024))} MiB.`);
+        }
+        const content = await this.readBlob(resolved.oid, resolved.path);
+        files.push({ requested_path: requestedPath, path: resolved.path, blob_oid: resolved.oid, content });
+      } catch (error) {
+        throw this.withReadErrorContext(error, paths, requestedPath, displayPath);
+      }
+    }
+    return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: snapshot.commit, files };
   }
 
   async readOptionalMarkdown(relativePath: string): Promise<{
@@ -381,75 +439,64 @@ export class CeoWorkspace {
     base_commit: string;
   } | null> {
     const validatedPath = validatePath(relativePath);
-    return await this.withReadyWorkspace(async (base) => {
-      const matcher = await this.loadIgnoreMatcher();
-      if (isPathIgnored(matcher, validatedPath)) {
-        throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: validatedPath });
-      }
-      await assertNoSymlink(this.config.repoDir, validatedPath);
-      const fullPath = path.join(this.config.repoDir, validatedPath);
-      let fileStat: Stats | null = null;
-      try {
-        fileStat = await stat(fullPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-        throw error;
-      }
-      if (!fileStat.isFile()) {
-        throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: validatedPath });
-      }
-      if (fileStat.size > LIMITS.maxFileWriteBytes) {
-        throw new CeoError(
-          "VALIDATION_FAILED",
-          `File size (${Math.round(fileStat.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`,
-          { path: validatedPath },
-        );
-      }
-      const content = await this.readUtf8(fullPath, validatedPath);
-      const oid = await blobOid(this.config, this.config.repoDir, base, validatedPath);
-      return {
-        path: validatedPath,
-        blob_oid: oid,
-        content,
-        base_commit: base,
-      };
-    });
+    const snapshot = await this.captureReadSnapshot();
+    if (isPathIgnored(snapshot.ignoreMatcher, validatedPath)) {
+      throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: validatedPath });
+    }
+
+    const entry = await this.getSnapshotTreeEntry(snapshot.commit, validatedPath);
+    if (!entry) return null;
+
+    if (entry.mode === "120000") {
+      throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: validatedPath });
+    }
+    if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) {
+      throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: validatedPath });
+    }
+    if (entry.bytes !== undefined && entry.bytes > LIMITS.maxFileWriteBytes) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        `File size (${Math.round(entry.bytes / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`,
+        { path: validatedPath },
+      );
+    }
+    const content = await this.readBlob(entry.oid, validatedPath);
+    return {
+      path: validatedPath,
+      blob_oid: entry.oid,
+      content,
+      base_commit: snapshot.commit,
+    };
   }
 
   /**
-   * Resolves where a requested file is read from and returns its actual path
-   * and size. When the requested `tasks/<name>.md` does not exist at base and
-   * exactly one tracked `archive/<year>/<name>.md` exists, the archive file is
-   * the read target. All other outcomes raise a closed-union CeoError (raw
-   * filesystem errors propagate up to be mapped by the batch loop).
+   * Resolves where a requested file is read from in the snapshot commit and
+   * returns its actual path, blob OID, and size. When the requested
+   * `tasks/<name>.md` does not exist in the snapshot and exactly one tracked
+   * `archive/<year>/<name>.md` exists, the archive file is the read target.
    */
-  private async resolveReadTarget(
-    base: string,
-    matcher: CeoIgnoreMatcher,
+  private async resolveSnapshotReadTarget(
+    snapshot: WorkspaceSnapshot,
     requestedPath: string,
     getArchiveIndex: () => Promise<Map<string, string[]>>,
-  ): Promise<{ path: string; size: number }> {
+  ): Promise<{ path: string; oid: string; size: number }> {
     const filePath = validatePath(requestedPath);
-    if (isPathIgnored(matcher, filePath)) {
+    if (isPathIgnored(snapshot.ignoreMatcher, filePath)) {
       throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: filePath });
     }
-    await assertNoSymlink(this.config.repoDir, filePath);
-    let original: Stats | null = null;
-    try {
-      original = await stat(path.join(this.config.repoDir, filePath));
-    } catch (error) {
-      // ENOENT: proceed to the archive fallback decision below. Every other
-      // errno (permission, IO, ...) rethrows as a whole-batch failure and never
-      // triggers the archive fallback.
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+
+    const original = await this.getSnapshotTreeEntry(snapshot.commit, filePath);
     if (original) {
-      if (!original.isFile()) {
+      if (original.mode === "120000") {
+        throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: filePath });
+      }
+      if (original.type !== "blob" || (original.mode !== "100644" && original.mode !== "100755")) {
         throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: filePath });
       }
       // The original exists: read it, never consult archive.
-      return { path: filePath, size: original.size };
+      return { path: filePath, oid: original.oid, size: original.bytes ?? 0 };
     }
+
     // Missing original. Only a single-level tasks/ reference may consult archive.
     if (!isTaskFilePath(filePath)) {
       throw new CeoError("INVALID_PATH", "Requested file was not found. Correct the path and retry the complete batch.", { path: filePath, reason: "NOT_FOUND" });
@@ -463,14 +510,17 @@ export class CeoWorkspace {
       throw new CeoError("INVALID_PATH", "Task file exists in multiple archive years. Specify the archive path explicitly and retry the complete batch.", { path: filePath, reason: "AMBIGUOUS_ARCHIVE_MATCH", candidates });
     }
     const actualPath = candidates[0]!;
-    // Re-validate the chosen archive target before reading. A permission/IO
-    // failure here is a whole-batch failure — never skip to another candidate.
-    await assertNoSymlink(this.config.repoDir, actualPath);
-    const archived = await stat(path.join(this.config.repoDir, actualPath));
-    if (!archived.isFile()) {
+    const archived = await this.getSnapshotTreeEntry(snapshot.commit, actualPath);
+    if (!archived) {
+      throw new CeoError("INVALID_PATH", "Requested file was not found. Correct the path and retry the complete batch.", { path: actualPath, reason: "NOT_FOUND" });
+    }
+    if (archived.mode === "120000") {
+      throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: actualPath });
+    }
+    if (archived.type !== "blob" || (archived.mode !== "100644" && archived.mode !== "100755")) {
       throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: actualPath });
     }
-    return { path: actualPath, size: archived.size };
+    return { path: actualPath, oid: archived.oid, size: archived.bytes ?? 0 };
   }
 
   /**
@@ -493,32 +543,38 @@ export class CeoWorkspace {
     if (!query || Buffer.byteLength(query, "utf8") > 512) {
       throw new CeoError("VALIDATION_FAILED", "Search query must contain 1 to 512 UTF-8 bytes.");
     }
-    return await this.withReadyWorkspace(async (base) => {
-      const matcher = await this.loadIgnoreMatcher();
-      const listed = await this.listTrackedFiles(base, matcher);
-      const safePrefixes = prefixes.length ? prefixes : [""];
-      for (const prefix of safePrefixes) {
-        if (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix)) {
-          throw new CeoError("INVALID_PATH", "Search prefix is invalid.", { prefix });
-        }
+    const safePrefixes = prefixes.length ? prefixes : [""];
+    for (const prefix of safePrefixes) {
+      if (prefix.includes("..") || prefix.includes("\\") || path.posix.isAbsolute(prefix)) {
+        throw new CeoError("INVALID_PATH", "Search prefix is invalid.", { prefix });
       }
-      const matches: Array<{ path: string; line: number; snippet: string }> = [];
-      for (const filePath of listed) {
-        if (prefixes.length === 0 && !isDefaultSearchPath(filePath)) continue;
-        if (!safePrefixes.some((prefix) => filePath.startsWith(prefix))) continue;
-        await assertNoSymlink(this.config.repoDir, filePath);
-        const content = await this.readUtf8(path.join(this.config.repoDir, filePath), filePath);
-        for (const [index, line] of content.split("\n").entries()) {
-          if (line.includes(query)) {
-            matches.push({ path: filePath, line: index + 1, snippet: line.slice(0, 300) });
-            if (matches.length >= limit) {
-              return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: base, matches, truncated: true };
-            }
+    }
+
+    const snapshot = await this.captureReadSnapshot();
+    const treeEntries = await this.listSnapshotTreeEntries(snapshot.commit);
+
+    const matches: Array<{ path: string; line: number; snippet: string }> = [];
+    for (const entry of treeEntries) {
+      const filePath = entry.path;
+      if (!isAllowedTrackedPath(filePath) || isPathIgnored(snapshot.ignoreMatcher, filePath)) continue;
+      if (prefixes.length === 0 && !isDefaultSearchPath(filePath)) continue;
+      if (!safePrefixes.some((prefix) => filePath.startsWith(prefix))) continue;
+      if (entry.mode === "120000") {
+        throw new CeoError("INVALID_PATH", "Symlinks are forbidden in CEO content paths.", { path: filePath });
+      }
+      if (entry.type !== "blob") continue;
+
+      const content = await this.readBlob(entry.oid, filePath);
+      for (const [index, line] of content.split("\n").entries()) {
+        if (line.includes(query)) {
+          matches.push({ path: filePath, line: index + 1, snippet: line.slice(0, 300) });
+          if (matches.length >= limit) {
+            return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: snapshot.commit, matches, truncated: true };
           }
         }
       }
-      return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: base, matches, truncated: false };
-    });
+    }
+    return { ok: true, request_id: randomUUID(), workspace_state: "READY", base_commit: snapshot.commit, matches, truncated: false };
   }
 
   async isRequestCompleted(requestId: string): Promise<Record<string, unknown> | null> {
@@ -547,7 +603,7 @@ export class CeoWorkspace {
       operationResultProducer,
       mutator,
     } = input;
-    return await this.withLock(async () => {
+    return await this.withExclusiveWorkspaceMutation(async () => {
       const completed = await this.readCompleted(requestId);
       if (completed) return this.completedResult(completed);
       await this.recoverPending();
@@ -665,7 +721,7 @@ export class CeoWorkspace {
   }
 
   async withReadyWorkspace<T>(operation: (base: string) => Promise<T>): Promise<T> {
-    return await this.withLock(async () => {
+    return await this.withExclusiveWorkspaceMutation(async () => {
       await this.recoverPending();
       if (this.state === "BLOCKED") throw new CeoError("WORKSPACE_DIVERGED", "Workspace requires operator repair.");
       await this.syncCleanWorkspace();
@@ -922,7 +978,7 @@ export class CeoWorkspace {
     await writeFile(filePath, JSON.stringify(meta), { encoding: "utf8", mode: 0o600 });
   }
 
-  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+  async withExclusiveWorkspaceMutation<T>(operation: () => Promise<T>): Promise<T> {
     return await this.acquireAndRunLock(operation, /* allowStaleRetry */ true);
   }
 

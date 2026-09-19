@@ -235,9 +235,14 @@ describe("CeoWorkspace", () => {
     const workspace = new CeoWorkspace(item.config);
     await workspace.initialize();
 
-    // Create .ceoignore as a directory to trigger EISDIR when reading as file
+    // Create and commit .ceoignore as a directory to trigger EISDIR when reading as file
     const ignoreDir = path.join(item.config.repoDir, ".ceoignore");
-    await import("node:fs/promises").then(({ mkdir }) => mkdir(ignoreDir, { recursive: true }));
+    await import("node:fs/promises").then(async ({ mkdir, writeFile }) => {
+      await mkdir(ignoreDir, { recursive: true });
+      await writeFile(path.join(ignoreDir, "entry"), "content\n");
+    });
+    git(item.config.repoDir, "add", ".ceoignore");
+    git(item.config.repoDir, "commit", "-m", "Commit .ceoignore as directory");
 
     await expect(workspace.listFiles()).rejects.toMatchObject({
       code: "NOT_READY",

@@ -3,6 +3,9 @@ import { readFile, readdir } from "node:fs/promises";
 import { parseMetaMarkdown, type ParsedMetaDocument } from "./meta.js";
 import type { ResourceMeta } from "./types.js";
 import { CeoError } from "../errors.js";
+import type { GitExecutionConfig, GitTreeEntry } from "../git.js";
+import { listTreeEntries, readBlobUtf8 } from "../git.js";
+import type { WorkspaceSnapshot } from "../workspace.js";
 
 export interface ResourceLocation {
   resource_id: string;
@@ -14,6 +17,11 @@ export interface LocatedResource {
   location: ResourceLocation;
   meta: ResourceMeta;
   doc: ParsedMetaDocument;
+}
+
+export interface LocatedResourceSnapshot extends LocatedResource {
+  artifactSet: Set<string>;
+  artifactEntries: Map<string, GitTreeEntry>;
 }
 
 /**
@@ -86,6 +94,109 @@ export async function resolveResourceLocation(
   const all = await enumerateResources(root);
   const found = all.find((r) => r.location.resource_id === resourceId);
   return found ? found.location : null;
+}
+
+export async function enumerateResourcesAtSnapshot(
+  config: GitExecutionConfig,
+  repoDir: string,
+  snapshot: WorkspaceSnapshot,
+): Promise<LocatedResourceSnapshot[]> {
+  const allEntries = await listTreeEntries(config, repoDir, snapshot.commit, "resources/");
+
+  const dirMap = new Map<string, Map<string, GitTreeEntry>>();
+  for (const entry of allEntries) {
+    if (!entry.path.startsWith("resources/")) continue;
+    const rel = entry.path.slice("resources/".length);
+    const slashIdx = rel.indexOf("/");
+    if (slashIdx === -1) continue;
+    const dirName = rel.slice(0, slashIdx);
+    if (!dirName || dirName.startsWith(".")) continue;
+    const innerPath = rel.slice(slashIdx + 1);
+    let entryMap = dirMap.get(dirName);
+    if (!entryMap) {
+      entryMap = new Map();
+      dirMap.set(dirName, entryMap);
+    }
+    entryMap.set(innerPath, entry);
+  }
+
+  const results: LocatedResourceSnapshot[] = [];
+  const seenIds = new Map<string, string>();
+
+  for (const [dirName, entryMap] of dirMap.entries()) {
+    const metaEntry = entryMap.get("meta.md");
+    if (!metaEntry || metaEntry.mode === "120000" || metaEntry.type !== "blob") continue;
+
+    let metaContent: string;
+    try {
+      metaContent = await readBlobUtf8(config, repoDir, metaEntry.oid, `resources/${dirName}/meta.md`);
+    } catch {
+      continue;
+    }
+
+    let doc: ParsedMetaDocument;
+    try {
+      doc = parseMetaMarkdown(metaContent);
+    } catch {
+      continue;
+    }
+
+    const resId = doc.meta.resource_id;
+    if (!resId) continue;
+
+    const existingDir = seenIds.get(resId);
+    if (existingDir && existingDir !== dirName) {
+      throw new CeoError(
+        "CORRUPTION",
+        `Multiple Resource directories share the same canonical resource_id '${resId}': '${existingDir}' and '${dirName}'.`,
+        {
+          resource_id: resId,
+          first_directory: existingDir,
+          second_directory: dirName,
+        },
+      );
+    }
+
+    seenIds.set(resId, dirName);
+
+    const artifactSet = new Set<string>();
+    for (const innerPath of entryMap.keys()) {
+      if (innerPath.startsWith("source/")) {
+        artifactSet.add("source");
+      }
+      const slash = innerPath.indexOf("/");
+      if (slash === -1) {
+        artifactSet.add(innerPath);
+      } else {
+        artifactSet.add(innerPath.slice(0, slash));
+      }
+    }
+
+    results.push({
+      location: {
+        resource_id: resId,
+        directory_name: dirName,
+        relative_path: path.posix.join("resources", dirName),
+      },
+      meta: doc.meta,
+      doc,
+      artifactSet,
+      artifactEntries: entryMap,
+    });
+  }
+
+  return results;
+}
+
+export async function resolveResourceLocationAtSnapshot(
+  config: GitExecutionConfig,
+  repoDir: string,
+  snapshot: WorkspaceSnapshot,
+  resourceId: string,
+): Promise<LocatedResourceSnapshot | null> {
+  const all = await enumerateResourcesAtSnapshot(config, repoDir, snapshot);
+  const found = all.find((r) => r.location.resource_id === resourceId);
+  return found ?? null;
 }
 
 /**
