@@ -502,6 +502,9 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
 
     // Invariant: Flow-first routing! Always inspect active flow BEFORE checking memberships.
     const flow = onboardingService.getOrCreateActiveFlow(session.userId, session.providerSubject);
+    if (oauthRequest && flow.host_oauth_request_id !== oauthRequest) {
+      onboardingService.storeInstance.updateFlow(flow.id, { host_oauth_request_id: oauthRequest });
+    }
 
     if (flow.state === "AWAITING_REPOSITORY_RESTRICTION") {
       const target = oauthRequest
@@ -537,17 +540,40 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       return;
     }
 
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.status(200).send(
-      renderOnboardingPage({
-        title: "Set up your CEO workspace",
-        subtitle: "CEO will create a private GitHub repository named `personal-vault`. GitHub temporarily requires broad repository access before creating it, after which CEO will require restricting access.",
-        flowId: flow.id,
-        defaultRepoName: flow.desired_repository_name || "personal-vault",
-        oauthRequest,
-        errorMessage: flow.last_error_message || undefined,
-      }),
-    );
+    // Fresh user onboarding: Zero intermediate UI inside CEO before installation.
+    // Directly launch continuous GitHub Install + User Authorization flow.
+    try {
+      const instState = await onboardingService.resolveInstallationState(flow.id, session.userId);
+
+      if (instState.status === "NEED_INSTALL") {
+        const installUrl = installationService.createInstallRedirect(
+          session.userId,
+          session.providerSubject,
+          { onboardingFlowId: flow.id, oauthRequest: flow.host_oauth_request_id || oauthRequest },
+        );
+        res.redirect(302, installUrl);
+        return;
+      }
+
+      // Live installation exists: initiate GitHub user authorization to obtain grant
+      const { authorizationUrl } = repositoryService.createAuthorizationRedirect({
+        sessionId: session.sessionId,
+        userId: session.userId,
+        providerSubject: session.providerSubject,
+        installationId: instState.installation.github_installation_id,
+        onboardingFlowId: flow.id,
+        oauthRequest: flow.host_oauth_request_id || oauthRequest,
+      });
+
+      res.redirect(302, authorizationUrl);
+      return;
+    } catch (error: any) {
+      res.redirect(
+        302,
+        `/onboarding/recovery?flow=${encodeURIComponent(flow.id)}${oauthRequest ? `&oauth_request=${encodeURIComponent(oauthRequest)}` : ""}`,
+      );
+      return;
+    }
   });
 
 function buildInstallationSettingsUrl(accountType: string, accountLogin: string, githubInstallationId: string): string {

@@ -799,7 +799,7 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
     };
   }
 
-  it("GET /onboarding renders setup screen with default repository name", async () => {
+  it("GET /onboarding sends fresh user directly to GitHub App installation with zero intermediate UI", async () => {
     const ctx = await createTestContext();
     const testApp = setupFullApp(ctx);
 
@@ -815,13 +815,18 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
         headers: {
           Cookie: `ceo_user_session=${session.sessionId}`,
         },
+        redirect: "manual",
       });
 
-      expect(res.status).toBe(200);
-      const html = await res.text();
-      expect(html).toContain("Set up your CEO workspace");
-      expect(html).toContain('value="personal-vault"');
-      expect(html).toContain('value="auth_req_123"');
+      expect(res.status).toBe(302);
+      const location = res.headers.get("location");
+      expect(location).toContain("https://github.com/apps/ceo-test-app/installations/new?state=");
+
+      // Verify active flow created with default repository name and bound oauth request
+      const activeFlow = ctx.onboardingStore.findActiveFlowForUser(ctx.freshUser.userId);
+      expect(activeFlow).toBeDefined();
+      expect(activeFlow?.desired_repository_name).toBe("personal-vault");
+      expect(activeFlow?.host_oauth_request_id).toBe("auth_req_123");
     } finally {
       await testApp.close();
     }
