@@ -5,6 +5,7 @@ import type { IdentityStore } from "../identity/store.js";
 import type { OAuthService } from "../oauth/service.js";
 import type { GitHubInstallationService } from "../github/installation-service.js";
 import type { GitHubRepositoryService } from "../github/repository-service.js";
+import { resolveBootstrapLocale } from "../bootstrap/index.js";
 
 export interface OnboardingRouterOptions {
   onboardingService: OnboardingService;
@@ -701,7 +702,10 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
     }
 
     try {
-      const result = await onboardingService.verifyRepositoryAccessAndBootstrap(flowId, session.userId);
+      const rawAccept = req.headers["accept-language"];
+      const acceptLanguage = Array.isArray(rawAccept) ? rawAccept.join(",") : rawAccept;
+      const locale = resolveBootstrapLocale({ acceptLanguage });
+      const result = await onboardingService.verifyRepositoryAccessAndBootstrap(flowId, session.userId, { locale });
       if (result.success && result.status === "READY") {
         res.redirect(302, `/onboarding/complete?flow=${encodeURIComponent(flowId)}`);
         return;
@@ -870,6 +874,10 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
       return;
     }
 
+    const rawAccept = req.headers["accept-language"];
+    const acceptLanguage = Array.isArray(rawAccept) ? rawAccept.join(",") : rawAccept;
+    const locale = resolveBootstrapLocale({ acceptLanguage });
+
     if (workspaceId) {
       const memberships = identityStore.listWorkspaceMembershipsForUser(session.userId);
       if (!memberships.some((m) => m.workspace_id === workspaceId)) {
@@ -893,7 +901,7 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
         return;
       }
       try {
-        await onboardingService.bootstrapServiceInstance.bootstrapWorkspace(workspaceId);
+        await onboardingService.bootstrapServiceInstance.bootstrapWorkspace(workspaceId, { locale });
         const target = oauthRequest
           ? `/onboarding/complete?oauth_request=${encodeURIComponent(oauthRequest)}`
           : `/onboarding/complete`;
@@ -931,7 +939,7 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
 
     try {
       if (flow.workspace_id) {
-        await onboardingService.retryBootstrap(flowId, session.userId);
+        await onboardingService.retryBootstrap(flowId, session.userId, { locale });
       }
       const target = oauthRequest
         ? `/onboarding/complete?flow=${encodeURIComponent(flowId)}&oauth_request=${encodeURIComponent(oauthRequest)}`

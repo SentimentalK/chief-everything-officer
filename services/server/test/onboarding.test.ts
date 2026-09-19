@@ -1567,6 +1567,95 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
         await testApp.close();
       }
     });
+
+    it("POST /onboarding/verify-repository-access extracts Accept-Language and forwards locale to bootstrap", async () => {
+      const ctx = await createTestContext();
+      const testApp = setupFullApp(ctx);
+
+      try {
+        const session = ctx.sessionManager.createSession({
+          userId: ctx.freshUser.userId,
+          provider: "github",
+          providerSubject: ctx.freshUser.providerSubject,
+          providerLogin: "fresh-user",
+        });
+
+        const flow = ctx.onboardingStore.getOrCreateActiveFlowInTx(
+          ctx.freshUser.userId,
+          ctx.freshUser.providerSubject,
+        );
+
+        const verifySpy = vi
+          .spyOn(ctx.onboardingService, "verifyRepositoryAccessAndBootstrap")
+          .mockResolvedValueOnce({
+            success: true,
+            status: "READY",
+          });
+
+        const res = await fetch(`${testApp.baseUrl}/onboarding/verify-repository-access`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Cookie: `ceo_user_session=${session.sessionId}`,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          },
+          body: new URLSearchParams({ flow_id: flow.id }).toString(),
+          redirect: "manual",
+        });
+
+        expect(verifySpy).toHaveBeenCalledWith(flow.id, ctx.freshUser.userId, { locale: "zh" });
+        expect(res.status).toBe(302);
+        expect(res.headers.get("location")).toBe(`/onboarding/complete?flow=${encodeURIComponent(flow.id)}`);
+
+        // Test retry endpoint forwarding locale
+        const retrySpy = vi
+          .spyOn(ctx.onboardingService, "retryBootstrap")
+          .mockResolvedValueOnce("READY");
+
+        const inst = ctx.store.upsertGitHubInstallationWithUser({
+          githubAppId: "10",
+          githubInstallationId: "9999",
+          accountId: ctx.freshUser.providerSubject,
+          accountLogin: "fresh-user",
+          accountType: "User",
+          repositorySelection: "selected",
+          userId: ctx.freshUser.userId,
+        });
+
+        const bound = ctx.store.createWorkspaceWithRepositoryBinding({
+          userId: ctx.freshUser.userId,
+          installationRowId: inst.installation.id,
+          githubRepositoryId: "123456",
+          ownerAccountId: ctx.freshUser.providerSubject,
+          ownerLogin: "fresh-user",
+          repositoryName: "ceo-data",
+          fullName: "fresh-user/ceo-data",
+          branch: "main",
+        });
+        ctx.store.markRepositoryBindingScopeVerified(bound.workspace.id);
+
+        ctx.onboardingStore.updateFlow(flow.id, {
+          workspace_id: bound.workspace.id,
+          state: "RECOVERY_REQUIRED",
+        });
+
+        const retryRes = await fetch(`${testApp.baseUrl}/onboarding/retry`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Cookie: `ceo_user_session=${session.sessionId}`,
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+          body: new URLSearchParams({ flow_id: flow.id }).toString(),
+          redirect: "manual",
+        });
+
+        expect(retrySpy).toHaveBeenCalledWith(flow.id, ctx.freshUser.userId, { locale: "en" });
+        expect(retryRes.status).toBe(302);
+      } finally {
+        await testApp.close();
+      }
+    });
   });
 });
 

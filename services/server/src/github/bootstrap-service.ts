@@ -1,8 +1,13 @@
 import type { IdentityStore, GitHubRepositoryBindingRecord, WorkspaceBootstrapRecord } from "../identity/store.js";
 import { IdentityStructureError } from "../identity/store.js";
 import type { GitHubAppClient } from "./app-client.js";
+import {
+  type BootstrapLocale,
+  type BootstrapFile,
+  buildFreshWorkspaceManifest,
+} from "../bootstrap/index.js";
 
-export const BOOTSTRAP_MANIFEST_V1 = [
+export const BOOTSTRAP_MANIFEST_V1: readonly BootstrapFile[] = [
   {
     path: "README.md",
     content: `# Chief Everything Officer (CEO) Workspace
@@ -12,6 +17,10 @@ Content stored here is user-owned and tracked by Git.
 `,
   },
 ] as const;
+
+export interface BootstrapWorkspaceOptions {
+  locale?: BootstrapLocale;
+}
 
 export type ProductProvisioningStatus =
   | "READY"
@@ -302,7 +311,12 @@ export class WorkspaceBootstrapService {
     };
   }
 
-  async bootstrapWorkspace(workspaceId: string): Promise<WorkspaceProvisioningResult> {
+  async bootstrapWorkspace(
+    workspaceId: string,
+    options?: BootstrapWorkspaceOptions,
+  ): Promise<WorkspaceProvisioningResult> {
+    const locale: BootstrapLocale = options?.locale ?? "en";
+
     // 1. Single-pod in-memory guard
     if (this.activeBootstraps.has(workspaceId)) {
       const existing = await this.getProvisioningStatus(workspaceId);
@@ -346,6 +360,7 @@ export class WorkspaceBootstrapService {
           attemptId,
           binding,
           instRow.github_installation_id,
+          locale,
         );
       } catch (err) {
         if (err instanceof WorkspaceBootstrapError) {
@@ -385,6 +400,7 @@ export class WorkspaceBootstrapService {
     attemptId: string,
     binding: GitHubRepositoryBindingRecord,
     githubInstallationId: string,
+    locale: BootstrapLocale = "en",
   ): Promise<WorkspaceBootstrapRecord> {
     // 1. Live installation capability check: Contents: write
     let instDetails;
@@ -482,6 +498,7 @@ export class WorkspaceBootstrapService {
         token,
         binding,
         liveRepoMeta,
+        locale,
       );
     }
 
@@ -506,6 +523,8 @@ export class WorkspaceBootstrapService {
       headCommitSha,
       token,
       binding,
+      undefined,
+      locale,
     );
   }
 
@@ -518,6 +537,7 @@ export class WorkspaceBootstrapService {
     token: string,
     binding: GitHubRepositoryBindingRecord,
     repoMeta: SafeRepositoryMetadata,
+    locale: BootstrapLocale = "en",
   ): Promise<WorkspaceBootstrapRecord> {
     const branchesRes = await this.fetchFn(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100`,
@@ -572,6 +592,7 @@ export class WorkspaceBootstrapService {
     }
 
     // Repo is confirmed eligible for empty-repository initialization
+    const freshManifest = buildFreshWorkspaceManifest(locale);
     return this.bootstrapEmptyRepository(
       workspaceId,
       attemptId,
@@ -580,6 +601,8 @@ export class WorkspaceBootstrapService {
       branch,
       token,
       binding,
+      freshManifest,
+      locale,
     );
   }
 
@@ -591,8 +614,13 @@ export class WorkspaceBootstrapService {
     branch: string,
     token: string,
     binding: GitHubRepositoryBindingRecord,
+    manifest: readonly BootstrapFile[] = BOOTSTRAP_MANIFEST_V1,
+    locale: BootstrapLocale = "en",
   ): Promise<WorkspaceBootstrapRecord> {
-    const firstAnchor = BOOTSTRAP_MANIFEST_V1.find((a) => a.path === "README.md") ?? BOOTSTRAP_MANIFEST_V1[0];
+    const firstAnchor = manifest.find((a) => a.path === "README.md") ?? manifest[0];
+    if (!firstAnchor) {
+      throw new ManualRecoveryBootstrapError("No bootstrap anchors provided in manifest", "EMPTY_MANIFEST");
+    }
 
     const contentsRes = await this.fetchFn(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponent(firstAnchor.path)}`,
@@ -638,6 +666,8 @@ export class WorkspaceBootstrapService {
       null,
       token,
       binding,
+      manifest,
+      locale,
     );
   }
 
@@ -651,6 +681,8 @@ export class WorkspaceBootstrapService {
     baseCommitSha: string | null,
     token: string,
     binding: GitHubRepositoryBindingRecord,
+    manifest?: readonly BootstrapFile[],
+    locale: BootstrapLocale = "en",
   ): Promise<WorkspaceBootstrapRecord> {
     let headCommitSha = initialHeadSha;
     if (!headCommitSha) {
@@ -690,7 +722,7 @@ export class WorkspaceBootstrapService {
       throw classifyGitHubResponseError(commitRes, "head commit read during reconciliation");
     }
 
-    const commitData = (await commitRes.json()) as { tree?: { sha?: string } };
+    const commitData = (await commitRes.json()) as { tree?: { sha?: string }; message?: string };
     const currentTreeSha = commitData.tree?.sha;
     if (!currentTreeSha) {
       throw new RetryableBootstrapError("TEMPORARY_GITHUB_ERROR", "Commit did not return tree SHA", 500);
@@ -722,9 +754,26 @@ export class WorkspaceBootstrapService {
       existingMap.set(item.path, item);
     }
 
-    const missingAnchors: Array<(typeof BOOTSTRAP_MANIFEST_V1)[number]> = [];
+    // Determine effective manifest for reconciliation:
+    // If this branch is recovering from a partial fresh bootstrap (sole commit created by CEO
+    // with message "chore: initialize CEO workspace" and tree having only README.md),
+    // build the fresh manifest for this locale so .ceoignore is added.
+    // Otherwise, for existing populated repositories, strictly use BOOTSTRAP_MANIFEST_V1
+    // so we never inject .ceoignore into a user's pre-existing repository.
+    const isPartialFreshBootstrap =
+      commitData.message === "chore: initialize CEO workspace" &&
+      treeItems.length === 1 &&
+      treeItems[0]?.path === "README.md";
 
-    for (const anchor of BOOTSTRAP_MANIFEST_V1) {
+    const effectiveManifest = manifest ?? (
+      isPartialFreshBootstrap
+        ? buildFreshWorkspaceManifest(locale)
+        : BOOTSTRAP_MANIFEST_V1
+    );
+
+    const missingAnchors: BootstrapFile[] = [];
+
+    for (const anchor of effectiveManifest) {
       const existing = existingMap.get(anchor.path);
       if (!existing) {
         missingAnchors.push(anchor);
@@ -755,6 +804,7 @@ export class WorkspaceBootstrapService {
         baseCommitSha,
         token,
         binding,
+        effectiveManifest,
       );
     }
 
@@ -853,6 +903,7 @@ export class WorkspaceBootstrapService {
       baseCommitSha,
       token,
       binding,
+      effectiveManifest,
     );
   }
 
@@ -865,6 +916,7 @@ export class WorkspaceBootstrapService {
     baseCommitSha: string | null,
     token: string,
     binding: GitHubRepositoryBindingRecord,
+    manifest: readonly BootstrapFile[] = BOOTSTRAP_MANIFEST_V1,
   ): Promise<WorkspaceBootstrapRecord> {
     // 1. Re-fetch and strictly validate live repository metadata (fail closed if identity/access changed)
     const repoRes = await this.fetchFn(
@@ -962,7 +1014,7 @@ export class WorkspaceBootstrapService {
       itemMap.set(it.path, it);
     }
 
-    for (const anchor of BOOTSTRAP_MANIFEST_V1) {
+    for (const anchor of manifest) {
       const it = itemMap.get(anchor.path);
       if (!it) {
         throw new RetryableBootstrapError(

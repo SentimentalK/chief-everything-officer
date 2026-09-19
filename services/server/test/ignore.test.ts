@@ -49,4 +49,10 @@ notes/private.md
     const matcher = parseCeoIgnore("mcp/\n!mcp/keep.md");
     expect(isPathIgnored(matcher, "mcp/keep.md")).toBe(true);
   });
+
+  it("strictly ignores README.md when .ceoignore contains 'README.md\\n'", () => {
+    const matcher = parseCeoIgnore("README.md\n");
+    expect(isPathIgnored(matcher, "README.md")).toBe(true);
+    expect(isPathIgnored(matcher, "personal/profile.md")).toBe(false);
+  });
 });

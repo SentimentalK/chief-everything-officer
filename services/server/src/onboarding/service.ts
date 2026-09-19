@@ -8,8 +8,9 @@ import {
   GitHubPartialCreationError,
   GitHubWorkspaceProvisioningIncompleteError,
 } from "../github/repository-service.js";
-import type { WorkspaceBootstrapService, ProductProvisioningStatus } from "../github/bootstrap-service.js";
+import type { WorkspaceBootstrapService, ProductProvisioningStatus, BootstrapWorkspaceOptions } from "../github/bootstrap-service.js";
 import type { GitHubAppClient } from "../github/app-client.js";
+import type { BootstrapLocale } from "../bootstrap/index.js";
 
 export interface OnboardingServiceOptions {
   store: OnboardingStore;
@@ -310,6 +311,7 @@ export class OnboardingService {
   async verifyRepositoryAccessAndBootstrap(
     flowId: string,
     userId: string,
+    options?: BootstrapWorkspaceOptions,
   ): Promise<
     | { success: true; status: ProductProvisioningStatus }
     | { success: false; reason: "STILL_ALL" | "SCOPE_MISMATCH" | "VERIFICATION_FAILED"; message: string }
@@ -352,7 +354,7 @@ export class OnboardingService {
     this.store.updateFlow(flowId, { state: "PROVISIONING" });
 
     try {
-      const bootResult = await this.bootstrapService.bootstrapWorkspace(flow.workspace_id);
+      const bootResult = await this.bootstrapService.bootstrapWorkspace(flow.workspace_id, options);
       if (bootResult.status === "READY") {
         this.store.updateFlow(flowId, {
           state: "READY_TO_RESUME",
@@ -410,7 +412,11 @@ export class OnboardingService {
     return { success: true, workspaceId: imported.workspace.id };
   }
 
-  async retryBootstrap(flowId: string, userId: string): Promise<ProductProvisioningStatus> {
+  async retryBootstrap(
+    flowId: string,
+    userId: string,
+    options?: BootstrapWorkspaceOptions,
+  ): Promise<ProductProvisioningStatus> {
     const flow = this.store.getFlow(flowId);
     if (!flow || flow.user_id !== userId) {
       throw new OnboardingError("Onboarding flow not found", "FLOW_NOT_FOUND", 404);
@@ -431,7 +437,7 @@ export class OnboardingService {
       );
     }
 
-    const result = await this.bootstrapService.bootstrapWorkspace(flow.workspace_id);
+    const result = await this.bootstrapService.bootstrapWorkspace(flow.workspace_id, options);
     if (result.status === "READY") {
       this.store.updateFlow(flowId, {
         state: "READY_TO_RESUME",

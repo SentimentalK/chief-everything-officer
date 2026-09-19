@@ -23,6 +23,7 @@ import {
 } from "../src/github/router.js";
 import packageJson from "../package.json" with { type: "json" };
 import packageLockJson from "../package-lock.json" with { type: "json" };
+import { README_ZH } from "../src/bootstrap/index.js";
 
 const cleanupDirs: string[] = [];
 const cleanupStores: IdentityStore[] = [];
@@ -537,13 +538,82 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(gitState.contentsPuts?.[0].path).toBe("README.md");
     // 2. POST /git/refs was NOT called as the first-ref mechanism
     expect(gitState.refCreations.length).toBe(0);
-    // 3. Normal reconciliation requires no extra tree creations since README.md is the sole anchor
-    expect(gitState.treeCreations.length).toBe(0);
+    // 3. Normal reconciliation commits .ceoignore for the fresh workspace manifest
+    expect(gitState.treeCreations.length).toBe(1);
+    expect(gitState.treeCreations[0].tree.map((x) => x.path)).toEqual([".ceoignore"]);
 
-    // 4. Resulting tree contains README anchor
+    // 4. Resulting tree contains README and .ceoignore anchors
     const readyCommit = gitState.commits.get(result.bootstrap.ready_commit_sha!)!;
     const readyTree = gitState.trees.get(readyCommit.tree)!;
-    expect(readyTree.map((x) => x.path).sort()).toEqual(["README.md"]);
+    expect(readyTree.map((x) => x.path).sort()).toEqual([".ceoignore", "README.md"]);
+    const ceoignore = readyTree.find((x) => x.path === ".ceoignore");
+    expect(ceoignore?.content).toBe("README.md\n");
+  });
+
+  it("I2. partial failure & locale-change retry preserves README and completes .ceoignore", async () => {
+    const ctx = await createBootstrapTestContext();
+    const gitState: MockGitState = {
+      repoExists: true,
+      repoPrivate: true,
+      repoArchived: false,
+      repoDisabled: false,
+      repoId: Number(ctx.repoId),
+      ownerLogin: ctx.ownerLogin,
+      repoName: ctx.repoName,
+      branch: ctx.branch,
+      appPermissions: { contents: "write" },
+      appSuspended: false,
+      commits: new Map(),
+      trees: new Map(),
+      branchRefSha: null, // empty repository
+      treeCreations: [],
+      commitCreations: [],
+      refUpdates: [],
+      refCreations: [],
+      failTreeCreateStatus: 500, // Fail Attempt 1 when creating .ceoignore tree
+    };
+
+    const fetchFn = createMockGitFetch(gitState);
+    const appClient = new GitHubAppClient({ clientId: ctx.clientId, privateKey: ctx.rsaKeys.privateKey, fetchFn });
+    const service = new WorkspaceBootstrapService({ appClient, store: ctx.store, fetchFn });
+
+    // Attempt 1: Start bootstrap with locale "zh" -> Contents PUT (README.md) succeeds, tree creation fails
+    const attempt1Result = await service.bootstrapWorkspace(ctx.workspaceId, { locale: "zh" });
+    expect(attempt1Result.status).toBe("RETRYABLE_FAILURE");
+    expect(gitState.contentsPuts?.length).toBe(1);
+    expect(gitState.contentsPuts?.[0].path).toBe("README.md");
+    expect(gitState.contentsPuts?.[0].content).toBe(Buffer.from(README_ZH, "utf-8").toString("base64"));
+
+    // Branch now exists with sole commit from CEO and single file README.md
+    expect(gitState.branchRefSha).toBeTruthy();
+
+    // Now remove failure injection and retry with locale "en" (simulating language preference change on retry)
+    delete gitState.failTreeCreateStatus;
+
+    const attempt2Result = await service.bootstrapWorkspace(ctx.workspaceId, { locale: "en" });
+    expect(attempt2Result.status).toBe("READY");
+    expect(attempt2Result.bootstrap.state).toBe("READY");
+
+    // Verify git API actions on Attempt 2:
+    // No additional Contents PUT (README was NOT overwritten)
+    expect(gitState.contentsPuts?.length).toBe(1);
+
+    // .ceoignore was added via tree creation
+    expect(gitState.treeCreations.length).toBe(1);
+    expect(gitState.treeCreations[0].tree.map((x) => x.path)).toEqual([".ceoignore"]);
+
+    // Resulting tree has both files
+    const readyCommit = gitState.commits.get(attempt2Result.bootstrap.ready_commit_sha!)!;
+    const readyTree = gitState.trees.get(readyCommit.tree)!;
+    expect(readyTree.map((x) => x.path).sort()).toEqual([".ceoignore", "README.md"]);
+
+    // README remains the Chinese version from Attempt 1!
+    const readmeBlob = readyTree.find((x) => x.path === "README.md");
+    expect(readmeBlob?.content).toBe(README_ZH);
+
+    // .ceoignore is present and correct
+    const ignoreBlob = readyTree.find((x) => x.path === ".ceoignore");
+    expect(ignoreBlob?.content).toBe("README.md\n");
   });
 
   it("J. additive bootstrap preserving existing user repository content", async () => {
@@ -596,6 +666,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     const finalTree = gitState.trees.get(finalTreeSha)!;
     expect(finalTree.find((x) => x.path === "app.ts")).toBeTruthy();
     expect(finalTree.find((x) => x.path === "README.md")).toBeTruthy();
+    expect(finalTree.find((x) => x.path === ".ceoignore")).toBeUndefined();
   });
 
   it("K. preserves existing anchor content and only adds missing files", async () => {
@@ -645,6 +716,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     expect(codeEntry?.content).toBe("console.log('hello');");
     const readmeEntry = finalTree.find((x) => x.path === "README.md");
     expect(readmeEntry).toBeDefined();
+    expect(finalTree.find((x) => x.path === ".ceoignore")).toBeUndefined();
   });
 
   it("L. idempotent no-op when all 3 canonical anchors are already present", async () => {
