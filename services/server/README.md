@@ -76,7 +76,7 @@ Identity database unavailable on a live request → `503`. `/healthz` and `/read
 
 `{ user_id, workspace_id, deployment_mode: "request_scoped_workspace" }`.
 
-The audit console keeps its login endpoint and session cookie but binds sessions to the same identity. Every Audit request re-verifies that the API key still exists and is not revoked, and that the user still has membership in the session workspace.
+The audit console uses the product GitHub cookie (`ceo_user_session`) plus `users.is_admin`. Authentication (who you are) is the CEO user session; authorization (whether you can open Audit) is the admin bit. V1 only lists traces for the admin user's own single workspace — it is not a global admin console. `grant-admin` / `revoke-admin` on `node dist/identity/cli.js` set the bit; migration defaults everyone to `0`. MCP Bearer API keys are unchanged.
 
 Audit traces are stored with `workspace_id NOT NULL` and queried only for the authenticated request workspace. An old Audit SQLite that lacks `workspace_id` is **fail-incompatible, not migrated**. The audit database is disposable: delete the local file and allow a fresh workspace-scoped schema.
 

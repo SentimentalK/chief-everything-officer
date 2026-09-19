@@ -38,7 +38,16 @@ export const ConsoleView: React.FC<ConsoleViewProps> = ({ onLogout }) => {
         setSelectedId(null);
       }
     } catch (err) {
-      setError(String(err));
+      const message = String(err);
+      if (message.includes("Workspace selection required")) {
+        setError(
+          "Audit currently requires exactly one workspace. Workspace selection is not available in V1.",
+        );
+      } else if (message.includes("Audit access denied")) {
+        setError("Not authorized for Audit.");
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(false);
     }

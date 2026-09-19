@@ -57,6 +57,7 @@ describe("UserView Component Tests", () => {
     expect(container.textContent).toContain("@SentimentalK");
     expect(container.textContent).toContain("usr_mock_123");
     expect(container.textContent).toContain("Active CEO User Session");
+    expect(container.querySelector("a[href='/audit']")).not.toBeNull();
 
     const signOutBtn = container.querySelector("button");
     expect(signOutBtn).not.toBeNull();

@@ -12,10 +12,9 @@ import { AuditStore, AuditSchemaIncompatibleError, createAuditRouter } from "../
 import { CeoWorkspace } from "../src/workspace.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { createMcpServer } from "../src/mcp.js";
-import { fixture, seedIdentity, createIdentityService, requestIdentity } from "./helpers.js";
+import { fixture, seedIdentity } from "./helpers.js";
 import { IdentityService } from "../src/identity/service.js";
-import { sha256Hex } from "../src/identity/store.js";
-import type { Config } from "../src/config.js";
+import { UserSessionManager } from "../src/auth/user-session.js";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 
@@ -397,33 +396,18 @@ describe("Audit HTTP API & Session Management", () => {
     const auditStore = new AuditStore(dbPath);
     cleanupStores.push(auditStore);
 
-    const config = {
-      dataRoot: tmpDir,
-      repoDir: path.join(tmpDir, "repo"),
-      txnDir: path.join(tmpDir, "txns"),
-      stateDir: path.join(tmpDir, "state"),
-      branch: "main",
-      remoteUrl: "dummy-remote",
-      port: 0,
-      bindHost: "127.0.0.1",
-      gitAuthorName: "x",
-      gitAuthorEmail: "x@example.com",
-      gitCommitterName: "x",
-      gitCommitterEmail: "x@example.com",
-      mcpApiKey: apiKey,
-      allowedHosts: ["localhost", "127.0.0.1"],
-      allowedOrigins: [],
-      auditDir: tmpDir,
-      auditDbPath: dbPath,
-      identityDbPath: path.join(tmpDir, "identity", "identity.sqlite"),
-    } as Config;
-
-    const service = createIdentityService(config, apiKey);
+    const identityDbPath = path.join(tmpDir, "identity", "identity.sqlite");
+    const ident = seedIdentity(
+      { identityDbPath, remoteUrl: "dummy-remote", branch: "main" },
+      apiKey,
+    );
+    const service = IdentityService.open(identityDbPath);
     cleanupServices.push(service);
 
+    const sessionManager = new UserSessionManager({ secureCookies: false });
     const app = express();
     app.use(express.json());
-    app.use(createAuditRouter({ auditStore, identityService: service }));
+    app.use(createAuditRouter({ auditStore, identityService: service, sessionManager }));
 
     const server = await new Promise<HttpServer>((resolve) => {
       const s = app.listen(0, "127.0.0.1", () => resolve(s));
@@ -432,22 +416,42 @@ describe("Audit HTTP API & Session Management", () => {
     const port = (server.address() as AddressInfo).port;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    return { baseUrl, auditStore, apiKey, config, service };
+    return { baseUrl, auditStore, apiKey, ident, service, sessionManager };
   }
 
-  it("returns 403 when a valid API key belongs to a user without workspace access", async () => {
-    const { baseUrl, config } = await setupTestApp("alice-key");
-
-    const raw = new DatabaseSync(config.identityDbPath);
-    raw.prepare("INSERT INTO users VALUES ('usr_bob', 2000, NULL);").run();
-    raw.prepare("INSERT INTO api_keys VALUES ('ak_bob', 'usr_bob', ?, 2000, NULL);").run(sha256Hex("bob-key"));
-    raw.close();
-
-    const res = await fetch(`${baseUrl}/api/audit/traces`, {
-      headers: { Authorization: "Bearer bob-key" },
+  function userCookie(
+    env: Awaited<ReturnType<typeof setupTestApp>>,
+    userId = env.ident.user_id,
+    grantAdmin = true,
+  ): string {
+    if (grantAdmin) {
+      env.service.storeInstance.grantAdmin(userId);
+    }
+    const session = env.sessionManager.createSession({
+      userId,
+      provider: "github",
+      providerSubject: "1",
     });
+    return `ceo_user_session=${session.sessionId}`;
+  }
+
+  it("returns 403 for a signed-in non-admin user", async () => {
+    const env = await setupTestApp();
+    env.service.storeInstance.withDb((db) => {
+      db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES ('usr_bob', 2000, NULL);").run();
+    });
+    const cookie = userCookie(env, "usr_bob", false);
+
+    const res = await fetch(`${env.baseUrl}/api/audit/traces`, { headers: { Cookie: cookie } });
     expect(res.status).toBe(403);
-    expect((await res.json() as any).error).toContain("workspace access denied");
+    expect((await res.json() as { error: string }).error).toContain("Audit access denied");
+
+    const session = await fetch(`${env.baseUrl}/api/audit/session`, { headers: { Cookie: cookie } });
+    expect(await session.json()).toEqual({
+      authenticated: true,
+      authorized: false,
+      user: { id: "usr_bob" },
+    });
   });
 
   it("enforces authentication on /api/audit/traces", async () => {
@@ -457,46 +461,12 @@ describe("Audit HTTP API & Session Management", () => {
     expect(res.status).toBe(401);
   });
 
-  it("invalidates a session when the bound API key is revoked", async () => {
-    const { baseUrl, apiKey, config, service } = await setupTestApp();
+  it("handles admin session query, detail, tenant isolation, and logout", async () => {
+    const env = await setupTestApp();
+    const myWorkspaceId = env.ident.workspace_id;
+    const cookie = userCookie(env);
 
-    // Login to get a session cookie bound to this key.
-    const login = await fetch(`${baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: apiKey }),
-    });
-    expect(login.status).toBe(200);
-    const cookieHeader = login.headers.get("set-cookie");
-    const sessionCookie = cookieHeader!.split(";")[0]!;
-
-    // Revoke the bound API key in the identity DB (cookie must not survive).
-    const cred = service.authenticateApiKey(apiKey);
-    expect(cred).not.toBeNull();
-    const raw = new DatabaseSync(config.identityDbPath);
-    raw.prepare("UPDATE api_keys SET revoked_at = ? WHERE id = ?;").run(Date.now(), cred!.api_key_id);
-    raw.close();
-
-    // The previously valid session now points at a revoked key -> rejected.
-    const traces = await fetch(`${baseUrl}/api/audit/traces`, { headers: { Cookie: sessionCookie } });
-    expect(traces.status).toBe(401);
-
-    // And the original key itself is no longer accepted.
-    const auth = await fetch(`${baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: apiKey }),
-    });
-    expect(auth.status).toBe(401);
-    expect(service.storeInstance.ping()).toBe(true);
-  });
-
-  it("handles login, session status, authenticated query, detail, and logout lifecycle", async () => {
-    const { baseUrl, auditStore, apiKey, service } = await setupTestApp();
-    const myWorkspaceId = requestIdentity(service, apiKey).workspace_id;
-
-    // Seed a trace for my workspace
-    auditStore.recordTrace({
+    env.auditStore.recordTrace({
       workspace_id: myWorkspaceId,
       timestamp_ms: Date.now(),
       tool_name: "list_files",
@@ -505,9 +475,7 @@ describe("Audit HTTP API & Session Management", () => {
       output_json: JSON.stringify({ files: ["tasks/001.md"] }),
       latency_ms: 8,
     });
-
-    // Seed a trace for another workspace (must not be visible to this session)
-    auditStore.recordTrace({
+    env.auditStore.recordTrace({
       workspace_id: "ws_other_tenant",
       timestamp_ms: Date.now(),
       tool_name: "policy_read",
@@ -517,132 +485,62 @@ describe("Audit HTTP API & Session Management", () => {
       latency_ms: 5,
     });
 
-    // 1. Initially unauthenticated
-    const checkUnauth = await fetch(`${baseUrl}/api/audit/session`);
-    expect(checkUnauth.status).toBe(200);
-    const checkUnauthBody = await checkUnauth.json();
-    expect(checkUnauthBody).toEqual({ authenticated: false });
+    const checkUnauth = await fetch(`${env.baseUrl}/api/audit/session`);
+    expect(await checkUnauth.json()).toEqual({ authenticated: false, authorized: false });
 
-    // 2. Login with bad token -> 401
-    const badLogin = await fetch(`${baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: "wrong-token" }),
+    const checkAuth = await fetch(`${env.baseUrl}/api/audit/session`, { headers: { Cookie: cookie } });
+    expect(await checkAuth.json()).toEqual({
+      authenticated: true,
+      authorized: true,
+      user: { id: env.ident.user_id },
     });
-    expect(badLogin.status).toBe(401);
 
-    // 3. Login with correct token -> 200 and Set-Cookie
-    const goodLogin = await fetch(`${baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: apiKey }),
-    });
-    expect(goodLogin.status).toBe(200);
-    const cookieHeader = goodLogin.headers.get("set-cookie");
-    expect(cookieHeader).toBeTruthy();
-    expect(cookieHeader).toContain("ceo_audit_session=");
-    expect(cookieHeader).toContain("HttpOnly");
-    expect(cookieHeader).toContain("SameSite=Strict");
-
-    const sessionCookie = cookieHeader!.split(";")[0]!;
-
-    // 4. Check authenticated session status
-    const checkAuth = await fetch(`${baseUrl}/api/audit/session`, {
-      headers: { Cookie: sessionCookie },
-    });
-    expect(checkAuth.status).toBe(200);
-    const checkAuthBody = await checkAuth.json();
-    expect(checkAuthBody).toEqual({ authenticated: true });
-
-    // 5. Query trace summaries
-    const tracesRes = await fetch(`${baseUrl}/api/audit/traces`, {
-      headers: { Cookie: sessionCookie },
-    });
+    const tracesRes = await fetch(`${env.baseUrl}/api/audit/traces`, { headers: { Cookie: cookie } });
     expect(tracesRes.status).toBe(200);
-    const tracesBody = await tracesRes.json();
-    expect(tracesBody.ok).toBe(true);
+    const tracesBody = await tracesRes.json() as { traces: Array<{ id: number }> };
     expect(tracesBody.traces.length).toBe(1);
-    const traceId = tracesBody.traces[0].id;
+    const traceId = tracesBody.traces[0]!.id;
 
-    // 6. Query trace detail
-    const detailRes = await fetch(`${baseUrl}/api/audit/traces/${traceId}`, {
-      headers: { Cookie: sessionCookie },
-    });
+    const detailRes = await fetch(`${env.baseUrl}/api/audit/traces/${traceId}`, { headers: { Cookie: cookie } });
     expect(detailRes.status).toBe(200);
-    const detailBody = await detailRes.json();
-    expect(detailBody.ok).toBe(true);
+    const detailBody = await detailRes.json() as { trace: { tool_name: string; input_json: string } };
     expect(detailBody.trace.tool_name).toBe("list_files");
     expect(JSON.parse(detailBody.trace.input_json)).toEqual({ pattern: "tasks/*.md" });
 
-    // 7. Also verify direct Bearer auth works
-    const bearerRes = await fetch(`${baseUrl}/api/audit/traces`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    expect(bearerRes.status).toBe(200);
-
-    // 8. Logout
-    const logoutRes = await fetch(`${baseUrl}/api/audit/session`, {
+    const logoutRes = await fetch(`${env.baseUrl}/api/audit/session`, {
       method: "DELETE",
-      headers: { Cookie: sessionCookie },
+      headers: { Cookie: cookie },
     });
     expect(logoutRes.status).toBe(200);
-    const logoutCookie = logoutRes.headers.get("set-cookie");
-    expect(logoutCookie).toContain("Max-Age=0");
+    expect(logoutRes.headers.getSetCookie().some((c) => c.includes("Max-Age=0"))).toBe(true);
 
-    // 9. Session is now invalidated
-    const checkAfterLogout = await fetch(`${baseUrl}/api/audit/session`, {
-      headers: { Cookie: sessionCookie },
-    });
-    const checkAfterLogoutBody = await checkAfterLogout.json();
-    expect(checkAfterLogoutBody).toEqual({ authenticated: false });
-
-    // 10. Traces endpoint rejects invalidated session
-    const tracesAfterLogout = await fetch(`${baseUrl}/api/audit/traces`, {
-      headers: { Cookie: sessionCookie },
-    });
-    expect(tracesAfterLogout.status).toBe(401);
+    const checkAfterLogout = await fetch(`${env.baseUrl}/api/audit/session`, { headers: { Cookie: cookie } });
+    expect(await checkAfterLogout.json()).toEqual({ authenticated: false, authorized: false });
+    expect((await fetch(`${env.baseUrl}/api/audit/traces`, { headers: { Cookie: cookie } })).status).toBe(401);
   });
 
-  it("session status is cookie-only and stays 200/false without a cookie (even with Bearer)", async () => {
+  it("session status stays 200/false without a cookie (even with Bearer)", async () => {
     const { baseUrl, apiKey } = await setupTestApp();
 
     const noCookie = await fetch(`${baseUrl}/api/audit/session`);
-    expect(noCookie.status).toBe(200);
-    expect(await noCookie.json()).toEqual({ authenticated: false });
+    expect(await noCookie.json()).toEqual({ authenticated: false, authorized: false });
 
-    // A Bearer credential does not imply a browser login session.
     const withBearer = await fetch(`${baseUrl}/api/audit/session`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
-    expect(withBearer.status).toBe(200);
-    expect(await withBearer.json()).toEqual({ authenticated: false });
+    expect(await withBearer.json()).toEqual({ authenticated: false, authorized: false });
   });
 
-  it("returns 503 on identity DB fault for both cookie and Bearer, preserving the session", async () => {
-    const { baseUrl, apiKey, service } = await setupTestApp();
+  it("returns 503 on identity DB fault without treating it as logout", async () => {
+    const env = await setupTestApp();
+    const cookie = userCookie(env);
+    env.service.close();
 
-    const login = await fetch(`${baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: apiKey }),
-    });
-    expect(login.status).toBe(200);
-    const cookieHeader = login.headers.get("set-cookie");
-    const sessionCookie = cookieHeader!.split(";")[0]!;
-
-    // Simulate the identity DB becoming unavailable mid-flight.
-    service.close();
-
-    const cookieTraces = await fetch(`${baseUrl}/api/audit/traces`, { headers: { Cookie: sessionCookie } });
+    const cookieTraces = await fetch(`${env.baseUrl}/api/audit/traces`, { headers: { Cookie: cookie } });
     expect(cookieTraces.status).toBe(503);
 
-    const cookieStatus = await fetch(`${baseUrl}/api/audit/session`, { headers: { Cookie: sessionCookie } });
+    const cookieStatus = await fetch(`${env.baseUrl}/api/audit/session`, { headers: { Cookie: cookie } });
     expect(cookieStatus.status).toBe(503);
-
-    const bearerTraces = await fetch(`${baseUrl}/api/audit/traces`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    expect(bearerTraces.status).toBe(503);
   });
 
   it("does not serve /audit static frontend or SPA fallback", async () => {

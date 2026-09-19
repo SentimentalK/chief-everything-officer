@@ -1,12 +1,14 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
-import os from "node:os";
+import os from "os";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
   IdentityStore,
   IDENTITY_DB_USER_VERSION,
+  IdentityError,
   IdentityStructureError,
+  provisionEmptyControlPlaneDatabase,
 } from "../src/identity/store.js";
 
 const cleanupDirs: string[] = [];
@@ -18,12 +20,12 @@ afterEach(async () => {
 });
 
 async function tempDbPath(): Promise<{ dir: string; dbPath: string }> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v9-migration-test-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v10-migration-test-"));
   cleanupDirs.push(dir);
   return { dir, dbPath: path.join(dir, "identity.sqlite") };
 }
 
-function createValidV8Database(dbPath: string): void {
+function createValidV9Database(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(`
     CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
@@ -67,6 +69,7 @@ function createValidV8Database(dbPath: string): void {
       github_installation_row_id TEXT NOT NULL, owner_account_id TEXT NOT NULL, owner_login TEXT NOT NULL,
       repository_name TEXT NOT NULL, full_name TEXT NOT NULL, branch TEXT NOT NULL,
       created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+      access_scope_verified_at_ms INTEGER,
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
       FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
     );
@@ -78,37 +81,15 @@ function createValidV8Database(dbPath: string): void {
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
     );
     CREATE TABLE onboarding_flows (
-      id TEXT PRIMARY KEY NOT NULL,
-      user_id TEXT NOT NULL,
-      provider_subject TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      desired_repository_name TEXT,
-      installation_row_id TEXT,
-      repository_id TEXT,
-      workspace_id TEXT,
-      state TEXT NOT NULL,
-      last_error_code TEXT,
-      last_error_message TEXT,
-      host_oauth_request_id TEXT,
-      created_at_ms INTEGER NOT NULL,
-      updated_at_ms INTEGER NOT NULL,
-      expires_at_ms INTEGER NOT NULL,
+      id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, provider_subject TEXT NOT NULL, mode TEXT NOT NULL,
+      desired_repository_name TEXT, installation_row_id TEXT, repository_id TEXT, workspace_id TEXT,
+      state TEXT NOT NULL, last_error_code TEXT, last_error_message TEXT, host_oauth_request_id TEXT,
+      created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (installation_row_id) REFERENCES github_installations(id) ON DELETE SET NULL,
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
     );
-    CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
-    CREATE INDEX idx_api_keys_user ON api_keys(user_id);
-    CREATE INDEX idx_external_identities_user ON external_identities(user_id);
-    CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
-    CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
     CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
-    CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
-    CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
-    CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
-    CREATE INDEX idx_workspace_bootstraps_state ON workspace_bootstraps(state);
-    CREATE INDEX idx_onboarding_flows_user ON onboarding_flows(user_id);
-    CREATE INDEX idx_onboarding_flows_state ON onboarding_flows(state);
     CREATE UNIQUE INDEX idx_onboarding_one_active_per_user
     ON onboarding_flows(user_id)
     WHERE state IN (
@@ -119,79 +100,88 @@ function createValidV8Database(dbPath: string): void {
       'READY_TO_RESUME',
       'RECOVERY_REQUIRED'
     );
-    PRAGMA user_version = 8;
+    PRAGMA user_version = 9;
+    INSERT INTO users VALUES ('usr_1', 1000, NULL);
   `);
   db.close();
 }
 
-describe("Identity DB v8 -> v9 migration (access_scope_verified_at_ms)", () => {
-  it("A. v8 database migrates cleanly to v9 with nullable column and NO blanket backfill", async () => {
+describe("Identity DB v9 -> v10 migration (users.is_admin)", () => {
+  it("migrates v9 users to is_admin=0 without granting anyone", async () => {
     const { dbPath } = await tempDbPath();
-    createValidV8Database(dbPath);
+    createValidV9Database(dbPath);
 
-    // Seed v8 data with a repository binding and a READY bootstrap
-    const seedDb = new DatabaseSync(dbPath);
-    seedDb.exec(`
-      INSERT INTO users VALUES ('usr_1', 1000, NULL);
-      INSERT INTO workspaces VALUES ('ws_1', 'usr_1', 'https://github.com/acme/vault.git', 'main', 1000);
-      INSERT INTO workspace_memberships VALUES ('wsm_1', 'ws_1', 'usr_1', 'owner', 1000);
-      INSERT INTO github_installations VALUES ('ghi_1', '12345678', '123456', '111111', 'acme', 'User', 'selected', NULL, 1000, 1000);
-      INSERT INTO github_installation_users VALUES ('ghiu_1', 'ghi_1', 'usr_1', 1000, 1000);
-      INSERT INTO github_repository_bindings VALUES (
-        'grb_1', 'ws_1', '98765432', 'ghi_1', '111111', 'acme', 'vault', 'acme/vault', 'main', 1000, 1000
-      );
-      INSERT INTO workspace_bootstraps VALUES (
-        'ws_1', 1, 'READY', 1, 'att_1', '0123456789abcdef0123456789abcdef01234567', '0123456789abcdef0123456789abcdef01234567', NULL, NULL, NULL, 1000, 1000, 1000
-      );
-    `);
-    seedDb.close();
-
-    // Opening with IdentityStore triggers migration
     const store = IdentityStore.open(dbPath);
     cleanupStores.push(store);
 
     store.withDb((rawDb) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
+      expect(Number(v.user_version)).toBe(10);
       expect(IDENTITY_DB_USER_VERSION).toBe(10);
 
-      // Verify column exists
-      const columns = rawDb.prepare("PRAGMA table_info(github_repository_bindings);").all() as Array<{ name: string }>;
-      expect(columns.some((c) => c.name === "access_scope_verified_at_ms")).toBe(true);
+      const columns = rawDb.prepare("PRAGMA table_info(users);").all() as Array<{ name: string }>;
+      expect(columns.some((c) => c.name === "is_admin")).toBe(true);
 
-      // Verify NO blanket backfill: value MUST be NULL
-      const row = rawDb.prepare("SELECT access_scope_verified_at_ms FROM github_repository_bindings WHERE id = 'grb_1';").get() as any;
-      expect(row.access_scope_verified_at_ms).toBeNull();
+      const row = rawDb.prepare("SELECT is_admin FROM users WHERE id = 'usr_1';").get() as { is_admin: number };
+      expect(row.is_admin).toBe(0);
+
+      const flows = rawDb.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='onboarding_flows';",
+      ).all();
+      expect(flows).toHaveLength(1);
     });
 
-    // Verify dual-condition readiness: bootstrap is READY but scope is NULL -> NOT READY FOR HOST!
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(false);
-
-    // Finding binding returns record with null access_scope_verified_at_ms
-    const binding = store.findRepositoryBindingByWorkspaceId("ws_1");
-    expect(binding).not.toBeNull();
-    expect(binding?.access_scope_verified_at_ms).toBeNull();
-
-    // Now mark scope verified
-    const verifiedMs = 123456789;
-    store.markRepositoryBindingScopeVerified("ws_1", verifiedMs);
-
-    const updatedBinding = store.findRepositoryBindingByWorkspaceId("ws_1");
-    expect(updatedBinding?.access_scope_verified_at_ms).toBe(verifiedMs);
-
-    // Now dual-condition check passes!
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(true);
-
-    // If scope is cleared, dual-condition check immediately fails closed!
-    store.clearRepositoryBindingScopeVerified("ws_1");
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(false);
+    expect(store.isUserAdmin("usr_1")).toBe(false);
   });
 
-  it("B. migrateV8ToV9 fails if user_version is not 8", async () => {
+  it("fresh control-plane DB is v10 with is_admin CHECK", async () => {
+    const { dbPath } = await tempDbPath();
+    provisionEmptyControlPlaneDatabase(dbPath);
+    const store = IdentityStore.open(dbPath);
+    cleanupStores.push(store);
+
+    store.withDb((rawDb) => {
+      const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
+      expect(Number(v.user_version)).toBe(10);
+      const sql = (rawDb.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users';",
+      ).get() as { sql: string }).sql;
+      expect(sql).toContain("is_admin");
+      expect(sql).toMatch(/CHECK \(is_admin IN \(0, 1\)\)/);
+    });
+  });
+
+  it("grant-admin rejects disabled users; revoke-admin allows them", async () => {
+    const { dbPath } = await tempDbPath();
+    provisionEmptyControlPlaneDatabase(dbPath);
+    const store = IdentityStore.open(dbPath);
+    cleanupStores.push(store);
+
+    store.withDb((db) => {
+      db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES ('usr_active', 1, NULL);").run();
+      db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES ('usr_off', 1, 2);").run();
+    });
+
+    store.grantAdmin("usr_active");
+    expect(store.isUserAdmin("usr_active")).toBe(true);
+
+    expect(() => store.grantAdmin("usr_off")).toThrow(IdentityError);
+
+    store.revokeAdmin("usr_off");
+    store.withDb((db) => {
+      const row = db.prepare("SELECT is_admin FROM users WHERE id = 'usr_off';").get() as { is_admin: number };
+      expect(row.is_admin).toBe(0);
+    });
+
+    expect(() => store.setUserAdmin("usr_active", "1" as unknown as boolean)).toThrow(IdentityStructureError);
+    expect(() => store.grantAdmin("usr_missing")).toThrow(IdentityError);
+  });
+
+  it("migrateV9ToV10 fails if user_version is not 9", async () => {
     const { dbPath } = await tempDbPath();
     const db = new DatabaseSync(dbPath);
-    db.exec("PRAGMA user_version = 7;");
-    expect(() => IdentityStore.migrateV8ToV9(db)).toThrow(IdentityStructureError);
+    db.exec("PRAGMA user_version = 8;");
+    expect(() => IdentityStore.migrateV9ToV10(db)).toThrow(IdentityStructureError);
     db.close();
   });
 });

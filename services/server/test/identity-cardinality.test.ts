@@ -79,7 +79,7 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
   db.exec(`PRAGMA user_version = ${IDENTITY_DB_USER_VERSION};`);
 
   const nowMs = 1000000;
-  db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(ctx.userA, nowMs);
+  db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(ctx.userA, nowMs);
   db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
     ctx.workspaceA,
     ctx.userA,
@@ -101,7 +101,7 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     nowMs,
   );
 
-  db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(ctx.userB, nowMs + 1);
+  db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(ctx.userB, nowMs + 1);
   db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
     ctx.workspaceB,
     ctx.userB,
@@ -134,7 +134,7 @@ describe("Identity request-scoped cardinality", () => {
     const userC = "usr_charlie";
     const keyC = "secret-key-charlie";
     const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(userC, 1000);
+    raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(userC, 1000);
     raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
       "ak_charlie_1",
       userC,
@@ -213,7 +213,7 @@ describe("Identity request-scoped cardinality", () => {
     const userC = "usr_charlie_i2";
     const keyC = "secret-key-charlie-i2";
     const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO users VALUES (?, ?, NULL);").run(userC, 1000);
+    raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(userC, 1000);
     raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
       "ak_charlie_i2",
       userC,

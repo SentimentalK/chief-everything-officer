@@ -48,7 +48,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     const now = 1000000;
 
     // Seed deployment workspace (ws_deploy) and owner user (usr_deploy)
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_deploy", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_deploy", now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_deploy",
       "usr_deploy",
@@ -71,7 +71,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     );
 
     // User Single: has exactly 1 workspace membership
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_single", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_single", now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_single",
       "usr_single",
@@ -94,7 +94,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     );
 
     // User Zero: has 0 workspace memberships
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_zero", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_zero", now);
     db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
       "ak_zero",
       "usr_zero",
@@ -103,7 +103,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     );
 
     // User Multi: has 2 workspace memberships
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_multi", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_multi", now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_multi_1",
       "usr_multi",
@@ -198,6 +198,19 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     const credMulti = identityService.authenticateApiKey("key_multi");
     expect(credMulti).not.toBeNull();
     expect(() => identityService.resolveRequestIdentity(credMulti!)).toThrow(
+      WorkspaceSelectionRequiredError,
+    );
+  });
+
+  it("resolveUserWorkspace: 1 membership selects; 0 and >1 fail closed without guessing", async () => {
+    const { identityService } = await createTestEnv();
+
+    expect(identityService.resolveUserWorkspace("usr_single")).toEqual({
+      user_id: "usr_single",
+      workspace_id: "ws_single",
+    });
+    expect(() => identityService.resolveUserWorkspace("usr_zero")).toThrow(WorkspaceAccessDeniedError);
+    expect(() => identityService.resolveUserWorkspace("usr_multi")).toThrow(
       WorkspaceSelectionRequiredError,
     );
   });

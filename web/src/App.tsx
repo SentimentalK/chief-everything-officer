@@ -17,13 +17,13 @@ export const App: React.FC = () => {
 };
 
 const AuditApp: React.FC = () => {
-  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [authorized, setAuthorized] = useState<boolean | null>(null);
 
   useEffect(() => {
-    checkSession().then((isAuth) => setAuthenticated(isAuth));
+    checkSession().then((state) => setAuthorized(state.authenticated && state.authorized));
   }, []);
 
-  if (authenticated === null) {
+  if (authorized === null) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-black">
         <Loader2 className="h-6 w-6 animate-spin text-neutral-400" />
@@ -31,11 +31,11 @@ const AuditApp: React.FC = () => {
     );
   }
 
-  if (!authenticated) {
-    return <LoginView onSuccess={() => setAuthenticated(true)} />;
+  if (!authorized) {
+    return <LoginView onSuccess={() => setAuthorized(true)} onLogout={() => setAuthorized(false)} />;
   }
 
-  return <ConsoleView onLogout={() => setAuthenticated(false)} />;
+  return <ConsoleView onLogout={() => setAuthorized(false)} />;
 };
 
 export default App;

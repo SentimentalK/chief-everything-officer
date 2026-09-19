@@ -306,4 +306,67 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       await env.close();
     }
   });
+
+  it("redirects to /audit when next is allowlisted and oauth_request is absent", async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://github.com/login/oauth/access_token") {
+        return { ok: true, status: 200, json: async () => ({ access_token: "tok" }) } as Response;
+      }
+      if (url === "https://api.github.com/user") {
+        return { ok: true, status: 200, json: async () => ({ id: 40360455, login: "SentimentalK" }) } as Response;
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    });
+
+    const env = await setupTestApp(mockFetch as typeof fetch, true);
+    try {
+      const initRes = await fetch(`${env.baseUrl}/auth/github?next=/audit`, { redirect: "manual" });
+      const state = new URL(initRes.headers.get("location")!).searchParams.get("state")!;
+      const callbackRes = await fetch(
+        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(state)}`,
+        { redirect: "manual" },
+      );
+      expect(callbackRes.headers.get("location")).toBe("/audit");
+    } finally {
+      await env.close();
+    }
+  });
+
+  it("ignores illegal next and keeps oauth_request precedence", async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://github.com/login/oauth/access_token") {
+        return { ok: true, status: 200, json: async () => ({ access_token: "tok" }) } as Response;
+      }
+      if (url === "https://api.github.com/user") {
+        return { ok: true, status: 200, json: async () => ({ id: 40360455, login: "SentimentalK" }) } as Response;
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    });
+
+    const env = await setupTestApp(mockFetch as typeof fetch, true);
+    try {
+      const evil = await fetch(`${env.baseUrl}/auth/github?next=https://evil.com`, { redirect: "manual" });
+      const evilState = new URL(evil.headers.get("location")!).searchParams.get("state")!;
+      const evilCb = await fetch(
+        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(evilState)}`,
+        { redirect: "manual" },
+      );
+      expect(evilCb.headers.get("location")).toBe("/login");
+
+      const both = await fetch(
+        `${env.baseUrl}/auth/github?next=/audit&oauth_request=oar_keep`,
+        { redirect: "manual" },
+      );
+      const bothState = new URL(both.headers.get("location")!).searchParams.get("state")!;
+      const bothCb = await fetch(
+        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(bothState)}`,
+        { redirect: "manual" },
+      );
+      expect(bothCb.headers.get("location")).toBe("/authorize/resume?request=oar_keep");
+    } finally {
+      await env.close();
+    }
+  });
 });

@@ -183,11 +183,12 @@ app.get(
   },
 );
 
-// Audit routes (login, session + query endpoints) reuse the same identity layer.
+// Audit routes use the product GitHub user session plus users.is_admin.
 app.use(
   createAuditRouter({
     auditStore,
     identityService,
+    sessionManager: userSessionManager,
   }),
 );
 

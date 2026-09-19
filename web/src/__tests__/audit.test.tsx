@@ -29,52 +29,45 @@ describe("Audit Web UI & Component Tests", () => {
     expect(timeStr).toMatch(/\d{2}:\d{2}:\d{2}/);
   });
 
-  it("renders LoginView and triggers login on submit", async () => {
+  it("renders LoginView with GitHub sign-in", async () => {
     const onSuccess = vi.fn();
     const root = createRoot(container);
 
-    // Mock fetch for login
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ ok: true }),
+      json: async () => ({ authenticated: false, authorized: false }),
     } as any);
 
     await act(async () => {
       root.render(<LoginView onSuccess={onSuccess} />);
     });
 
-    const input = container.querySelector("input#token") as HTMLInputElement;
-    expect(input).not.toBeNull();
-    expect(input.placeholder).toBe("Paste MCP_API_KEY");
+    const link = container.querySelector("a[href='/auth/github?next=/audit']");
+    expect(link).not.toBeNull();
+    expect(container.textContent).toContain("Continue with GitHub");
+    expect(container.querySelector("input#token")).toBeNull();
+  });
 
-    const button = container.querySelector("button[type='submit']") as HTMLButtonElement;
-    expect(button).not.toBeNull();
-    expect(button.textContent).toContain("Sign In");
+  it("shows unauthorized Sign Out when GitHub user is not admin", async () => {
+    const onSuccess = vi.fn();
+    const root = createRoot(container);
 
-    // Enter token using native value setter for React controlled component
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype,
-      "value"
-    )?.set;
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        authenticated: true,
+        authorized: false,
+        user: { id: "usr_0229" },
+      }),
+    } as any);
+
     await act(async () => {
-      nativeSetter?.call(input, "secret-key-123");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+      root.render(<LoginView onSuccess={onSuccess} />);
     });
 
-    const form = container.querySelector("form") as HTMLFormElement;
-    await act(async () => {
-      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-    });
-
-    expect(global.fetch).toHaveBeenCalledWith(
-      "/api/audit/session",
-      expect.objectContaining({
-        method: "POST",
-        credentials: "include",
-      })
-    );
-    expect(onSuccess).toHaveBeenCalled();
+    expect(container.textContent).toContain("not authorized for Audit");
+    expect(container.textContent).toContain("Sign Out");
+    expect(onSuccess).not.toHaveBeenCalled();
   });
 
   it("renders TraceItem summary card with tool pills, status, and tokens", async () => {

@@ -107,7 +107,7 @@ export class UserSessionManager {
     if (this.secureCookies) {
       cookieParts.push("Secure");
     }
-    res.setHeader("Set-Cookie", cookieParts.join("; "));
+    res.append("Set-Cookie", cookieParts.join("; "));
   }
 
   private getCookieToken(req: Request): string | null {

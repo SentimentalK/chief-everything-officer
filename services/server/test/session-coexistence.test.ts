@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import express from "express";
 import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
+import os from "os";
 import type { Server as HttpServer } from "node:http";
 import { IdentityService } from "../src/identity/service.js";
 import { seedIdentity } from "./helpers.js";
@@ -26,8 +26,8 @@ afterEach(async () => {
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function setupCoexistenceApp() {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-coexistence-test-"));
+async function setupApp() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-audit-session-test-"));
   cleanupDirs.push(dir);
 
   const dbPath = path.join(dir, "identity.sqlite");
@@ -46,101 +46,119 @@ async function setupCoexistenceApp() {
 
   const app = express();
   app.use(express.json());
-
-  // Mount both routers exactly as in server.ts
-  app.use(createAuditRouter({ auditStore, identityService }));
+  app.use(createAuditRouter({ auditStore, identityService, sessionManager }));
   app.use("/api/user", createUserRouter({ store: identityService.storeInstance, sessionManager }));
 
   const server = app.listen(0);
   cleanupServers.push(server);
-  const port = (server.address() as any).port;
+  const port = (server.address() as { port: number }).port;
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  return {
-    baseUrl,
-    apiKey,
-    ident,
-    sessionManager,
-  };
+  return { baseUrl, apiKey, ident, sessionManager, identityService };
 }
 
-describe("Session Coexistence: ceo_audit_session vs ceo_user_session", () => {
-  it("strictly enforces boundary separation and independent lifetimes", async () => {
-    const env = await setupCoexistenceApp();
+function cookieHeader(sessionId: string): string {
+  return `ceo_user_session=${sessionId}`;
+}
 
-    // 1. Obtain ceo_audit_session via API key login
-    const auditLoginRes = await fetch(`${env.baseUrl}/api/audit/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: env.apiKey }),
-    });
-    expect(auditLoginRes.status).toBe(200);
-    const auditSetCookie = auditLoginRes.headers.get("set-cookie")!;
-    expect(auditSetCookie).toContain("ceo_audit_session=");
-    const auditToken = auditSetCookie.match(/ceo_audit_session=([^;]+)/)![1];
+describe("Audit uses ceo_user_session + users.is_admin", () => {
+  it("admin user session can read traces; non-admin cannot; API-key cookie is gone", async () => {
+    const env = await setupApp();
+    env.identityService.storeInstance.grantAdmin(env.ident.user_id);
 
-    // 2. Create ceo_user_session via UserSessionManager
-    const userSession = env.sessionManager.createSession({
+    const adminSession = env.sessionManager.createSession({
       userId: env.ident.user_id,
       provider: "github",
       providerSubject: "40360455",
       providerLogin: "SentimentalK",
     });
-    const userToken = userSession.sessionId;
 
-    // Test A: ONLY ceo_user_session presented
-    const reqA_User = await fetch(`${env.baseUrl}/api/user/session`, {
-      headers: { Cookie: `ceo_user_session=${userToken}` },
+    const adminTraces = await fetch(`${env.baseUrl}/api/audit/traces`, {
+      headers: { Cookie: cookieHeader(adminSession.sessionId) },
     });
-    expect(reqA_User.status).toBe(200);
-    expect((await reqA_User.json()).authenticated).toBe(true);
+    expect(adminTraces.status).toBe(200);
 
-    const reqA_Audit = await fetch(`${env.baseUrl}/api/audit/traces`, {
-      headers: { Cookie: `ceo_user_session=${userToken}` },
+    const adminStatus = await fetch(`${env.baseUrl}/api/audit/session`, {
+      headers: { Cookie: cookieHeader(adminSession.sessionId) },
     });
-    expect(reqA_Audit.status).toBe(401); // User session MUST NOT grant audit access
-
-    // Test B: ONLY ceo_audit_session presented
-    const reqB_Audit = await fetch(`${env.baseUrl}/api/audit/traces`, {
-      headers: { Cookie: `ceo_audit_session=${auditToken}` },
+    expect(await adminStatus.json()).toEqual({
+      authenticated: true,
+      authorized: true,
+      user: { id: env.ident.user_id },
     });
-    expect(reqB_Audit.status).toBe(200); // Audit session grants audit access
 
-    const reqB_User = await fetch(`${env.baseUrl}/api/user/session`, {
-      headers: { Cookie: `ceo_audit_session=${auditToken}` },
+    env.identityService.storeInstance.revokeAdmin(env.ident.user_id);
+    const afterRevoke = await fetch(`${env.baseUrl}/api/audit/traces`, {
+      headers: { Cookie: cookieHeader(adminSession.sessionId) },
     });
-    expect(reqB_User.status).toBe(200);
-    expect((await reqB_User.json()).authenticated).toBe(false); // Audit session MUST NOT count as product user
+    expect(afterRevoke.status).toBe(403);
 
-    // Test C: BOTH cookies presented simultaneously
-    const reqC_Audit = await fetch(`${env.baseUrl}/api/audit/traces`, {
-      headers: { Cookie: `ceo_user_session=${userToken}; ceo_audit_session=${auditToken}` },
+    const afterRevokeSession = await fetch(`${env.baseUrl}/api/audit/session`, {
+      headers: { Cookie: cookieHeader(adminSession.sessionId) },
     });
-    expect(reqC_Audit.status).toBe(200);
-
-    const reqC_User = await fetch(`${env.baseUrl}/api/user/session`, {
-      headers: { Cookie: `ceo_user_session=${userToken}; ceo_audit_session=${auditToken}` },
+    expect(await afterRevokeSession.json()).toEqual({
+      authenticated: true,
+      authorized: false,
+      user: { id: env.ident.user_id },
     });
-    expect(reqC_User.status).toBe(200);
-    expect((await reqC_User.json()).authenticated).toBe(true);
 
-    // Test D: Log out from user session does NOT destroy audit session
-    const logoutUserRes = await fetch(`${env.baseUrl}/api/user/session/logout`, {
+    env.identityService.storeInstance.grantAdmin(env.ident.user_id);
+    const afterGrant = await fetch(`${env.baseUrl}/api/audit/session`, {
+      headers: { Cookie: cookieHeader(adminSession.sessionId) },
+    });
+    expect((await afterGrant.json()).authorized).toBe(true);
+
+    const loginGone = await fetch(`${env.baseUrl}/api/audit/session`, {
       method: "POST",
-      headers: { Cookie: `ceo_user_session=${userToken}; ceo_audit_session=${auditToken}` },
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: env.apiKey }),
     });
-    expect(logoutUserRes.status).toBe(200);
+    expect(loginGone.status).toBe(410);
 
-    // Audit session remains valid
-    const reqD_Audit = await fetch(`${env.baseUrl}/api/audit/traces`, {
-      headers: { Cookie: `ceo_audit_session=${auditToken}` },
+    const bearer = await fetch(`${env.baseUrl}/api/audit/traces`, {
+      headers: { Authorization: `Bearer ${env.apiKey}` },
     });
-    expect(reqD_Audit.status).toBe(200);
+    expect(bearer.status).toBe(401);
+  });
 
-    // User session is gone
-    const reqD_User = await fetch(`${env.baseUrl}/api/user/session`, {
-      headers: { Cookie: `ceo_user_session=${userToken}` },
+  it("clears both cookies on audit logout without overwriting Set-Cookie", async () => {
+    const env = await setupApp();
+    env.identityService.storeInstance.grantAdmin(env.ident.user_id);
+    const session = env.sessionManager.createSession({
+      userId: env.ident.user_id,
+      provider: "github",
+      providerSubject: "1",
     });
-    expect((await reqD_User.json()).authenticated).toBe(false);
+
+    const logoutRes = await fetch(`${env.baseUrl}/api/audit/session`, {
+      method: "DELETE",
+      headers: { Cookie: cookieHeader(session.sessionId) },
+    });
+    expect(logoutRes.status).toBe(200);
+    const cookies = logoutRes.headers.getSetCookie();
+    expect(cookies.some((c) => c.startsWith("ceo_user_session=") && c.includes("Max-Age=0"))).toBe(true);
+    expect(cookies.some((c) => c.startsWith("ceo_audit_session=") && c.includes("Max-Age=0"))).toBe(true);
+  });
+
+  it("disabled admin session is destroyed on GET /api/audit/session", async () => {
+    const env = await setupApp();
+    env.identityService.storeInstance.grantAdmin(env.ident.user_id);
+    const session = env.sessionManager.createSession({
+      userId: env.ident.user_id,
+      provider: "github",
+      providerSubject: "1",
+    });
+
+    env.identityService.storeInstance.withDb((db) => {
+      db.prepare("UPDATE users SET disabled_at = ? WHERE id = ?;").run(Date.now(), env.ident.user_id);
+    });
+
+    const status = await fetch(`${env.baseUrl}/api/audit/session`, {
+      headers: { Cookie: cookieHeader(session.sessionId) },
+    });
+    expect(await status.json()).toEqual({ authenticated: false, authorized: false });
+    const cookies = status.headers.getSetCookie();
+    expect(cookies.some((c) => c.startsWith("ceo_user_session=") && c.includes("Max-Age=0"))).toBe(true);
+    expect(env.sessionManager.getSessionFromToken(session.sessionId)).toBeNull();
   });
 });

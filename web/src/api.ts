@@ -55,32 +55,26 @@ export async function logoutUser(): Promise<void> {
   }).catch(() => {});
 }
 
-export async function checkSession(): Promise<boolean> {
-  try {
-    const res = await fetch("/api/audit/session", { credentials: "include" });
-    if (!res.ok) return false;
-    const data = await res.json();
-    return Boolean(data.authenticated);
-  } catch {
-    return false;
-  }
+export interface AuditSessionState {
+  authenticated: boolean;
+  authorized: boolean;
+  user?: {
+    id: string;
+  };
 }
 
-export async function login(token: string): Promise<{ ok: boolean; error?: string }> {
+export async function checkSession(): Promise<AuditSessionState> {
   try {
-    const res = await fetch("/api/audit/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ token }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      return { ok: false, error: data.error || "Authentication failed" };
-    }
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: String(err) };
+    const res = await fetch("/api/audit/session", { credentials: "include" });
+    if (!res.ok) return { authenticated: false, authorized: false };
+    const data = await res.json();
+    return {
+      authenticated: Boolean(data.authenticated),
+      authorized: Boolean(data.authorized),
+      user: data.user,
+    };
+  } catch {
+    return { authenticated: false, authorized: false };
   }
 }
 
@@ -99,7 +93,11 @@ export async function fetchTraces(options?: { from?: number; to?: number; limit?
 
   const url = `/api/audit/traces${params.toString() ? `?${params.toString()}` : ""}`;
   const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const message = typeof data.error === "string" ? data.error : `HTTP ${res.status}`;
+    throw new Error(message);
+  }
   const data = await res.json();
   return data.traces || [];
 }

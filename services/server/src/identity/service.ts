@@ -79,6 +79,31 @@ export class IdentityService {
     return this.store.hasWorkspaceAccess(workspaceId, userId);
   }
 
+  /**
+   * Resolves the single accessible workspace for a user without an API-key credential.
+   * 0 memberships -> WorkspaceAccessDeniedError
+   * 1 membership  -> WorkspaceIdentity
+   * >1 memberships -> WorkspaceSelectionRequiredError
+   * Does not inspect is_admin, sessions, or GitHub identity.
+   */
+  resolveUserWorkspace(userId: string): WorkspaceIdentity {
+    const memberships = this.store.listWorkspaceMembershipsForUser(userId);
+    if (memberships.length === 0) {
+      throw new WorkspaceAccessDeniedError(
+        `Authenticated user '${userId}' workspace access denied (no accessible workspaces).`,
+      );
+    }
+    if (memberships.length > 1) {
+      throw new WorkspaceSelectionRequiredError(
+        `Authenticated user '${userId}' has multiple accessible workspaces (${memberships.length}). Workspace selection required.`,
+      );
+    }
+    return {
+      user_id: userId,
+      workspace_id: memberships[0]!.workspace_id,
+    };
+  }
+
   close(): void {
     this.store.close();
   }

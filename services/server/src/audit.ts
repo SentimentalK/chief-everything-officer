@@ -1,11 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import express, { type Request, type Response, type NextFunction, type Router } from "express";
 import {
   type IdentityService,
-  type AuthIdentity,
+  type WorkspaceIdentity,
   WorkspaceAccessDeniedError,
   WorkspaceSelectionRequiredError,
 } from "./identity/service.js";
@@ -14,6 +13,7 @@ import {
   IdentityDbContextClosed,
   IdentityStructureError,
 } from "./identity/store.js";
+import type { UserSessionManager } from "./auth/user-session.js";
 
 export class AuditSchemaIncompatibleError extends Error {
   constructor(message: string) {
@@ -343,44 +343,22 @@ export class AuditStore {
   }
 }
 
-interface Session {
-  user_id: string;
-  api_key_id: string;
-  workspace_id: string;
-  expiresAt: number;
-}
-
-type SessionIdentity = Omit<Session, "expiresAt">;
-
-function getSessionCookie(req: Request): string | null {
-  const cookie = req.headers.cookie;
-  if (!cookie) return null;
-  const match = cookie.match(/(?:^|;\s*)ceo_audit_session=([^;]+)/);
-  const token = match?.[1];
-  return token ? decodeURIComponent(token) : null;
-}
-
-function getAuditBearer(req: Request): string | null {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.substring(7);
-  return token ? token : null;
-}
-
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-
-function setAuditCookie(res: Response, value: string, maxAgeSeconds: number, secure: boolean): void {
+function expireLegacyAuditCookie(res: Response, secure: boolean): void {
   const cookieParts = [
-    `ceo_audit_session=${encodeURIComponent(value)}`,
+    "ceo_audit_session=",
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
-    `Max-Age=${maxAgeSeconds}`,
+    "Max-Age=0",
   ];
   if (secure) {
     cookieParts.push("Secure");
   }
-  res.setHeader("Set-Cookie", cookieParts.join("; "));
+  res.append("Set-Cookie", cookieParts.join("; "));
+}
+
+function isSecureRequest(req: Request): boolean {
+  return req.secure || req.headers["x-forwarded-proto"] === "https";
 }
 
 /**
@@ -398,95 +376,43 @@ function isIdentityUnavailable(error: unknown): boolean {
 export function createAuditRouter(options: {
   auditStore: AuditStore;
   identityService: IdentityService;
+  sessionManager: UserSessionManager;
 }): Router {
-  const { auditStore, identityService } = options;
+  const { auditStore, identityService, sessionManager } = options;
+  const store = identityService.storeInstance;
   const router = express.Router();
   router.use(express.json());
 
-  const sessions = new Map<string, Session>();
-
-  /**
-   * Re-derives the identity for a cookie session from the current DB (not the
-   * cached value). Revalidates that the underlying credential is still active
-   * and unrevoked, user is enabled, and user maintains access to the workspace.
-   * Returns null and deletes session on expiry/revocation/loss of access.
-   * Throws on DB faults so the session is preserved during transient outages.
-   */
-  function sessionIdentityOrNull(sessionId: string | null): AuthIdentity | null {
-    if (!sessionId) return null;
-    const session = sessions.get(sessionId);
-    if (!session) return null;
-    if (Date.now() > session.expiresAt) {
-      sessions.delete(sessionId);
-      return null;
+  function clearBrowserSessions(req: Request, res: Response): void {
+    const session = sessionManager.getSession(req);
+    if (session) {
+      sessionManager.destroySession(session.sessionId);
     }
-
-    // 1. Re-verify credential still valid and active in DB (revocation/disablement check)
-    const cred = identityService.storeInstance.resolveCredentialByKey(session.api_key_id, session.user_id);
-    if (!cred) {
-      sessions.delete(sessionId);
-      return null;
-    }
-
-    // 2. Re-verify user still has access to the session workspace
-    const hasAccess = identityService.storeInstance.hasWorkspaceAccess(session.workspace_id, session.user_id);
-    if (!hasAccess) {
-      sessions.delete(sessionId);
-      return null;
-    }
-
-    return {
-      user_id: session.user_id,
-      api_key_id: session.api_key_id,
-      workspace_id: session.workspace_id,
-    };
+    sessionManager.clearCookie(res);
+    expireLegacyAuditCookie(res, isSecureRequest(req));
   }
 
-  function respondUnauthorized(res: Response): void {
-    res.status(401).json({ error: "Unauthorized" });
-  }
-
-  /**
-   * Requires a valid bound session cookie OR a valid Bearer credential. Both
-   * paths resolve the request-scoped AuthIdentity and attach it to res.locals.identity.
-   * DB faults are surfaced as 503 without deleting cookie sessions.
-   */
   function auditAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-    // Cookie-first.
-    const cookieSessionId = getSessionCookie(req);
-    if (cookieSessionId) {
-      try {
-        const ident = sessionIdentityOrNull(cookieSessionId);
-        if (!ident) {
-          respondUnauthorized(res);
-          return;
-        }
-        res.locals.identity = ident;
-        next();
-        return;
-      } catch (error) {
-        if (isIdentityUnavailable(error)) {
-          res.status(503).json({ error: "Identity service unavailable" });
-          return;
-        }
-        throw error;
-      }
-    }
-
-    // No cookie: require a Bearer credential.
-    const token = getAuditBearer(req);
-    if (!token) {
-      respondUnauthorized(res);
+    const session = sessionManager.getSession(req);
+    if (!session) {
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
+
     try {
-      const credential = identityService.authenticateApiKey(token);
-      if (!credential) {
-        respondUnauthorized(res);
+      if (!store.isUserActive(session.userId)) {
+        sessionManager.destroySession(session.sessionId);
+        sessionManager.clearCookie(res);
+        expireLegacyAuditCookie(res, isSecureRequest(req));
+        res.status(401).json({ error: "Unauthorized" });
         return;
       }
-      const identity = identityService.resolveRequestIdentity(credential);
-      res.locals.identity = identity;
+      if (!store.isUserAdmin(session.userId)) {
+        res.status(403).json({ error: "Audit access denied" });
+        return;
+      }
+      const workspace: WorkspaceIdentity = identityService.resolveUserWorkspace(session.userId);
+      res.locals.auditWorkspace = workspace;
       next();
     } catch (error) {
       if (isIdentityUnavailable(error)) {
@@ -501,61 +427,30 @@ export function createAuditRouter(options: {
     }
   }
 
-  router.post("/api/audit/session", (req: Request, res: Response) => {
-    const { token } = req.body ?? {};
-    if (typeof token !== "string" || token.length === 0) {
-      res.status(401).json({ error: "Invalid access token" });
-      return;
-    }
-
-    let identity: AuthIdentity;
-    try {
-      const result = identityService.authenticateApiKey(token);
-      if (!result) {
-        res.status(401).json({ error: "Invalid access token" });
-        return;
-      }
-      identity = identityService.resolveRequestIdentity(result);
-    } catch (error) {
-      if (isIdentityUnavailable(error)) {
-        res.status(503).json({ error: "Identity service unavailable" });
-        return;
-      }
-      if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
-        res.status(403).json({ error: error.message });
-        return;
-      }
-      throw error;
-    }
-
-    const sessionId = crypto.randomBytes(32).toString("hex");
-    const expiresAt = Date.now() + SESSION_TTL_MS;
-    sessions.set(sessionId, {
-      user_id: identity.user_id,
-      api_key_id: identity.api_key_id,
-      workspace_id: identity.workspace_id,
-      expiresAt,
-    });
-
-    if (sessions.size > 1000) {
-      const now = Date.now();
-      for (const [id, s] of sessions.entries()) {
-        if (now > s.expiresAt) sessions.delete(id);
-      }
-    }
-
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-    setAuditCookie(res, sessionId, SESSION_TTL_MS / 1000, isSecure);
-    res.status(200).json({ ok: true });
+  router.post("/api/audit/session", (_req: Request, res: Response) => {
+    res.status(410).json({ error: "Audit API-key login has been removed. Sign in with GitHub." });
   });
 
-  // Session status: COOKIE ONLY. A missing/invalid cookie is 200 {false}.
-  // A Bearer header does not count as “browser logged in”. DB fault -> 503.
   router.get("/api/audit/session", (req: Request, res: Response) => {
-    const sessionId = getSessionCookie(req);
     try {
-      const ident = sessionId ? sessionIdentityOrNull(sessionId) : null;
-      res.status(200).json({ authenticated: ident !== null });
+      const session = sessionManager.getSession(req);
+      if (!session) {
+        res.status(200).json({ authenticated: false, authorized: false });
+        return;
+      }
+      if (!store.isUserActive(session.userId)) {
+        sessionManager.destroySession(session.sessionId);
+        sessionManager.clearCookie(res);
+        expireLegacyAuditCookie(res, isSecureRequest(req));
+        res.status(200).json({ authenticated: false, authorized: false });
+        return;
+      }
+      const authorized = store.isUserAdmin(session.userId);
+      res.status(200).json({
+        authenticated: true,
+        authorized,
+        user: { id: session.userId },
+      });
     } catch (error) {
       if (isIdentityUnavailable(error)) {
         res.status(503).json({ error: "Identity service unavailable" });
@@ -566,12 +461,7 @@ export function createAuditRouter(options: {
   });
 
   router.delete("/api/audit/session", (req: Request, res: Response) => {
-    const sessionId = getSessionCookie(req);
-    if (sessionId) {
-      sessions.delete(sessionId);
-    }
-    const isSecure = req.secure || req.headers["x-forwarded-proto"] === "https";
-    setAuditCookie(res, "", 0, isSecure);
+    clearBrowserSessions(req, res);
     res.status(200).json({ ok: true });
   });
 
@@ -579,7 +469,7 @@ export function createAuditRouter(options: {
     const from = req.query.from ? Number(req.query.from) : undefined;
     const to = req.query.to ? Number(req.query.to) : undefined;
     const limit = req.query.limit ? Number(req.query.limit) : 200;
-    const workspaceId = res.locals.identity!.workspace_id;
+    const workspaceId = (res.locals.auditWorkspace as WorkspaceIdentity).workspace_id;
 
     const traces = auditStore.listSummaries(workspaceId, { from, to, limit });
     res.status(200).json({ ok: true, traces });
@@ -591,7 +481,7 @@ export function createAuditRouter(options: {
       res.status(400).json({ error: "Invalid trace ID" });
       return;
     }
-    const workspaceId = res.locals.identity!.workspace_id;
+    const workspaceId = (res.locals.auditWorkspace as WorkspaceIdentity).workspace_id;
 
     const trace = auditStore.getDetail(workspaceId, id);
     if (!trace) {

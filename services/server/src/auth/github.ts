@@ -13,10 +13,17 @@ export interface GitHubAuthRouterOptions {
   fetchFn?: typeof fetch;
 }
 
+type AllowedNextPath = "/audit" | "/login";
+
 interface PendingOAuthState {
   codeVerifier: string;
   expiresAt: number;
   oauthRequest?: string;
+  next?: AllowedNextPath;
+}
+
+function parseAllowedNext(raw: unknown): AllowedNextPath | undefined {
+  return raw === "/audit" || raw === "/login" ? raw : undefined;
 }
 
 const STATE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -60,6 +67,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
     cleanupStates();
 
     const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
+    const next = parseAllowedNext(req.query.next);
     const state = crypto.randomBytes(32).toString("hex");
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto
@@ -71,6 +79,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
       codeVerifier,
       expiresAt: Date.now() + STATE_TTL_MS,
       oauthRequest,
+      next,
     });
 
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
@@ -190,6 +199,10 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
       sessionManager.setCookie(res, session.sessionId);
       if (pending.oauthRequest) {
         res.redirect(302, `/authorize/resume?request=${encodeURIComponent(pending.oauthRequest)}`);
+        return;
+      }
+      if (pending.next) {
+        res.redirect(302, pending.next);
         return;
       }
       res.redirect(302, "/login");

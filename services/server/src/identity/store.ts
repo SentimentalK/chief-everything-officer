@@ -46,7 +46,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 9;
+export const IDENTITY_DB_USER_VERSION = 10;
 
 export type WorkspaceBootstrapState =
   | "PENDING"
@@ -155,7 +155,8 @@ export const IDENTITY_DDL = `
 CREATE TABLE users (
   id TEXT PRIMARY KEY NOT NULL,
   created_at INTEGER NOT NULL,
-  disabled_at INTEGER
+  disabled_at INTEGER,
+  is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))
 );
 
 CREATE TABLE workspaces (
@@ -318,7 +319,7 @@ const EXPECTED_TABLES = [
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
-  users: ["id", "created_at"],
+  users: ["id", "created_at", "is_admin"],
   workspaces: ["id", "owner_user_id", "remote_url", "branch", "created_at"],
   api_keys: ["id", "user_id", "key_digest", "created_at"],
   external_identities: ["id", "provider", "provider_subject", "user_id", "created_at_ms", "updated_at_ms"],
@@ -711,6 +712,15 @@ export class IdentityStore {
 
   private validateData(): void {
     const db = this.requireDb();
+
+    const badAdmin = db.prepare(
+      "SELECT id, is_admin FROM users WHERE is_admin NOT IN (0, 1) OR is_admin IS NULL LIMIT 1;",
+    ).get() as { id: string; is_admin: number } | undefined;
+    if (badAdmin) {
+      throw new IdentityStructureError(
+        `Identity database contains user '${badAdmin.id}' with invalid is_admin '${String(badAdmin.is_admin)}' (must be 0 or 1).`,
+      );
+    }
 
     const badRole = db.prepare(
       "SELECT id FROM workspace_memberships WHERE role != 'owner' LIMIT 1;",
@@ -1177,6 +1187,9 @@ export class IdentityStore {
           break;
         case 8:
           IdentityStore.migrateV8ToV9(db);
+          break;
+        case 9:
+          IdentityStore.migrateV9ToV10(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -1654,6 +1667,37 @@ export class IdentityStore {
     }
   }
 
+  static migrateV9ToV10(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 9) {
+        throw new IdentityStructureError("migrateV9ToV10 requires user_version = 9.");
+      }
+
+      const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users';",
+      ).get() as { name: string } | undefined;
+      if (!row) {
+        throw new IdentityStructureError("Cannot migrate to v10: missing required v9 table 'users'.");
+      }
+
+      db.exec(`
+        ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1));
+        PRAGMA user_version = 10;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 9 to 10: ${error}`);
+    }
+  }
+
   findExternalIdentity(provider: string, providerSubject: string): {
     id: string;
     provider: string;
@@ -1755,7 +1799,7 @@ export class IdentityStore {
         const externalIdentityId = newId("ext");
 
         db.prepare(
-          "INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);",
+          "INSERT INTO users (id, created_at, disabled_at, is_admin) VALUES (?, ?, NULL, 0);",
         ).run(userId, nowMs);
 
         db.prepare(
@@ -1801,6 +1845,45 @@ export class IdentityStore {
       ).get(userId) as { id: string } | undefined;
       return Boolean(row);
     });
+  }
+
+  isUserAdmin(userId: string): boolean {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id FROM users WHERE id = ? AND disabled_at IS NULL AND is_admin = 1 LIMIT 1;",
+      ).get(userId) as { id: string } | undefined;
+      return Boolean(row);
+    });
+  }
+
+  /**
+   * Low-level admin bit writer. User must exist. `value` must be a runtime boolean.
+   * Disabled users may be revoked (false) but grant is enforced by grantAdmin.
+   */
+  setUserAdmin(userId: string, value: boolean): void {
+    if (typeof value !== "boolean") {
+      throw new IdentityStructureError("setUserAdmin requires a boolean is_admin value.");
+    }
+    this.withDb((db) => {
+      const row = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1;").get(userId) as
+        | { id: string }
+        | undefined;
+      if (!row) {
+        throw new IdentityError(`User '${userId}' does not exist.`);
+      }
+      db.prepare("UPDATE users SET is_admin = ? WHERE id = ?;").run(value ? 1 : 0, userId);
+    });
+  }
+
+  grantAdmin(userId: string): void {
+    if (!this.isUserActive(userId)) {
+      throw new IdentityError(`Cannot grant admin to missing or disabled user '${userId}'.`);
+    }
+    this.setUserAdmin(userId, true);
+  }
+
+  revokeAdmin(userId: string): void {
+    this.setUserAdmin(userId, false);
   }
 
   hasWorkspaceAccess(workspaceId: string, userId: string): boolean {

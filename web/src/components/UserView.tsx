@@ -107,6 +107,14 @@ export const UserView: React.FC = () => {
               </div>
             </div>
 
+            <a
+              href="/audit"
+              className="flex w-full items-center justify-center gap-1 rounded-md border border-neutral-700 bg-neutral-800 px-4 py-2 text-sm font-medium text-neutral-200 transition hover:bg-neutral-700"
+            >
+              Operator Audit Console
+              <ArrowRight className="h-3 w-3" />
+            </a>
+
             <button
               type="button"
               onClick={handleLogout}

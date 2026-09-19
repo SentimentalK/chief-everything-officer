@@ -88,7 +88,7 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     const now = 1000000;
 
     // Workspace 1
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_alice", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_alice", now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_one",
       "usr_alice",
@@ -135,7 +135,7 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     `).run("ws_one", now, now, now);
 
     // Workspace 2
-    db.prepare("INSERT INTO users VALUES (?, ?, NULL);").run("usr_bob", now);
+    db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_bob", now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_two",
       "usr_bob",
