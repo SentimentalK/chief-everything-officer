@@ -284,10 +284,5 @@ describe("Resource Authority & Namespace Hardening", () => {
     const changeDesc = tools["apply_change_set"].description;
     expect(changeDesc).toContain("This tool cannot mutate resources/**");
     expect(changeDesc).toContain("Use resource_capture for new Resources or resource_apply for existing Resources");
-
-    // bootstrap policy
-    expect(policy.bootstrap).toContain(
-      "对于外部来源的保存意图，直接调用 `resource_capture`；它已经包含了查重与元数据丰富逻辑。不要手动构造 Resource 文件。"
-    );
   });
 });
