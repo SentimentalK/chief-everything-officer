@@ -2,7 +2,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as z from "zod/v4";
-import { safeError } from "./errors.js";
+import { CeoError, safeError } from "./errors.js";
 import { LIMITS } from "./limits.js";
 import type { ChangeOperation, CeoWorkspace } from "./workspace.js";
 import { type ProductPolicy, getPolicy } from "./product-policy.js";
@@ -68,11 +68,19 @@ function tracedHandler<T>(
       res = result(rawResult);
     } catch (error) {
       status = "error";
+      if (!(error instanceof CeoError)) {
+        console.error(
+          `[CEO MCP] unhandled error in tool '${toolName}':`,
+          error instanceof Error ? error.stack || error.message : error,
+        );
+      }
       rawResult = safeError(error);
       res = result(rawResult, true);
-      errorMessage = typeof (rawResult as Record<string, unknown>).message === "string"
-        ? ((rawResult as Record<string, unknown>).message as string)
-        : String(error);
+      errorMessage = error instanceof Error
+        ? error.message
+        : (typeof (rawResult as Record<string, unknown>).message === "string"
+            ? ((rawResult as Record<string, unknown>).message as string)
+            : String(error));
     }
 
     const latency_ms = Math.round(performance.now() - start);

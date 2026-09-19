@@ -546,7 +546,14 @@ export class CeoWorkspace {
         }
 
         await runGit(this.config, worktree, ["add", "-A"]);
-        await runGit(this.config, worktree, ["diff", "--cached", "--check"]);
+        try {
+          await runGit(this.config, worktree, ["diff", "--cached", "--check"]);
+        } catch (err: any) {
+          throw new CeoError(
+            "VALIDATION_FAILED",
+            `Git diff check rejected changes: ${err?.message || err}`,
+          );
+        }
         await runGit(this.config, worktree, ["commit", "-m", commitMessage]);
         committed = true;
         const commit = await resolveRef(this.config, worktree, "HEAD");

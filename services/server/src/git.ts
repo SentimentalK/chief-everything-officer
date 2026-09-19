@@ -68,7 +68,12 @@ export function validateGitAuthMode(config: GitExecutionConfig): void {
 }
 
 function gitPrefix(config: GitExecutionConfig, credential?: GitCredential): string[] {
-  const prefix = ["-c", "core.quotepath=false"];
+  const prefix = [
+    "-c",
+    "core.quotepath=false",
+    "-c",
+    "core.whitespace=-trailing-space,-blank-at-eol,-blank-at-eof",
+  ];
 
   if (config.sshKeyPath && config.knownHostsPath) {
     const command = [
@@ -144,8 +149,9 @@ export async function runGit(
         resolve({ stdout: safeStdout, stderr: safeStderr });
       } else {
         const commandName = redactSecrets(args[0] ?? "command", [credential?.token]);
-        const rawErrorMsg = safeStderr
-          ? `git ${commandName} failed with exit code ${code}: ${safeStderr}`
+        const details = safeStderr || safeStdout;
+        const rawErrorMsg = details
+          ? `git ${commandName} failed with exit code ${code}: ${details}`
           : `git ${commandName} failed with exit code ${code}`;
         const errorMsg = redactSecrets(rawErrorMsg, [credential?.token]);
         reject(new Error(errorMsg));

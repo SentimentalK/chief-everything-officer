@@ -316,4 +316,50 @@ describe("CeoWorkspace", () => {
     })).rejects.toMatchObject({ code: "BLOB_MISMATCH" });
     expect(git(item.remote, "rev-list", "--count", "main")).toBe("1");
   });
+
+  it("supports Markdown line breaks with trailing whitespace without failing diff check", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const status = await workspace.workspaceStatus();
+
+    // Standard markdown trailing double space for hard line break
+    const markdownWithHardBreaks = "# Title  \nSecond line with trailing spaces  \nThird line\n";
+    const result = await workspace.applyChangeSet({
+      base_commit: status.remote_commit as string,
+      summary: "Add markdown with hard line breaks",
+      operations: [{
+        op: "create",
+        path: "rules/test.md",
+        content: markdownWithHardBreaks,
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(git(item.remote, "show", "main:rules/test.md")).toBe(markdownWithHardBreaks.trimEnd());
+    const read = await workspace.readFiles(["rules/test.md"]);
+    expect((read.files as any[])[0].content).toBe(markdownWithHardBreaks);
+  });
+
+  it("rejects changes containing leftover conflict markers with VALIDATION_FAILED", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const status = await workspace.workspaceStatus();
+
+    const conflictContent = "<<<<<<< HEAD\nlocal changes\n=======\nremote changes\n>>>>>>> main\n";
+    await expect(workspace.applyChangeSet({
+      base_commit: status.remote_commit as string,
+      summary: "Attempt committing conflict markers",
+      operations: [{
+        op: "create",
+        path: "conflict.md",
+        content: conflictContent,
+      }],
+    })).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+    });
+  });
 });
