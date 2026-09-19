@@ -5,7 +5,8 @@ import * as z from "zod/v4";
 import { CeoError, safeError } from "./errors.js";
 import { LIMITS } from "./limits.js";
 import type { ChangeOperation, CeoWorkspace } from "./workspace.js";
-import { type ProductPolicy, getPolicy } from "./product-policy.js";
+import type { ProductPolicy } from "./product-policy.js";
+import { resolveEffectivePolicy } from "./policy-resolver.js";
 import type { AuditStore } from "./audit.js";
 import type { WorkspaceIdentity } from "./identity/store.js";
 import { BUILD_INFO } from "./build-info.js";
@@ -348,13 +349,13 @@ export function createMcpServer(
 
   // 6. policy_read
   server.registerTool("policy_read", {
-    title: "Read CEO runtime product policy",
-    description: "Use this to read runtime-owned default policy documents (e.g. 'tasks', 'personal', 'journal', 'resources'). Does not read user workspace files. Returns NO_DEFAULT_POLICY for unknown areas.",
+    title: "Read CEO effective policy",
+    description: "Read CEO effective policy for a semantic area (e.g. 'tasks', 'personal', 'journal', 'decision', 'resources', 'well-being'). Runtime policy and workspace policy composition is resolved by the backend. The returned content is the policy the model should follow. Returns NO_DEFAULT_POLICY when neither runtime nor workspace policy is defined.",
     inputSchema: {
-      name: z.string().min(1).max(64).describe("Policy document name to look up in runtime defaults, e.g. 'tasks', 'personal', 'journal', 'resources'"),
+      name: z.string().min(1).max(64).describe("Policy document name to look up, e.g. 'tasks', 'personal', 'journal', 'decision', 'resources', 'well-being'"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, trace("policy_read", async ({ name }: { name: string }) => getPolicy(productPolicy, name)));
+  }, trace("policy_read", async ({ name }: { name: string }) => resolveEffectivePolicy(productPolicy, workspace, name)));
 
   // 7. resource_capture
   server.registerTool("resource_capture", {

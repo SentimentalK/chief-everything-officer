@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CeoError } from "./errors.js";
 
-export interface PolicyDocument {
+export interface RuntimePolicyDocument {
   ok: boolean;
   name: string;
   status: "FOUND" | "NO_DEFAULT_POLICY";
@@ -13,9 +13,22 @@ export interface PolicyDocument {
   [key: string]: unknown;
 }
 
+export type PolicyDocument = RuntimePolicyDocument;
+
+export interface EffectivePolicyResolution {
+  strategy: "runtime_only" | "runtime_plus_workspace" | "workspace_only" | "none";
+  workspace_mode?: "extend" | "override";
+  runtime_policy: boolean;
+  workspace_policy: boolean;
+}
+
+export interface EffectivePolicyDocument extends RuntimePolicyDocument {
+  resolution: EffectivePolicyResolution;
+}
+
 export interface ProductPolicy {
   bootstrap: string;
-  policies: Map<string, PolicyDocument>;
+  policies: Map<string, RuntimePolicyDocument>;
 }
 
 export function getPolicyDir(): string {
@@ -28,7 +41,7 @@ export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<Pro
   const bootstrapRaw = await readFile(bootstrapPath, "utf8");
   const bootstrap = bootstrapRaw.trim();
 
-  const policies = new Map<string, PolicyDocument>();
+  const policies = new Map<string, RuntimePolicyDocument>();
   const entries = await readdir(policyDir).catch(() => []);
 
   for (const entry of entries) {
@@ -52,7 +65,7 @@ export async function loadProductPolicy(policyDir = getPolicyDir()): Promise<Pro
   };
 }
 
-export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDocument {
+export function getRuntimePolicy(productPolicy: ProductPolicy, name: string): RuntimePolicyDocument {
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     throw new CeoError(
       "INVALID_PATH",
@@ -72,6 +85,6 @@ export function getPolicy(productPolicy: ProductPolicy, name: string): PolicyDoc
     status: "NO_DEFAULT_POLICY",
     content: null,
     bytes: 0,
-    message: `No runtime default policy for '${name}'. Check for workspace-specific rules in rules/${name}.md or reason from workspace context.`,
+    message: `No runtime default policy for '${name}'.`,
   };
 }

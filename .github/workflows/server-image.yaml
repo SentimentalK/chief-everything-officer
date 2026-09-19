@@ -51,10 +51,12 @@ jobs:
         run: |
           docker run --rm --entrypoint sh ceo-server:ci -c '
             test -s /app/policy/bootstrap.md &&
+            test -s /app/policy/decision.md &&
             test -s /app/policy/journal.md &&
             test -s /app/policy/personal.md &&
             test -s /app/policy/resources.md &&
             test -s /app/policy/tasks.md &&
+            test -s /app/policy/well-being.md &&
             echo "All policy files verified successfully"
           '
 

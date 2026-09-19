@@ -374,6 +374,48 @@ export class CeoWorkspace {
     });
   }
 
+  async readOptionalMarkdown(relativePath: string): Promise<{
+    path: string;
+    blob_oid: string | null;
+    content: string;
+    base_commit: string;
+  } | null> {
+    const validatedPath = validatePath(relativePath);
+    return await this.withReadyWorkspace(async (base) => {
+      const matcher = await this.loadIgnoreMatcher();
+      if (isPathIgnored(matcher, validatedPath)) {
+        throw new CeoError("ACCESS_DENIED", "Requested path is excluded by .ceoignore.", { path: validatedPath });
+      }
+      await assertNoSymlink(this.config.repoDir, validatedPath);
+      const fullPath = path.join(this.config.repoDir, validatedPath);
+      let fileStat: Stats | null = null;
+      try {
+        fileStat = await stat(fullPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+      if (!fileStat.isFile()) {
+        throw new CeoError("INVALID_PATH", "Requested path is not a regular file.", { path: validatedPath });
+      }
+      if (fileStat.size > LIMITS.maxFileWriteBytes) {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `File size (${Math.round(fileStat.size / 1024)} KiB) exceeds max single-file limit (${Math.round(LIMITS.maxFileWriteBytes / (1024 * 1024))} MiB).`,
+          { path: validatedPath },
+        );
+      }
+      const content = await this.readUtf8(fullPath, validatedPath);
+      const oid = await blobOid(this.config, this.config.repoDir, base, validatedPath);
+      return {
+        path: validatedPath,
+        blob_oid: oid,
+        content,
+        base_commit: base,
+      };
+    });
+  }
+
   /**
    * Resolves where a requested file is read from and returns its actual path
    * and size. When the requested `tasks/<name>.md` does not exist at base and
