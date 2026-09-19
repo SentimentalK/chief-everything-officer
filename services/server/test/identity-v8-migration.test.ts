@@ -135,8 +135,8 @@ describe("Identity DB v7 -> v8 migration (AWAITING_REPOSITORY_RESTRICTION)", () 
     // Verify user_version is 8
     store.withDb((rawDb: DatabaseSync) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(8);
-      expect(IDENTITY_DB_USER_VERSION).toBe(8);
+      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
+      expect(IDENTITY_DB_USER_VERSION).toBe(9);
 
       // Verify the column host_oauth_request_id exists
       const columns = rawDb.prepare("PRAGMA table_info(onboarding_flows);").all() as Array<{ name: string }>;
@@ -197,7 +197,7 @@ describe("Identity DB v7 -> v8 migration (AWAITING_REPOSITORY_RESTRICTION)", () 
 
     store.withDb((rawDb: DatabaseSync) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(8);
+      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
 
       const columns = rawDb.prepare("PRAGMA table_info(onboarding_flows);").all() as Array<{ name: string }>;
       expect(columns.some((c) => c.name === "host_oauth_request_id")).toBe(true);
@@ -293,12 +293,15 @@ describe("Identity DB v7 -> v8 migration (AWAITING_REPOSITORY_RESTRICTION)", () 
     // Bootstrap is currently PENDING -> not ready
     expect(store.isWorkspaceReadyForHost(bound.workspace.id)).toBe(false);
 
-    // Transition to READY -> now ready
+    // Transition to READY -> still not ready until scope is verified
     const attempt = store.beginWorkspaceBootstrapAttempt(bound.workspace.id);
     store.markWorkspaceBootstrapReady(bound.workspace.id, attempt.attemptId, {
       readyCommitSha: "a".repeat(40),
     });
+    expect(store.isWorkspaceReadyForHost(bound.workspace.id)).toBe(false);
 
+    // After marking scope verified -> ready!
+    store.markRepositoryBindingScopeVerified(bound.workspace.id);
     expect(store.isWorkspaceReadyForHost(bound.workspace.id)).toBe(true);
   });
 });

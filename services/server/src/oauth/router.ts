@@ -12,6 +12,7 @@ import {
 import type { IdentityStore } from "../identity/store.js";
 import type { WorkspaceBootstrapService } from "../github/bootstrap-service.js";
 import { OnboardingStore } from "../onboarding/store.js";
+import type { OnboardingService } from "../onboarding/service.js";
 
 export interface OAuthRouterOptions {
   oauthService: OAuthService;
@@ -19,6 +20,7 @@ export interface OAuthRouterOptions {
   identityStore?: IdentityStore;
   bootstrapService?: WorkspaceBootstrapService;
   onboardingStore?: OnboardingStore;
+  onboardingService?: OnboardingService;
 }
 
 export function escapeHtml(str: string): string {
@@ -302,11 +304,41 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
         return;
       }
 
-      // Exactly 1 workspace: verify bootstrap status using authoritative helper
+      // Exactly 1 workspace: verify restriction scope and bootstrap status
       const targetMembership = memberships[0];
-      if (targetMembership && !identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
-        res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
-        return;
+      if (targetMembership) {
+        const binding = identityStore.findRepositoryBindingByWorkspaceId(targetMembership.workspace_id);
+        if (binding && options.onboardingService) {
+          const verification = await options.onboardingService.verifyLiveInstallationScope(targetMembership.workspace_id);
+          if (!verification.success) {
+            identityStore.clearRepositoryBindingScopeVerified(targetMembership.workspace_id);
+            if (onboardingStore) {
+              const flow = onboardingStore.getOrCreateActiveFlowInTx(
+                session.userId,
+                session.providerSubject || "",
+                undefined,
+                request.id,
+              );
+              onboardingStore.updateFlow(flow.id, {
+                workspace_id: targetMembership.workspace_id,
+                repository_id: binding.github_repository_id,
+                installation_row_id: binding.github_installation_row_id,
+                state: "AWAITING_REPOSITORY_RESTRICTION",
+                last_error_code: verification.reason,
+                last_error_message: verification.message,
+              });
+              res.redirect(302, `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(request.id)}`);
+              return;
+            }
+          } else {
+            identityStore.markRepositoryBindingScopeVerified(targetMembership.workspace_id);
+          }
+        }
+
+        if (!identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
+          res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(request.id)}`);
+          return;
+        }
       }
 
       // Logged in: generate consent nonce and render consent screen
@@ -387,11 +419,41 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       return;
     }
 
-    // Exactly 1 workspace: verify bootstrap status using authoritative helper
+    // Exactly 1 workspace: verify restriction scope and bootstrap status
     const targetMembership = memberships[0];
-    if (targetMembership && !identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
-      res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
-      return;
+    if (targetMembership) {
+      const binding = identityStore.findRepositoryBindingByWorkspaceId(targetMembership.workspace_id);
+      if (binding && options.onboardingService) {
+        const verification = await options.onboardingService.verifyLiveInstallationScope(targetMembership.workspace_id);
+        if (!verification.success) {
+          identityStore.clearRepositoryBindingScopeVerified(targetMembership.workspace_id);
+          if (onboardingStore) {
+            const flow = onboardingStore.getOrCreateActiveFlowInTx(
+              session.userId,
+              session.providerSubject || "",
+              undefined,
+              requestId,
+            );
+            onboardingStore.updateFlow(flow.id, {
+              workspace_id: targetMembership.workspace_id,
+              repository_id: binding.github_repository_id,
+              installation_row_id: binding.github_installation_row_id,
+              state: "AWAITING_REPOSITORY_RESTRICTION",
+              last_error_code: verification.reason,
+              last_error_message: verification.message,
+            });
+            res.redirect(302, `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(requestId)}`);
+            return;
+          }
+        } else {
+          identityStore.markRepositoryBindingScopeVerified(targetMembership.workspace_id);
+        }
+      }
+
+      if (!identityStore.isWorkspaceReadyForHost(targetMembership.workspace_id)) {
+        res.redirect(302, `/onboarding/recovery?workspace_id=${encodeURIComponent(targetMembership.workspace_id)}&oauth_request=${encodeURIComponent(requestId)}`);
+        return;
+      }
     }
 
     const nonce = oauthService.createConsentNonce(request.id);

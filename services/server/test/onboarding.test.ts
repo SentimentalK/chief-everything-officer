@@ -528,8 +528,8 @@ describe("Component 2: Onboarding Service Logic", () => {
     expect(partialFlow.repository_id).toBe("999889");
     expect(partialFlow.last_error_message).toContain("DB commit failed");
 
-    // Mock importRepository for recovery
-    vi.spyOn(ctx.repositoryService, "importRepository").mockImplementation(async () => {
+    // Mock importRepositoryAndBind for recovery
+    vi.spyOn(ctx.repositoryService, "importRepositoryAndBind").mockImplementation(async () => {
       const bound = ctx.store.createWorkspaceWithRepositoryBinding({
         userId: ctx.freshUser.userId,
         installationRowId: freshInst.installation.id,
@@ -559,7 +559,7 @@ describe("Component 2: Onboarding Service Logic", () => {
 
     expect(recResult.success).toBe(true);
     const recoveredFlow = ctx.onboardingStore.getFlow(flow.id)!;
-    expect(recoveredFlow.state).toBe("READY_TO_RESUME");
+    expect(recoveredFlow.state).toBe("AWAITING_REPOSITORY_RESTRICTION");
     expect(recoveredFlow.workspace_id).toBe(recResult.workspaceId);
   });
 });
@@ -575,6 +575,8 @@ describe("Component 4: OAuth Interception & Zero-Workspace Routing", () => {
       sessionManager: ctx.sessionManager,
       identityStore: ctx.store,
       bootstrapService: ctx.bootstrapService,
+      onboardingService: ctx.onboardingService,
+      onboardingStore: ctx.onboardingStore,
     });
     app.use(oauthRouter);
 
@@ -702,10 +704,16 @@ describe("Component 4: OAuth Interception & Zero-Workspace Routing", () => {
     const testApp = setupOAuthApp(ctx);
 
     try {
-      // userWithWorkspace has 1 workspace. Let's make its bootstrap READY
+      // userWithWorkspace has 1 workspace. Let's make its bootstrap READY and verify scope
       const attempt = ctx.store.beginWorkspaceBootstrapAttempt(ctx.userWithWorkspace.workspaceId);
       ctx.store.markWorkspaceBootstrapReady(ctx.userWithWorkspace.workspaceId, attempt.attemptId, {
         readyCommitSha: "a".repeat(40),
+      });
+      ctx.store.markRepositoryBindingScopeVerified(ctx.userWithWorkspace.workspaceId);
+      vi.spyOn(ctx.onboardingService, "verifyLiveInstallationScope").mockResolvedValue({
+        success: true,
+        binding: ctx.store.findRepositoryBindingByWorkspaceId(ctx.userWithWorkspace.workspaceId)!,
+        liveRepo: { id: 1, name: "repo", full_name: "dev-user-1/repo" },
       });
 
       const session = ctx.sessionManager.createSession({
@@ -738,6 +746,12 @@ describe("Component 4: OAuth Interception & Zero-Workspace Routing", () => {
 
     try {
       // Seeded workspace has state 'PENDING'
+      ctx.store.markRepositoryBindingScopeVerified(ctx.userWithWorkspace.workspaceId);
+      vi.spyOn(ctx.onboardingService, "verifyLiveInstallationScope").mockResolvedValue({
+        success: true,
+        binding: ctx.store.findRepositoryBindingByWorkspaceId(ctx.userWithWorkspace.workspaceId)!,
+        liveRepo: { id: 1, name: "repo", full_name: "dev-user-1/repo" },
+      });
       const session = ctx.sessionManager.createSession({
         userId: ctx.userWithWorkspace.userId,
         provider: "github",
@@ -1016,6 +1030,8 @@ describe("Component 5: Full Onboarding HTTP Flow & Callback", () => {
           status: "READY",
         };
       });
+
+      ctx.store.markRepositoryBindingScopeVerified(ctx.userWithWorkspace.workspaceId);
 
       const params = new URLSearchParams({
         workspace_id: ctx.userWithWorkspace.workspaceId,

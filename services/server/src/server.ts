@@ -27,7 +27,6 @@ import { WorkspaceBootstrapService } from "./github/bootstrap-service.js";
 import {
   createGitHubAppAuthRouter,
   createGitHubInstallationsApiRouter,
-  createGitHubRepositoryAuthorizationsRouter,
   createWorkspaceProvisioningRouter,
 } from "./github/router.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
@@ -308,15 +307,6 @@ if (config.githubAppEnabled && gitHubAppClient) {
   );
 
   app.use(
-    "/api/github/repository-authorizations",
-    createGitHubRepositoryAuthorizationsRouter({
-      repositoryService,
-      sessionManager: userSessionManager,
-      store: identityService.storeInstance,
-    }),
-  );
-
-  app.use(
     "/api/workspaces",
     createWorkspaceProvisioningRouter({
       bootstrapService,
@@ -370,6 +360,7 @@ if (config.oauthEnabled) {
       sessionManager: userSessionManager,
       identityStore: identityService.storeInstance,
       bootstrapService: bootstrapService ?? undefined,
+      onboardingService: onboardingService ?? undefined,
     }),
   );
 }

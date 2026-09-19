@@ -16,16 +16,25 @@ afterEach(async () => {
 
 describe("WorkspaceRuntime Git Credentials & Redaction", () => {
   it("GitHubAppGitCredentialProvider resolves x-access-token and token from appClient", async () => {
+    let capturedReq: any;
     const mockAppClient = {
-      getInstallationToken: async (installationId: string) => `ghs_secret_token_${installationId}`,
+      getScopedInstallationToken: async (req: any) => {
+        capturedReq = req;
+        return `ghs_scoped_token_${req.githubInstallationId}_${req.repositoryIds[0]}`;
+      },
     } as unknown as GitHubAppClient;
 
-    const provider = new GitHubAppGitCredentialProvider(mockAppClient, "987654");
+    const provider = new GitHubAppGitCredentialProvider(mockAppClient, "987654", "112233");
     const cred = await provider.getCredential();
 
+    expect(capturedReq).toEqual({
+      githubInstallationId: "987654",
+      repositoryIds: ["112233"],
+      permissions: { contents: "write" },
+    });
     expect(cred).toEqual({
       username: "x-access-token",
-      token: "ghs_secret_token_987654",
+      token: "ghs_scoped_token_987654_112233",
     });
   });
 

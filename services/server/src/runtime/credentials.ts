@@ -5,10 +5,15 @@ export class GitHubAppGitCredentialProvider implements GitCredentialProvider {
   constructor(
     private readonly appClient: GitHubAppClient,
     private readonly installationId: string,
+    private readonly repositoryId: string,
   ) {}
 
   async getCredential(): Promise<GitCredential> {
-    const token = await this.appClient.getInstallationToken(this.installationId);
+    const token = await this.appClient.getScopedInstallationToken({
+      githubInstallationId: this.installationId,
+      repositoryIds: [this.repositoryId],
+      permissions: { contents: "write" },
+    });
     return {
       username: "x-access-token",
       token,

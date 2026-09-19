@@ -1,7 +1,7 @@
 import { OnboardingStore } from "./store.js";
 import type { OnboardingFlow, OnboardingState } from "./types.js";
 import { OnboardingError } from "./types.js";
-import type { IdentityStore, UserGitHubInstallationItem } from "../identity/store.js";
+import type { IdentityStore, UserGitHubInstallationItem, GitHubRepositoryBindingRecord } from "../identity/store.js";
 import type { GitHubInstallationService } from "../github/installation-service.js";
 import {
   type GitHubRepositoryService,
@@ -199,34 +199,31 @@ export class OnboardingService {
   }
 
   /**
-   * Live-verifies that the user has restricted the GitHub App installation to ONLY the CEO repository,
-   * reconciles binding metadata if renamed, and then triggers bootstrapWorkspace.
+   * Live-verifies that the GitHub App installation for the specified workspace is restricted
+   * to strictly and only the bound repository.
    */
-  async verifyRepositoryAccessAndBootstrap(
-    flowId: string,
-    userId: string,
-  ): Promise<
-    | { success: true; status: ProductProvisioningStatus }
-    | { success: false; reason: "STILL_ALL" | "SCOPE_MISMATCH" | "VERIFICATION_FAILED"; message: string }
+  async verifyLiveInstallationScope(workspaceId: string): Promise<
+    | {
+        success: true;
+        binding: GitHubRepositoryBindingRecord;
+        liveRepo: { id: number; name: string; full_name: string; owner?: { login?: string }; default_branch?: string };
+      }
+    | {
+        success: false;
+        reason: "STILL_ALL" | "SCOPE_MISMATCH" | "VERIFICATION_FAILED";
+        message: string;
+      }
   > {
-    const flow = this.store.getFlow(flowId);
-    if (!flow || flow.user_id !== userId) {
-      throw new OnboardingError("Onboarding flow not found", "FLOW_NOT_FOUND", 404);
+    const binding = this.identityStore.findRepositoryBindingByWorkspaceId(workspaceId);
+    if (!binding) {
+      return { success: false, reason: "VERIFICATION_FAILED", message: "Repository binding not found for workspace" };
     }
 
-    if (flow.state !== "AWAITING_REPOSITORY_RESTRICTION") {
-      throw new OnboardingError(`Flow state is ${flow.state}; expected AWAITING_REPOSITORY_RESTRICTION`, "INVALID_STATE", 400);
-    }
-    if (!flow.installation_row_id || !flow.repository_id || !flow.workspace_id) {
-      throw new OnboardingError("Missing required installation or repository binding for verification", "INCOMPLETE_FLOW", 400);
-    }
-
-    const instRow = this.identityStore.findGitHubInstallationByRowId(flow.installation_row_id);
+    const instRow = this.identityStore.findGitHubInstallationByRowId(binding.github_installation_row_id);
     if (!instRow) {
-      throw new OnboardingError("Installation record not found", "INSTALLATION_NOT_FOUND", 404);
+      return { success: false, reason: "VERIFICATION_FAILED", message: "Installation record not found for binding" };
     }
 
-    // 1. Live installation verification
     let liveInst;
     try {
       liveInst = await this.appClient.getInstallation(instRow.github_installation_id);
@@ -239,7 +236,7 @@ export class OnboardingService {
     }
 
     const repoSelection = (liveInst as any).repository_selection;
-    if (repoSelection === "all") {
+    if (repoSelection !== "selected") {
       return {
         success: false,
         reason: "STILL_ALL",
@@ -247,10 +244,10 @@ export class OnboardingService {
       };
     }
 
-    // 2. Invalidate any cached tokens specifically for this installation
+    // Invalidate any cached tokens specifically for this installation
     this.appClient.invalidateInstallationTokens(instRow.github_installation_id);
 
-    // 3. Enumerate live selected repositories using an uncached verification token
+    // Enumerate live selected repositories using an uncached verification token
     let verificationToken: string;
     try {
       verificationToken = await this.appClient.mintInstallationVerificationToken(instRow.github_installation_id);
@@ -279,10 +276,10 @@ export class OnboardingService {
       return { success: false, reason: "VERIFICATION_FAILED", message: `Failed to enumerate repositories: ${err.message || err}` };
     }
 
-    const targetRepoIdNum = Number(flow.repository_id);
+    const targetRepoIdNum = Number(binding.github_repository_id);
     const accessibleIds = accessibleRepos.map((r) => r.id);
 
-    // Exact equality check: accessible repository IDs must be [flow.repository_id]
+    // Exact equality check: accessible repository IDs must be strictly [binding.github_repository_id]
     if (accessibleIds.length !== 1 || accessibleIds[0] !== targetRepoIdNum) {
       if (!accessibleIds.includes(targetRepoIdNum)) {
         return {
@@ -298,16 +295,60 @@ export class OnboardingService {
       };
     }
 
-    // 4. Atomically reconcile mutable binding metadata and workspace remote_url if changed
-    const liveTargetRepo = accessibleRepos[0]!;
+    return {
+      success: true,
+      binding,
+      liveRepo: accessibleRepos[0]!,
+    };
+  }
+
+  /**
+   * Live-verifies that the user has restricted the GitHub App installation to ONLY the CEO repository,
+   * records the verified scope timestamp in DB, reconciles binding metadata if renamed,
+   * and then triggers bootstrapWorkspace.
+   */
+  async verifyRepositoryAccessAndBootstrap(
+    flowId: string,
+    userId: string,
+  ): Promise<
+    | { success: true; status: ProductProvisioningStatus }
+    | { success: false; reason: "STILL_ALL" | "SCOPE_MISMATCH" | "VERIFICATION_FAILED"; message: string }
+  > {
+    const flow = this.store.getFlow(flowId);
+    if (!flow || flow.user_id !== userId) {
+      throw new OnboardingError("Onboarding flow not found", "FLOW_NOT_FOUND", 404);
+    }
+
+    if (flow.state !== "AWAITING_REPOSITORY_RESTRICTION") {
+      throw new OnboardingError(`Flow state is ${flow.state}; expected AWAITING_REPOSITORY_RESTRICTION`, "INVALID_STATE", 400);
+    }
+    if (!flow.workspace_id) {
+      throw new OnboardingError("Missing required workspace binding for verification", "INCOMPLETE_FLOW", 400);
+    }
+
+    const verification = await this.verifyLiveInstallationScope(flow.workspace_id);
+    if (!verification.success) {
+      this.identityStore.clearRepositoryBindingScopeVerified(flow.workspace_id);
+      this.store.updateFlow(flowId, {
+        last_error_code: verification.reason,
+        last_error_message: verification.message,
+      });
+      return verification;
+    }
+
+    // Mark scope verified in database
+    this.identityStore.markRepositoryBindingScopeVerified(flow.workspace_id);
+
+    // Atomically reconcile mutable binding metadata and workspace remote_url if changed
+    const liveTargetRepo = verification.liveRepo;
     this.identityStore.reconcileRepositoryMetadataById({
-      githubRepositoryId: flow.repository_id,
+      githubRepositoryId: verification.binding.github_repository_id,
       ownerLogin: liveTargetRepo.owner?.login || "",
       repositoryName: liveTargetRepo.name,
       fullName: liveTargetRepo.full_name,
     });
 
-    // 5. Transition flow to PROVISIONING and bootstrap
+    // Transition flow to PROVISIONING and bootstrap
     this.store.updateFlow(flowId, { state: "PROVISIONING" });
 
     try {
@@ -350,7 +391,7 @@ export class OnboardingService {
       throw new OnboardingError("No partial repository to recover", "NO_PARTIAL_REPOSITORY", 400);
     }
 
-    const imported = await this.repositoryService.importRepository(
+    const imported = await this.repositoryService.importRepositoryAndBind(
       grantId,
       session.sessionId,
       session.userId,
@@ -360,7 +401,8 @@ export class OnboardingService {
 
     this.store.updateFlow(flowId, {
       workspace_id: imported.workspace.id,
-      state: "READY_TO_RESUME",
+      installation_row_id: imported.binding.github_installation_row_id,
+      state: "AWAITING_REPOSITORY_RESTRICTION",
       last_error_code: null,
       last_error_message: null,
     });
@@ -373,8 +415,20 @@ export class OnboardingService {
     if (!flow || flow.user_id !== userId) {
       throw new OnboardingError("Onboarding flow not found", "FLOW_NOT_FOUND", 404);
     }
+    if (flow.state !== "RECOVERY_REQUIRED") {
+      throw new OnboardingError(`Flow state is ${flow.state}; expected RECOVERY_REQUIRED`, "INVALID_STATE", 400);
+    }
     if (!flow.workspace_id) {
       throw new OnboardingError("No workspace to bootstrap", "NO_WORKSPACE", 400);
+    }
+
+    const binding = this.identityStore.findRepositoryBindingByWorkspaceId(flow.workspace_id);
+    if (binding && binding.access_scope_verified_at_ms == null) {
+      throw new OnboardingError(
+        "Repository access restriction has not been verified",
+        "RESTRICTION_REQUIRED",
+        400,
+      );
     }
 
     const result = await this.bootstrapService.bootstrapWorkspace(flow.workspace_id);

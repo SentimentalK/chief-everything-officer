@@ -77,7 +77,11 @@ export class WorkspaceRuntimeRegistry {
     if (this.options.credentialProviderFactory) {
       credentialProvider = this.options.credentialProviderFactory(descriptor);
     } else if (this.options.appClient) {
-      credentialProvider = new GitHubAppGitCredentialProvider(this.options.appClient, descriptor.installationId);
+      credentialProvider = new GitHubAppGitCredentialProvider(
+        this.options.appClient,
+        descriptor.installationId,
+        binding.github_repository_id,
+      );
     } else {
       throw new WorkspaceRuntimeResolutionError(
         "INVALID_WORKSPACE_STATE",
@@ -236,6 +240,14 @@ export class WorkspaceRuntimeRegistry {
       throw new WorkspaceRuntimeResolutionError(
         "INVALID_REPOSITORY_DATA",
         `Invalid repository branch '${binding.branch}'; must be non-empty without control characters.`,
+      );
+    }
+
+    // 8. Repository Access Scope Restriction
+    if (binding.access_scope_verified_at_ms == null) {
+      throw new WorkspaceRuntimeResolutionError(
+        "REPOSITORY_SCOPE_NOT_VERIFIED",
+        `Workspace '${workspaceId}' repository access restriction has not been verified.`,
       );
     }
 

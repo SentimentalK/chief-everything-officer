@@ -506,6 +506,57 @@ export function createOnboardingRouter(options: OnboardingRouterOptions): Router
       onboardingService.storeInstance.updateFlow(flow.id, { host_oauth_request_id: oauthRequest });
     }
 
+    if (flow.state === "PROVISIONING") {
+      let wsId = flow.workspace_id;
+      if (!wsId) {
+        const owned = identityStore.listWorkspaceMembershipsForUser(session.userId).find((m) => m.role === "owner");
+        if (owned) {
+          wsId = owned.workspace_id;
+          const binding = identityStore.findRepositoryBindingByWorkspaceId(wsId);
+          onboardingService.storeInstance.updateFlow(flow.id, {
+            workspace_id: wsId,
+            repository_id: binding ? binding.github_repository_id : flow.repository_id,
+            installation_row_id: binding ? binding.github_installation_row_id : flow.installation_row_id,
+          });
+        }
+      }
+
+      if (wsId) {
+        const binding = identityStore.findRepositoryBindingByWorkspaceId(wsId);
+        if (binding && binding.access_scope_verified_at_ms == null) {
+          onboardingService.storeInstance.updateFlow(flow.id, {
+            state: "AWAITING_REPOSITORY_RESTRICTION",
+          });
+          const target = oauthRequest
+            ? `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+            : `/onboarding/security?flow=${encodeURIComponent(flow.id)}`;
+          res.redirect(302, target);
+          return;
+        }
+        if (identityStore.isWorkspaceReadyForHost(wsId)) {
+          onboardingService.storeInstance.updateFlow(flow.id, {
+            state: "READY_TO_RESUME",
+          });
+          const target = oauthRequest
+            ? `/onboarding/complete?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+            : `/onboarding/complete?flow=${encodeURIComponent(flow.id)}`;
+          res.redirect(302, target);
+          return;
+        }
+      }
+
+      onboardingService.storeInstance.updateFlow(flow.id, {
+        state: "RECOVERY_REQUIRED",
+        last_error_code: "PROVISIONING_INTERRUPTED",
+        last_error_message: "Workspace provisioning was interrupted. Please retry.",
+      });
+      const target = oauthRequest
+        ? `/onboarding/recovery?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+        : `/onboarding/recovery?flow=${encodeURIComponent(flow.id)}`;
+      res.redirect(302, target);
+      return;
+    }
+
     if (flow.state === "AWAITING_REPOSITORY_RESTRICTION") {
       const target = oauthRequest
         ? `/onboarding/security?flow=${encodeURIComponent(flow.id)}&oauth_request=${encodeURIComponent(oauthRequest)}`
@@ -825,6 +876,22 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
         res.status(403).send("Access denied");
         return;
       }
+      const binding = identityStore.findRepositoryBindingByWorkspaceId(workspaceId);
+      if (binding && binding.access_scope_verified_at_ms == null) {
+        const target = oauthRequest
+          ? `/onboarding/recovery?workspace_id=${encodeURIComponent(workspaceId)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+          : `/onboarding/recovery?workspace_id=${encodeURIComponent(workspaceId)}`;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.status(400).send(
+          renderRecoveryPage({
+            workspaceId,
+            errorCode: "RESTRICTION_REQUIRED",
+            errorMessage: "Repository access restriction has not been verified. You must restrict CEO access to this repository first.",
+            oauthRequest,
+          }),
+        );
+        return;
+      }
       try {
         await onboardingService.bootstrapServiceInstance.bootstrapWorkspace(workspaceId);
         const target = oauthRequest
@@ -849,6 +916,17 @@ function buildInstallationSettingsUrl(accountType: string, accountLogin: string,
     if (!flow || flow.user_id !== session.userId) {
       res.redirect(302, "/onboarding");
       return;
+    }
+
+    if (flow.workspace_id) {
+      const binding = identityStore.findRepositoryBindingByWorkspaceId(flow.workspace_id);
+      if (binding && binding.access_scope_verified_at_ms == null) {
+        const target = oauthRequest
+          ? `/onboarding/security?flow=${encodeURIComponent(flowId)}&oauth_request=${encodeURIComponent(oauthRequest)}`
+          : `/onboarding/security?flow=${encodeURIComponent(flowId)}`;
+        res.redirect(302, target);
+        return;
+      }
     }
 
     try {

@@ -122,9 +122,9 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
       INSERT INTO github_repository_bindings (
         id, workspace_id, github_repository_id, github_installation_row_id,
         owner_account_id, owner_login, repository_name, full_name,
-        branch, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, '99001', ?, '1', ?, ?, ?, ?, ?, ?);
-    `).run("grb_ws_one", "ws_one", "ghi_1", "org-one", "repo-one", "org-one/repo-one", "main", now, now);
+        branch, access_scope_verified_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, '99001', ?, '1', ?, ?, ?, ?, ?, ?, ?);
+    `).run("grb_ws_one", "ws_one", "ghi_1", "org-one", "repo-one", "org-one/repo-one", "main", now, now, now);
 
     db.prepare(`
       INSERT INTO workspace_bootstraps (
@@ -169,9 +169,9 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
       INSERT INTO github_repository_bindings (
         id, workspace_id, github_repository_id, github_installation_row_id,
         owner_account_id, owner_login, repository_name, full_name,
-        branch, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, '99002', ?, '1', ?, ?, ?, ?, ?, ?);
-    `).run("grb_ws_two", "ws_two", "ghi_2", "org-two", "repo-two", "org-two/repo-two", "main", now, now);
+        branch, access_scope_verified_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, '99002', ?, '1', ?, ?, ?, ?, ?, ?, ?);
+    `).run("grb_ws_two", "ws_two", "ghi_2", "org-two", "repo-two", "org-two/repo-two", "main", now, now, now);
 
     db.prepare(`
       INSERT INTO workspace_bootstraps (

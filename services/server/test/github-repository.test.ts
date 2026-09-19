@@ -1324,7 +1324,7 @@ describe("Step 3.5B: Create Repository", () => {
       INSERT INTO workspaces VALUES ('ws_conflict', ?, 'https://github.com/c.git', 'main', 1000);
     `).run(ctx.userId);
     raw.prepare(`
-      INSERT INTO github_repository_bindings VALUES ('grb_conf', 'ws_conflict', '9995', ?, '123456', 'dev-user', 'other', 'dev-user/other', 'main', 1000, 1000);
+      INSERT INTO github_repository_bindings (id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms) VALUES ('grb_conf', 'ws_conflict', '9995', ?, '123456', 'dev-user', 'other', 'dev-user/other', 'main', 1000, 1000);
     `).run(ctx.installationRowId);
     raw.close();
 

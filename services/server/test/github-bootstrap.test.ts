@@ -1108,7 +1108,13 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     const retryForbidden = await invoke("POST", `/api/workspaces/${ctx.workspaceId}/bootstrap/retry`, otherSession.sessionId);
     expect(retryForbidden.status).toBe(403);
 
-    // 7. POST retry owner -> 200 and transitions to READY
+    // 7. POST retry without verified scope -> 400 RESTRICTION_REQUIRED
+    const retryUnverified = await invoke("POST", `/api/workspaces/${ctx.workspaceId}/bootstrap/retry`, ctx.sessionId);
+    expect(retryUnverified.status).toBe(400);
+    expect(retryUnverified.body.error).toBe("RESTRICTION_REQUIRED");
+
+    // 8. POST retry owner with verified scope -> 200 and transitions to READY
+    ctx.store.markRepositoryBindingScopeVerified(ctx.workspaceId);
     const retryOk = await invoke("POST", `/api/workspaces/${ctx.workspaceId}/bootstrap/retry`, ctx.sessionId);
     expect(retryOk.status).toBe(200);
     expect(retryOk.body.status).toBe("READY");

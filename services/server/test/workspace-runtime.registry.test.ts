@@ -89,6 +89,7 @@ describe("WorkspaceRuntimeRegistry", () => {
     fullName?: string;
     branch?: string;
     bootstrapState?: "PENDING" | "APPLYING" | "READY" | "FAILED";
+    accessScopeVerifiedAtMs?: number | null;
   }) {
     const userId = options.userId ?? "usr_test_1";
     const installationRowId = options.installationRowId ?? "ghi_1";
@@ -129,13 +130,17 @@ describe("WorkspaceRuntimeRegistry", () => {
         nowMs,
       );
 
+      const verifiedAt = options.accessScopeVerifiedAtMs !== undefined
+        ? options.accessScopeVerifiedAtMs
+        : (bootstrapState === "READY" ? nowMs : null);
+
       // Insert repository binding
       db.prepare(`
         INSERT OR REPLACE INTO github_repository_bindings (
           id, workspace_id, github_repository_id, github_installation_row_id,
           owner_account_id, owner_login, repository_name, full_name,
-          branch, created_at_ms, updated_at_ms
-        ) VALUES (?, ?, ?, ?, 'acct_1', ?, ?, ?, ?, ?, ?);
+          branch, access_scope_verified_at_ms, created_at_ms, updated_at_ms
+        ) VALUES (?, ?, ?, ?, 'acct_1', ?, ?, ?, ?, ?, ?, ?);
       `).run(
         `grb_${options.workspaceId}`,
         options.workspaceId,
@@ -145,6 +150,7 @@ describe("WorkspaceRuntimeRegistry", () => {
         repositoryName,
         fullName,
         branch,
+        verifiedAt,
         nowMs,
         nowMs,
       );

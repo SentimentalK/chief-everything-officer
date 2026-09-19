@@ -348,7 +348,6 @@ export function createGitHubRepositoryAuthorizationsRouter(
   const { repositoryService, sessionManager, store } = options;
   const router = express.Router();
 
-  // Support JSON and urlencoded body if mounted independently
   router.use(express.json());
   router.use(express.urlencoded({ extended: false }));
 
@@ -619,6 +618,15 @@ export function createWorkspaceProvisioningRouter(
 
     if (!store.hasWorkspaceAccess(workspaceId, session.userId)) {
       res.status(403).json({ error: "forbidden", message: "User is not the owner of this workspace" });
+      return;
+    }
+
+    const retryBinding = store.findRepositoryBindingByWorkspaceId(workspaceId);
+    if (retryBinding && retryBinding.access_scope_verified_at_ms == null) {
+      res.status(400).json({
+        error: "RESTRICTION_REQUIRED",
+        message: "Repository access restriction has not been verified",
+      });
       return;
     }
 

@@ -46,7 +46,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 8;
+export const IDENTITY_DB_USER_VERSION = 9;
 
 export type WorkspaceBootstrapState =
   | "PENDING"
@@ -109,6 +109,7 @@ export interface GitHubRepositoryBindingRecord {
   branch: string;
   created_at_ms: number;
   updated_at_ms: number;
+  access_scope_verified_at_ms: number | null;
 }
 
 export interface CreateWorkspaceWithRepositoryBindingInput {
@@ -120,6 +121,7 @@ export interface CreateWorkspaceWithRepositoryBindingInput {
   repositoryName: string;
   fullName: string;
   branch: string;
+  accessScopeVerifiedAtMs?: number | null;
 }
 
 
@@ -234,6 +236,7 @@ CREATE TABLE github_repository_bindings (
   branch TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
+  access_scope_verified_at_ms INTEGER,
   FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
   FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
 );
@@ -698,6 +701,11 @@ export class IdentityStore {
       "state IN ('AWAITING_REPOSITORY_CHOICE', 'AWAITING_GITHUB_ACCESS', 'PROVISIONING', 'AWAITING_REPOSITORY_RESTRICTION', 'READY_TO_RESUME', 'RECOVERY_REQUIRED')",
     );
 
+    const bindingCols = db.prepare("PRAGMA table_info(github_repository_bindings);").all() as Array<{ name: string }>;
+    if (!bindingCols.some((c) => c.name === "access_scope_verified_at_ms")) {
+      throw new IdentityStructureError("Identity table 'github_repository_bindings' is missing column 'access_scope_verified_at_ms'.");
+    }
+
     this.validateData();
   }
 
@@ -822,7 +830,7 @@ export class IdentityStore {
     }
 
     const bindings = db.prepare(
-      "SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms FROM github_repository_bindings;",
+      "SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms FROM github_repository_bindings;",
     ).all() as Array<{
       id: string;
       workspace_id: string;
@@ -835,6 +843,7 @@ export class IdentityStore {
       branch: string;
       created_at_ms: number;
       updated_at_ms: number;
+      access_scope_verified_at_ms: number | null;
     }>;
 
     for (const b of bindings) {
@@ -870,6 +879,11 @@ export class IdentityStore {
       }
       if (!Number.isInteger(b.updated_at_ms) || b.updated_at_ms < 0) {
         throw new IdentityStructureError(`Invalid updated_at_ms in github_repository_bindings row '${b.id}'.`);
+      }
+      if (b.access_scope_verified_at_ms !== null && b.access_scope_verified_at_ms !== undefined) {
+        if (!Number.isInteger(b.access_scope_verified_at_ms) || b.access_scope_verified_at_ms < 0) {
+          throw new IdentityStructureError(`Invalid access_scope_verified_at_ms in github_repository_bindings row '${b.id}'.`);
+        }
       }
     }
 
@@ -1160,6 +1174,9 @@ export class IdentityStore {
           break;
         case 7:
           IdentityStore.migrateV7ToV8(db);
+          break;
+        case 8:
+          IdentityStore.migrateV8ToV9(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -1605,6 +1622,38 @@ export class IdentityStore {
     }
   }
 
+  static migrateV8ToV9(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 8) {
+        throw new IdentityStructureError("migrateV8ToV9 requires user_version = 8.");
+      }
+
+      const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'github_repository_bindings';",
+      ).get() as { name: string } | undefined;
+      if (!row) {
+        throw new IdentityStructureError("Cannot migrate to v9: missing required v8 table 'github_repository_bindings'.");
+      }
+
+      db.exec(`
+        ALTER TABLE github_repository_bindings ADD COLUMN access_scope_verified_at_ms INTEGER;
+
+        PRAGMA user_version = 9;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 8 to 9: ${error}`);
+    }
+  }
+
   findExternalIdentity(provider: string, providerSubject: string): {
     id: string;
     provider: string;
@@ -1997,7 +2046,7 @@ export class IdentityStore {
   findRepositoryBindingByWorkspaceId(workspaceId: string): GitHubRepositoryBindingRecord | null {
     return this.withDb((db) => {
       const row = db.prepare(`
-        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms
         FROM github_repository_bindings
         WHERE workspace_id = ?
         LIMIT 1;
@@ -2009,7 +2058,7 @@ export class IdentityStore {
   findRepositoryBindingByGitHubRepoId(githubRepositoryId: string): GitHubRepositoryBindingRecord | null {
     return this.withDb((db) => {
       const row = db.prepare(`
-        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms
         FROM github_repository_bindings
         WHERE github_repository_id = ?
         LIMIT 1;
@@ -2021,7 +2070,7 @@ export class IdentityStore {
   findRepositoryBindingById(id: string): GitHubRepositoryBindingRecord | null {
     return this.withDb((db) => {
       const row = db.prepare(`
-        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms
         FROM github_repository_bindings
         WHERE id = ?
         LIMIT 1;
@@ -2127,17 +2176,26 @@ export class IdentityStore {
 
   /**
    * Authoritative helper for checking whether a workspace is ready for Host access.
-   * If the workspace is GitHub-managed or has a bootstrap record, it is ready if and only if
-   * its bootstrap record exists and is in READY state.
+   * If the workspace is GitHub-managed:
+   * 1. access_scope_verified_at_ms MUST NOT be null (least privilege verified).
+   * 2. bootstrap record must exist and be in READY state.
+   * If the workspace has a bootstrap record (or is GitHub-managed), bootstrap must be READY.
    */
   isWorkspaceReadyForHost(workspaceId: string): boolean {
     return this.withDb((db) => {
       const bindingRow = db.prepare(
-        "SELECT id FROM github_repository_bindings WHERE workspace_id = ? LIMIT 1;",
-      ).get(workspaceId);
+        "SELECT access_scope_verified_at_ms FROM github_repository_bindings WHERE workspace_id = ? LIMIT 1;",
+      ).get(workspaceId) as { access_scope_verified_at_ms: number | null } | undefined;
       const bootstrapRow = db.prepare(
         "SELECT state FROM workspace_bootstraps WHERE workspace_id = ? LIMIT 1;",
       ).get(workspaceId) as { state: string } | undefined;
+
+      // If workspace is GitHub-managed, access scope MUST have been verified
+      if (bindingRow) {
+        if (bindingRow.access_scope_verified_at_ms == null) {
+          return false;
+        }
+      }
 
       if (bindingRow || bootstrapRow) {
         return bootstrapRow !== undefined && bootstrapRow.state === "READY";
@@ -2147,10 +2205,47 @@ export class IdentityStore {
     });
   }
 
+  /**
+   * Dedicated method to record that the repository binding's access scope
+   * has been verified as restricted to this single repository.
+   */
+  markRepositoryBindingScopeVerified(workspaceId: string, verifiedAtMs?: number): void {
+    const now = verifiedAtMs ?? Date.now();
+    this.withDb((db) => {
+      const res = db.prepare(`
+        UPDATE github_repository_bindings
+        SET access_scope_verified_at_ms = ?,
+            updated_at_ms = ?
+        WHERE workspace_id = ?;
+      `).run(now, now, workspaceId);
+      if (Number(res.changes) === 0) {
+        throw new IdentityError(
+          `Cannot mark repository binding scope verified: binding for workspace '${workspaceId}' not found.`,
+        );
+      }
+    });
+  }
+
+  /**
+   * Dedicated method to clear the access scope verification of a repository binding,
+   * indicating that access restriction must be re-verified.
+   */
+  clearRepositoryBindingScopeVerified(workspaceId: string): void {
+    const now = Date.now();
+    this.withDb((db) => {
+      db.prepare(`
+        UPDATE github_repository_bindings
+        SET access_scope_verified_at_ms = NULL,
+            updated_at_ms = ?
+        WHERE workspace_id = ?;
+      `).run(now, workspaceId);
+    });
+  }
+
   listRepositoryBindingsForInstallation(installationRowId: string): GitHubRepositoryBindingRecord[] {
     return this.withDb((db) => {
       return db.prepare(`
-        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        SELECT id, workspace_id, github_repository_id, github_installation_row_id, owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms
         FROM github_repository_bindings
         WHERE github_installation_row_id = ?
         ORDER BY created_at_ms ASC, id ASC;
@@ -2268,8 +2363,8 @@ export class IdentityStore {
           INSERT INTO github_repository_bindings (
             id, workspace_id, github_repository_id, github_installation_row_id,
             owner_account_id, owner_login, repository_name, full_name,
-            branch, created_at_ms, updated_at_ms
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            branch, created_at_ms, updated_at_ms, access_scope_verified_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         `).run(
           bindingId,
           workspaceId,
@@ -2282,6 +2377,7 @@ export class IdentityStore {
           input.branch.trim(),
           nowMs,
           nowMs,
+          input.accessScopeVerifiedAtMs ?? null,
         );
 
         db.prepare(`
@@ -2321,6 +2417,7 @@ export class IdentityStore {
             branch: input.branch.trim(),
             created_at_ms: nowMs,
             updated_at_ms: nowMs,
+            access_scope_verified_at_ms: input.accessScopeVerifiedAtMs ?? null,
           },
           bootstrap: {
             workspace_id: workspaceId,
