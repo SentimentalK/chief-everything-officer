@@ -619,7 +619,7 @@ export class WorkspaceBootstrapService {
   ): Promise<WorkspaceBootstrapRecord> {
     const firstAnchor = manifest.find((a) => a.path === "README.md") ?? manifest[0];
     if (!firstAnchor) {
-      throw new ManualRecoveryBootstrapError("No bootstrap anchors provided in manifest", "EMPTY_MANIFEST");
+      throw new ManualRecoveryBootstrapError("EMPTY_MANIFEST", "No bootstrap anchors provided in manifest");
     }
 
     const contentsRes = await this.fetchFn(

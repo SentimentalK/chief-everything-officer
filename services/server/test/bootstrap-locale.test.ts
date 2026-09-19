@@ -68,6 +68,18 @@ describe("resolveBootstrapLocale", () => {
         acceptLanguage: "en,zh;q=0.9",
       }),
     ).toBe("en");
+
+    // Explicit q=0 means unacceptable per RFC 9110
+    expect(
+      resolveBootstrapLocale({
+        acceptLanguage: "fr;q=1,zh;q=0",
+      }),
+    ).toBe("en");
+    expect(
+      resolveBootstrapLocale({
+        acceptLanguage: "zh;q=0,en;q=0.1",
+      }),
+    ).toBe("en");
   });
 
   it("handles malformed and edge-case header formats gracefully", () => {

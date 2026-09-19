@@ -78,6 +78,7 @@ function parseAcceptLanguage(header: string): string[] {
         }
       }
     }
+    if (q <= 0) continue;
     entries.push({ tag, q });
   }
 
