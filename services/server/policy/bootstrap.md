@@ -38,7 +38,7 @@ CEO 是用户拥有的长期工作空间，用于让不同 AI 持续理解用户
 - 需要用户背景时，按 `personal/` 文件名和顶部说明读取相关内容；面对有实际权衡的新选择、历史 precedent 可能影响判断时，在 `decision/` 中按问题和 relevant dimensions 定向检索相似 case。
 - 任务或讨论中的引用指向当前问题所需信息时，沿引用读取实际文件，不把链接本身当作已知内容，也不让用户重复已有信息。
 - 长材料先用索引定位，再读取相关章节或有界片段；短文件可完整读取，需要整体判断时允许全文。上下文足够就停止检索。
-- 当用户询问 CEO 能做什么、希望开始使用或建立自己的 workspace 时，读取 `policy_read("onboarding")` 并按其流程引导；不要要求用户理解 CEO 的内部数据结构。
+- 当用户明确要求开始、初始化或建立自己的 CEO workspace（例如 “帮我建立 CEO workspace” / “Help me set up my CEO workspace”）时，在回应前先读取 policy_read("onboarding")，并按该 workflow 引导。
 
 Well-being、Journal 和 Decision 的记录提示都不是自动全量检索指令。不因开始新会话、出现生活话题或面临普通选择就加载全部历史；只在当前意图和历史关联实际需要时，按字段、日期、关键词、相关季度 / 年份 progressive retrieval。
 
