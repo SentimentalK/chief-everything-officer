@@ -32,6 +32,7 @@ import {
   validatePath,
 } from "./policy.js";
 import { isAllowedResourceSourcePath } from "./resource/security.js";
+import { parseWorkspaceRuleFrontmatter } from "./policy-resolver.js";
 
 export interface WorkspaceSnapshot {
   commit: string;
@@ -120,6 +121,11 @@ const ARCHIVE_ENTRY_RE = /^archive\/(\d{4})\/([^/]+\.md)$/;
 /** A `tasks/<filename>.md` reference, exactly one segment under tasks/. */
 function isTaskFilePath(filePath: string): boolean {
   return /^tasks\/[^/]+\.md$/.test(filePath);
+}
+
+/** A `rules/<filename>.md` reference, exactly one segment under rules/. */
+export function isRuleFilePath(filePath: string): boolean {
+  return /^rules\/[^/]+\.md$/.test(filePath);
 }
 
 /** Basename of a valid archived entry, or null when the entry is not a task archive file. */
@@ -789,7 +795,12 @@ export class CeoWorkspace {
           throw new CeoError("INVALID_OPERATION", "Move source and target cannot be identical.", { source, target });
         }
       }
-      if ("content" in operation) total += assertContentSize(operation.content);
+      if ("content" in operation) {
+        total += assertContentSize(operation.content);
+        if ((operation.op === "create" || operation.op === "replace") && isRuleFilePath(source)) {
+          parseWorkspaceRuleFrontmatter(operation.content, source);
+        }
+      }
       for (const filePath of paths) {
         if (touched.has(filePath)) throw new CeoError("INVALID_OPERATION", "A path may be changed only once per transaction.", { path: filePath });
         touched.add(filePath);
@@ -815,7 +826,11 @@ export class CeoWorkspace {
         await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
         const current = await this.readUtf8(absolute, filePath);
         assertContentSize(current + operation.content);
-        await writeFile(absolute, current + operation.content, "utf8");
+        const combined = current + operation.content;
+        if (isRuleFilePath(filePath)) {
+          parseWorkspaceRuleFrontmatter(combined, filePath);
+        }
+        await writeFile(absolute, combined, "utf8");
       } else if (operation.op === "delete") {
         await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
         await rm(absolute, { force: true });
@@ -826,6 +841,10 @@ export class CeoWorkspace {
         const targetAbsolute = path.join(worktree, target);
         const exists = await access(targetAbsolute).then(() => true).catch(() => false);
         if (exists) throw new CeoError("INVALID_OPERATION", "Move target already exists.", { target });
+        if (isRuleFilePath(target)) {
+          const current = await this.readUtf8(absolute, filePath);
+          parseWorkspaceRuleFrontmatter(current, target);
+        }
         await mkdir(path.dirname(targetAbsolute), { recursive: true });
         await rename(absolute, targetAbsolute);
       }
@@ -884,6 +903,10 @@ export class CeoWorkspace {
         // Safe document file in resources/<id>/source/original.<ext>
       } else {
         validatePath(filePath);
+      }
+      if (!isDeleted && isRuleFilePath(filePath)) {
+        const ruleContent = await readFile(path.join(worktree, filePath), "utf8");
+        parseWorkspaceRuleFrontmatter(ruleContent, filePath);
       }
       if (isPathIgnored(matcher, filePath)) {
         throw new CeoError("ACCESS_DENIED", "Changed path in diff is excluded by .ceoignore.", { path: filePath });

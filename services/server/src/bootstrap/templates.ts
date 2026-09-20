@@ -22,15 +22,27 @@ CEO 已经内置了默认规则，并会在需要时自动创建和维护相应�
 
 ## 你可以修改 CEO 的规则
 
-如果默认行为不适合你，可以在 \`rules/\` 下创建对应领域的规则。
+如果默认行为不适合你，可以在 \`rules/\` 下创建对应领域的规则文件（如 \`rules/<area>.md\`）。
+
+规则文件必须在开头使用 YAML frontmatter 声明扩展模式：
+
+\`\`\`markdown
+---
+mode: extend
+---
+
+你的自定义规则...
+\`\`\`
+
+有两种模式可选：
+- \`extend\`（常规/默认选择）：保留 CEO 该领域的内置政策，并在此基础上补充或重载你的工作空间专属行为。绝大多数情况下应该使用此模式。
+- \`override\`：彻底废弃该领域的内置政策，完全使用你编写的自定义规则。
 
 例如：
 
 \`rules/tasks.md\`
 
-可以告诉 AI 你希望如何维护 Tasks。
-
-Workspace 中的对应规则会优先于 CEO 为该领域提供的默认规则。
+可以根据你的偏好定义 Tasks 领域的扩展或自定义规则。
 
 ## 你也可以创建自己的领域
 
@@ -87,15 +99,27 @@ These files and folders may not exist yet. CEO creates them when they become use
 
 ## You can customize how CEO works
 
-If the default behavior for an area does not fit you, create a corresponding rule under \`rules/\`.
+If the default behavior for an area does not fit you, create a corresponding rule file under \`rules/\` (such as \`rules/<area>.md\`).
+
+Rule files must declare an extension mode using YAML frontmatter at the very top:
+
+\`\`\`markdown
+---
+mode: extend
+---
+
+Your custom rules...
+\`\`\`
+
+Two modes are available:
+- \`extend\` (normal / default choice): keep CEO's built-in policy for this area, while adding or overriding workspace-specific behaviors. This is the standard choice in almost all cases.
+- \`override\`: completely replace the built-in policy for that area with your own custom rules.
 
 For example:
 
 \`rules/tasks.md\`
 
 can describe how you want your Tasks maintained.
-
-A workspace rule for an area takes priority over CEO's built-in default rule for that area.
 
 ## You can create your own areas
 

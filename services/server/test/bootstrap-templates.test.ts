@@ -60,4 +60,36 @@ describe("Bootstrap templates and manifest", () => {
       expect(content).not.toContain("System Prompt");
     }
   });
+
+  it("explains YAML frontmatter and extend / override modes in both README locales", () => {
+    // English README
+    expect(README_EN).toContain("rules/<area>.md");
+    expect(README_EN).toContain("mode: extend");
+    expect(README_EN).toContain("extend` (normal / default choice)");
+    expect(README_EN).toContain("override`: completely replace the built-in policy");
+
+    // Chinese README
+    expect(README_ZH).toContain("rules/<area>.md");
+    expect(README_ZH).toContain("mode: extend");
+    expect(README_ZH).toContain("extend`（常规/默认选择）");
+    expect(README_ZH).toContain("override`：彻底废弃该领域的内置政策");
+  });
+
+  it("ensures AI bootstrap policy contains the separate rule authoring contract", async () => {
+    const { loadProductPolicy } = await import("../src/product-policy.js");
+    const policy = await loadProductPolicy();
+
+    expect(policy.bootstrap).toBeDefined();
+    // Preserves existing policy_read resolution requirement
+    expect(policy.bootstrap).toContain('policy_read("<area>")');
+    expect(policy.bootstrap).toContain("AI 不自行读取、解析或拼接 `rules/<area>.md` 来重建规则优先级");
+
+    // Separate Rule Authoring Contract
+    expect(policy.bootstrap).toContain("## 规则编写（Rule Authoring）");
+    expect(policy.bootstrap).toContain("`rules/<area>.md`");
+    expect(policy.bootstrap).toContain("mode: extend");
+    expect(policy.bootstrap).toContain("`extend`：默认选择");
+    expect(policy.bootstrap).toContain("`override`：仅当用户明确要求完全替换该领域的内置 policy 时使用");
+    expect(policy.bootstrap).toContain("规则正文必须非空");
+  });
 });

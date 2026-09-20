@@ -336,14 +336,14 @@ describe("CeoWorkspace", () => {
       summary: "Add markdown with hard line breaks",
       operations: [{
         op: "create",
-        path: "rules/test.md",
+        path: "notes/test.md",
         content: markdownWithHardBreaks,
       }],
     });
 
     expect(result.ok).toBe(true);
-    expect(git(item.remote, "show", "main:rules/test.md")).toBe(markdownWithHardBreaks.trimEnd());
-    const read = await workspace.readFiles(["rules/test.md"]);
+    expect(git(item.remote, "show", "main:notes/test.md")).toBe(markdownWithHardBreaks.trimEnd());
+    const read = await workspace.readFiles(["notes/test.md"]);
     expect((read.files as any[])[0].content).toBe(markdownWithHardBreaks);
   });
 

@@ -55,6 +55,30 @@ Workspace customization 的存储格式、extend / override 语义、legacy comp
 
 规则名与领域对应：tasks、personal、well-being、journal、decision、resources 分别对应同名语义区域。Well-being、Journal 和 Decision 分别定义纵向 observation、生活 episode 与 decision precedent 的边界。通用原则留在本文件；各领域 policy 保留足够的分流提示，使 AI 只读当前 effective policy 也能知道何时转向其他领域，目标领域的详细规则不重复展开。实现、部署、故障和开发计划留在项目任务及代码仓库。
 
+## 规则编写（Rule Authoring）
+
+读取规则时，始终使用 `policy_read("<area>")` 获取 backend 已解析的 effective policy；不要自行读取或拼接 `rules/<area>.md` 来模拟规则优先级。
+
+当用户要求创建或修改 workspace-specific rule 时，写入：
+
+`rules/<area>.md`
+
+格式：
+
+```md
+---
+mode: extend
+---
+
+<规则正文>
+```
+
+`mode` 只能是：
+
+- `extend`：默认选择。保留 CEO 内置 policy，并增加或特化 workspace 行为。
+- `override`：仅当用户明确要求完全替换该领域的内置 policy 时使用。
+
+规则正文必须非空。后端会在写入时校验规则格式；校验失败时按返回错误修正后再提交。
 
 ## Routing depth 与规则集中原则
 

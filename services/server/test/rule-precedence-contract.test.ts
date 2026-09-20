@@ -189,4 +189,163 @@ describe("Rule Precedence Contract — Dynamic Black-Box Lifecycle", () => {
 
     await client.close();
   });
+
+  it("rejects invalid rules/*.md writes at transaction time with VALIDATION_FAILED and maintains atomic cleanliness", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const productPolicy = await loadProductPolicy();
+
+    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, productPolicy), { legacy: "reject" });
+    const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
+      fetch: (url, init) => mcpHandler.fetch(new Request(url, init)),
+    });
+
+    const client = new Client(
+      { name: "rule-validation-client", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto" } },
+    );
+    await client.connect(transport);
+
+    const statusRes = await client.callTool({ name: "workspace_status" });
+    const initialBase = (statusRes.structuredContent as any).local_commit;
+
+    // 1. Missing frontmatter
+    const missingFmRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create rule with missing frontmatter",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "# Tasks Rule\nNo frontmatter\n" }],
+      },
+    });
+    expect(missingFmRes.isError).toBe(true);
+    expect((missingFmRes.content[0] as any).text).toContain("VALIDATION_FAILED");
+    expect((missingFmRes.content[0] as any).text).toContain("MISSING_FRONTMATTER");
+
+    // 2. Malformed frontmatter delimiters
+    const malformedDelimRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create rule with malformed delimiter",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "---\nmode: extend\n# Unclosed frontmatter" }],
+      },
+    });
+    expect(malformedDelimRes.isError).toBe(true);
+    expect((malformedDelimRes.content[0] as any).text).toContain("VALIDATION_FAILED");
+    expect((malformedDelimRes.content[0] as any).text).toContain("MALFORMED_FRONTMATTER_DELIMITER");
+
+    // 3. Malformed YAML
+    const malformedYamlRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create rule with malformed yaml",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "---\nmode: [unclosed\n---\n\n# Body\n" }],
+      },
+    });
+    expect(malformedYamlRes.isError).toBe(true);
+    expect((malformedYamlRes.content[0] as any).text).toContain("VALIDATION_FAILED");
+    expect((malformedYamlRes.content[0] as any).text).toContain("MALFORMED_YAML");
+
+    // 4. Unsupported mode
+    const unsupportedModeRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create rule with unsupported mode",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "---\nmode: merge\n---\n\n# Body\n" }],
+      },
+    });
+    expect(unsupportedModeRes.isError).toBe(true);
+    expect((unsupportedModeRes.content[0] as any).text).toContain("VALIDATION_FAILED");
+    expect((unsupportedModeRes.content[0] as any).text).toContain("UNSUPPORTED_MODE");
+
+    // 5. Empty body
+    const emptyBodyRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create rule with empty body",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "---\nmode: extend\n---\n   \n" }],
+      },
+    });
+    expect(emptyBodyRes.isError).toBe(true);
+    expect((emptyBodyRes.content[0] as any).text).toContain("VALIDATION_FAILED");
+    expect((emptyBodyRes.content[0] as any).text).toContain("EMPTY_POLICY_BODY");
+
+    // Verify atomicity: local_commit unchanged, workspace clean
+    const statusAfterFailures = await client.callTool({ name: "workspace_status" });
+    expect((statusAfterFailures.structuredContent as any).local_commit).toBe(initialBase);
+    expect((statusAfterFailures.structuredContent as any).clean).toBe(true);
+
+    // 6. Valid write with the original base_commit succeeds
+    const validRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: initialBase,
+        summary: "create valid extend rule",
+        operations: [{ op: "create", path: "rules/tasks.md", content: "---\nmode: extend\n---\n\n# Valid Task Rules\n" }],
+      },
+    });
+    expect(validRes.isError).toBeFalsy();
+    expect((validRes.structuredContent as any).ok).toBe(true);
+
+    await client.close();
+  });
+
+  it("allows normal non-rule Markdown writes without frontmatter to proceed unaffected", async () => {
+    const item = await fixture();
+    cleanupDirs.push(item.root);
+
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const productPolicy = await loadProductPolicy();
+
+    const mcpHandler = createMcpHandler(() => createMcpServer(workspace, productPolicy), { legacy: "reject" });
+    const transport = new StreamableHTTPClientTransport(new URL("http://localhost/mcp"), {
+      fetch: (url, init) => mcpHandler.fetch(new Request(url, init)),
+    });
+
+    const client = new Client(
+      { name: "normal-write-client", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto" } },
+    );
+    await client.connect(transport);
+
+    const statusRes = await client.callTool({ name: "workspace_status" });
+    const baseCommit = (statusRes.structuredContent as any).local_commit;
+
+    // Normal markdown without frontmatter in tasks/ and notes/ must succeed
+    const normalRes = await client.callTool({
+      name: "apply_change_set",
+      arguments: {
+        base_commit: baseCommit,
+        summary: "create normal markdown without frontmatter",
+        operations: [
+          {
+            op: "create",
+            path: "tasks/task-001.md",
+            content: "# Just a regular task\n- [ ] do the laundry\n- [x] drink water\n",
+          },
+          {
+            op: "create",
+            path: "notes/random.md",
+            content: "Plain unformatted note text with no YAML frontmatter whatsoever.\n",
+          },
+        ],
+      },
+    });
+
+    expect(normalRes.isError).toBeFalsy();
+    expect((normalRes.structuredContent as any).ok).toBe(true);
+    expect((normalRes.structuredContent as any).changed_files).toEqual(
+      expect.arrayContaining(["tasks/task-001.md", "notes/random.md"]),
+    );
+
+    await client.close();
+  });
 });
