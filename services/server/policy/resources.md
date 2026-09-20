@@ -130,3 +130,13 @@ Resource 讨论不会仅因为“聊过”就自动修改 State。只有确实�
 `resource_capture` 返回后必须检查回执中的 `naming_source` 与可靠来源 metadata。若 `naming_source = "id"`，且回执或 Resource metadata 已取得非空的可靠 `title` 或 `original_name`，则本次 workflow **必须继续调用 `resource_apply` 的 `op: "rename"`**，不能在 capture 成功后直接结束。rename 只更新语义化 `display_name` 与目录名，不改写来源 `title`；名称应遵守上文的命名规范。
 
 若没有可靠 `title` / `original_name`，但用户上下文已经足以给出安全、明确的语义名称，也应继续 rename。只有在 metadata 与用户上下文都不足以安全命名时，才允许保留 `naming_source = "id"`。已为 `naming_source = "explicit"` 的资源不适用本条，不因普通 refresh / revisit 自动再次改名。
+
+## 删除与销毁
+
+Resource 的生命周期销毁必须通过官方的 `resource_delete` 工具执行。
+
+- **显式意图要求**：只有在用户明确提出删除、销毁或清理特定资源时，才能调用 `resource_delete`；不得因整理、重命名或更新而擅自删除 Resource。
+- **原子彻底删除**：`resource_delete` 一次性永久删除目标 Resource 的整个目录及其所有 owned artifacts（包括 metadata、content、summary、evidence、interactions 及 source assets 等）。
+- **无应用层墓碑（Tombstone）**：当前工作空间 HEAD 中直接删除，不保留墓碑标记文件；历史变更由底层 Git commit 自然追踪。删除后若用户再次 capture 相同来源，将作为全新 Resource 分配新 ID。
+- **禁止绕过 Resource Plane**：严禁尝试使用 `apply_change_set`、GitHub 直接操作或文件系统删除手段操作 `resources/**`。
+

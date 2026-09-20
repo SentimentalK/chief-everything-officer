@@ -23,6 +23,7 @@ import {
 import type {
   ResourceApplyInput,
   ResourceCaptureInput,
+  ResourceDeleteInput,
   ResourceGetInput,
   ResourceSearchInput,
 } from "./resource/types.js";
@@ -111,7 +112,7 @@ function tracedHandler<T>(
           if (rawResult && typeof rawResult.commit === "string") {
             resultingCommit = rawResult.commit as string;
           }
-        } else if (toolName === "resource_capture" || toolName === "resource_apply") {
+        } else if (toolName === "resource_capture" || toolName === "resource_apply" || toolName === "resource_delete") {
           if (rawResult && Array.isArray(rawResult.changed_files)) {
             affectedPaths = rawResult.changed_files as string[];
           }
@@ -337,7 +338,7 @@ export function createMcpServer(
   server.registerTool("apply_change_set", {
     title: "Apply an atomic CEO change set",
     description:
-      "Use this for generic CEO State/workspace Markdown updates outside Resource semantic storage. This tool cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources. The server checks optimistic concurrency, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
+      "Use this for generic CEO State/workspace Markdown updates outside Resource semantic storage. This tool cannot mutate resources/**. Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them. The server checks optimistic concurrency, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),
@@ -385,7 +386,7 @@ export function createMcpServer(
   server.registerTool("resource_apply", {
     title: "Apply updates to a CEO resource",
     description:
-      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set. 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。rename 同步展示名与实际目录；相同目标可以成功返回无变化。",
+      "Use this to modify an existing CEO Resource after its resource_id is known. Use typed Resource operations for evidence, content, summary, interactions, topics, source assets, and rename (to move the physical directory from res-<uuid> to a clean, retrieval-friendly semantic display name). Do not modify Resource artifacts through generic apply_change_set. To permanently delete a resource, use resource_delete. 新资源仅收藏、命名时保持 CAPTURED；已有资源 rename 不改变阶段。rename 同步展示名与实际目录；相同目标可以成功返回无变化。",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
       resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),
@@ -435,6 +436,21 @@ export function createMcpServer(
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, trace("resource_get", async (input: ResourceGetInput) =>
     await resourceRetrieval.get(input)));
+
+  // 11. resource_delete
+  server.registerTool("resource_delete", {
+    title: "Delete a CEO resource",
+    description:
+      "Permanently delete an existing CEO Resource and all its owned artifacts from current workspace state. This includes its metadata, summary, content, evidence, interactions, source assets, and directory. Requires an explicit user request or instruction to remove/destroy the resource. The server verifies optimistic concurrency via base_commit, executes atomic deletion, fast-forward pushes main, and returns a deletion receipt. Never delete resources via apply_change_set or filesystem manipulation.",
+    inputSchema: {
+      request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency"),
+      resource_id: z.string().regex(/^res-[0-9a-f-]{36}$/i).describe("Target resource ID (res-<uuid>)"),
+      base_commit: z.string().regex(/^[0-9a-f]{40,64}$/).describe("Base commit hash verified by reader"),
+      summary: z.string().min(1).max(120).describe("Git commit summary describing the deletion"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, trace("resource_delete", async (input: ResourceDeleteInput) =>
+    await resourceService.delete(input)));
 
   // Register MCP Resource endpoint for source document binary retrieval
   server.registerResource(

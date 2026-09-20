@@ -283,6 +283,11 @@ describe("Resource Authority & Namespace Hardening", () => {
     // apply_change_set
     const changeDesc = tools["apply_change_set"].description;
     expect(changeDesc).toContain("This tool cannot mutate resources/**");
-    expect(changeDesc).toContain("Use resource_capture for new Resources or resource_apply for existing Resources");
+    expect(changeDesc).toContain("Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them");
+
+    // resource_delete
+    const delDesc = tools["resource_delete"].description;
+    expect(delDesc).toContain("Permanently delete an existing CEO Resource and all its owned artifacts");
+    expect(delDesc).toContain("Never delete resources via apply_change_set or filesystem manipulation");
   });
 });

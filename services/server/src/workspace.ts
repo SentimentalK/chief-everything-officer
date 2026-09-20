@@ -164,7 +164,7 @@ export function assertNoResourceMutations(
       }
       const message =
         context === "apply_change_set"
-          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources."
+          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them."
           : "Resource state_changes cannot mutate resources/**. Use typed Resource operations for Resource artifacts.";
       throw new CeoError("RESOURCE_API_REQUIRED", message, details);
     }
@@ -178,7 +178,7 @@ export function assertNoResourceMutations(
       };
       const message =
         context === "apply_change_set"
-          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture for new Resources or resource_apply for existing Resources."
+          ? "Generic apply_change_set cannot mutate resources/**. Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them."
           : "Resource state_changes cannot mutate resources/**. Use typed Resource operations for Resource artifacts.";
       throw new CeoError("RESOURCE_API_REQUIRED", message, details);
     }
@@ -591,6 +591,7 @@ export class CeoWorkspace {
     commitMessage: string;
     allowResourceSourceFiles?: boolean;
     allowEmpty?: boolean;
+    resourceDeletePrefix?: string | (() => string | undefined);
     operationResultProducer?: (changedFiles: string[]) => Record<string, unknown>;
     mutator: (worktree: string, worktreeMatcher: CeoIgnoreMatcher) => Promise<void>;
   }): Promise<Record<string, unknown>> {
@@ -600,6 +601,7 @@ export class CeoWorkspace {
       commitMessage,
       allowResourceSourceFiles = false,
       allowEmpty = false,
+      resourceDeletePrefix,
       operationResultProducer,
       mutator,
     } = input;
@@ -624,7 +626,15 @@ export class CeoWorkspace {
       let committed = false;
       try {
         await mutator(worktree, worktreeMatcher);
-        const changed = await this.validateDiff(worktree, worktreeMatcher, allowResourceSourceFiles, allowEmpty);
+        const resolvedDeletePrefix =
+          typeof resourceDeletePrefix === "function" ? resourceDeletePrefix() : resourceDeletePrefix;
+        const changed = await this.validateDiff(
+          worktree,
+          worktreeMatcher,
+          allowResourceSourceFiles,
+          allowEmpty,
+          resolvedDeletePrefix,
+        );
 
         if (changed.length === 0) {
           await this.discardWorktree(worktree);
@@ -827,6 +837,7 @@ export class CeoWorkspace {
     matcher: CeoIgnoreMatcher,
     allowResourceSourceFiles = false,
     allowEmpty = false,
+    resourceDeletePrefix?: string,
   ): Promise<string[]> {
     const tracked = (await runGit(this.config, worktree, ["diff", "--name-only", "-z"])).stdout
       .split("\0").filter(Boolean);
@@ -837,8 +848,39 @@ export class CeoWorkspace {
       if (allowEmpty) return [];
       throw new CeoError("VALIDATION_FAILED", "Change set produces no file changes.");
     }
+
+    const trackedStatus = new Map<string, string>();
+    const diffStatusOutput = (await runGit(this.config, worktree, ["diff", "--name-status", "-z"])).stdout;
+    const tokens = diffStatusOutput.split("\0");
+    if (tokens.length > 0 && tokens[tokens.length - 1] === "") {
+      tokens.pop();
+    }
+    let i = 0;
+    while (i < tokens.length) {
+      const status = tokens[i++];
+      if (!status) break;
+      const statusCode = status.charAt(0);
+      if (status.startsWith("R") || status.startsWith("C")) {
+        const oldPath = tokens[i++];
+        const newPath = tokens[i++];
+        if (oldPath) trackedStatus.set(oldPath, statusCode);
+        if (newPath) trackedStatus.set(newPath, statusCode);
+      } else {
+        const filePath = tokens[i++];
+        if (filePath) trackedStatus.set(filePath, statusCode);
+      }
+    }
+
     for (const filePath of changed) {
-      if (allowResourceSourceFiles && isAllowedResourceSourcePath(filePath)) {
+      const isUnderDeletePrefix = Boolean(
+        resourceDeletePrefix &&
+        (filePath === resourceDeletePrefix || filePath.startsWith(resourceDeletePrefix + "/"))
+      );
+      const isDeleted = trackedStatus.get(filePath) === "D";
+
+      if (isUnderDeletePrefix && isDeleted) {
+        // Scoped resource deletion: allow deleting any owned artifact under resourceDeletePrefix
+      } else if (allowResourceSourceFiles && isAllowedResourceSourcePath(filePath)) {
         // Safe document file in resources/<id>/source/original.<ext>
       } else {
         validatePath(filePath);

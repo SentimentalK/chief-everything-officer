@@ -219,3 +219,10 @@ export interface ResourceGetInput {
   start_line?: number;
   line_count?: number;
 }
+
+export interface ResourceDeleteInput {
+  request_id?: string;
+  resource_id: string;
+  base_commit: string;
+  summary: string;
+}

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { access, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import {
   type ChangeOperation,
   type CeoWorkspace,
@@ -16,6 +16,7 @@ import type {
   ResourceApplyOperation,
   ResourceCaptureInitialOperation,
   ResourceCaptureInput,
+  ResourceDeleteInput,
   ResourceId,
   ResourceKind,
   ResourceMeta,
@@ -983,5 +984,99 @@ export class ResourceService {
       commit: tx.commit as string,
       replayed,
     };
+  }
+
+  async delete(input: ResourceDeleteInput): Promise<Record<string, unknown>> {
+    const requestId = input.request_id ?? randomUUID();
+    if (!/^[0-9a-f-]{36}$/i.test(requestId)) {
+      throw new CeoError("VALIDATION_FAILED", "request_id must be a UUID.");
+    }
+    if (!input.resource_id || !/^res-[0-9a-f-]{36}$/i.test(input.resource_id)) {
+      throw new CeoError("VALIDATION_FAILED", "Invalid resource_id format.", {
+        resource_id: input.resource_id,
+      });
+    }
+    if (!input.summary || !input.summary.trim() || input.summary.length > 120 || /[\r\n]/.test(input.summary)) {
+      throw new CeoError("VALIDATION_FAILED", "Summary must be a single line of 1 to 120 characters.");
+    }
+    if (!input.base_commit || !/^[0-9a-f]{40,64}$/.test(input.base_commit)) {
+      throw new CeoError("VALIDATION_FAILED", "base_commit must be a valid commit hash.");
+    }
+
+    let deletedResourceReceipt: Record<string, unknown> | null = null;
+    let deletedRelativePath = "";
+
+    return await this.workspace.withAtomicWorkspaceTransaction({
+      requestId,
+      baseCommit: input.base_commit,
+      commitMessage: `CEO: ${input.summary.trim()}`,
+      allowResourceSourceFiles: true,
+      allowEmpty: false,
+      resourceDeletePrefix: () => deletedRelativePath || undefined,
+      operationResultProducer: (_changedFiles) => {
+        return {
+          deleted: true,
+          resource: deletedResourceReceipt,
+          deleted_path: deletedRelativePath,
+        };
+      },
+      mutator: async (worktree, _worktreeMatcher) => {
+        const location = await resolveResourceLocation(worktree, input.resource_id);
+        if (!location) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
+            resource_id: input.resource_id,
+          });
+        }
+
+        const resourceRoot = path.resolve(worktree, "resources");
+        const targetDir = path.resolve(worktree, location.relative_path);
+
+        // Path safety check:
+        // 1. Must be strictly 1 level under resources/ (dirname === 'resources')
+        // 2. Must start with 'resources/'
+        // 3. Must be strictly inside <worktree>/resources/ and not the root itself
+        if (
+          !location.relative_path.startsWith("resources/") ||
+          path.posix.dirname(location.relative_path) !== "resources" ||
+          targetDir === resourceRoot ||
+          !targetDir.startsWith(resourceRoot + path.sep)
+        ) {
+          throw new CeoError("INVALID_PATH", "Resource directory path is invalid or outside resource boundary.", {
+            path: location.relative_path,
+          });
+        }
+
+        const st = await lstat(targetDir).catch(() => null);
+        if (!st || !st.isDirectory() || st.isSymbolicLink()) {
+          throw new CeoError("INVALID_PATH", "Resource target is not a valid directory.", {
+            path: location.relative_path,
+          });
+        }
+
+        const metaPath = path.join(targetDir, "meta.md");
+        const metaContent = await readFile(metaPath, "utf8").catch(() => null);
+        if (!metaContent) {
+          throw new CeoError("CORRUPTION", "Resource meta.md not found.", {
+            resource_id: input.resource_id,
+          });
+        }
+
+        const doc = parseMetaMarkdown(metaContent);
+        const meta = doc.meta;
+
+        deletedResourceReceipt = {
+          resource_id: meta.resource_id,
+          display_name: meta.display_name,
+          source_identity: meta.source_identity,
+          relative_path: location.relative_path,
+          title: meta.title,
+          platform: meta.platform,
+          resource_kind: meta.resource_kind,
+        };
+        deletedRelativePath = location.relative_path;
+
+        await rm(targetDir, { recursive: true, force: false });
+      },
+    });
   }
 }

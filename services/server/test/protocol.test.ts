@@ -64,6 +64,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "resource_apply",
       "resource_search",
       "resource_get",
+      "resource_delete",
     ]);
 
     const statusResult = await client.callTool({ name: "workspace_status" });
@@ -236,6 +237,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "resource_apply",
       "resource_search",
       "resource_get",
+      "resource_delete",
     ]);
 
     // Real tool call through Express + auth endpoint succeeds
@@ -290,7 +292,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
 
     // Request A: list tools
     const listRes = await client.listTools();
-    expect(listRes.tools).toHaveLength(10);
+    expect(listRes.tools).toHaveLength(11);
     const countAfterReqA = serverFactoryCallCount;
     expect(countAfterReqA).toBeGreaterThan(initialFactoryCount);
 

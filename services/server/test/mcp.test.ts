@@ -31,11 +31,16 @@ describe("MCP contract", () => {
       "resource_apply",
       "resource_search",
       "resource_get",
+      "resource_delete",
     ]);
-    const writeToolNames = new Set(["apply_change_set", "resource_capture", "resource_apply"]);
+    const writeToolNames = new Set(["apply_change_set", "resource_capture", "resource_apply", "resource_delete"]);
     const readTools = response.tools.filter((t) => !writeToolNames.has(t.name));
     expect(readTools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
-    const writeTools = response.tools.filter((t) => writeToolNames.has(t.name));
-    expect(writeTools.every((tool) => tool.annotations?.readOnlyHint === false && tool.annotations?.openWorldHint === true)).toBe(true);
+    const openWorldWriteTools = response.tools.filter((t) => ["apply_change_set", "resource_capture", "resource_apply"].includes(t.name));
+    expect(openWorldWriteTools.every((tool) => tool.annotations?.readOnlyHint === false && tool.annotations?.openWorldHint === true)).toBe(true);
+    const deleteTool = response.tools.find((tool) => tool.name === "resource_delete");
+    expect(deleteTool?.annotations?.readOnlyHint).toBe(false);
+    expect(deleteTool?.annotations?.destructiveHint).toBe(true);
+    expect(deleteTool?.annotations?.openWorldHint).toBe(false);
   });
 });
