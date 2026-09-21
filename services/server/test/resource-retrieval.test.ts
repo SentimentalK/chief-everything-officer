@@ -11,7 +11,7 @@ import { fixture } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
 afterEach(async () => {
-  await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await Promise.all(cleanupDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })));
 });
 
 // Hand-written fixtures give each resource a controlled first_captured_at,
