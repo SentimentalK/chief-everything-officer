@@ -330,7 +330,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
     }
   });
 
-  it("I. fails login immediately and creates no user when GitHub verified primary email is missing", async () => {
+  it("I. allows login and creates user when GitHub verified primary email is missing", async () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://github.com/login/oauth/access_token") {
@@ -371,14 +371,16 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
         { redirect: "manual" },
       );
       expect(callbackRes.status).toBe(302);
-      expect(callbackRes.headers.get("location")).toBe("/login?error=verified_primary_email_required");
+      expect(callbackRes.headers.get("location")).toBe("/login");
 
-      // No session cookie set
-      expect(callbackRes.headers.get("set-cookie")).toBeNull();
+      // Session cookie is set
+      expect(callbackRes.headers.get("set-cookie")).not.toBeNull();
 
-      // No identity or user created in store
+      // User created in store with null provider_email
       const bound = env.store.findExternalIdentity("github", "555666777");
-      expect(bound).toBeNull();
+      expect(bound).not.toBeNull();
+      expect(bound?.provider_login).toBe("UnverifiedUser");
+      expect(bound?.provider_email).toBeNull();
     } finally {
       await env.close();
     }

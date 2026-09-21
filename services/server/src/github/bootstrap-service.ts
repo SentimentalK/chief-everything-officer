@@ -307,18 +307,24 @@ export class WorkspaceBootstrapService {
       throw new ManualRecoveryBootstrapError("WORKSPACE_NOT_FOUND", `Workspace '${workspaceId}' not found during commit attribution.`, 404);
     }
     const ownerIdentity = this.store.findExternalIdentityByUser("github", workspace.owner_user_id);
-    if (!ownerIdentity || !ownerIdentity.provider_email || !ownerIdentity.provider_login) {
-      throw new ManualRecoveryBootstrapError(
-        "INVALID_WORKSPACE_STATE",
-        `Workspace owner '${workspace.owner_user_id}' does not have a verified GitHub email and login for git author attribution.`,
-        400,
-      );
-    }
-    return {
-      author: {
+    let author = {
+      name: this.gitCommitter.name,
+      email: this.gitCommitter.email,
+    };
+    if (
+      ownerIdentity &&
+      ownerIdentity.provider_login &&
+      ownerIdentity.provider_login.trim().length > 0 &&
+      ownerIdentity.provider_email &&
+      ownerIdentity.provider_email.trim().length > 0
+    ) {
+      author = {
         name: ownerIdentity.provider_login.trim(),
         email: ownerIdentity.provider_email.trim(),
-      },
+      };
+    }
+    return {
+      author,
       committer: {
         name: this.gitCommitter.name,
         email: this.gitCommitter.email,

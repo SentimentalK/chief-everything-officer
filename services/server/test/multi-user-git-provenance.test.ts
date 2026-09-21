@@ -119,7 +119,7 @@ describe("Multi-User Git Commit Attribution & Provenance", () => {
     }
   });
 
-  it("fails fast at WorkspaceRuntimeRegistry initialization when owner GitHub identity is incomplete (INVALID_WORKSPACE_STATE)", async () => {
+  it("gracefully falls back to CEO bot author when owner GitHub identity lacks email", async () => {
     const item = await fixture();
     cleanup.push(item.root);
 
@@ -165,6 +165,9 @@ describe("Multi-User Git Commit Attribution & Provenance", () => {
     rawUpdate.prepare("UPDATE workspace_bootstraps SET state = 'READY' WHERE workspace_id = ?;").run(workspaceId);
     rawUpdate.close();
 
+    const wsRepoDir = path.join(item.config.dataRoot, "workspaces", workspaceId, "repo");
+    git(item.root, "clone", item.remote, wsRepoDir);
+
     const registry = new WorkspaceRuntimeRegistry({
       dataRoot: item.config.dataRoot,
       store,
@@ -175,12 +178,27 @@ describe("Multi-User Git Commit Attribution & Provenance", () => {
       credentialProviderFactory: () => ({
         getCredential: async () => ({ username: "x-access-token", token: "dummy" }),
       }),
+      workspaceFactory: (cfg) => new CeoWorkspace({ ...cfg, remoteUrl: item.remote }),
     });
 
-    // Fails fast at runtime init
-    await expect(registry.get(workspaceId)).rejects.toMatchObject({
-      code: "INVALID_WORKSPACE_STATE",
+    // Successfully resolves runtime with CEO bot as author fallback
+    const runtime = await registry.get(workspaceId);
+    expect(runtime).toBeDefined();
+
+    // Commit is authored by CEO bot
+    const read = await runtime.workspace.readFiles(["TODO.md"]);
+    const todo = (read.files as any[])[0];
+    const res = await runtime.workspace.applyChangeSet({
+      request_id: randomUUID(),
+      base_commit: read.base_commit as string,
+      summary: "Bot author fallback test",
+      operations: [
+        { op: "replace", path: "TODO.md", expected_blob_oid: todo.blob_oid, content: "# TODO\n- Fallback\n" },
+      ],
     });
+
+    const log = git(wsRepoDir, "log", "-1", "--format=%an|%ae|%cn|%ce", res.commit as string);
+    expect(log).toBe("CEO State MCP|ceo-mcp@users.noreply.github.com|CEO State MCP|ceo-mcp@users.noreply.github.com");
   });
 
   it("WorkspaceRuntimeRegistry initializes successfully and sets owner as author when identity is complete", async () => {

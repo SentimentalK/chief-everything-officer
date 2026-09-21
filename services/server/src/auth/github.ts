@@ -173,14 +173,14 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
         return;
       }
 
-      const githubUser = (await userRes.json()) as { id: unknown; login: unknown };
+      const githubUser = (await userRes.json()) as { id: unknown; login: unknown; email?: unknown };
       const profile = validateGitHubProfile(githubUser);
       if (!profile) {
         res.redirect(302, "/login?error=invalid_user_response");
         return;
       }
 
-      // 2b. Fetch verified primary email (strict invariant: login fails if missing)
+      // 2b. Fetch verified primary email (best-effort; gracefully falls back to profile email, or null -> CEO bot)
       let providerEmail: string | null = null;
       try {
         const emailsRes = await fetchClient("https://api.github.com/user/emails", {
@@ -204,13 +204,11 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
           }
         }
       } catch {
-        res.redirect(302, "/login?error=email_fetch_failed");
-        return;
+        // Non-blocking: failure to fetch /user/emails gracefully falls back
       }
 
-      if (!providerEmail) {
-        res.redirect(302, "/login?error=verified_primary_email_required");
-        return;
+      if (!providerEmail && typeof githubUser.email === "string" && githubUser.email.trim().length > 0) {
+        providerEmail = githubUser.email.trim();
       }
 
       // Discard accessToken immediately (do not persist)

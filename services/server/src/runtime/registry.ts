@@ -93,14 +93,18 @@ export class WorkspaceRuntimeRegistry {
     }
 
     const ownerIdentity = this.options.store.findExternalIdentityByUser("github", workspaceRecord.owner_user_id);
-    if (!ownerIdentity || !ownerIdentity.provider_login || !ownerIdentity.provider_email) {
-      throw new WorkspaceRuntimeResolutionError(
-        "INVALID_WORKSPACE_STATE",
-        `Workspace owner '${workspaceRecord.owner_user_id}' does not have a complete GitHub identity (login and email required for git author attribution).`,
-      );
+    let gitAuthorName = this.gitCommitter.name;
+    let gitAuthorEmail = this.gitCommitter.email;
+    if (
+      ownerIdentity &&
+      ownerIdentity.provider_login &&
+      ownerIdentity.provider_login.trim().length > 0 &&
+      ownerIdentity.provider_email &&
+      ownerIdentity.provider_email.trim().length > 0
+    ) {
+      gitAuthorName = ownerIdentity.provider_login.trim();
+      gitAuthorEmail = ownerIdentity.provider_email.trim();
     }
-    const gitAuthorName = ownerIdentity.provider_login.trim();
-    const gitAuthorEmail = ownerIdentity.provider_email.trim();
 
     const runtimeConfig: WorkspaceRuntimeConfig = {
       workspaceId,
