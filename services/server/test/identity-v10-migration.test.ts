@@ -116,8 +116,8 @@ describe("Identity DB v9 -> v10 migration (users.is_admin)", () => {
 
     store.withDb((rawDb) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(10);
-      expect(IDENTITY_DB_USER_VERSION).toBe(10);
+      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
+      expect(IDENTITY_DB_USER_VERSION).toBe(11);
 
       const columns = rawDb.prepare("PRAGMA table_info(users);").all() as Array<{ name: string }>;
       expect(columns.some((c) => c.name === "is_admin")).toBe(true);
@@ -142,7 +142,7 @@ describe("Identity DB v9 -> v10 migration (users.is_admin)", () => {
 
     store.withDb((rawDb) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(10);
+      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
       const sql = (rawDb.prepare(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='users';",
       ).get() as { sql: string }).sql;

@@ -6,10 +6,16 @@ export interface AccountResolution {
   provider: string;
   providerSubject: string;
   providerLogin?: string;
+  providerEmail?: string;
 }
 
 export interface AccountProvisioner {
-  resolveOrCreate(provider: string, providerSubject: string, providerLogin?: string): AccountResolution;
+  resolveOrCreate(
+    provider: string,
+    providerSubject: string,
+    providerLogin?: string,
+    providerEmail?: string | null,
+  ): AccountResolution;
 }
 
 /**
@@ -23,11 +29,17 @@ export class IdentityAccountProvisioner implements AccountProvisioner {
     this.store = store;
   }
 
-  resolveOrCreate(provider: string, providerSubject: string, providerLogin?: string): AccountResolution {
+  resolveOrCreate(
+    provider: string,
+    providerSubject: string,
+    providerLogin?: string,
+    providerEmail?: string | null,
+  ): AccountResolution {
     const row = this.store.resolveOrCreateExternalUser({
       provider,
       providerSubject,
       providerLogin,
+      providerEmail,
     });
     return {
       userId: row.user_id,
@@ -35,6 +47,7 @@ export class IdentityAccountProvisioner implements AccountProvisioner {
       provider: row.provider,
       providerSubject: row.provider_subject,
       providerLogin: row.provider_login ?? undefined,
+      providerEmail: row.provider_email ?? undefined,
     };
   }
 }

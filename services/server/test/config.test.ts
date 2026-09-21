@@ -41,38 +41,21 @@ describe("Config Validation", () => {
   });
 
   describe("Git Identity Attribution", () => {
-    it("defaults author and committer to CEO State MCP when unconfigured", () => {
+    it("defaults committer to CEO State MCP when unconfigured", () => {
       const config = loadConfig(baseEnv({}));
       expect(config.gitCommitterName).toBe("CEO State MCP");
       expect(config.gitCommitterEmail).toBe("ceo-mcp@users.noreply.github.com");
-      expect(config.gitAuthorName).toBe("CEO State MCP");
-      expect(config.gitAuthorEmail).toBe("ceo-mcp@users.noreply.github.com");
+      expect((config as any).gitAuthorName).toBeUndefined();
+      expect((config as any).gitAuthorEmail).toBeUndefined();
     });
 
-    it("credits user as author while keeping CEO runtime as committer", () => {
+    it("allows customization of committer identity", () => {
       const config = loadConfig(
         baseEnv({
-          CEO_GIT_AUTHOR_NAME: "Xinghan Xu",
-          CEO_GIT_AUTHOR_EMAIL: "kevinxu.senti@gmail.com",
-        }),
-      );
-      expect(config.gitAuthorName).toBe("Xinghan Xu");
-      expect(config.gitAuthorEmail).toBe("kevinxu.senti@gmail.com");
-      expect(config.gitCommitterName).toBe("CEO State MCP");
-      expect(config.gitCommitterEmail).toBe("ceo-mcp@users.noreply.github.com");
-    });
-
-    it("allows independent customization of all four identity fields", () => {
-      const config = loadConfig(
-        baseEnv({
-          CEO_GIT_AUTHOR_NAME: "Author Name",
-          CEO_GIT_AUTHOR_EMAIL: "author@example.com",
           CEO_GIT_COMMITTER_NAME: "Custom Committer",
           CEO_GIT_COMMITTER_EMAIL: "committer@example.com",
         }),
       );
-      expect(config.gitAuthorName).toBe("Author Name");
-      expect(config.gitAuthorEmail).toBe("author@example.com");
       expect(config.gitCommitterName).toBe("Custom Committer");
       expect(config.gitCommitterEmail).toBe("committer@example.com");
     });

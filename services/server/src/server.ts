@@ -90,11 +90,9 @@ try {
 const runtimeRegistry = new WorkspaceRuntimeRegistry({
   store: identityService.storeInstance,
   dataRoot: config.dataRoot,
-  gitConfig: {
-    gitAuthorName: config.gitAuthorName,
-    gitAuthorEmail: config.gitAuthorEmail,
-    gitCommitterName: config.gitCommitterName,
-    gitCommitterEmail: config.gitCommitterEmail,
+  gitCommitter: {
+    name: config.gitCommitterName,
+    email: config.gitCommitterEmail,
   },
   appClient: gitHubAppClient,
   sharedResourceDependencies: {
@@ -270,6 +268,10 @@ if (config.githubAppEnabled && gitHubAppClient) {
   bootstrapService = new WorkspaceBootstrapService({
     appClient: gitHubAppClient,
     store: identityService.storeInstance,
+    gitCommitter: {
+      name: config.gitCommitterName,
+      email: config.gitCommitterEmail,
+    },
   });
 
   const repositoryService = new GitHubRepositoryService({

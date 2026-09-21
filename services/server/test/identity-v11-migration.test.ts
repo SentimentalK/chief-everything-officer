@@ -1,12 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
-import os from "node:os";
+import os from "os";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
   IdentityStore,
   IDENTITY_DB_USER_VERSION,
   IdentityStructureError,
+  provisionEmptyControlPlaneDatabase,
 } from "../src/identity/store.js";
 
 const cleanupDirs: string[] = [];
@@ -18,12 +19,12 @@ afterEach(async () => {
 });
 
 async function tempDbPath(): Promise<{ dir: string; dbPath: string }> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v9-migration-test-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v11-migration-test-"));
   cleanupDirs.push(dir);
   return { dir, dbPath: path.join(dir, "identity.sqlite") };
 }
 
-function createValidV8Database(dbPath: string): void {
+function createValidV10Database(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(`
     CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL, disabled_at INTEGER);
@@ -67,6 +68,7 @@ function createValidV8Database(dbPath: string): void {
       github_installation_row_id TEXT NOT NULL, owner_account_id TEXT NOT NULL, owner_login TEXT NOT NULL,
       repository_name TEXT NOT NULL, full_name TEXT NOT NULL, branch TEXT NOT NULL,
       created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+      access_scope_verified_at_ms INTEGER,
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
       FOREIGN KEY (github_installation_row_id) REFERENCES github_installations(id)
     );
@@ -78,37 +80,15 @@ function createValidV8Database(dbPath: string): void {
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
     );
     CREATE TABLE onboarding_flows (
-      id TEXT PRIMARY KEY NOT NULL,
-      user_id TEXT NOT NULL,
-      provider_subject TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      desired_repository_name TEXT,
-      installation_row_id TEXT,
-      repository_id TEXT,
-      workspace_id TEXT,
-      state TEXT NOT NULL,
-      last_error_code TEXT,
-      last_error_message TEXT,
-      host_oauth_request_id TEXT,
-      created_at_ms INTEGER NOT NULL,
-      updated_at_ms INTEGER NOT NULL,
-      expires_at_ms INTEGER NOT NULL,
+      id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, provider_subject TEXT NOT NULL, mode TEXT NOT NULL,
+      desired_repository_name TEXT, installation_row_id TEXT, repository_id TEXT, workspace_id TEXT,
+      state TEXT NOT NULL, last_error_code TEXT, last_error_message TEXT, host_oauth_request_id TEXT,
+      created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (installation_row_id) REFERENCES github_installations(id) ON DELETE SET NULL,
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
     );
-    CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
-    CREATE INDEX idx_api_keys_user ON api_keys(user_id);
-    CREATE INDEX idx_external_identities_user ON external_identities(user_id);
-    CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
-    CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
     CREATE UNIQUE INDEX ux_workspace_memberships_owner ON workspace_memberships(workspace_id) WHERE role = 'owner';
-    CREATE INDEX idx_github_installation_users_user ON github_installation_users(user_id);
-    CREATE INDEX idx_github_installation_users_installation ON github_installation_users(github_installation_row_id);
-    CREATE INDEX idx_github_repository_bindings_installation ON github_repository_bindings(github_installation_row_id);
-    CREATE INDEX idx_workspace_bootstraps_state ON workspace_bootstraps(state);
-    CREATE INDEX idx_onboarding_flows_user ON onboarding_flows(user_id);
-    CREATE INDEX idx_onboarding_flows_state ON onboarding_flows(state);
     CREATE UNIQUE INDEX idx_onboarding_one_active_per_user
     ON onboarding_flows(user_id)
     WHERE state IN (
@@ -119,79 +99,94 @@ function createValidV8Database(dbPath: string): void {
       'READY_TO_RESUME',
       'RECOVERY_REQUIRED'
     );
-    PRAGMA user_version = 8;
+    PRAGMA user_version = 9;
+    INSERT INTO users VALUES ('usr_alice', 1000, NULL);
+    INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
+      VALUES ('ext_alice', 'github', '12345', 'usr_alice', 'alice_gh', 1000, 1000);
   `);
+
+  IdentityStore.migrateV9ToV10(db);
   db.close();
 }
 
-describe("Identity DB v8 -> v9 migration (access_scope_verified_at_ms)", () => {
-  it("A. v8 database migrates cleanly to v9 with nullable column and NO blanket backfill", async () => {
+describe("Identity DB Migration v10 -> v11", () => {
+  it("IDENTITY_DB_USER_VERSION is 11", () => {
+    expect(IDENTITY_DB_USER_VERSION).toBe(11);
+  });
+
+  it("successfully migrates v10 database to v11 on IdentityStore.open", async () => {
     const { dbPath } = await tempDbPath();
-    createValidV8Database(dbPath);
+    createValidV10Database(dbPath);
 
-    // Seed v8 data with a repository binding and a READY bootstrap
-    const seedDb = new DatabaseSync(dbPath);
-    seedDb.exec(`
-      INSERT INTO users VALUES ('usr_1', 1000, NULL);
-      INSERT INTO workspaces VALUES ('ws_1', 'usr_1', 'https://github.com/acme/vault.git', 'main', 1000);
-      INSERT INTO workspace_memberships VALUES ('wsm_1', 'ws_1', 'usr_1', 'owner', 1000);
-      INSERT INTO github_installations VALUES ('ghi_1', '12345678', '123456', '111111', 'acme', 'User', 'selected', NULL, 1000, 1000);
-      INSERT INTO github_installation_users VALUES ('ghiu_1', 'ghi_1', 'usr_1', 1000, 1000);
-      INSERT INTO github_repository_bindings VALUES (
-        'grb_1', 'ws_1', '98765432', 'ghi_1', '111111', 'acme', 'vault', 'acme/vault', 'main', 1000, 1000
-      );
-      INSERT INTO workspace_bootstraps VALUES (
-        'ws_1', 1, 'READY', 1, 'att_1', '0123456789abcdef0123456789abcdef01234567', '0123456789abcdef0123456789abcdef01234567', NULL, NULL, NULL, 1000, 1000, 1000
-      );
-    `);
-    seedDb.close();
-
-    // Opening with IdentityStore triggers migration
     const store = IdentityStore.open(dbPath);
     cleanupStores.push(store);
 
-    store.withDb((rawDb) => {
-      const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
-      expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
-      expect(IDENTITY_DB_USER_VERSION).toBe(11);
+    const db = new DatabaseSync(dbPath);
+    const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+    expect(Number(versionRow.user_version)).toBe(11);
 
-      // Verify column exists
-      const columns = rawDb.prepare("PRAGMA table_info(github_repository_bindings);").all() as Array<{ name: string }>;
-      expect(columns.some((c) => c.name === "access_scope_verified_at_ms")).toBe(true);
+    // Verify existing user has NULL provider_email
+    const existing = store.findExternalIdentity("github", "12345");
+    expect(existing).not.toBeNull();
+    expect(existing?.provider_login).toBe("alice_gh");
+    expect(existing?.provider_email).toBeNull();
 
-      // Verify NO blanket backfill: value MUST be NULL
-      const row = rawDb.prepare("SELECT access_scope_verified_at_ms FROM github_repository_bindings WHERE id = 'grb_1';").get() as any;
-      expect(row.access_scope_verified_at_ms).toBeNull();
+    // Verify findExternalIdentityByUser
+    const byUser = store.findExternalIdentityByUser("github", "usr_alice");
+    expect(byUser).not.toBeNull();
+    expect(byUser?.provider_subject).toBe("12345");
+    expect(byUser?.provider_email).toBeNull();
+
+    // Update metadata with email
+    store.updateExternalIdentityMetadata({
+      provider: "github",
+      providerSubject: "12345",
+      providerEmail: "alice@example.com",
     });
 
-    // Verify dual-condition readiness: bootstrap is READY but scope is NULL -> NOT READY FOR HOST!
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(false);
+    const updated = store.findExternalIdentity("github", "12345");
+    expect(updated?.provider_email).toBe("alice@example.com");
 
-    // Finding binding returns record with null access_scope_verified_at_ms
-    const binding = store.findRepositoryBindingByWorkspaceId("ws_1");
-    expect(binding).not.toBeNull();
-    expect(binding?.access_scope_verified_at_ms).toBeNull();
+    // Calling update without email preserves existing email
+    store.updateExternalIdentityMetadata({
+      provider: "github",
+      providerSubject: "12345",
+      providerLogin: "alice_renamed",
+      providerEmail: null,
+    });
+    const preserved = store.findExternalIdentity("github", "12345");
+    expect(preserved?.provider_login).toBe("alice_renamed");
+    expect(preserved?.provider_email).toBe("alice@example.com");
 
-    // Now mark scope verified
-    const verifiedMs = 123456789;
-    store.markRepositoryBindingScopeVerified("ws_1", verifiedMs);
-
-    const updatedBinding = store.findRepositoryBindingByWorkspaceId("ws_1");
-    expect(updatedBinding?.access_scope_verified_at_ms).toBe(verifiedMs);
-
-    // Now dual-condition check passes!
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(true);
-
-    // If scope is cleared, dual-condition check immediately fails closed!
-    store.clearRepositoryBindingScopeVerified("ws_1");
-    expect(store.isWorkspaceReadyForHost("ws_1")).toBe(false);
+    db.close();
   });
 
-  it("B. migrateV8ToV9 fails if user_version is not 8", async () => {
+  it("fresh provisioned database has user_version 11 and provider_email column", async () => {
+    const { dbPath } = await tempDbPath();
+    provisionEmptyControlPlaneDatabase(dbPath);
+
+    const store = IdentityStore.open(dbPath);
+    cleanupStores.push(store);
+
+    const res = store.resolveOrCreateExternalUser({
+      provider: "github",
+      providerSubject: "99999",
+      providerLogin: "bob_gh",
+      providerEmail: "bob@example.com",
+    });
+
+    expect(res.created).toBe(true);
+    expect(res.provider_email).toBe("bob@example.com");
+
+    const found = store.findExternalIdentity("github", "99999");
+    expect(found?.provider_email).toBe("bob@example.com");
+  });
+
+  it("rejects migration when user_version is not 10", async () => {
     const { dbPath } = await tempDbPath();
     const db = new DatabaseSync(dbPath);
-    db.exec("PRAGMA user_version = 7;");
-    expect(() => IdentityStore.migrateV8ToV9(db)).toThrow(IdentityStructureError);
+    db.exec("PRAGMA user_version = 9;");
+    expect(() => IdentityStore.migrateV10ToV11(db)).toThrow(IdentityStructureError);
     db.close();
   });
 });

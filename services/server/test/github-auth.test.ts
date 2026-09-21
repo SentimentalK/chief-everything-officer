@@ -139,6 +139,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       expect(url.pathname).toBe("/login/oauth/authorize");
       expect(url.searchParams.get("client_id")).toBe("test-client-id");
       expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:3000/auth/github/callback");
+      expect(url.searchParams.get("scope")).toBe("user:email");
       expect(url.searchParams.get("code_challenge_method")).toBe("S256");
       expect(url.searchParams.get("code_challenge")).toBeTruthy();
       expect(url.searchParams.get("state")).toBeTruthy();
@@ -191,6 +192,19 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
           json: async () => ({ id: 40360455, login: "SentimentalK" }),
         } as Response;
       }
+      if (url === "https://api.github.com/user/emails") {
+        expect(init?.headers).toMatchObject({
+          Authorization: "Bearer mock-gh-token-123",
+        });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            { email: "secondary@example.com", primary: false, verified: true },
+            { email: "primary@example.com", primary: true, verified: true },
+          ],
+        } as Response;
+      }
       throw new Error(`Unexpected fetch to ${url}`);
     });
 
@@ -221,6 +235,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       expect(bound).not.toBeNull();
       expect(bound?.user_id).toBe(env.ident.user_id);
       expect(bound?.provider_login).toBe("SentimentalK");
+      expect(bound?.provider_email).toBe("primary@example.com");
 
       const sessionRes = await fetch(`${env.baseUrl}/api/user/session`, {
         headers: { Cookie: `ceo_user_session=${sessionToken}` },
@@ -266,6 +281,13 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
           json: async () => ({ id: 999888777, login: "NewUser" }),
         } as Response;
       }
+      if (url === "https://api.github.com/user/emails") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [{ email: "newuser@example.com", primary: true, verified: true }],
+        } as Response;
+      }
       throw new Error(`Unexpected fetch to ${url}`);
     });
 
@@ -283,6 +305,7 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       const bound = env.store.findExternalIdentity("github", "999888777");
       expect(bound).not.toBeNull();
       expect(bound!.user_id).not.toBe(env.ident.user_id);
+      expect(bound!.provider_email).toBe("newuser@example.com");
 
       const raw = new DatabaseSync(env.dbPath);
       const wsCount = raw.prepare("SELECT COUNT(*) AS c FROM workspaces WHERE owner_user_id = ?;").get(bound!.user_id) as {
@@ -307,6 +330,60 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
     }
   });
 
+  it("I. fails login immediately and creates no user when GitHub verified primary email is missing", async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://github.com/login/oauth/access_token") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: "mock-gh-token" }),
+        } as Response;
+      }
+      if (url === "https://api.github.com/user") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 555666777, login: "UnverifiedUser" }),
+        } as Response;
+      }
+      if (url === "https://api.github.com/user/emails") {
+        return {
+          ok: true,
+          status: 200,
+          // Only unverified or non-primary emails returned
+          json: async () => [
+            { email: "unverified@example.com", primary: true, verified: false },
+            { email: "secondary@example.com", primary: false, verified: true },
+          ],
+        } as Response;
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    });
+
+    const env = await setupTestApp(mockFetch as typeof fetch, false);
+    try {
+      const initRes = await fetch(`${env.baseUrl}/auth/github`, { redirect: "manual" });
+      const state = new URL(initRes.headers.get("location")!).searchParams.get("state")!;
+
+      const callbackRes = await fetch(
+        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(state)}`,
+        { redirect: "manual" },
+      );
+      expect(callbackRes.status).toBe(302);
+      expect(callbackRes.headers.get("location")).toBe("/login?error=verified_primary_email_required");
+
+      // No session cookie set
+      expect(callbackRes.headers.get("set-cookie")).toBeNull();
+
+      // No identity or user created in store
+      const bound = env.store.findExternalIdentity("github", "555666777");
+      expect(bound).toBeNull();
+    } finally {
+      await env.close();
+    }
+  });
+
   it("redirects to /audit when next is allowlisted and oauth_request is absent", async () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -315,6 +392,13 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       }
       if (url === "https://api.github.com/user") {
         return { ok: true, status: 200, json: async () => ({ id: 40360455, login: "SentimentalK" }) } as Response;
+      }
+      if (url === "https://api.github.com/user/emails") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [{ email: "sentimentalk@example.com", primary: true, verified: true }],
+        } as Response;
       }
       throw new Error(`Unexpected fetch to ${url}`);
     });
@@ -341,6 +425,13 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       }
       if (url === "https://api.github.com/user") {
         return { ok: true, status: 200, json: async () => ({ id: 40360455, login: "SentimentalK" }) } as Response;
+      }
+      if (url === "https://api.github.com/user/emails") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [{ email: "sentimentalk@example.com", primary: true, verified: true }],
+        } as Response;
       }
       throw new Error(`Unexpected fetch to ${url}`);
     });

@@ -46,7 +46,26 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 10;
+export const IDENTITY_DB_USER_VERSION = 11;
+
+export interface ExternalIdentityRecord {
+  id: string;
+  provider: string;
+  provider_subject: string;
+  user_id: string;
+  provider_login: string | null;
+  provider_email: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface WorkspaceRecord {
+  id: string;
+  owner_user_id: string;
+  remote_url: string;
+  branch: string;
+  created_at: number;
+}
 
 export type WorkspaceBootstrapState =
   | "PENDING"
@@ -183,6 +202,7 @@ CREATE TABLE external_identities (
   provider_subject TEXT NOT NULL,
   user_id TEXT NOT NULL,
   provider_login TEXT,
+  provider_email TEXT,
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   UNIQUE(provider, provider_subject),
@@ -1191,6 +1211,9 @@ export class IdentityStore {
         case 9:
           IdentityStore.migrateV9ToV10(db);
           break;
+        case 10:
+          IdentityStore.migrateV10ToV11(db);
+          break;
         default:
           throw new IdentityStructureError(
             `Identity database has unsupported user_version ${version}; expected at least 1 before migration to ${IDENTITY_DB_USER_VERSION}.`,
@@ -1698,30 +1721,95 @@ export class IdentityStore {
     }
   }
 
-  findExternalIdentity(provider: string, providerSubject: string): {
-    id: string;
-    provider: string;
-    provider_subject: string;
-    user_id: string;
-    provider_login: string | null;
-    created_at_ms: number;
-    updated_at_ms: number;
-  } | null {
+  static migrateV10ToV11(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 10) {
+        throw new IdentityStructureError("migrateV10ToV11 requires user_version = 10.");
+      }
+
+      const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'external_identities';",
+      ).get() as { name: string } | undefined;
+      if (!row) {
+        throw new IdentityStructureError("Cannot migrate to v11: missing required v10 table 'external_identities'.");
+      }
+
+      db.exec(`
+        ALTER TABLE external_identities ADD COLUMN provider_email TEXT;
+        PRAGMA user_version = 11;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 10 to 11: ${error}`);
+    }
+  }
+
+  findExternalIdentity(provider: string, providerSubject: string): ExternalIdentityRecord | null {
     return this.withDb((db) => {
       const row = db.prepare(
-        "SELECT id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
-      ).get(provider, providerSubject) as
-        | {
-            id: string;
-            provider: string;
-            provider_subject: string;
-            user_id: string;
-            provider_login: string | null;
-            created_at_ms: number;
-            updated_at_ms: number;
-          }
-        | undefined;
+        "SELECT id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+      ).get(provider, providerSubject) as ExternalIdentityRecord | undefined;
       return row ?? null;
+    });
+  }
+
+  findExternalIdentityByUser(provider: string, userId: string): ExternalIdentityRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND user_id = ? LIMIT 1;",
+      ).get(provider, userId) as ExternalIdentityRecord | undefined;
+      return row ?? null;
+    });
+  }
+
+  updateExternalIdentityMetadata(input: {
+    provider: string;
+    providerSubject: string;
+    providerLogin?: string | null;
+    providerEmail?: string | null;
+  }): void {
+    this.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const existing = db.prepare(
+          "SELECT id, provider_login, provider_email FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+        ).get(input.provider, input.providerSubject) as { id: string; provider_login: string | null; provider_email: string | null } | undefined;
+
+        if (!existing) {
+          throw new IdentityConflictError(
+            `Cannot update external identity metadata: identity ${input.provider}:${input.providerSubject} not found.`,
+          );
+        }
+
+        const nowMs = Date.now();
+        const login = input.providerLogin !== undefined ? input.providerLogin : existing.provider_login;
+        // Never overwrite existing valid email with null/empty unless explicitly provided
+        const email = (input.providerEmail != null && input.providerEmail.trim().length > 0)
+          ? input.providerEmail.trim()
+          : existing.provider_email;
+
+        db.prepare(
+          "UPDATE external_identities SET provider_login = ?, provider_email = ?, updated_at_ms = ? WHERE id = ?;",
+        ).run(login, email, nowMs, existing.id);
+
+        db.exec("COMMIT;");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          /* ignore */
+        }
+        if (error instanceof IdentityError) throw error;
+        throw new IdentityDbUnavailable(`Failed to update external identity metadata: ${error}`);
+      }
     });
   }
 
@@ -1733,6 +1821,7 @@ export class IdentityStore {
     provider: string;
     providerSubject: string;
     providerLogin?: string;
+    providerEmail?: string | null;
   }): {
     user_id: string;
     external_identity_id: string;
@@ -1740,23 +1829,14 @@ export class IdentityStore {
     provider: string;
     provider_subject: string;
     provider_login: string | null;
+    provider_email: string | null;
   } {
     return this.withDb((db) => {
       db.exec("BEGIN IMMEDIATE;");
       try {
         const existing = db.prepare(
-          "SELECT id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
-        ).get(input.provider, input.providerSubject) as
-          | {
-              id: string;
-              provider: string;
-              provider_subject: string;
-              user_id: string;
-              provider_login: string | null;
-              created_at_ms: number;
-              updated_at_ms: number;
-            }
-          | undefined;
+          "SELECT id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms FROM external_identities WHERE provider = ? AND provider_subject = ? LIMIT 1;",
+        ).get(input.provider, input.providerSubject) as ExternalIdentityRecord | undefined;
 
         if (existing) {
           const userRow = db.prepare(
@@ -1776,12 +1856,19 @@ export class IdentityStore {
 
           let providerLogin = existing.provider_login;
           if (input.providerLogin !== undefined) {
-            const nowMs = Date.now();
-            db.prepare(
-              "UPDATE external_identities SET provider_login = ?, updated_at_ms = ? WHERE id = ?;",
-            ).run(input.providerLogin, nowMs, existing.id);
             providerLogin = input.providerLogin;
           }
+
+          // If a new valid email is provided, update it; otherwise preserve existing
+          let providerEmail = existing.provider_email;
+          if (input.providerEmail != null && input.providerEmail.trim().length > 0) {
+            providerEmail = input.providerEmail.trim();
+          }
+
+          const nowMs = Date.now();
+          db.prepare(
+            "UPDATE external_identities SET provider_login = ?, provider_email = ?, updated_at_ms = ? WHERE id = ?;",
+          ).run(providerLogin, providerEmail, nowMs, existing.id);
 
           db.exec("COMMIT;");
           return {
@@ -1791,26 +1878,29 @@ export class IdentityStore {
             provider: existing.provider,
             provider_subject: existing.provider_subject,
             provider_login: providerLogin,
+            provider_email: providerEmail,
           };
         }
 
         const nowMs = Date.now();
         const userId = newId("usr");
         const externalIdentityId = newId("ext");
+        const providerEmail = input.providerEmail?.trim() || null;
 
         db.prepare(
           "INSERT INTO users (id, created_at, disabled_at, is_admin) VALUES (?, ?, NULL, 0);",
         ).run(userId, nowMs);
 
         db.prepare(
-          `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?);`,
+          `INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
         ).run(
           externalIdentityId,
           input.provider,
           input.providerSubject,
           userId,
           input.providerLogin ?? null,
+          providerEmail,
           nowMs,
           nowMs,
         );
@@ -1823,6 +1913,7 @@ export class IdentityStore {
           provider: input.provider,
           provider_subject: input.providerSubject,
           provider_login: input.providerLogin ?? null,
+          provider_email: providerEmail,
         };
       } catch (error) {
         try {
@@ -1941,6 +2032,15 @@ export class IdentityStore {
         | { id: string; owner_user_id: string; remote_url: string; branch: string; created_at: number }
         | undefined;
       return row ?? null;
+    });
+  }
+
+  listAllWorkspaces(): WorkspaceRecord[] {
+    return this.withDb((db) => {
+      const rows = db.prepare(
+        "SELECT id, owner_user_id, remote_url, branch, created_at FROM workspaces ORDER BY id ASC;",
+      ).all() as unknown as WorkspaceRecord[];
+      return rows;
     });
   }
 

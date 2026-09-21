@@ -261,6 +261,10 @@ export function classifyGitHubResponseError(
 export interface WorkspaceBootstrapServiceOptions {
   appClient: GitHubAppClient;
   store: IdentityStore;
+  gitCommitter?: {
+    name: string;
+    email: string;
+  };
   fetchFn?: typeof fetch;
 }
 
@@ -281,12 +285,45 @@ export class WorkspaceBootstrapService {
   private readonly appClient: GitHubAppClient;
   private readonly store: IdentityStore;
   private readonly fetchFn: typeof fetch;
+  private readonly gitCommitter: { name: string; email: string };
   private readonly activeBootstraps = new Set<string>();
 
   constructor(options: WorkspaceBootstrapServiceOptions) {
     this.appClient = options.appClient;
     this.store = options.store;
     this.fetchFn = options.fetchFn ?? fetch;
+    this.gitCommitter = options.gitCommitter ?? {
+      name: "CEO State MCP",
+      email: "ceo-mcp@users.noreply.github.com",
+    };
+  }
+
+  private resolveCommitIdentity(workspaceId: string): {
+    author: { name: string; email: string };
+    committer: { name: string; email: string };
+  } {
+    const workspace = this.store.findWorkspaceById(workspaceId);
+    if (!workspace) {
+      throw new ManualRecoveryBootstrapError("WORKSPACE_NOT_FOUND", `Workspace '${workspaceId}' not found during commit attribution.`, 404);
+    }
+    const ownerIdentity = this.store.findExternalIdentityByUser("github", workspace.owner_user_id);
+    if (!ownerIdentity || !ownerIdentity.provider_email || !ownerIdentity.provider_login) {
+      throw new ManualRecoveryBootstrapError(
+        "INVALID_WORKSPACE_STATE",
+        `Workspace owner '${workspace.owner_user_id}' does not have a verified GitHub email and login for git author attribution.`,
+        400,
+      );
+    }
+    return {
+      author: {
+        name: ownerIdentity.provider_login.trim(),
+        email: ownerIdentity.provider_email.trim(),
+      },
+      committer: {
+        name: this.gitCommitter.name,
+        email: this.gitCommitter.email,
+      },
+    };
   }
 
   async getProvisioningStatus(workspaceId: string): Promise<WorkspaceProvisioningResult> {
@@ -622,6 +659,8 @@ export class WorkspaceBootstrapService {
       throw new ManualRecoveryBootstrapError("EMPTY_MANIFEST", "No bootstrap anchors provided in manifest");
     }
 
+    const commitIdentity = this.resolveCommitIdentity(workspaceId);
+
     const contentsRes = await this.fetchFn(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponent(firstAnchor.path)}`,
       {
@@ -636,6 +675,8 @@ export class WorkspaceBootstrapService {
           message: "chore: initialize CEO workspace",
           content: Buffer.from(firstAnchor.content, "utf-8").toString("base64"),
           branch,
+          author: commitIdentity.author,
+          committer: commitIdentity.committer,
         }),
       },
     );
@@ -840,6 +881,8 @@ export class WorkspaceBootstrapService {
 
     const createdTree = (await createTreeRes.json()) as { sha: string };
 
+    const commitIdentity = this.resolveCommitIdentity(workspaceId);
+
     // Create commit with parent = headCommitSha
     const createCommitRes = await this.fetchFn(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits`,
@@ -855,6 +898,8 @@ export class WorkspaceBootstrapService {
           message: "chore: bootstrap CEO workspace canonical anchors",
           tree: createdTree.sha,
           parents: [headCommitSha],
+          author: commitIdentity.author,
+          committer: commitIdentity.committer,
         }),
       },
     );

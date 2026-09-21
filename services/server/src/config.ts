@@ -5,8 +5,6 @@ export interface Config {
   dataRoot: string;
   port: number;
   bindHost: string;
-  gitAuthorName: string;
-  gitAuthorEmail: string;
   gitCommitterName: string;
   gitCommitterEmail: string;
   allowedHosts: string[];
@@ -59,8 +57,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const gitCommitterName = env.CEO_GIT_COMMITTER_NAME ?? "CEO State MCP";
   const gitCommitterEmail = env.CEO_GIT_COMMITTER_EMAIL ?? "ceo-mcp@users.noreply.github.com";
-  const gitAuthorName = env.CEO_GIT_AUTHOR_NAME ?? gitCommitterName;
-  const gitAuthorEmail = env.CEO_GIT_AUTHOR_EMAIL ?? gitCommitterEmail;
 
   const contentResolverUrl = env.CONTENT_RESOLVER_URL?.trim() || undefined;
   const contentResolverToken = env.CONTENT_RESOLVER_TOKEN?.trim() || undefined;
@@ -144,8 +140,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataRoot,
     port,
     bindHost,
-    gitAuthorName,
-    gitAuthorEmail,
     gitCommitterName,
     gitCommitterEmail,
     allowedHosts,

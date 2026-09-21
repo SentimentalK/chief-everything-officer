@@ -89,6 +89,10 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
 
     // Workspace 1
     db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_alice", now);
+    db.prepare(`
+      INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
+      VALUES ('ext_alice', 'github', 'sub_alice', 'usr_alice', 'alice', 'alice@example.com', ?, ?);
+    `).run(now, now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_one",
       "usr_alice",
@@ -136,6 +140,10 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
 
     // Workspace 2
     db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_bob", now);
+    db.prepare(`
+      INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
+      VALUES ('ext_bob', 'github', 'sub_bob', 'usr_bob', 'bob', 'bob@example.com', ?, ?);
+    `).run(now, now);
     db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
       "ws_two",
       "usr_bob",

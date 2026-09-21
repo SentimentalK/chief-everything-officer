@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { IdentityStore, GitHubRepositoryBindingRecord } from "../identity/store.js";
+import type { IdentityStore, GitHubRepositoryBindingRecord, WorkspaceRecord } from "../identity/store.js";
 import type { GitHubAppClient } from "../github/app-client.js";
 import { CeoWorkspace } from "../workspace.js";
 import { ResourceService, type SharedResourceDependencies } from "../resource/service.js";
@@ -19,11 +19,9 @@ const GITHUB_REPO_NAME_REGEX = /^[a-zA-Z0-9_.-]+$/;
 export interface WorkspaceRuntimeRegistryOptions {
   store: IdentityStore;
   dataRoot: string;
-  gitConfig: {
-    gitAuthorName: string;
-    gitAuthorEmail: string;
-    gitCommitterName: string;
-    gitCommitterEmail: string;
+  gitCommitter?: {
+    name: string;
+    email: string;
   };
   appClient?: GitHubAppClient;
   credentialProviderFactory?: (descriptor: WorkspaceRuntimeDescriptor) => GitCredentialProvider;
@@ -33,11 +31,16 @@ export interface WorkspaceRuntimeRegistryOptions {
 
 export class WorkspaceRuntimeRegistry {
   private readonly runtimes = new Map<string, Promise<WorkspaceRuntime>>();
+  private readonly gitCommitter: { name: string; email: string };
 
   constructor(private readonly options: WorkspaceRuntimeRegistryOptions) {
     if (!options.dataRoot || options.dataRoot.trim().length === 0) {
       throw new Error("dataRoot must be a non-empty string");
     }
+    this.gitCommitter = options.gitCommitter ?? {
+      name: "CEO State MCP",
+      email: "ceo-mcp@users.noreply.github.com",
+    };
   }
 
   async get(workspaceId: string): Promise<WorkspaceRuntime> {
@@ -65,7 +68,7 @@ export class WorkspaceRuntimeRegistry {
   }
 
   private async initRuntime(workspaceId: string): Promise<WorkspaceRuntime> {
-    const { descriptor, binding } = this.resolveRuntimeRecord(workspaceId);
+    const { descriptor, binding, workspace: workspaceRecord } = this.resolveRuntimeRecord(workspaceId);
 
     const workspaceDir = path.join(this.options.dataRoot, "workspaces", workspaceId);
     const repoDir = path.join(workspaceDir, "repo");
@@ -89,6 +92,16 @@ export class WorkspaceRuntimeRegistry {
       );
     }
 
+    const ownerIdentity = this.options.store.findExternalIdentityByUser("github", workspaceRecord.owner_user_id);
+    if (!ownerIdentity || !ownerIdentity.provider_login || !ownerIdentity.provider_email) {
+      throw new WorkspaceRuntimeResolutionError(
+        "INVALID_WORKSPACE_STATE",
+        `Workspace owner '${workspaceRecord.owner_user_id}' does not have a complete GitHub identity (login and email required for git author attribution).`,
+      );
+    }
+    const gitAuthorName = ownerIdentity.provider_login.trim();
+    const gitAuthorEmail = ownerIdentity.provider_email.trim();
+
     const runtimeConfig: WorkspaceRuntimeConfig = {
       workspaceId,
       dataRoot: workspaceDir,
@@ -97,10 +110,10 @@ export class WorkspaceRuntimeRegistry {
       stateDir,
       remoteUrl,
       branch: descriptor.branch,
-      gitAuthorName: this.options.gitConfig.gitAuthorName,
-      gitAuthorEmail: this.options.gitConfig.gitAuthorEmail,
-      gitCommitterName: this.options.gitConfig.gitCommitterName,
-      gitCommitterEmail: this.options.gitConfig.gitCommitterEmail,
+      gitAuthorName,
+      gitAuthorEmail,
+      gitCommitterName: this.gitCommitter.name,
+      gitCommitterEmail: this.gitCommitter.email,
       credentialProvider,
     };
 
@@ -133,6 +146,7 @@ export class WorkspaceRuntimeRegistry {
   private resolveRuntimeRecord(workspaceId: string): {
     descriptor: WorkspaceRuntimeDescriptor;
     binding: GitHubRepositoryBindingRecord;
+    workspace: WorkspaceRecord;
   } {
     // 1. Workspace
     const workspace = this.options.store.findWorkspaceById(workspaceId);
@@ -262,6 +276,7 @@ export class WorkspaceRuntimeRegistry {
         branch,
       },
       binding,
+      workspace,
     };
   }
 }

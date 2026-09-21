@@ -122,6 +122,10 @@ describe("Onboarding & Host Runtime Security Hardening", () => {
 
     store.withDb((db) => {
       db.prepare("INSERT OR REPLACE INTO users (id, created_at) VALUES (?, ?);").run(userId, now);
+      db.prepare(`
+        INSERT OR REPLACE INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
+        VALUES ('ext_sec_1', 'github', 'sub_sec_1', ?, 'alice', 'alice@example.com', ?, ?);
+      `).run(userId, now, now);
       db.prepare("INSERT OR REPLACE INTO workspaces (id, owner_user_id, remote_url, branch, created_at) VALUES (?, ?, ?, 'main', ?);")
         .run(workspaceId, userId, "https://github.com/alice/personal-vault.git", now);
       db.prepare("INSERT OR REPLACE INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);")

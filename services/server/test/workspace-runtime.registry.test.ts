@@ -113,6 +113,12 @@ describe("WorkspaceRuntimeRegistry", () => {
         VALUES (?, ?);
       `).run(userId, nowMs);
 
+      // Insert external identity for github user
+      db.prepare(`
+        INSERT OR IGNORE INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
+        VALUES (?, 'github', ?, ?, ?, ?, ?, ?);
+      `).run(`ext_${userId}`, `sub_${userId}`, userId, ownerLogin, `${ownerLogin}@example.com`, nowMs, nowMs);
+
       // Insert workspace
       db.prepare(`
         INSERT OR REPLACE INTO workspaces (id, owner_user_id, remote_url, branch, created_at)

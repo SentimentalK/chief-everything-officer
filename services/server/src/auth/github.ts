@@ -85,6 +85,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
     authorizeUrl.searchParams.set("client_id", clientId);
     authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
+    authorizeUrl.searchParams.set("scope", "user:email");
     authorizeUrl.searchParams.set("state", state);
     authorizeUrl.searchParams.set("code_challenge", codeChallenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
@@ -179,6 +180,39 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
         return;
       }
 
+      // 2b. Fetch verified primary email (strict invariant: login fails if missing)
+      let providerEmail: string | null = null;
+      try {
+        const emailsRes = await fetchClient("https://api.github.com/user/emails", {
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "CEO-Server",
+          },
+        });
+        if (emailsRes.ok) {
+          const emails = (await emailsRes.json()) as Array<{
+            email?: unknown;
+            primary?: unknown;
+            verified?: unknown;
+          }>;
+          if (Array.isArray(emails)) {
+            const primaryVerified = emails.find((e) => e.primary === true && e.verified === true);
+            if (primaryVerified && typeof primaryVerified.email === "string" && primaryVerified.email.trim().length > 0) {
+              providerEmail = primaryVerified.email.trim();
+            }
+          }
+        }
+      } catch {
+        res.redirect(302, "/login?error=email_fetch_failed");
+        return;
+      }
+
+      if (!providerEmail) {
+        res.redirect(302, "/login?error=verified_primary_email_required");
+        return;
+      }
+
       // Discard accessToken immediately (do not persist)
 
       // 3. Resolve or create CEO user from external identity
@@ -186,6 +220,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
         "github",
         profile.providerSubject,
         profile.providerLogin,
+        providerEmail,
       );
 
       // 4. Create CEO product session & set cookie
