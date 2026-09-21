@@ -432,6 +432,7 @@ async function createBootstrapTestContext(): Promise<TestContext> {
     provider: "github",
     providerSubject,
     providerLogin: "dev-owner",
+    providerEmail: "dev-owner@example.com",
   });
   const userId = extUser.user_id;
 
@@ -547,7 +548,8 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     const readyTree = gitState.trees.get(readyCommit.tree)!;
     expect(readyTree.map((x) => x.path).sort()).toEqual([".ceoignore", "README.md"]);
     const ceoignore = readyTree.find((x) => x.path === ".ceoignore");
-    expect(ceoignore?.content).toBe("README.md\n");
+    expect(ceoignore?.content).toContain("# Paths listed below are ignored by CEO");
+    expect(ceoignore?.content.endsWith("\n")).toBe(true);
   });
 
   it("I2. partial failure & locale-change retry preserves README and completes .ceoignore", async () => {
@@ -613,7 +615,8 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
 
     // .ceoignore is present and correct
     const ignoreBlob = readyTree.find((x) => x.path === ".ceoignore");
-    expect(ignoreBlob?.content).toBe("README.md\n");
+    expect(ignoreBlob?.content).toContain("# Paths listed below are ignored by CEO");
+    expect(ignoreBlob?.content.endsWith("\n")).toBe(true);
   });
 
   it("J. additive bootstrap preserving existing user repository content", async () => {
@@ -1102,6 +1105,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       provider: "github",
       providerSubject: "44444",
       providerLogin: "other_user",
+      providerEmail: "other_user@example.com",
     });
     const otherSession = ctx.sessionManager.createSession({
       userId: otherExtUser.user_id,
@@ -1200,6 +1204,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       provider: "github",
       providerSubject: "22222",
       providerLogin: "user2",
+      providerEmail: "user2@example.com",
     });
     const session2 = ctx.sessionManager.createSession({
       userId: user2.user_id,
@@ -1326,6 +1331,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
       provider: "github",
       providerSubject: "33333",
       providerLogin: "user3",
+      providerEmail: "user3@example.com",
     });
     const session3 = ctx.sessionManager.createSession({
       userId: user3.user_id,

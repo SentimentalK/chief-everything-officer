@@ -12,7 +12,7 @@ describe("Bootstrap templates and manifest", () => {
     expect(renderBootstrapReadme("zh")).toBe(README_ZH);
   });
 
-  it("builds fresh workspace manifest for en with README.md and .ceoignore", () => {
+  it("builds fresh workspace manifest for en with README.md and comment-only .ceoignore", () => {
     const manifest = buildFreshWorkspaceManifest("en");
     expect(manifest).toHaveLength(2);
 
@@ -21,13 +21,16 @@ describe("Bootstrap templates and manifest", () => {
     expect(readme!.content).toBe(README_EN);
     expect(readme!.content).toContain("# Welcome to CEO");
     expect(readme!.content).toContain("## You do not need to configure anything first");
+    expect(readme!.content).toContain("## Quick Setup Guide (For You & AI)");
 
     const ceoignore = manifest.find((f) => f.path === ".ceoignore");
     expect(ceoignore).toBeDefined();
-    expect(ceoignore!.content).toBe("README.md\n");
+    expect(ceoignore!.content).toContain("# Paths listed below are ignored by CEO");
+    expect(ceoignore!.content).not.toContain("README.md\n");
+    expect(ceoignore!.content.endsWith("\n")).toBe(true);
   });
 
-  it("builds fresh workspace manifest for zh with README.md and .ceoignore", () => {
+  it("builds fresh workspace manifest for zh with README.md and comment-only .ceoignore", () => {
     const manifest = buildFreshWorkspaceManifest("zh");
     expect(manifest).toHaveLength(2);
 
@@ -36,21 +39,26 @@ describe("Bootstrap templates and manifest", () => {
     expect(readme!.content).toBe(README_ZH);
     expect(readme!.content).toContain("# Welcome to CEO");
     expect(readme!.content).toContain("## 你不需要先配置任何东西");
+    expect(readme!.content).toContain("## 如何快速上手（给用户与 AI 的快速启动建议）");
 
     const ceoignore = manifest.find((f) => f.path === ".ceoignore");
     expect(ceoignore).toBeDefined();
-    expect(ceoignore!.content).toBe("README.md\n");
+    expect(ceoignore!.content).toContain("# Paths listed below are ignored by CEO");
+    expect(ceoignore!.content).not.toContain("README.md\n");
+    expect(ceoignore!.content.endsWith("\n")).toBe(true);
   });
 
-  it("ensures .ceoignore ends with newline and strictly ignores README.md", () => {
+  it("ensures .ceoignore ends with newline and does not ignore README.md", () => {
     const manifestEn = buildFreshWorkspaceManifest("en");
     const manifestZh = buildFreshWorkspaceManifest("zh");
 
     const ignoreEn = manifestEn.find((f) => f.path === ".ceoignore")!.content;
     const ignoreZh = manifestZh.find((f) => f.path === ".ceoignore")!.content;
 
-    expect(ignoreEn).toBe("README.md\n");
-    expect(ignoreZh).toBe("README.md\n");
+    expect(ignoreEn.endsWith("\n")).toBe(true);
+    expect(ignoreZh.endsWith("\n")).toBe(true);
+    expect(ignoreEn).not.toContain("README.md");
+    expect(ignoreZh).not.toContain("README.md");
   });
 
   it("ensures human user guides do not contain AI runtime directives", () => {
@@ -71,15 +79,42 @@ describe("Bootstrap templates and manifest", () => {
     // Chinese README
     expect(README_ZH).toContain("rules/<area>.md");
     expect(README_ZH).toContain("mode: extend");
-    expect(README_ZH).toContain("extend`（常规/默认选择）");
+    expect(README_ZH).toContain("extend`（常规 / 默认选择）");
     expect(README_ZH).toContain("override`：彻底废弃该领域的内置政策");
   });
 
-  it("ensures AI bootstrap policy contains the separate rule authoring contract", async () => {
+  it("explains custom folders, custom rules, and quick setup guide in both locales", () => {
+    // Chinese README
+    expect(README_ZH).toContain("自定义文件夹");
+    expect(README_ZH).toContain("自定义规则");
+    expect(README_ZH).toContain("它能帮你干什么");
+    expect(README_ZH).toContain("从一件你正在做的事情开始");
+
+    // English README
+    expect(README_EN).toContain("Custom folders");
+    expect(README_EN).toContain("Custom rules");
+    expect(README_EN).toContain("What it helps you do");
+    expect(README_EN).toContain("start with one real thing you are currently working on");
+  });
+
+  it("ensures policy/onboarding.md is removed and policy_read('onboarding') returns NO_DEFAULT_POLICY", async () => {
+    const { loadProductPolicy, getRuntimePolicy } = await import("../src/product-policy.js");
+    const policy = await loadProductPolicy();
+
+    const onboardingDoc = getRuntimePolicy(policy, "onboarding");
+    expect(onboardingDoc.status).toBe("NO_DEFAULT_POLICY");
+    expect(onboardingDoc.content).toBeNull();
+  });
+
+  it("ensures AI bootstrap policy routes onboarding intent to root README.md and contains rule authoring contract", async () => {
     const { loadProductPolicy } = await import("../src/product-policy.js");
     const policy = await loadProductPolicy();
 
     expect(policy.bootstrap).toBeDefined();
+    // Onboarding routing points to root README.md
+    expect(policy.bootstrap).toContain("先读取 workspace 根目录的 `README.md`");
+    expect(policy.bootstrap).not.toContain('policy_read("onboarding")');
+
     // Preserves existing policy_read resolution requirement
     expect(policy.bootstrap).toContain('policy_read("<area>")');
     expect(policy.bootstrap).toContain("AI 不自行读取、解析或拼接 `rules/<area>.md` 来重建规则优先级");

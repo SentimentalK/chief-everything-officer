@@ -6,6 +6,10 @@ export interface BootstrapFile {
   content: string;
 }
 
+export const DEFAULT_CEOIGNORE_CONTENT =
+  "# Paths listed below are ignored by CEO when reading or searching this workspace.\n" +
+  "# Add one relative file path per line, or a directory ending in /.\n";
+
 export function buildFreshWorkspaceManifest(locale: BootstrapLocale = "en"): BootstrapFile[] {
   return [
     {
@@ -14,7 +18,8 @@ export function buildFreshWorkspaceManifest(locale: BootstrapLocale = "en"): Boo
     },
     {
       path: ".ceoignore",
-      content: "README.md\n",
+      content: DEFAULT_CEOIGNORE_CONTENT,
     },
   ];
 }
+
