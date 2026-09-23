@@ -153,7 +153,7 @@ describe("Identity DB v8 -> v9 migration (access_scope_verified_at_ms)", () => {
     store.withDb((rawDb) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
       expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
-      expect(IDENTITY_DB_USER_VERSION).toBe(11);
+      expect(IDENTITY_DB_USER_VERSION).toBe(12);
 
       // Verify column exists
       const columns = rawDb.prepare("PRAGMA table_info(github_repository_bindings);").all() as Array<{ name: string }>;

@@ -110,11 +110,11 @@ function createValidV10Database(dbPath: string): void {
 }
 
 describe("Identity DB Migration v10 -> v11", () => {
-  it("IDENTITY_DB_USER_VERSION is 11", () => {
-    expect(IDENTITY_DB_USER_VERSION).toBe(11);
+  it("IDENTITY_DB_USER_VERSION is 12", () => {
+    expect(IDENTITY_DB_USER_VERSION).toBe(12);
   });
 
-  it("successfully migrates v10 database to v11 on IdentityStore.open", async () => {
+  it("successfully migrates v10 database to v11 (and v12) on IdentityStore.open", async () => {
     const { dbPath } = await tempDbPath();
     createValidV10Database(dbPath);
 
@@ -123,7 +123,7 @@ describe("Identity DB Migration v10 -> v11", () => {
 
     const db = new DatabaseSync(dbPath);
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(11);
+    expect(Number(versionRow.user_version)).toBe(IDENTITY_DB_USER_VERSION);
 
     // Verify existing user has NULL provider_email
     const existing = store.findExternalIdentity("github", "12345");
@@ -161,7 +161,7 @@ describe("Identity DB Migration v10 -> v11", () => {
     db.close();
   });
 
-  it("fresh provisioned database has user_version 11 and provider_email column", async () => {
+  it("fresh provisioned database has user_version 12 and provider_email column", async () => {
     const { dbPath } = await tempDbPath();
     provisionEmptyControlPlaneDatabase(dbPath);
 

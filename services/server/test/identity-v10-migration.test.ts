@@ -117,7 +117,7 @@ describe("Identity DB v9 -> v10 migration (users.is_admin)", () => {
     store.withDb((rawDb) => {
       const v = rawDb.prepare("PRAGMA user_version;").get() as { user_version: number };
       expect(Number(v.user_version)).toBe(IDENTITY_DB_USER_VERSION);
-      expect(IDENTITY_DB_USER_VERSION).toBe(11);
+      expect(IDENTITY_DB_USER_VERSION).toBe(12);
 
       const columns = rawDb.prepare("PRAGMA table_info(users);").all() as Array<{ name: string }>;
       expect(columns.some((c) => c.name === "is_admin")).toBe(true);

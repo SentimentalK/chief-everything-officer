@@ -46,7 +46,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 11;
+export const IDENTITY_DB_USER_VERSION = 12;
 
 export interface ExternalIdentityRecord {
   id: string;
@@ -322,6 +322,87 @@ WHERE state IN (
   'READY_TO_RESUME',
   'RECOVERY_REQUIRED'
 );
+
+CREATE TABLE devices (
+  id TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  revoked_at_ms INTEGER,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE device_credentials (
+  id TEXT PRIMARY KEY NOT NULL,
+  device_id TEXT NOT NULL,
+  secret_digest TEXT NOT NULL UNIQUE,
+  issued_at_ms INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  revoked_at_ms INTEGER,
+  FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+);
+
+CREATE TABLE execution_targets (
+  id TEXT PRIMARY KEY NOT NULL,
+  workspace_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  repository_provider TEXT,
+  repository_external_id TEXT,
+  repository_full_name TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  disabled_at_ms INTEGER,
+  UNIQUE(workspace_id, alias),
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+  CHECK (
+    (
+      repository_provider IS NULL
+      AND repository_external_id IS NULL
+      AND repository_full_name IS NULL
+    )
+    OR
+    (
+      repository_provider IS NOT NULL
+      AND repository_external_id IS NOT NULL
+      AND repository_full_name IS NOT NULL
+    )
+  )
+);
+
+CREATE TABLE device_target_bindings (
+  id TEXT PRIMARY KEY NOT NULL,
+  device_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  disabled_at_ms INTEGER,
+  UNIQUE(device_id, target_id),
+  FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+  FOREIGN KEY (target_id) REFERENCES execution_targets(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_devices_user ON devices(user_id);
+CREATE INDEX idx_devices_active_user ON devices(user_id, revoked_at_ms);
+
+CREATE INDEX idx_device_credentials_device ON device_credentials(device_id);
+CREATE INDEX idx_device_credentials_expiry ON device_credentials(expires_at_ms);
+
+CREATE INDEX idx_execution_targets_workspace ON execution_targets(workspace_id);
+CREATE INDEX idx_execution_targets_workspace_state ON execution_targets(workspace_id, disabled_at_ms);
+CREATE INDEX idx_execution_targets_repository
+ON execution_targets(
+  workspace_id,
+  repository_provider,
+  repository_external_id
+);
+
+CREATE INDEX idx_device_target_bindings_device ON device_target_bindings(device_id);
+CREATE INDEX idx_device_target_bindings_target ON device_target_bindings(target_id);
+CREATE INDEX idx_device_target_bindings_device_state ON device_target_bindings(device_id, disabled_at_ms);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
@@ -336,6 +417,10 @@ const EXPECTED_TABLES = [
   "github_repository_bindings",
   "workspace_bootstraps",
   "onboarding_flows",
+  "devices",
+  "device_credentials",
+  "execution_targets",
+  "device_target_bindings",
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
@@ -393,6 +478,10 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
     "updated_at_ms",
     "expires_at_ms",
   ],
+  devices: ["id", "user_id", "display_name", "platform", "created_at_ms", "updated_at_ms"],
+  device_credentials: ["id", "device_id", "secret_digest", "issued_at_ms", "expires_at_ms"],
+  execution_targets: ["id", "workspace_id", "alias", "display_name", "kind", "created_at_ms", "updated_at_ms"],
+  device_target_bindings: ["id", "device_id", "target_id", "created_at_ms", "updated_at_ms"],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -419,13 +508,22 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
     { from: "installation_row_id", to: "id", referencedTable: "github_installations" },
     { from: "workspace_id", to: "id", referencedTable: "workspaces" },
   ],
+  devices: [{ from: "user_id", to: "id", referencedTable: "users" }],
+  device_credentials: [{ from: "device_id", to: "id", referencedTable: "devices" }],
+  execution_targets: [{ from: "workspace_id", to: "id", referencedTable: "workspaces" }],
+  device_target_bindings: [
+    { from: "device_id", to: "id", referencedTable: "devices" },
+    { from: "target_id", to: "id", referencedTable: "execution_targets" },
+  ],
 };
 
 export function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-export function newId(prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba" | "onb"): string {
+export function newId(
+  prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba" | "onb" | "dev" | "dcr" | "tgt" | "dtb",
+): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
@@ -721,6 +819,25 @@ export class IdentityStore {
       ["user_id"],
       "state IN ('AWAITING_REPOSITORY_CHOICE', 'AWAITING_GITHUB_ACCESS', 'PROVISIONING', 'AWAITING_REPOSITORY_RESTRICTION', 'READY_TO_RESUME', 'RECOVERY_REQUIRED')",
     );
+
+    this.requireUniqueIndex(db, "device_credentials", ["secret_digest"]);
+    this.requireUniqueIndex(db, "execution_targets", ["workspace_id", "alias"]);
+    this.requireUniqueIndex(db, "device_target_bindings", ["device_id", "target_id"]);
+
+    const etMaster = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_targets';").get() as
+      | { sql: string | null }
+      | undefined;
+    const etSqlNorm = (etMaster?.sql ?? "").toLowerCase().replace(/\s+/g, " ");
+    if (
+      !etSqlNorm.includes("repository_provider is null") ||
+      !etSqlNorm.includes("repository_external_id is null") ||
+      !etSqlNorm.includes("repository_full_name is null") ||
+      !etSqlNorm.includes("repository_provider is not null") ||
+      !etSqlNorm.includes("repository_external_id is not null") ||
+      !etSqlNorm.includes("repository_full_name is not null")
+    ) {
+      throw new IdentityStructureError("Identity table 'execution_targets' is missing required repository CHECK constraint.");
+    }
 
     const bindingCols = db.prepare("PRAGMA table_info(github_repository_bindings);").all() as Array<{ name: string }>;
     if (!bindingCols.some((c) => c.name === "access_scope_verified_at_ms")) {
@@ -1035,6 +1152,130 @@ export class IdentityStore {
       }
     }
 
+    const devices = db.prepare("SELECT id, user_id, display_name, platform, created_at_ms, updated_at_ms, revoked_at_ms FROM devices;").all() as Array<{
+      id: string;
+      user_id: string;
+      display_name: string;
+      platform: string;
+      created_at_ms: number;
+      updated_at_ms: number;
+      revoked_at_ms: number | null;
+    }>;
+    for (const d of devices) {
+      if (typeof d.id !== "string" || !d.id.startsWith("dev_")) {
+        throw new IdentityStructureError(`Invalid devices id '${d.id}'.`);
+      }
+      if (typeof d.display_name !== "string" || d.display_name.trim().length === 0) {
+        throw new IdentityStructureError(`display_name in devices row '${d.id}' must be non-empty.`);
+      }
+      if (typeof d.platform !== "string" || d.platform.trim().length === 0) {
+        throw new IdentityStructureError(`platform in devices row '${d.id}' must be non-empty.`);
+      }
+      if (!Number.isInteger(d.created_at_ms) || d.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in devices row '${d.id}'.`);
+      }
+      if (!Number.isInteger(d.updated_at_ms) || d.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in devices row '${d.id}'.`);
+      }
+      if (d.revoked_at_ms !== null && (!Number.isInteger(d.revoked_at_ms) || d.revoked_at_ms <= 0)) {
+        throw new IdentityStructureError(`Invalid revoked_at_ms in devices row '${d.id}'.`);
+      }
+    }
+
+    const deviceCreds = db.prepare("SELECT id, device_id, secret_digest, issued_at_ms, expires_at_ms, revoked_at_ms FROM device_credentials;").all() as Array<{
+      id: string;
+      device_id: string;
+      secret_digest: string;
+      issued_at_ms: number;
+      expires_at_ms: number;
+      revoked_at_ms: number | null;
+    }>;
+    const sha256HexRegex = /^[0-9a-f]{64}$/;
+    for (const c of deviceCreds) {
+      if (typeof c.id !== "string" || !c.id.startsWith("dcr_")) {
+        throw new IdentityStructureError(`Invalid device_credentials id '${c.id}'.`);
+      }
+      if (typeof c.secret_digest !== "string" || !sha256HexRegex.test(c.secret_digest)) {
+        throw new IdentityStructureError(`secret_digest in device_credentials row '${c.id}' must be 64-char hex.`);
+      }
+      if (!Number.isInteger(c.issued_at_ms) || c.issued_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid issued_at_ms in device_credentials row '${c.id}'.`);
+      }
+      if (!Number.isInteger(c.expires_at_ms) || c.expires_at_ms <= c.issued_at_ms) {
+        throw new IdentityStructureError(`expires_at_ms in device_credentials row '${c.id}' must be > issued_at_ms.`);
+      }
+      if (c.revoked_at_ms !== null && (!Number.isInteger(c.revoked_at_ms) || c.revoked_at_ms <= 0)) {
+        throw new IdentityStructureError(`Invalid revoked_at_ms in device_credentials row '${c.id}'.`);
+      }
+    }
+
+    const targetAliasRegex = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+    const targets = db.prepare("SELECT id, workspace_id, alias, display_name, kind, repository_provider, repository_external_id, repository_full_name, created_at_ms, updated_at_ms, disabled_at_ms FROM execution_targets;").all() as Array<{
+      id: string;
+      workspace_id: string;
+      alias: string;
+      display_name: string;
+      kind: string;
+      repository_provider: string | null;
+      repository_external_id: string | null;
+      repository_full_name: string | null;
+      created_at_ms: number;
+      updated_at_ms: number;
+      disabled_at_ms: number | null;
+    }>;
+    for (const t of targets) {
+      if (typeof t.id !== "string" || !t.id.startsWith("tgt_")) {
+        throw new IdentityStructureError(`Invalid execution_targets id '${t.id}'.`);
+      }
+      if (typeof t.alias !== "string" || !targetAliasRegex.test(t.alias)) {
+        throw new IdentityStructureError(`alias in execution_targets row '${t.id}' must match ${targetAliasRegex}.`);
+      }
+      if (typeof t.display_name !== "string" || t.display_name.trim().length === 0) {
+        throw new IdentityStructureError(`display_name in execution_targets row '${t.id}' must be non-empty.`);
+      }
+      if (typeof t.kind !== "string" || t.kind.trim().length === 0) {
+        throw new IdentityStructureError(`kind in execution_targets row '${t.id}' must be non-empty.`);
+      }
+      if (!Number.isInteger(t.created_at_ms) || t.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in execution_targets row '${t.id}'.`);
+      }
+      if (!Number.isInteger(t.updated_at_ms) || t.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in execution_targets row '${t.id}'.`);
+      }
+      if (t.disabled_at_ms !== null && (!Number.isInteger(t.disabled_at_ms) || t.disabled_at_ms <= 0)) {
+        throw new IdentityStructureError(`Invalid disabled_at_ms in execution_targets row '${t.id}'.`);
+      }
+      const hasProvider = t.repository_provider !== null;
+      const hasExtId = t.repository_external_id !== null;
+      const hasFullName = t.repository_full_name !== null;
+      if (!((hasProvider && hasExtId && hasFullName) || (!hasProvider && !hasExtId && !hasFullName))) {
+        throw new IdentityStructureError(`execution_targets row '${t.id}' repository fields must be all NULL or all NOT NULL.`);
+      }
+    }
+
+    const targetBindings = db.prepare("SELECT id, device_id, target_id, created_at_ms, updated_at_ms, disabled_at_ms FROM device_target_bindings;").all() as Array<{
+      id: string;
+      device_id: string;
+      target_id: string;
+      created_at_ms: number;
+      updated_at_ms: number;
+      disabled_at_ms: number | null;
+    }>;
+    for (const b of targetBindings) {
+      if (typeof b.id !== "string" || !b.id.startsWith("dtb_")) {
+        throw new IdentityStructureError(`Invalid device_target_bindings id '${b.id}'.`);
+      }
+      if (!Number.isInteger(b.created_at_ms) || b.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in device_target_bindings row '${b.id}'.`);
+      }
+      if (!Number.isInteger(b.updated_at_ms) || b.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in device_target_bindings row '${b.id}'.`);
+      }
+      if (b.disabled_at_ms !== null && (!Number.isInteger(b.disabled_at_ms) || b.disabled_at_ms <= 0)) {
+        throw new IdentityStructureError(`Invalid disabled_at_ms in device_target_bindings row '${b.id}'.`);
+      }
+    }
+
     const fkViolations = db.prepare("PRAGMA foreign_key_check;").all() as Array<{
       table: string;
       rowid: number;
@@ -1213,6 +1454,9 @@ export class IdentityStore {
           break;
         case 10:
           IdentityStore.migrateV10ToV11(db);
+          break;
+        case 11:
+          IdentityStore.migrateV11ToV12(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -1749,6 +1993,126 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 10 to 11: ${error}`);
+    }
+  }
+
+  static migrateV11ToV12(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 11) {
+        throw new IdentityStructureError("migrateV11ToV12 requires user_version = 11.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+        "github_repository_bindings",
+        "workspace_bootstraps",
+        "onboarding_flows",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v12: missing required v11 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE devices (
+          id TEXT PRIMARY KEY NOT NULL,
+          user_id TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          revoked_at_ms INTEGER,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_devices_user ON devices(user_id);
+        CREATE INDEX idx_devices_active_user ON devices(user_id, revoked_at_ms);
+
+        CREATE TABLE device_credentials (
+          id TEXT PRIMARY KEY NOT NULL,
+          device_id TEXT NOT NULL,
+          secret_digest TEXT NOT NULL UNIQUE,
+          issued_at_ms INTEGER NOT NULL,
+          expires_at_ms INTEGER NOT NULL,
+          revoked_at_ms INTEGER,
+          FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_device_credentials_device ON device_credentials(device_id);
+        CREATE INDEX idx_device_credentials_expiry ON device_credentials(expires_at_ms);
+
+        CREATE TABLE execution_targets (
+          id TEXT PRIMARY KEY NOT NULL,
+          workspace_id TEXT NOT NULL,
+          alias TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          repository_provider TEXT,
+          repository_external_id TEXT,
+          repository_full_name TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          disabled_at_ms INTEGER,
+          UNIQUE(workspace_id, alias),
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+          CHECK (
+            (
+              repository_provider IS NULL
+              AND repository_external_id IS NULL
+              AND repository_full_name IS NULL
+            )
+            OR
+            (
+              repository_provider IS NOT NULL
+              AND repository_external_id IS NOT NULL
+              AND repository_full_name IS NOT NULL
+            )
+          )
+        );
+        CREATE INDEX idx_execution_targets_workspace ON execution_targets(workspace_id);
+        CREATE INDEX idx_execution_targets_workspace_state ON execution_targets(workspace_id, disabled_at_ms);
+        CREATE INDEX idx_execution_targets_repository
+        ON execution_targets(
+          workspace_id,
+          repository_provider,
+          repository_external_id
+        );
+
+        CREATE TABLE device_target_bindings (
+          id TEXT PRIMARY KEY NOT NULL,
+          device_id TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          disabled_at_ms INTEGER,
+          UNIQUE(device_id, target_id),
+          FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+          FOREIGN KEY (target_id) REFERENCES execution_targets(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_device_target_bindings_device ON device_target_bindings(device_id);
+        CREATE INDEX idx_device_target_bindings_target ON device_target_bindings(target_id);
+        CREATE INDEX idx_device_target_bindings_device_state ON device_target_bindings(device_id, disabled_at_ms);
+
+        PRAGMA user_version = 12;
+      `);
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 11 to 12: ${error}`);
     }
   }
 
