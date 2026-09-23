@@ -243,4 +243,30 @@ describe("createDeviceAuthMiddleware", () => {
     const res = await sendRequest(app, `Bearer ${token}`);
     expect(res.status).toBe(401);
   });
+
+  it("returns 503 identity_unavailable when IdentityStore is closed", async () => {
+    const secret = crypto.randomBytes(32).toString("base64url");
+    const secretDigest = crypto.createHash("sha256").update(secret, "utf8").digest("hex");
+
+    const dev = controlStore.createDevice({
+      userId: testUserId,
+      displayName: "My PC",
+      platform: "linux",
+    });
+    const cred = controlStore.createDeviceCredential({
+      deviceId: dev.id,
+      secretDigest,
+      expiresAtMs: Date.now() + 1000000,
+    });
+
+    const app = createTestApp();
+    const token = `ceo_dev1.${cred.id}.${secret}`;
+
+    // Close identityStore
+    identityStore.close();
+
+    const res = await sendRequest(app, `Bearer ${token}`);
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ error: "identity_unavailable" });
+  });
 });

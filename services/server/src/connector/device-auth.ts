@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import type { ConnectorControlStore } from "./control-store.js";
-import { IdentityDbUnavailable, type IdentityStore } from "../identity/store.js";
+import {
+  IdentityDbUnavailable,
+  IdentityDbContextClosed,
+  IdentityStructureError,
+  type IdentityStore,
+} from "../identity/store.js";
 
 export const DEVICE_CREDENTIAL_PREFIX = "ceo_dev1.";
 export const CREDENTIAL_ID_RE = /^dcr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -100,11 +105,15 @@ export function createDeviceAuthMiddleware(
 
       next();
     } catch (error) {
-      if (error instanceof IdentityDbUnavailable) {
+      if (
+        error instanceof IdentityDbUnavailable ||
+        error instanceof IdentityDbContextClosed ||
+        error instanceof IdentityStructureError
+      ) {
         res.status(503).json({ error: "identity_unavailable" });
         return;
       }
-      res.status(401).json({ error: "unauthorized" });
+      next(error);
     }
   };
 }

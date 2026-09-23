@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import express, { type Request, type Response, type Router } from "express";
+import express, { type Request, type Response, type Router, type RequestHandler } from "express";
 import type { ConnectorControlStore } from "./control-store.js";
 import {
   DeviceEnrollmentStore,
@@ -17,7 +17,9 @@ export interface ConnectorRouterOptions {
   enrollmentStore: DeviceEnrollmentStore;
   identityStore: IdentityStore;
   sessionManager: UserSessionManager;
-  publicOrigin?: string;
+  publicOrigin: string;
+  hostGuard?: RequestHandler;
+  originGuard?: RequestHandler;
 }
 
 function escapeHtml(s: string): string {
@@ -142,10 +144,19 @@ function renderHtml(title: string, bodyContent: string): string {
 }
 
 export function createConnectorRouter(options: ConnectorRouterOptions): Router {
-  const { controlStore, enrollmentStore, identityStore, sessionManager, publicOrigin } = options;
+  const { controlStore, enrollmentStore, identityStore, sessionManager, publicOrigin, hostGuard, originGuard } = options;
+  if (!publicOrigin || typeof publicOrigin !== "string" || publicOrigin.trim().length === 0) {
+    throw new Error("ConnectorRouter requires an authoritative non-empty publicOrigin.");
+  }
   const router = express.Router();
+  if (hostGuard) {
+    router.use(hostGuard);
+  }
+  if (originGuard) {
+    router.use(originGuard);
+  }
 
-  const baseUrl = (publicOrigin ? publicOrigin.replace(/\/+$/, "") : "http://localhost:3000");
+  const baseUrl = publicOrigin.trim().replace(/\/+$/, "");
 
   // ---------------------------------------------------------------------------
   // 1. Native API: Begin Enrollment
@@ -220,7 +231,7 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
       const deviceCode = body.device_code.trim();
       const digest = crypto.createHash("sha256").update(deviceCode, "utf8").digest("hex");
 
-      const enrollment = enrollmentStore.findByDeviceCodeDigest(digest);
+      const enrollment = enrollmentStore.lookupByDeviceCodeDigest(digest);
       if (!enrollment) {
         res.status(400).json({ error: "enrollment_not_found" });
         return;
@@ -249,6 +260,8 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
 
       if (enrollment.state === "approved") {
         try {
+          const issuedAtMs = Date.now();
+          const expiresAtMs = issuedAtMs + DEVICE_CREDENTIAL_TTL_MS;
           const finalRes = controlStore.finalizeDeviceEnrollment({
             deviceId: enrollment.reserved_device_id,
             credentialId: enrollment.reserved_credential_id,
@@ -256,8 +269,8 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
             displayName: enrollment.display_name,
             platform: enrollment.platform,
             secretDigest: enrollment.credential_secret_digest,
-            issuedAtMs: Date.now(),
-            expiresAtMs: Date.now() + DEVICE_CREDENTIAL_TTL_MS,
+            issuedAtMs,
+            expiresAtMs,
           });
 
           enrollmentStore.markConsumed(enrollment.enrollment_id);
@@ -550,6 +563,11 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
 
       if (suppliedDigest.length !== storedDigest.length || !crypto.timingSafeEqual(suppliedDigest, storedDigest)) {
         res.status(400).send(renderHtml("Security Warning", "<p>Consent nonce verification failed. Please try again.</p>"));
+        return;
+      }
+
+      if (decision !== "approve" && decision !== "deny") {
+        res.status(400).send(renderHtml("Invalid Decision", "<p>Invalid decision parameter; must be &#39;approve&#39; or &#39;deny&#39;.</p>"));
         return;
       }
 

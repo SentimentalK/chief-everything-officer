@@ -173,4 +173,55 @@ describe("DeviceEnrollmentStore - lifecycle & operations", () => {
     });
     expect(created.enrollment.display_name).toBe("Fresh device");
   });
+
+  it("enforces approved -> consumed lifecycle for markConsumed", () => {
+    // 1. Pending -> consumed is rejected
+    const { enrollment: enr1 } = store.createEnrollment({
+      displayName: "PC 1",
+      platform: "linux",
+      credentialSecretDigest: dummyDigest,
+    });
+    expect(store.markConsumed(enr1.enrollment_id)).toBe(false);
+
+    // 2. Denied -> consumed is rejected
+    const { enrollment: enr2 } = store.createEnrollment({
+      displayName: "PC 2",
+      platform: "linux",
+      credentialSecretDigest: dummyDigest,
+    });
+    store.deny(enr2.enrollment_id);
+    expect(store.markConsumed(enr2.enrollment_id)).toBe(false);
+
+    // 3. Approved -> consumed succeeds
+    const { enrollment: enr3 } = store.createEnrollment({
+      displayName: "PC 3",
+      platform: "linux",
+      credentialSecretDigest: dummyDigest,
+    });
+    store.approve(enr3.enrollment_id, "usr_alice");
+    expect(store.markConsumed(enr3.enrollment_id)).toBe(true);
+
+    // 4. Consumed -> consumed is idempotent replay (returns true)
+    expect(store.markConsumed(enr3.enrollment_id)).toBe(true);
+  });
+
+  it("lookupByDeviceCodeDigest returns record even if expired", () => {
+    const now = 1000000;
+    const { enrollment } = store.createEnrollment({
+      displayName: "Expiring PC",
+      platform: "linux",
+      credentialSecretDigest: dummyDigest,
+      nowMs: now,
+      ttlMs: 5000,
+    });
+
+    const pastExpiry = now + 10000;
+    // findByDeviceCodeDigest returns null when expired
+    expect(store.findByDeviceCodeDigest(enrollment.device_code_digest, pastExpiry)).toBeNull();
+
+    // lookupByDeviceCodeDigest returns the record even when expired
+    const record = store.lookupByDeviceCodeDigest(enrollment.device_code_digest);
+    expect(record).not.toBeNull();
+    expect(record?.enrollment_id).toBe(enrollment.enrollment_id);
+  });
 });

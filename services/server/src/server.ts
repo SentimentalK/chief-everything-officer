@@ -211,16 +211,22 @@ app.use(
   }),
 );
 
-// Connector trusted-device enrollment & auth router
-app.use(
-  createConnectorRouter({
-    controlStore: connectorControlStore,
-    enrollmentStore: deviceEnrollmentStore,
-    identityStore: identityService.storeInstance,
-    sessionManager: userSessionManager,
-    publicOrigin: config.publicOrigin,
-  }),
-);
+// Connector trusted-device enrollment & auth router (when publicOrigin is configured)
+if (config.publicOrigin) {
+  app.use(
+    createConnectorRouter({
+      controlStore: connectorControlStore,
+      enrollmentStore: deviceEnrollmentStore,
+      identityStore: identityService.storeInstance,
+      sessionManager: userSessionManager,
+      publicOrigin: config.publicOrigin,
+      hostGuard: createHostGuard(config.allowedHosts),
+      originGuard: createOriginGuard(config.allowedOrigins),
+    }),
+  );
+} else {
+  process.stdout.write("Connector enrollment router disabled: publicOrigin is not configured\n");
+}
 
 // GitHub OAuth authorization router (when configured)
 if (config.githubClientId && config.githubClientSecret) {

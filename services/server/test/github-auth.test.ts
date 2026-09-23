@@ -452,12 +452,8 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
         `${env.baseUrl}/auth/github?next=/audit&oauth_request=oar_keep`,
         { redirect: "manual" },
       );
-      const bothState = new URL(both.headers.get("location")!).searchParams.get("state")!;
-      const bothCb = await fetch(
-        `${env.baseUrl}/auth/github/callback?code=valid-code&state=${encodeURIComponent(bothState)}`,
-        { redirect: "manual" },
-      );
-      expect(bothCb.headers.get("location")).toBe("/authorize/resume?request=oar_keep");
+      expect(both.status).toBe(400);
+      expect(await both.json()).toEqual({ error: "ambiguous_auth_continuation" });
     } finally {
       await env.close();
     }

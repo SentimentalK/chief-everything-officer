@@ -76,7 +76,12 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
     const rawConnectorEnrollment = typeof req.query.connector_enrollment === "string" ? req.query.connector_enrollment.trim() : undefined;
     const rawNext = typeof req.query.next === "string" ? req.query.next.trim() : undefined;
 
-    if (rawConnectorEnrollment && (rawOauthRequest || rawNext)) {
+    let continuationCount = 0;
+    if (rawOauthRequest && rawOauthRequest.length > 0) continuationCount++;
+    if (rawConnectorEnrollment && rawConnectorEnrollment.length > 0) continuationCount++;
+    if (rawNext && rawNext.length > 0) continuationCount++;
+
+    if (continuationCount > 1) {
       res.status(400).json({ error: "ambiguous_auth_continuation" });
       return;
     }

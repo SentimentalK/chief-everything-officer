@@ -211,6 +211,12 @@ export class DeviceEnrollmentStore {
     return enr;
   }
 
+  lookupByDeviceCodeDigest(digest: string): DeviceEnrollment | null {
+    const id = this.deviceCodeDigestIndex.get(digest);
+    if (!id) return null;
+    return this.enrollments.get(id) ?? null;
+  }
+
   getEnrollment(enrollmentId: string): DeviceEnrollment | null {
     return this.enrollments.get(enrollmentId) ?? null;
   }
@@ -244,6 +250,8 @@ export class DeviceEnrollmentStore {
   markConsumed(enrollmentId: string, nowMs?: number): boolean {
     const enr = this.enrollments.get(enrollmentId);
     if (!enr) return false;
+    if (enr.state === "consumed") return true; // idempotent replay / no-op
+    if (enr.state !== "approved") return false; // reject pending or denied -> consumed
     enr.state = "consumed";
     enr.consumed_at_ms = nowMs ?? Date.now();
     return true;

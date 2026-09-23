@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 import os from "os";
 import crypto from "node:crypto";
+import http from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import express, { type Request, type Response } from "express";
 import {
@@ -15,7 +16,11 @@ import { createUserRouter } from "../src/auth/user-router.js";
 import { UserSessionManager } from "../src/auth/user-session.js";
 import { createGitHubAuthRouter } from "../src/auth/github.js";
 import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
-import { createIdentityAuthMiddleware } from "../src/auth.js";
+import {
+  createIdentityAuthMiddleware,
+  createHostGuard,
+  createOriginGuard,
+} from "../src/auth.js";
 import { IdentityService } from "../src/identity/service.js";
 
 const cleanupDirs: string[] = [];
@@ -56,7 +61,11 @@ afterEach(async () => {
   await Promise.all(cleanupDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
 });
 
-function createTestServer() {
+function createTestServer(options?: {
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+  publicOrigin?: string;
+}) {
   const app = express();
   app.use(express.json());
 
@@ -70,14 +79,19 @@ function createTestServer() {
     }),
   );
 
-  // Mount Connector Router
+  const allowedHosts = options?.allowedHosts ?? ["127.0.0.1", "localhost"];
+  const allowedOrigins = options?.allowedOrigins ?? ["http://127.0.0.1:3000"];
+
+  // Mount Connector Router with guards
   app.use(
     createConnectorRouter({
       controlStore,
       enrollmentStore,
       identityStore,
       sessionManager,
-      publicOrigin: "http://127.0.0.1:3000",
+      publicOrigin: options?.publicOrigin ?? "http://127.0.0.1:3000",
+      hostGuard: createHostGuard(allowedHosts),
+      originGuard: createOriginGuard(allowedOrigins),
     }),
   );
 
@@ -434,6 +448,22 @@ describe("CEO Connector V1.2 - E2E Trusted Device Enrollment", () => {
       expect(ambigNextRes.status).toBe(400);
       expect((await ambigNextRes.json()) as any).toEqual({ error: "ambiguous_auth_continuation" });
 
+      // 2b. Ambiguous continuation (oauth_request + next) -> 400
+      const ambigOauthNextRes = await fetch(
+        `${baseUrl}/auth/github?oauth_request=oar_123&next=/audit`,
+        { redirect: "manual" },
+      );
+      expect(ambigOauthNextRes.status).toBe(400);
+      expect((await ambigOauthNextRes.json()) as any).toEqual({ error: "ambiguous_auth_continuation" });
+
+      // 2c. Ambiguous continuation (all three) -> 400
+      const ambigAllThreeRes = await fetch(
+        `${baseUrl}/auth/github?oauth_request=oar_123&connector_enrollment=ABCD-EFGH&next=/audit`,
+        { redirect: "manual" },
+      );
+      expect(ambigAllThreeRes.status).toBe(400);
+      expect((await ambigAllThreeRes.json()) as any).toEqual({ error: "ambiguous_auth_continuation" });
+
       // 3. Invalid connector_enrollment -> 400
       const invalidRes = await fetch(
         `${baseUrl}/auth/github?connector_enrollment=invalid!!`,
@@ -564,5 +594,283 @@ describe("CEO Connector V1.2 - E2E Trusted Device Enrollment", () => {
     } finally {
       close();
     }
+  });
+
+  it("enforces Host and Origin guards on connector routes", async () => {
+    const { baseUrl, close } = createTestServer({
+      allowedHosts: ["127.0.0.1", "localhost"],
+      allowedOrigins: ["http://127.0.0.1:3000"],
+    });
+    try {
+      const localSecret = crypto.randomBytes(32).toString("base64url");
+      const localSecretDigest = crypto.createHash("sha256").update(localSecret, "utf8").digest("hex");
+      const validPayload = {
+        display_name: "Guarded Machine",
+        platform: "linux",
+        credential_secret_sha256: localSecretDigest,
+      };
+
+      // 1. Invalid Host header -> 421 Misdirected Request
+      const port = Number(new URL(baseUrl).port);
+      const badHostStatus = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: "/api/connector/enrollments",
+            method: "POST",
+            headers: {
+              host: "evil.attacker.com",
+              "content-type": "application/json",
+            },
+          },
+          (res) => resolve(res.statusCode ?? 0),
+        );
+        req.on("error", reject);
+        req.write(JSON.stringify(validPayload));
+        req.end();
+      });
+      expect(badHostStatus).toBe(421);
+
+      // 1b. Invalid Host on browser enroll UI -> 421
+      const badHostUiStatus = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: "/connector/enroll?user_code=ABCD-EFGH",
+            method: "GET",
+            headers: { host: "evil.attacker.com" },
+          },
+          (res) => resolve(res.statusCode ?? 0),
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      expect(badHostUiStatus).toBe(421);
+
+      // 2. Foreign Origin -> 403 Forbidden
+      const resBadOrigin = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://malicious-site.com",
+        },
+        body: JSON.stringify(validPayload),
+      });
+      expect(resBadOrigin.status).toBe(403);
+
+      // 3. Native client with NO Origin header -> allowed (200)
+      const resNativeNoOrigin = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validPayload),
+      });
+      expect(resNativeNoOrigin.status).toBe(200);
+
+      // 4. Browser client with allowed Origin header -> allowed (200)
+      const resAllowedOrigin = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://127.0.0.1:3000",
+        },
+        body: JSON.stringify(validPayload),
+      });
+      expect(resAllowedOrigin.status).toBe(200);
+    } finally {
+      close();
+    }
+  });
+
+  it("returns expired_token when polling an expired enrollment", async () => {
+    const { baseUrl, close } = createTestServer();
+    try {
+      const localSecret = crypto.randomBytes(32).toString("base64url");
+      const localSecretDigest = crypto.createHash("sha256").update(localSecret, "utf8").digest("hex");
+
+      const enrollRes = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          display_name: "Quick Expiry Machine",
+          platform: "linux",
+          credential_secret_sha256: localSecretDigest,
+        }),
+      });
+      expect(enrollRes.status).toBe(200);
+      const enrollData = (await enrollRes.json()) as any;
+
+      // Manually set expiration in the past
+      const enr = enrollmentStore.findByUserCode(enrollData.user_code);
+      expect(enr).toBeTruthy();
+      enr!.expires_at_ms = Date.now() - 1000;
+
+      // Polling known but expired device_code -> expired_token
+      const pollExpiredRes = await fetch(`${baseUrl}/api/connector/enrollments/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_code: enrollData.device_code }),
+      });
+      expect(pollExpiredRes.status).toBe(400);
+      expect(await pollExpiredRes.json()).toEqual({ error: "expired_token" });
+
+      // Polling completely unknown device_code -> enrollment_not_found
+      const pollUnknownRes = await fetch(`${baseUrl}/api/connector/enrollments/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_code: "unknown_device_code_12345" }),
+      });
+      expect(pollUnknownRes.status).toBe(400);
+      expect(await pollUnknownRes.json()).toEqual({ error: "enrollment_not_found" });
+    } finally {
+      close();
+    }
+  });
+
+  it("rejects invalid decision in /connector/enroll/decision with 400", async () => {
+    const { baseUrl, close } = createTestServer();
+    try {
+      const localSecret = crypto.randomBytes(32).toString("base64url");
+      const localSecretDigest = crypto.createHash("sha256").update(localSecret, "utf8").digest("hex");
+
+      const enrollRes = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          display_name: "Machine",
+          platform: "linux",
+          credential_secret_sha256: localSecretDigest,
+        }),
+      });
+      const enrollData = (await enrollRes.json()) as any;
+
+      const session = sessionManager.createSession({
+        userId: userAId,
+        provider: "github",
+        providerSubject: "123456",
+        providerLogin: "alice-gh",
+      });
+      const cookieHeader = `ceo_user_session=${session.sessionId}`;
+
+      const pageRes = await fetch(`${baseUrl}/connector/enroll?user_code=${enrollData.user_code}`, {
+        headers: { Cookie: cookieHeader },
+      });
+      const pageHtml = await pageRes.text();
+      const nonceMatch = pageHtml.match(/name="consent_nonce" value="([^"]+)"/);
+      const consentNonce = nonceMatch![1]!;
+
+      // Invalid decision value (not "approve" and not "deny")
+      const invalidDecisionRes = await fetch(`${baseUrl}/connector/enroll/decision`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: cookieHeader,
+        },
+        body: new URLSearchParams({
+          user_code: enrollData.user_code,
+          consent_nonce: consentNonce,
+          decision: "maybe",
+        }).toString(),
+      });
+      expect(invalidDecisionRes.status).toBe(400);
+      expect(await invalidDecisionRes.text()).toContain("Invalid Decision");
+
+      // Enrollment remains pending because invalid decision was rejected
+      const pollRes = await fetch(`${baseUrl}/api/connector/enrollments/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_code: enrollData.device_code }),
+      });
+      expect(pollRes.status).toBe(400);
+      expect(await pollRes.json()).toEqual({ error: "authorization_pending" });
+    } finally {
+      close();
+    }
+  });
+
+  it("freezes credential expiry to exactly issued_at_ms + DEVICE_CREDENTIAL_TTL_MS", async () => {
+    const { baseUrl, close } = createTestServer();
+    try {
+      const localSecret = crypto.randomBytes(32).toString("base64url");
+      const localSecretDigest = crypto.createHash("sha256").update(localSecret, "utf8").digest("hex");
+
+      const enrollRes = await fetch(`${baseUrl}/api/connector/enrollments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          display_name: "TTL Machine",
+          platform: "linux",
+          credential_secret_sha256: localSecretDigest,
+        }),
+      });
+      const enrollData = (await enrollRes.json()) as any;
+
+      const session = sessionManager.createSession({
+        userId: userAId,
+        provider: "github",
+        providerSubject: "123456",
+        providerLogin: "alice-gh",
+      });
+      const cookieHeader = `ceo_user_session=${session.sessionId}`;
+
+      const pageRes = await fetch(`${baseUrl}/connector/enroll?user_code=${enrollData.user_code}`, {
+        headers: { Cookie: cookieHeader },
+      });
+      const pageHtml = await pageRes.text();
+      const nonceMatch = pageHtml.match(/name="consent_nonce" value="([^"]+)"/);
+      const consentNonce = nonceMatch![1]!;
+
+      await fetch(`${baseUrl}/connector/enroll/decision`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: cookieHeader,
+        },
+        body: new URLSearchParams({
+          user_code: enrollData.user_code,
+          consent_nonce: consentNonce,
+          decision: "approve",
+        }).toString(),
+      });
+
+      const pollRes = await fetch(`${baseUrl}/api/connector/enrollments/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_code: enrollData.device_code }),
+      });
+      expect(pollRes.status).toBe(200);
+      const pollData = (await pollRes.json()) as any;
+
+      const cred = controlStore.getDeviceCredential(pollData.credential.id);
+      expect(cred).not.toBeNull();
+      const expectedTtl = 365 * 24 * 60 * 60 * 1000;
+      expect(cred!.expires_at_ms - cred!.issued_at_ms).toBe(expectedTtl);
+      expect(pollData.credential.expires_at_ms).toBe(cred!.expires_at_ms);
+    } finally {
+      close();
+    }
+  });
+
+  it("fails closed when publicOrigin is missing or empty", () => {
+    expect(() =>
+      createConnectorRouter({
+        controlStore,
+        enrollmentStore,
+        identityStore,
+        sessionManager,
+        publicOrigin: "",
+      }),
+    ).toThrow(/publicOrigin/);
+
+    expect(() =>
+      createConnectorRouter({
+        controlStore,
+        enrollmentStore,
+        identityStore,
+        sessionManager,
+        publicOrigin: "   ",
+      }),
+    ).toThrow(/publicOrigin/);
   });
 });
