@@ -3,6 +3,7 @@ import express, { type Request, type Response, type Router } from "express";
 import type { AccountProvisioner } from "../identity/provisioner.js";
 import { IdentityConflictError } from "../identity/store.js";
 import type { UserSessionManager } from "./user-session.js";
+import { normalizeDeviceUserCode } from "../connector/enrollment-store.js";
 
 export interface GitHubAuthRouterOptions {
   clientId: string;
@@ -13,13 +14,18 @@ export interface GitHubAuthRouterOptions {
   fetchFn?: typeof fetch;
 }
 
-type AllowedNextPath = "/audit" | "/login";
+export type AllowedNextPath = "/audit" | "/login";
+
+export type GitHubAuthContinuation =
+  | { kind: "host_oauth"; requestId: string }
+  | { kind: "connector_enrollment"; userCode: string }
+  | { kind: "product"; path: AllowedNextPath }
+  | null;
 
 interface PendingOAuthState {
   codeVerifier: string;
   expiresAt: number;
-  oauthRequest?: string;
-  next?: AllowedNextPath;
+  continuation: GitHubAuthContinuation;
 }
 
 function parseAllowedNext(raw: unknown): AllowedNextPath | undefined {
@@ -66,8 +72,33 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
   router.get("/", (req: Request, res: Response) => {
     cleanupStates();
 
-    const oauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request : undefined;
-    const next = parseAllowedNext(req.query.next);
+    const rawOauthRequest = typeof req.query.oauth_request === "string" ? req.query.oauth_request.trim() : undefined;
+    const rawConnectorEnrollment = typeof req.query.connector_enrollment === "string" ? req.query.connector_enrollment.trim() : undefined;
+    const rawNext = typeof req.query.next === "string" ? req.query.next.trim() : undefined;
+
+    if (rawConnectorEnrollment && (rawOauthRequest || rawNext)) {
+      res.status(400).json({ error: "ambiguous_auth_continuation" });
+      return;
+    }
+
+    let continuation: GitHubAuthContinuation = null;
+    if (rawConnectorEnrollment && rawConnectorEnrollment.length > 0) {
+      try {
+        const userCode = normalizeDeviceUserCode(rawConnectorEnrollment);
+        continuation = { kind: "connector_enrollment", userCode };
+      } catch {
+        res.status(400).json({ error: "invalid_connector_enrollment" });
+        return;
+      }
+    } else if (rawOauthRequest && rawOauthRequest.length > 0) {
+      continuation = { kind: "host_oauth", requestId: rawOauthRequest };
+    } else if (rawNext) {
+      const next = parseAllowedNext(rawNext);
+      if (next) {
+        continuation = { kind: "product", path: next };
+      }
+    }
+
     const state = crypto.randomBytes(32).toString("hex");
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto
@@ -78,8 +109,7 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
     pendingStates.set(state, {
       codeVerifier,
       expiresAt: Date.now() + STATE_TTL_MS,
-      oauthRequest,
-      next,
+      continuation,
     });
 
     const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
@@ -230,12 +260,16 @@ export function createGitHubAuthRouter(options: GitHubAuthRouterOptions): Router
       });
 
       sessionManager.setCookie(res, session.sessionId);
-      if (pending.oauthRequest) {
-        res.redirect(302, `/authorize/resume?request=${encodeURIComponent(pending.oauthRequest)}`);
+      if (pending.continuation?.kind === "host_oauth") {
+        res.redirect(302, `/authorize/resume?request=${encodeURIComponent(pending.continuation.requestId)}`);
         return;
       }
-      if (pending.next) {
-        res.redirect(302, pending.next);
+      if (pending.continuation?.kind === "connector_enrollment") {
+        res.redirect(302, `/connector/enroll?user_code=${encodeURIComponent(pending.continuation.userCode)}`);
+        return;
+      }
+      if (pending.continuation?.kind === "product") {
+        res.redirect(302, pending.continuation.path);
         return;
       }
       res.redirect(302, "/login");

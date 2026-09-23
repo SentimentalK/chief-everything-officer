@@ -20,6 +20,9 @@ import { IdentityAccountProvisioner } from "./identity/provisioner.js";
 import { UserSessionManager } from "./auth/user-session.js";
 import { createGitHubAuthRouter } from "./auth/github.js";
 import { createUserRouter } from "./auth/user-router.js";
+import { ConnectorControlStore } from "./connector/control-store.js";
+import { DeviceEnrollmentStore } from "./connector/enrollment-store.js";
+import { createConnectorRouter } from "./connector/router.js";
 import { GitHubAppClient } from "./github/app-client.js";
 import { GitHubInstallationService } from "./github/installation-service.js";
 import { GitHubRepositoryService } from "./github/repository-service.js";
@@ -114,6 +117,9 @@ const userSessionManager = new UserSessionManager({
   secureCookies: isSecureOrigin,
 });
 
+const connectorControlStore = new ConnectorControlStore(identityService.storeInstance);
+const deviceEnrollmentStore = new DeviceEnrollmentStore();
+
 // Optional worker-bridge job layer (disabled unless configured). Resource
 // existence for new tasks is checked against repo contents of the requested workspace runtime.
 const jobBridge = openJobBridge({
@@ -201,6 +207,18 @@ app.use(
   createUserRouter({
     store: identityService.storeInstance,
     sessionManager: userSessionManager,
+    controlStore: connectorControlStore,
+  }),
+);
+
+// Connector trusted-device enrollment & auth router
+app.use(
+  createConnectorRouter({
+    controlStore: connectorControlStore,
+    enrollmentStore: deviceEnrollmentStore,
+    identityStore: identityService.storeInstance,
+    sessionManager: userSessionManager,
+    publicOrigin: config.publicOrigin,
   }),
 );
 

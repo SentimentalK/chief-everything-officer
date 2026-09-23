@@ -1,6 +1,11 @@
 import { IdentityStore, IdentityError, newId } from "../identity/store.js";
 
-export class ConnectorControlError extends IdentityError {}
+export class ConnectorControlError extends IdentityError {
+  constructor(message: string, public readonly code?: string) {
+    super(message);
+    this.name = this.constructor.name;
+  }
+}
 export class ConnectorTargetConflictError extends ConnectorControlError {}
 export class ConnectorNotFoundError extends ConnectorControlError {}
 export class ConnectorValidationError extends ConnectorControlError {}
@@ -222,6 +227,129 @@ export class ConnectorControlStore {
         WHERE id = ? AND revoked_at_ms IS NULL;
       `).run(now, credentialId);
       return Number(res.changes) > 0;
+    });
+  }
+
+  finalizeDeviceEnrollment(input: {
+    deviceId: string;
+    credentialId: string;
+    userId: string;
+    displayName: string;
+    platform: string;
+    secretDigest: string;
+    issuedAtMs?: number;
+    expiresAtMs: number;
+  }): { device: DeviceRecord; credential: DeviceCredentialRecord; replayed: boolean } {
+    const trimmedName = input.displayName.trim();
+    if (trimmedName.length === 0 || trimmedName.length > 128) {
+      throw new ConnectorValidationError("Device display_name must be between 1 and 128 characters.");
+    }
+    const trimmedPlatform = input.platform.trim().toLowerCase();
+    if (trimmedPlatform.length === 0 || trimmedPlatform.length > 32) {
+      throw new ConnectorValidationError("Device platform must be between 1 and 32 characters.");
+    }
+    if (!SHA256_HEX_RE.test(input.secretDigest)) {
+      throw new ConnectorValidationError("secret_digest must be a 64-character lowercase hex string.");
+    }
+
+    const issuedAt = input.issuedAtMs ?? Date.now();
+    if (input.expiresAtMs <= issuedAt) {
+      throw new ConnectorValidationError("expires_at_ms must be strictly greater than issued_at_ms.");
+    }
+
+    return this.identityStore.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const user = db.prepare("SELECT id FROM users WHERE id = ? AND disabled_at IS NULL LIMIT 1;").get(input.userId);
+        if (!user) {
+          throw new ConnectorNotFoundError(`User '${input.userId}' not found or disabled.`);
+        }
+
+        const existingDevice = db.prepare(
+          "SELECT id, user_id, display_name, platform, created_at_ms, updated_at_ms, revoked_at_ms FROM devices WHERE id = ? LIMIT 1;",
+        ).get(input.deviceId) as DeviceRecord | undefined;
+
+        const existingCredential = db.prepare(
+          "SELECT id, device_id, secret_digest, issued_at_ms, expires_at_ms, revoked_at_ms FROM device_credentials WHERE id = ? LIMIT 1;",
+        ).get(input.credentialId) as DeviceCredentialRecord | undefined;
+
+        // Case 1: Both exist -> check exact match for idempotent replay
+        if (existingDevice && existingCredential) {
+          const matches =
+            existingDevice.user_id === input.userId &&
+            existingDevice.display_name === trimmedName &&
+            existingDevice.platform === trimmedPlatform &&
+            existingCredential.device_id === input.deviceId &&
+            existingCredential.secret_digest === input.secretDigest;
+
+          if (matches) {
+            db.exec("COMMIT;");
+            return {
+              device: existingDevice,
+              credential: existingCredential,
+              replayed: true,
+            };
+          }
+
+          throw new ConnectorControlError(
+            `Conflict: Device '${input.deviceId}' and/or Credential '${input.credentialId}' already exist with conflicting metadata.`,
+            "INTERNAL_CONFLICT",
+          );
+        }
+
+        // Case 2: One exists and the other does not -> partial state, fail closed
+        if (existingDevice || existingCredential) {
+          throw new ConnectorControlError(
+            `Conflict: Partial existing state for Device '${input.deviceId}' or Credential '${input.credentialId}'.`,
+            "INTERNAL_CONFLICT",
+          );
+        }
+
+        // Case 3: Neither exists -> atomic insert
+        db.prepare(`
+          INSERT INTO devices (id, user_id, display_name, platform, created_at_ms, updated_at_ms, revoked_at_ms)
+          VALUES (?, ?, ?, ?, ?, ?, NULL);
+        `).run(input.deviceId, input.userId, trimmedName, trimmedPlatform, issuedAt, issuedAt);
+
+        db.prepare(`
+          INSERT INTO device_credentials (id, device_id, secret_digest, issued_at_ms, expires_at_ms, revoked_at_ms)
+          VALUES (?, ?, ?, ?, ?, NULL);
+        `).run(input.credentialId, input.deviceId, input.secretDigest, issuedAt, input.expiresAtMs);
+
+        db.exec("COMMIT;");
+
+        const device: DeviceRecord = {
+          id: input.deviceId,
+          user_id: input.userId,
+          display_name: trimmedName,
+          platform: trimmedPlatform,
+          created_at_ms: issuedAt,
+          updated_at_ms: issuedAt,
+          revoked_at_ms: null,
+        };
+
+        const credential: DeviceCredentialRecord = {
+          id: input.credentialId,
+          device_id: input.deviceId,
+          secret_digest: input.secretDigest,
+          issued_at_ms: issuedAt,
+          expires_at_ms: input.expiresAtMs,
+          revoked_at_ms: null,
+        };
+
+        return {
+          device,
+          credential,
+          replayed: false,
+        };
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
     });
   }
 

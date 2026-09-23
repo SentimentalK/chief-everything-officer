@@ -8,6 +8,7 @@ import {
 } from "../src/identity/store.js";
 import {
   ConnectorControlStore,
+  ConnectorControlError,
   ConnectorTargetConflictError,
   ConnectorValidationError,
   ConnectorNotFoundError,
@@ -353,5 +354,154 @@ describe("ConnectorControlStore - Bindings & Full Eligibility", () => {
     expect(resUserDisabled.eligible).toBe(false);
     expect(resUserDisabled.reason).toMatch(/disabled/);
     expect(connectorStore.listEligibleTargetIdsForDevice(dev.id)).toHaveLength(0);
+  });
+});
+
+describe("ConnectorControlStore - finalizeDeviceEnrollment", () => {
+  const secretDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+  it("atomically creates both device and credential", () => {
+    const deviceId = "dev_11111111-1111-1111-1111-111111111111";
+    const credentialId = "dcr_11111111-1111-1111-1111-111111111111";
+    const now = 1700000000000;
+    const expiresAt = now + 365 * 24 * 60 * 60 * 1000;
+
+    const result = connectorStore.finalizeDeviceEnrollment({
+      deviceId,
+      credentialId,
+      userId: testUserId,
+      displayName: "Omen Gaming Rig",
+      platform: "linux",
+      secretDigest,
+      issuedAtMs: now,
+      expiresAtMs: expiresAt,
+    });
+
+    expect(result.replayed).toBe(false);
+    expect(result.device.id).toBe(deviceId);
+    expect(result.device.display_name).toBe("Omen Gaming Rig");
+    expect(result.device.platform).toBe("linux");
+    expect(result.device.user_id).toBe(testUserId);
+    expect(result.device.created_at_ms).toBe(now);
+
+    expect(result.credential.id).toBe(credentialId);
+    expect(result.credential.device_id).toBe(deviceId);
+    expect(result.credential.secret_digest).toBe(secretDigest);
+    expect(result.credential.expires_at_ms).toBe(expiresAt);
+
+    // Verify stored
+    const dev = connectorStore.getDevice(deviceId);
+    expect(dev).toEqual(result.device);
+    const cred = connectorStore.getDeviceCredential(credentialId);
+    expect(cred).toEqual(result.credential);
+  });
+
+  it("idempotently replays with exact match metadata", () => {
+    const deviceId = "dev_22222222-2222-2222-2222-222222222222";
+    const credentialId = "dcr_22222222-2222-2222-2222-222222222222";
+    const now = 1700000000000;
+    const expiresAt = now + 365 * 24 * 60 * 60 * 1000;
+
+    const first = connectorStore.finalizeDeviceEnrollment({
+      deviceId,
+      credentialId,
+      userId: testUserId,
+      displayName: "Laptop",
+      platform: "macos",
+      secretDigest,
+      issuedAtMs: now,
+      expiresAtMs: expiresAt,
+    });
+    expect(first.replayed).toBe(false);
+
+    const second = connectorStore.finalizeDeviceEnrollment({
+      deviceId,
+      credentialId,
+      userId: testUserId,
+      displayName: "Laptop",
+      platform: "macos",
+      secretDigest,
+      issuedAtMs: now,
+      expiresAtMs: expiresAt,
+    });
+    expect(second.replayed).toBe(true);
+    expect(second.device.id).toBe(deviceId);
+    expect(second.credential.id).toBe(credentialId);
+  });
+
+  it("fails closed on conflicting metadata for existing IDs", () => {
+    const deviceId = "dev_33333333-3333-3333-3333-333333333333";
+    const credentialId = "dcr_33333333-3333-3333-3333-333333333333";
+    const now = 1700000000000;
+    const expiresAt = now + 365 * 24 * 60 * 60 * 1000;
+
+    connectorStore.finalizeDeviceEnrollment({
+      deviceId,
+      credentialId,
+      userId: testUserId,
+      displayName: "Workstation",
+      platform: "linux",
+      secretDigest,
+      issuedAtMs: now,
+      expiresAtMs: expiresAt,
+    });
+
+    // Conflict: Different display_name
+    expect(() =>
+      connectorStore.finalizeDeviceEnrollment({
+        deviceId,
+        credentialId,
+        userId: testUserId,
+        displayName: "Different Name",
+        platform: "linux",
+        secretDigest,
+        issuedAtMs: now,
+        expiresAtMs: expiresAt,
+      }),
+    ).toThrow(ConnectorControlError);
+
+    // Conflict: Different secret digest
+    const otherDigest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    expect(() =>
+      connectorStore.finalizeDeviceEnrollment({
+        deviceId,
+        credentialId,
+        userId: testUserId,
+        displayName: "Workstation",
+        platform: "linux",
+        secretDigest: otherDigest,
+        issuedAtMs: now,
+        expiresAtMs: expiresAt,
+      }),
+    ).toThrow(ConnectorControlError);
+  });
+
+  it("fails closed on partial existing state", () => {
+    const deviceId = "dev_44444444-4444-4444-4444-444444444444";
+    const credentialId = "dcr_44444444-4444-4444-4444-444444444444";
+    const now = 1700000000000;
+    const expiresAt = now + 365 * 24 * 60 * 60 * 1000;
+
+    // Create device alone first
+    connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Pre-existing Device",
+      platform: "linux",
+    });
+
+    // Now try to finalize with an existing device ID but new credential ID
+    const preExistingDev = connectorStore.listDevicesForUser(testUserId)[0]!;
+    expect(() =>
+      connectorStore.finalizeDeviceEnrollment({
+        deviceId: preExistingDev.id,
+        credentialId,
+        userId: testUserId,
+        displayName: "Pre-existing Device",
+        platform: "linux",
+        secretDigest,
+        issuedAtMs: now,
+        expiresAtMs: expiresAt,
+      }),
+    ).toThrow(ConnectorControlError);
   });
 });
