@@ -88,6 +88,26 @@ describe("Redis V2 Coordination Schema", () => {
     received_at_ms: 2100,
   };
 
+  const undispatchedReport: PersistedExecutionReport = {
+    schema_version: 2,
+    execution_status: "FAILED",
+    business_outcome: "NOT_STARTED",
+    task_dispatched: false,
+    finished_at_ms: 1200,
+    duration_ms: 200,
+    executor: {
+      type: "local-worker",
+      version: "1.0.0",
+    },
+    receipt_sha256: "d".repeat(64),
+    error: {
+      stage: "dispatch",
+      code: "TARGET_UNAVAILABLE",
+      message: "Target directory missing",
+    },
+    received_at_ms: 1250,
+  };
+
   const validResult: PersistedJobResult = {
     target: "resource",
     attempt_id: validAttempt.attempt_id,
@@ -104,29 +124,42 @@ describe("Redis V2 Coordination Schema", () => {
       expect(parsed).toEqual(validJob);
     });
 
-    it("round-trips a valid job with result_target=resource and valid resource_id", () => {
-      const resJob: JobRecordV2 = {
-        ...validJob,
-        result_target: "resource",
-        resource_id: "res-00000000-0000-0000-0000-000000000001",
-      };
-      const serialized = serializeJobRecordV2(resJob);
-      expect(parseJobRecordV2(serialized)).toEqual(resJob);
+    it("accepts result_target=none with resource_id=null", () => {
+      const job = { ...validJob, result_target: "none" as const, resource_id: null };
+      expect(parseJobRecordV2(serializeJobRecordV2(job))).toEqual(job);
     });
 
-    it("rejects result_target=resource without resource_id", () => {
+    it("accepts result_target=none with valid resource_id", () => {
+      const job = {
+        ...validJob,
+        result_target: "none" as const,
+        resource_id: "res-00000000-0000-0000-0000-000000000001",
+      };
+      expect(parseJobRecordV2(serializeJobRecordV2(job))).toEqual(job);
+    });
+
+    it("accepts result_target=resource with valid resource_id", () => {
+      const job = {
+        ...validJob,
+        result_target: "resource" as const,
+        resource_id: "res-00000000-0000-0000-0000-000000000001",
+      };
+      expect(parseJobRecordV2(serializeJobRecordV2(job))).toEqual(job);
+    });
+
+    it("rejects result_target=resource with resource_id=null", () => {
       expect(() =>
         parseJobRecordV2({ ...validJob, result_target: "resource", resource_id: null }),
       ).toThrow(V2SchemaError);
     });
 
-    it("rejects result_target=none with resource_id set", () => {
+    it("rejects malformed non-null resource_id regardless of result_target", () => {
       expect(() =>
-        parseJobRecordV2({
-          ...validJob,
-          result_target: "none",
-          resource_id: "res-00000000-0000-0000-0000-000000000001",
-        }),
+        parseJobRecordV2({ ...validJob, result_target: "none", resource_id: "not-a-res-id" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, result_target: "resource", resource_id: "not-a-res-id" }),
       ).toThrow(V2SchemaError);
     });
 
@@ -326,6 +359,63 @@ describe("Redis V2 Coordination Schema", () => {
       };
       const serialized = serializeAttemptRecordV1(terminalWithResult);
       expect(parseAttemptRecordV1(serialized)).toEqual(terminalWithResult);
+    });
+
+    it("allows terminal reporting before start (task_dispatched=false, started_at_ms=null)", () => {
+      const terminalUndispatched: AttemptRecordV1 = {
+        ...validAttempt,
+        phase: "terminal",
+        started_at_ms: null,
+        report: undispatchedReport,
+      };
+      const serialized = serializeAttemptRecordV1(terminalUndispatched);
+      expect(parseAttemptRecordV1(serialized)).toEqual(terminalUndispatched);
+    });
+
+    it("allows terminal reporting before start with optional started_at_ms >= claimed_at_ms", () => {
+      const terminalUndispatchedWithStart: AttemptRecordV1 = {
+        ...validAttempt,
+        phase: "terminal",
+        started_at_ms: 1100,
+        report: undispatchedReport,
+      };
+      const serialized = serializeAttemptRecordV1(terminalUndispatchedWithStart);
+      expect(parseAttemptRecordV1(serialized)).toEqual(terminalUndispatchedWithStart);
+    });
+
+    it("rejects dispatched terminal attempt when started_at_ms is null", () => {
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: null,
+          report: validReport, // validReport has task_dispatched: true
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects undispatched terminal attempt if a result is present", () => {
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: null,
+          report: undispatchedReport,
+          result: validResult,
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects undispatched terminal attempt when started_at_ms < claimed_at_ms", () => {
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          claimed_at_ms: 2000,
+          started_at_ms: 1500,
+          report: undispatchedReport,
+        }),
+      ).toThrow(V2SchemaError);
     });
 
     it("rejects claimed attempt with started_at_ms or result", () => {

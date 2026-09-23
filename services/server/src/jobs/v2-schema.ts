@@ -228,8 +228,11 @@ export function parseJobRecordV2(raw: unknown): JobRecordV2 {
       throw new V2SchemaError("Invalid job record: 'resource_id' (res-<uuid>) is required when result_target is 'resource'.");
     }
   } else {
+    // result_target === "none": resource_id may be null or a valid res-<uuid>
     if (rec.resource_id !== null && rec.resource_id !== undefined) {
-      throw new V2SchemaError("Invalid job record: 'resource_id' must be null when result_target is 'none'.");
+      if (typeof rec.resource_id !== "string" || !RESOURCE_ID_V2_RE.test(rec.resource_id)) {
+        throw new V2SchemaError("Invalid job record: 'resource_id' must be null or a valid res-<uuid> when result_target is 'none'.");
+      }
     }
   }
 
@@ -467,14 +470,6 @@ export function parseAttemptRecordV1(raw: unknown): AttemptRecordV1 {
     }
   } else {
     // terminal
-    if (
-      typeof rec.started_at_ms !== "number" ||
-      !Number.isInteger(rec.started_at_ms) ||
-      rec.started_at_ms < rec.claimed_at_ms ||
-      rec.started_at_ms > Number.MAX_SAFE_INTEGER
-    ) {
-      throw new V2SchemaError("Attempt in 'terminal' phase must have started_at_ms >= claimed_at_ms.");
-    }
     if (rec.report === undefined || rec.report === null) {
       throw new V2SchemaError("Attempt in 'terminal' phase requires a valid execution report.");
     }
@@ -484,15 +479,48 @@ export function parseAttemptRecordV1(raw: unknown): AttemptRecordV1 {
       throw new V2SchemaError(`Invalid attempt report: ${(err as Error).message}`);
     }
 
-    if (rec.result !== undefined && rec.result !== null) {
-      try {
-        validatedResult = validatePersistedJobResult(rec.result);
-      } catch (err) {
-        throw new V2SchemaError(`Invalid attempt result: ${(err as Error).message}`);
-      }
-      if (validatedResult.attempt_id !== rec.attempt_id) {
+    if (validatedReport.task_dispatched) {
+      // task_dispatched = true: started_at_ms MUST exist and be >= claimed_at_ms
+      if (
+        typeof rec.started_at_ms !== "number" ||
+        !Number.isInteger(rec.started_at_ms) ||
+        rec.started_at_ms < rec.claimed_at_ms ||
+        rec.started_at_ms > Number.MAX_SAFE_INTEGER
+      ) {
         throw new V2SchemaError(
-          `Result attempt_id '${validatedResult.attempt_id}' does not match attempt record attempt_id '${rec.attempt_id}'.`,
+          "Dispatched terminal attempt requires started_at_ms >= claimed_at_ms.",
+        );
+      }
+      if (rec.result !== undefined && rec.result !== null) {
+        try {
+          validatedResult = validatePersistedJobResult(rec.result);
+        } catch (err) {
+          throw new V2SchemaError(`Invalid attempt result: ${(err as Error).message}`);
+        }
+        if (validatedResult.attempt_id !== rec.attempt_id) {
+          throw new V2SchemaError(
+            `Result attempt_id '${validatedResult.attempt_id}' does not match attempt record attempt_id '${rec.attempt_id}'.`,
+          );
+        }
+      }
+    } else {
+      // task_dispatched = false: started_at_ms MAY be null
+      if (rec.started_at_ms !== null) {
+        if (
+          typeof rec.started_at_ms !== "number" ||
+          !Number.isInteger(rec.started_at_ms) ||
+          rec.started_at_ms < rec.claimed_at_ms ||
+          rec.started_at_ms > Number.MAX_SAFE_INTEGER
+        ) {
+          throw new V2SchemaError(
+            "Undispatched terminal attempt with started_at_ms requires started_at_ms >= claimed_at_ms.",
+          );
+        }
+      }
+      // Undispatched task cannot have a result
+      if (rec.result !== undefined && rec.result !== null) {
+        throw new V2SchemaError(
+          "Undispatched terminal attempt cannot have a result.",
         );
       }
     }
