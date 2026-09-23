@@ -18,7 +18,15 @@ import {
   V2SchemaError,
   type JobRecordV2,
   type AttemptRecordV1,
+  type JobStreamEntryV2,
 } from "../src/jobs/v2-schema.js";
+import {
+  type PersistedExecutionReport,
+  type PersistedJobResult,
+  validatePersistedExecutionReport,
+  validatePersistedJobResult,
+  ExecutionContractError,
+} from "../src/jobs/execution-contract.js";
 
 describe("Redis V2 Coordination Schema", () => {
   it("generates correct key namespaces including 1:N attempt ZSET", () => {
@@ -29,31 +37,97 @@ describe("Redis V2 Coordination Schema", () => {
     expect(requestKeyV2("usr_a", "ws_b", "req_c")).toBe("ceo:request:v2:usr_a:ws_b:req_c");
   });
 
-  describe("JobRecordV2 serialization & state invariants", () => {
-    const validJob: JobRecordV2 = {
-      schema_version: JOBS_V2_SCHEMA_VERSION,
-      job_id: "job-00000000-0000-0000-0000-000000000001",
-      request_id: "req-00000000-0000-0000-0000-000000000001",
-      user_id: "usr_alice",
-      workspace_id: "ws_alpha",
-      target_id: "tgt_omega",
-      prompt: "Implement connector schema",
-      acceptance: "Schema version 12 passes tests",
-      resource_id: null,
-      execution_timeout_seconds: 3600,
-      result_target: "none",
-      request_digest: "0123456789abcdef".repeat(4),
-      status: "queued",
-      stream_entry_id: "1720000000000-0",
-      latest_attempt_id: null,
-      created_at_ms: 1000,
-      claim_deadline_ms: 2000,
-    };
+  const validJob: JobRecordV2 = {
+    schema_version: JOBS_V2_SCHEMA_VERSION,
+    job_id: "job-00000000-0000-0000-0000-000000000001",
+    request_id: "req-00000000-0000-0000-0000-000000000001",
+    user_id: "usr_alice",
+    workspace_id: "ws_alpha",
+    target_id: "tgt_00000000-0000-0000-0000-000000000001",
+    prompt: "Implement connector schema",
+    acceptance: "Schema version 12 passes tests",
+    resource_id: null,
+    execution_timeout_seconds: 3600,
+    result_target: "none",
+    request_digest: "0123456789abcdef".repeat(4),
+    status: "queued",
+    stream_entry_id: "1720000000000-0",
+    latest_attempt_id: null,
+    created_at_ms: 1000,
+    claim_deadline_ms: 2000,
+  };
 
+  const validAttempt: AttemptRecordV1 = {
+    schema_version: ATTEMPT_V1_SCHEMA_VERSION,
+    attempt_id: "att_00000000-0000-0000-0000-000000000001",
+    job_id: "job-00000000-0000-0000-0000-000000000001",
+    user_id: "usr_alice",
+    workspace_id: "ws_alpha",
+    target_id: "tgt_00000000-0000-0000-0000-000000000001",
+    device_id: "dev_00000000-0000-0000-0000-000000000001",
+    target_binding_id: "dtb_00000000-0000-0000-0000-000000000001",
+    claim_token_sha256: "c".repeat(64),
+    phase: "claimed",
+    claimed_at_ms: 1000,
+    started_at_ms: null,
+  };
+
+  const validReport: PersistedExecutionReport = {
+    schema_version: 2,
+    execution_status: "COMPLETED",
+    business_outcome: "UNVERIFIED",
+    task_dispatched: true,
+    finished_at_ms: 2000,
+    duration_ms: 500,
+    executor: {
+      type: "local-worker",
+      version: "1.0.0",
+    },
+    receipt_sha256: "a".repeat(64),
+    error: null,
+    received_at_ms: 2100,
+  };
+
+  const validResult: PersistedJobResult = {
+    target: "resource",
+    attempt_id: validAttempt.attempt_id,
+    payload_sha256: "b".repeat(64),
+    resource_id: "res-00000000-0000-0000-0000-000000000001",
+    commit: "c0ffee1234567890",
+    received_at_ms: 2200,
+  };
+
+  describe("JobRecordV2 validation & state invariants", () => {
     it("round-trips a valid queued job", () => {
       const serialized = serializeJobRecordV2(validJob);
       const parsed = parseJobRecordV2(serialized);
       expect(parsed).toEqual(validJob);
+    });
+
+    it("round-trips a valid job with result_target=resource and valid resource_id", () => {
+      const resJob: JobRecordV2 = {
+        ...validJob,
+        result_target: "resource",
+        resource_id: "res-00000000-0000-0000-0000-000000000001",
+      };
+      const serialized = serializeJobRecordV2(resJob);
+      expect(parseJobRecordV2(serialized)).toEqual(resJob);
+    });
+
+    it("rejects result_target=resource without resource_id", () => {
+      expect(() =>
+        parseJobRecordV2({ ...validJob, result_target: "resource", resource_id: null }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects result_target=none with resource_id set", () => {
+      expect(() =>
+        parseJobRecordV2({
+          ...validJob,
+          result_target: "none",
+          resource_id: "res-00000000-0000-0000-0000-000000000001",
+        }),
+      ).toThrow(V2SchemaError);
     });
 
     it("enforces preparing state invariants", () => {
@@ -69,6 +143,14 @@ describe("Redis V2 Coordination Schema", () => {
       expect(() =>
         parseJobRecordV2({ ...preparingJob, stream_entry_id: "123-0" }),
       ).toThrow(V2SchemaError);
+
+      // Illegal: preparing with latest_attempt_id
+      expect(() =>
+        parseJobRecordV2({
+          ...preparingJob,
+          latest_attempt_id: "att_00000000-0000-0000-0000-000000000001",
+        }),
+      ).toThrow(V2SchemaError);
     });
 
     it("enforces queued state invariants", () => {
@@ -79,7 +161,11 @@ describe("Redis V2 Coordination Schema", () => {
 
       // Illegal: queued with latest_attempt_id
       expect(() =>
-        parseJobRecordV2({ ...validJob, status: "queued", latest_attempt_id: "att_1" }),
+        parseJobRecordV2({
+          ...validJob,
+          status: "queued",
+          latest_attempt_id: "att_00000000-0000-0000-0000-000000000001",
+        }),
       ).toThrow(V2SchemaError);
     });
 
@@ -88,7 +174,7 @@ describe("Redis V2 Coordination Schema", () => {
         ...validJob,
         status: "active",
         stream_entry_id: "1720000000000-0",
-        latest_attempt_id: "att_1",
+        latest_attempt_id: "att_00000000-0000-0000-0000-000000000001",
       };
       expect(parseJobRecordV2(activeJob)).toEqual(activeJob);
 
@@ -96,9 +182,34 @@ describe("Redis V2 Coordination Schema", () => {
       expect(() =>
         parseJobRecordV2({ ...activeJob, latest_attempt_id: null }),
       ).toThrow(V2SchemaError);
+
+      // Illegal: active without stream_entry_id
+      expect(() =>
+        parseJobRecordV2({ ...activeJob, stream_entry_id: null }),
+      ).toThrow(V2SchemaError);
     });
 
-    it("rejects forbidden legacy fields", () => {
+    it("enforces terminal state invariants", () => {
+      const terminalJob: JobRecordV2 = {
+        ...validJob,
+        status: "terminal",
+        stream_entry_id: "1720000000000-0",
+        latest_attempt_id: "att_00000000-0000-0000-0000-000000000001",
+      };
+      expect(parseJobRecordV2(terminalJob)).toEqual(terminalJob);
+
+      // Illegal: terminal without latest_attempt_id
+      expect(() =>
+        parseJobRecordV2({ ...terminalJob, latest_attempt_id: null }),
+      ).toThrow(V2SchemaError);
+
+      // Illegal: terminal without stream_entry_id
+      expect(() =>
+        parseJobRecordV2({ ...terminalJob, stream_entry_id: null }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects unknown extra fields and forbidden legacy fields", () => {
       expect(() =>
         parseJobRecordV2({ ...validJob, workspace_ref: "tools" }),
       ).toThrow(V2SchemaError);
@@ -110,76 +221,355 @@ describe("Redis V2 Coordination Schema", () => {
       expect(() =>
         parseJobRecordV2({ ...validJob, execution: { worker_id: "wrk-123" } }),
       ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, report: validReport }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, result: validResult }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, arbitrary_extra_field: "disallowed" }),
+      ).toThrow(V2SchemaError);
     });
 
-    it("rejects unsupported schema version", () => {
+    it("rejects bad ID and digest formats", () => {
       expect(() =>
-        parseJobRecordV2({ ...validJob, schema_version: 5 }),
+        parseJobRecordV2({ ...validJob, target_id: "not-a-tgt-id" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, job_id: "not-a-job-id" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, request_digest: "not-64-hex" }),
+      ).toThrow(V2SchemaError);
+
+      // Uppercase hex in request_digest rejected
+      expect(() =>
+        parseJobRecordV2({ ...validJob, request_digest: "A".repeat(64) }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects timeout out of policy bounds [60, 7200]", () => {
+      expect(() =>
+        parseJobRecordV2({ ...validJob, execution_timeout_seconds: 30 }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, execution_timeout_seconds: 7201 }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects prompt and acceptance byte limit overflows", () => {
+      expect(() =>
+        parseJobRecordV2({ ...validJob, prompt: "x".repeat(64 * 1024 + 1) }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, acceptance: "y".repeat(8 * 1024 + 1) }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseJobRecordV2({ ...validJob, prompt: "   " }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects invalid JSON on parse", () => {
+      expect(() => parseJobRecordV2("{ malformed json")).toThrow(V2SchemaError);
+    });
+
+    it("rejects serialization of invalid job record", () => {
+      expect(() =>
+        serializeJobRecordV2({ ...validJob, prompt: "" }),
       ).toThrow(V2SchemaError);
     });
   });
 
   describe("AttemptRecordV1 serialization & phase invariants", () => {
-    const validAttempt: AttemptRecordV1 = {
-      schema_version: ATTEMPT_V1_SCHEMA_VERSION,
-      attempt_id: "att_001",
-      job_id: "job_001",
-      user_id: "usr_alice",
-      workspace_id: "ws_alpha",
-      target_id: "tgt_omega",
-      device_id: "dev_omen",
-      target_binding_id: "dtb_main",
-      claim_token_sha256: "c".repeat(64),
-      phase: "claimed",
-      claimed_at_ms: 1000,
-      started_at_ms: null,
-    };
-
-    it("round-trips claimed and running attempts", () => {
+    it("round-trips claimed attempt", () => {
       const serialized = serializeAttemptRecordV1(validAttempt);
       expect(parseAttemptRecordV1(serialized)).toEqual(validAttempt);
+    });
 
+    it("round-trips running attempt", () => {
       const runningAttempt: AttemptRecordV1 = {
         ...validAttempt,
         phase: "running",
         started_at_ms: 1500,
       };
-      expect(parseAttemptRecordV1(runningAttempt)).toEqual(runningAttempt);
+      const serialized = serializeAttemptRecordV1(runningAttempt);
+      expect(parseAttemptRecordV1(serialized)).toEqual(runningAttempt);
     });
 
-    it("requires report on terminal attempt, while result remains optional", () => {
-      const mockReport = {
-        status: "COMPLETED" as const,
-        summary: "Done",
-        duration_ms: 500,
-        completed_at_iso: new Date().toISOString(),
-      };
-
-      // Terminal with report but NO result is valid! (execution completion != business result)
-      const terminalNoResult: AttemptRecordV1 = {
+    it("round-trips terminal attempt with real execution report (no result)", () => {
+      const terminalAttempt: AttemptRecordV1 = {
         ...validAttempt,
         phase: "terminal",
         started_at_ms: 1500,
-        report: mockReport,
+        report: validReport,
       };
-      expect(parseAttemptRecordV1(terminalNoResult)).toEqual(terminalNoResult);
+      const serialized = serializeAttemptRecordV1(terminalAttempt);
+      expect(parseAttemptRecordV1(serialized)).toEqual(terminalAttempt);
+    });
 
-      // Terminal without report is rejected
+    it("round-trips terminal attempt with real execution report AND valid result", () => {
+      const terminalWithResult: AttemptRecordV1 = {
+        ...validAttempt,
+        phase: "terminal",
+        started_at_ms: 1500,
+        report: validReport,
+        result: validResult,
+      };
+      const serialized = serializeAttemptRecordV1(terminalWithResult);
+      expect(parseAttemptRecordV1(serialized)).toEqual(terminalWithResult);
+    });
+
+    it("rejects claimed attempt with started_at_ms or result", () => {
       expect(() =>
-        parseAttemptRecordV1({ ...validAttempt, phase: "terminal" }),
+        parseAttemptRecordV1({ ...validAttempt, phase: "claimed", started_at_ms: 1200 }),
       ).toThrow(V2SchemaError);
 
-      // Claimed/running with report is rejected
       expect(() =>
-        parseAttemptRecordV1({ ...validAttempt, phase: "claimed", report: mockReport }),
+        parseAttemptRecordV1({ ...validAttempt, phase: "claimed", result: validResult }),
       ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, phase: "claimed", report: validReport }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects running attempt with started_at_ms=null or with report/result", () => {
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, phase: "running", started_at_ms: null }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "running",
+          started_at_ms: 1500,
+          report: validReport,
+        }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "running",
+          started_at_ms: 1500,
+          result: validResult,
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects started_at_ms < claimed_at_ms", () => {
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "running",
+          claimed_at_ms: 2000,
+          started_at_ms: 1500,
+        }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          claimed_at_ms: 2000,
+          started_at_ms: 1500,
+          report: validReport,
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects terminal attempt without report or with invalid report", () => {
+      // Terminal without report
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+        }),
+      ).toThrow(V2SchemaError);
+
+      // Terminal with fake/unstructured report (the hole from before)
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+          report: { status: "COMPLETED", summary: "Done" },
+        }),
+      ).toThrow(V2SchemaError);
+
+      // Terminal with report violating business invariants (non-completed without error)
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+          report: {
+            ...validReport,
+            execution_status: "FAILED",
+            error: null,
+          },
+        }),
+      ).toThrow(V2SchemaError);
+
+      // Terminal with report violating business invariants (completed with error)
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+          report: {
+            ...validReport,
+            execution_status: "COMPLETED",
+            error: { stage: "build", code: "ERR", message: "fail" },
+          },
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects terminal attempt with malformed result or result for another attempt", () => {
+      // Malformed result
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+          report: validReport,
+          result: { target: "invalid_target" },
+        }),
+      ).toThrow(V2SchemaError);
+
+      // Result for another attempt_id
+      expect(() =>
+        parseAttemptRecordV1({
+          ...validAttempt,
+          phase: "terminal",
+          started_at_ms: 1500,
+          report: validReport,
+          result: {
+            ...validResult,
+            attempt_id: "att_99999999-9999-9999-9999-999999999999",
+          },
+        }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects unknown extra fields and bad identifiers", () => {
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, workspace_ref: "repo" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, worker_id: "wrk-123" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, extra_field: "bad" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, claim_token_sha256: "not-64-hex" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, target_id: "bad_target" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, device_id: "bad_device" }),
+      ).toThrow(V2SchemaError);
+
+      expect(() =>
+        parseAttemptRecordV1({ ...validAttempt, target_binding_id: "bad_binding" }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects serialization of invalid attempt record", () => {
+      expect(() =>
+        serializeAttemptRecordV1({ ...validAttempt, phase: "running", started_at_ms: null }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects invalid JSON string on attempt parse", () => {
+      expect(() => parseAttemptRecordV1("{ bad json")).toThrow(V2SchemaError);
+    });
+  });
+
+  describe("JobStreamEntryV2", () => {
+    const validEntry: JobStreamEntryV2 = {
+      schema_version: STREAM_V2_SCHEMA_VERSION,
+      job_id: "job-00000000-0000-0000-0000-000000000001",
+      user_id: "usr_alice",
+      workspace_id: "ws_alpha",
+      target_id: "tgt_00000000-0000-0000-0000-000000000001",
+      created_at_ms: 1720000000000,
+    };
+
+    it("serializes and parses clean stream entries without payload data", () => {
+      const fields = serializeStreamEntryV2(validEntry);
+      expect(fields.job_id).toBe(validEntry.job_id);
+      expect(fields).not.toHaveProperty("prompt");
+
+      const parsed = parseStreamEntryV2(fields);
+      expect(parsed).toEqual(validEntry);
+    });
+
+    it("rejects unknown fields on stream entry", () => {
+      expect(() =>
+        serializeStreamEntryV2({ ...validEntry, prompt: "sneak_in" }),
+      ).toThrow(V2SchemaError);
+    });
+
+    it("rejects invalid ID format on stream entry", () => {
+      expect(() =>
+        serializeStreamEntryV2({ ...validEntry, target_id: "invalid_target" }),
+      ).toThrow(V2SchemaError);
+    });
+  });
+
+  describe("execution-contract runtime validators", () => {
+    it("validates genuine PersistedExecutionReport and rejects invalid shapes", () => {
+      expect(validatePersistedExecutionReport(validReport)).toEqual(validReport);
+
+      expect(() =>
+        validatePersistedExecutionReport({
+          status: "COMPLETED",
+        }),
+      ).toThrow(ExecutionContractError);
+    });
+
+    it("validates genuine PersistedJobResult and rejects invalid shapes", () => {
+      expect(validatePersistedJobResult(validResult)).toEqual(validResult);
+
+      expect(() =>
+        validatePersistedJobResult({
+          target: "wrong",
+          attempt_id: "att_001",
+        }),
+      ).toThrow(ExecutionContractError);
+
+      expect(() =>
+        validatePersistedJobResult({
+          ...validResult,
+          payload_sha256: "not-64-hex",
+        }),
+      ).toThrow(ExecutionContractError);
     });
   });
 
   describe("businessDigestV2", () => {
     it("is stable regardless of parameter authoring order and uses target_id", () => {
       const d1 = businessDigestV2({
-        target_id: "tgt_alpha",
+        target_id: "tgt_00000000-0000-0000-0000-000000000001",
         prompt: "Task A",
         acceptance: "Criteria B",
         resource_id: null,
@@ -192,32 +582,12 @@ describe("Redis V2 Coordination Schema", () => {
         result_target: "none",
         prompt: "Task A",
         execution_timeout_seconds: 3600,
-        target_id: "tgt_alpha",
+        target_id: "tgt_00000000-0000-0000-0000-000000000001",
         resource_id: null,
       });
 
       expect(d1).toBe(d2);
       expect(d1).toMatch(/^[0-9a-f]{64}$/);
-    });
-  });
-
-  describe("JobStreamEntryV2", () => {
-    it("serializes and parses clean stream entries without payload data", () => {
-      const entry = {
-        schema_version: STREAM_V2_SCHEMA_VERSION,
-        job_id: "job-1",
-        user_id: "usr_alice",
-        workspace_id: "ws_alpha",
-        target_id: "tgt_omega",
-        created_at_ms: 1720000000000,
-      };
-
-      const fields = serializeStreamEntryV2(entry);
-      expect(fields.job_id).toBe("job-1");
-      expect(fields).not.toHaveProperty("prompt");
-
-      const parsed = parseStreamEntryV2(fields);
-      expect(parsed).toEqual(entry);
     });
   });
 });

@@ -41,9 +41,17 @@ export function utf8ByteLength(s: string): number {
 }
 
 import * as z from "zod/v4";
+import {
+  RESULT_TARGET_VALUES,
+  type ResultTarget,
+  type PersistedJobResult,
+} from "./execution-contract.js";
 
-export const RESULT_TARGET_VALUES = ["none", "resource"] as const;
-export type ResultTarget = (typeof RESULT_TARGET_VALUES)[number];
+export {
+  RESULT_TARGET_VALUES,
+  type ResultTarget,
+  type PersistedJobResult,
+};
 
 /** Public submit payload after strict parse + policy checks. */
 export interface NormalizedSubmit {
@@ -66,15 +74,6 @@ export type JobRecordStatus = "queued";
  * Derived execution/claim state surfaced to consumers.
  */
 export type JobState = AssignmentState;
-
-export interface PersistedJobResult {
-  target: "resource";
-  attempt_id: string;
-  payload_sha256: string;
-  resource_id: string;
-  commit: string;
-  received_at_ms: number;
-}
 
 export interface PersistedJobRecord {
   schema_version: typeof JOBS_SCHEMA_VERSION;
