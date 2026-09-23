@@ -12,6 +12,10 @@ import {
   ConnectorTargetConflictError,
   ConnectorValidationError,
   ConnectorNotFoundError,
+  ConnectorPermissionError,
+  ConnectorTargetDisabledError,
+  ConnectorTargetRepositoryNotFoundError,
+  ConnectorDeviceRevokedError,
 } from "../src/connector/control-store.js";
 
 const cleanupDirs: string[] = [];
@@ -503,5 +507,427 @@ describe("ConnectorControlStore - finalizeDeviceEnrollment", () => {
         expiresAtMs: expiresAt,
       }),
     ).toThrow(ConnectorControlError);
+  });
+});
+
+describe("ConnectorControlStore - Execution Target Registry & Device Bindings", () => {
+  let dev1: { id: string };
+  let dev2: { id: string };
+  let memberUserId: string;
+
+  beforeEach(() => {
+    dev1 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Omen Machine",
+      platform: "linux",
+    });
+    dev2 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Windows Machine",
+      platform: "windows",
+    });
+
+    memberUserId = "usr_bob";
+    store.withDb((db) => {
+      db.prepare("INSERT INTO users VALUES (?, 1000, NULL, 0);").run(memberUserId);
+      db.prepare("INSERT INTO workspace_memberships VALUES ('wsm_bob', ?, ?, 'member', 1000);").run(
+        testWorkspaceId,
+        memberUserId,
+      );
+      // Setup github installation and repository binding on test workspace
+      db.prepare(`
+        INSERT INTO github_installations (
+          id, github_installation_id, github_app_id, account_id, account_login, account_type,
+          repository_selection, suspended_at_ms, created_at_ms, updated_at_ms
+        ) VALUES ('inst_row_1', 'inst_1', 'app_1', 'acc_1', 'alice', 'User', 'selected', NULL, 1000, 1000);
+      `).run();
+      db.prepare(`
+        INSERT INTO github_repository_bindings (
+          id, workspace_id, github_repository_id, github_installation_row_id,
+          owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        ) VALUES ('grb_1', ?, '123456', 'inst_row_1', 'acc_1', 'alice', 'test-repo', 'alice/test-repo', 'main', 1000, 1000);
+      `).run(testWorkspaceId);
+    });
+  });
+
+  it("owner registers target with repository = null", () => {
+    const res = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    expect(res.targetCreated).toBe(true);
+    expect(res.bindingCreated).toBe(true);
+    expect(res.replayed).toBe(false);
+    expect(res.target.alias).toBe("ceo-dev");
+    expect(res.target.kind).toBe("coding");
+    expect(res.target.repository_provider).toBeNull();
+    expect(res.target.repository_external_id).toBeNull();
+    expect(res.target.repository_full_name).toBeNull();
+
+    expect(res.binding.device_id).toBe(dev1.id);
+    expect(res.binding.target_id).toBe(res.target.id);
+    expect(res.binding.disabled_at_ms).toBeNull();
+  });
+
+  it("owner registers target with repositorySource = 'workspace_repository'", () => {
+    const res = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-main",
+      displayName: "CEO Main",
+      kind: "coding",
+      repositorySource: "workspace_repository",
+    });
+
+    expect(res.targetCreated).toBe(true);
+    expect(res.target.repository_provider).toBe("github");
+    expect(res.target.repository_external_id).toBe("123456");
+    expect(res.target.repository_full_name).toBe("alice/test-repo");
+  });
+
+  it("throws TARGET_REPOSITORY_NOT_FOUND when workspace has no repository binding", () => {
+    const emptyWsId = "ws_empty";
+    store.withDb((db) => {
+      db.prepare("INSERT INTO workspaces VALUES (?, ?, 'https://github.com/alice/empty.git', 'main', 1000);").run(
+        emptyWsId,
+        testUserId,
+      );
+      db.prepare("INSERT INTO workspace_memberships VALUES ('wsm_empty', ?, ?, 'owner', 1000);").run(
+        emptyWsId,
+        testUserId,
+      );
+    });
+
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: emptyWsId,
+        alias: "empty-target",
+        displayName: "Empty Target",
+        kind: "coding",
+        repositorySource: "workspace_repository",
+      }),
+    ).toThrow(ConnectorTargetRepositoryNotFoundError);
+  });
+
+  it("replays registration idempotently with exact match metadata", () => {
+    const first = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+    expect(first.targetCreated).toBe(true);
+    expect(first.replayed).toBe(false);
+
+    const second = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+    expect(second.targetCreated).toBe(false);
+    expect(second.replayed).toBe(true);
+    expect(second.target.id).toBe(first.target.id);
+    expect(second.binding.id).toBe(first.binding.id);
+  });
+
+  it("registration re-enables previously disabled binding for calling device", () => {
+    const first = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    // Unbind dev1
+    connectorStore.unbindTargetForDevice({ deviceId: dev1.id, targetId: first.target.id });
+
+    // Re-register dev1
+    const reRegister = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+    expect(reRegister.targetCreated).toBe(false);
+    expect(reRegister.bindingCreated).toBe(false);
+    expect(reRegister.replayed).toBe(false); // Re-enabled
+    expect(reRegister.binding.disabled_at_ms).toBeNull();
+  });
+
+  it("throws ConnectorTargetConflictError when metadata conflicts on existing alias", () => {
+    connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    // Conflict: Different kind
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "ceo-dev",
+        displayName: "CEO Development",
+        kind: "general_automation",
+        repositorySource: null,
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    // Conflict: Different display_name
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "ceo-dev",
+        displayName: "Different Name",
+        kind: "coding",
+        repositorySource: null,
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    // Conflict: Different repository source
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "ceo-dev",
+        displayName: "CEO Development",
+        kind: "coding",
+        repositorySource: "workspace_repository",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+  });
+
+  it("throws ConnectorTargetDisabledError when target is disabled", () => {
+    const res = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-dev",
+      displayName: "CEO Development",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    connectorStore.disableExecutionTarget(res.target.id);
+
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "ceo-dev",
+        displayName: "CEO Development",
+        kind: "coding",
+        repositorySource: null,
+      }),
+    ).toThrow(ConnectorTargetDisabledError);
+  });
+
+  it("forbids non-owner from creating a new target, but allows binding to existing target", () => {
+    const bobDev = connectorStore.createDevice({
+      userId: memberUserId,
+      displayName: "Bob Device",
+      platform: "linux",
+    });
+
+    // Bob cannot create new target
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: bobDev.id,
+        workspaceId: testWorkspaceId,
+        alias: "bob-target",
+        displayName: "Bob Target",
+        kind: "coding",
+        repositorySource: null,
+      }),
+    ).toThrow(ConnectorPermissionError);
+
+    // Alice creates target
+    const aliceRes = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "shared-target",
+      displayName: "Shared Target",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    // Bob binds to existing target via register or bindTargetForDevice
+    const bobBind = connectorStore.bindTargetForDevice({
+      deviceId: bobDev.id,
+      targetId: aliceRes.target.id,
+    });
+    expect(bobBind.binding.device_id).toBe(bobDev.id);
+    expect(bobBind.binding.target_id).toBe(aliceRes.target.id);
+    expect(bobBind.replayed).toBe(false);
+
+    // Bob replaying bind returns replayed = true
+    const bobReplay = connectorStore.bindTargetForDevice({
+      deviceId: bobDev.id,
+      targetId: aliceRes.target.id,
+    });
+    expect(bobReplay.replayed).toBe(true);
+  });
+
+  it("multi-device binding lifecycle: unbinding one device leaves other device and target active", () => {
+    const reg = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "shared-env",
+      displayName: "Shared Env",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    // Dev2 binds to same target
+    connectorStore.bindTargetForDevice({
+      deviceId: dev2.id,
+      targetId: reg.target.id,
+    });
+
+    // Verify active count is 2
+    let visible = connectorStore.listTargetsVisibleToDevice(dev1.id);
+    expect(visible[0]!.activeBindingCount).toBe(2);
+
+    // Dev1 unbinds
+    connectorStore.unbindTargetForDevice({
+      deviceId: dev1.id,
+      targetId: reg.target.id,
+    });
+
+    // Target is still active, Dev2 is still active, Dev1 has no active binding
+    visible = connectorStore.listTargetsVisibleToDevice(dev1.id);
+    expect(visible[0]!.thisBinding?.disabled_at_ms).not.toBeNull();
+    expect(visible[0]!.activeBindingCount).toBe(1);
+
+    const dev2Visible = connectorStore.listTargetsVisibleToDevice(dev2.id);
+    expect(dev2Visible[0]!.thisBinding?.disabled_at_ms).toBeNull();
+    expect(dev2Visible[0]!.activeBindingCount).toBe(1);
+
+    // Dev2 also unbinds -> target remains active with 0 active bindings
+    connectorStore.unbindTargetForDevice({
+      deviceId: dev2.id,
+      targetId: reg.target.id,
+    });
+    const afterAllUnbind = connectorStore.listTargetsVisibleToDevice(dev1.id);
+    expect(afterAllUnbind[0]!.target.disabled_at_ms).toBeNull();
+    expect(afterAllUnbind[0]!.activeBindingCount).toBe(0);
+  });
+
+  it("global disable and enable lifecycle", () => {
+    const reg = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "ceo-prod",
+      displayName: "CEO Production",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    expect(connectorStore.resolveEligibleBinding(dev1.id, reg.target.id).eligible).toBe(true);
+
+    // Global disable
+    expect(connectorStore.disableExecutionTarget(reg.target.id)).toBe(true);
+    expect(connectorStore.resolveEligibleBinding(dev1.id, reg.target.id).eligible).toBe(false);
+
+    // Global enable
+    expect(connectorStore.enableExecutionTarget(reg.target.id)).toBe(true);
+    expect(connectorStore.resolveEligibleBinding(dev1.id, reg.target.id).eligible).toBe(true);
+  });
+
+  it("reconcileExecutionTargetRepositoryMetadata updates all matching targets", () => {
+    const t1 = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "t1",
+      displayName: "Target 1",
+      kind: "coding",
+      repositorySource: "workspace_repository",
+    });
+    const t2 = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "t2",
+      displayName: "Target 2",
+      kind: "coding",
+      repositorySource: "workspace_repository",
+    });
+
+    expect(t1.target.repository_full_name).toBe("alice/test-repo");
+    expect(t2.target.repository_full_name).toBe("alice/test-repo");
+
+    const updatedCount = connectorStore.reconcileExecutionTargetRepositoryMetadata({
+      provider: "github",
+      externalId: "123456",
+      fullName: "alice/new-repo-name",
+    });
+    expect(updatedCount).toBe(2);
+
+    expect(connectorStore.getExecutionTarget(t1.target.id)!.repository_full_name).toBe("alice/new-repo-name");
+    expect(connectorStore.getExecutionTarget(t2.target.id)!.repository_full_name).toBe("alice/new-repo-name");
+  });
+
+  it("masks foreign target IDs as 404 in bind and unbind", () => {
+    // Another user in foreign workspace
+    const foreignUserId = "usr_charlie";
+    const foreignWsId = "ws_foreign";
+    store.withDb((db) => {
+      db.prepare("INSERT INTO users VALUES (?, 1000, NULL, 0);").run(foreignUserId);
+      db.prepare("INSERT INTO workspaces VALUES (?, ?, 'https://github.com/charlie/repo.git', 'main', 1000);").run(
+        foreignWsId,
+        foreignUserId,
+      );
+      db.prepare("INSERT INTO workspace_memberships VALUES ('wsm_charlie', ?, ?, 'owner', 1000);").run(
+        foreignWsId,
+        foreignUserId,
+      );
+    });
+    const charlieDev = connectorStore.createDevice({
+      userId: foreignUserId,
+      displayName: "Charlie Device",
+      platform: "linux",
+    });
+
+    const foreignTarget = connectorStore.registerExecutionTargetForDevice({
+      deviceId: charlieDev.id,
+      workspaceId: foreignWsId,
+      alias: "charlie-target",
+      displayName: "Charlie Target",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    // Alice dev1 tries to bind to Charlie's target
+    expect(() =>
+      connectorStore.bindTargetForDevice({
+        deviceId: dev1.id,
+        targetId: foreignTarget.target.id,
+      }),
+    ).toThrow(ConnectorNotFoundError);
+
+    // Alice dev1 tries to unbind from Charlie's target
+    expect(() =>
+      connectorStore.unbindTargetForDevice({
+        deviceId: dev1.id,
+        targetId: foreignTarget.target.id,
+      }),
+    ).toThrow(ConnectorNotFoundError);
   });
 });

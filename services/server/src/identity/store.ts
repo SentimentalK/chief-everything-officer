@@ -2365,6 +2365,23 @@ export class IdentityStore {
     });
   }
 
+  findWorkspaceMembership(workspaceId: string, userId: string): {
+    id: string;
+    workspace_id: string;
+    user_id: string;
+    role: string;
+    created_at: number;
+  } | null {
+    return this.withDb((db) => {
+      const row = db.prepare(
+        "SELECT id, workspace_id, user_id, role, created_at FROM workspace_memberships WHERE workspace_id = ? AND user_id = ? LIMIT 1;",
+      ).get(workspaceId, userId) as
+        | { id: string; workspace_id: string; user_id: string; role: string; created_at: number }
+        | undefined;
+      return row ?? null;
+    });
+  }
+
   getOwnerMembershipForWorkspace(workspaceId: string): {
     id: string;
     workspace_id: string;
@@ -2705,6 +2722,14 @@ export class IdentityStore {
           SET remote_url = ?
           WHERE id = ?;
         `).run(newRemoteUrl, bindingRow.workspace_id);
+
+        db.prepare(`
+          UPDATE execution_targets
+          SET repository_full_name = ?,
+              updated_at_ms = ?
+          WHERE repository_provider = 'github'
+            AND repository_external_id = ?;
+        `).run(params.fullName, now, params.githubRepositoryId);
 
         db.exec("COMMIT;");
 

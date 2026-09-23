@@ -1,6 +1,15 @@
 import crypto from "node:crypto";
 import express, { type Request, type Response, type Router, type RequestHandler } from "express";
-import type { ConnectorControlStore } from "./control-store.js";
+import {
+  ConnectorControlStore,
+  ConnectorPermissionError,
+  ConnectorTargetDisabledError,
+  ConnectorTargetConflictError,
+  ConnectorTargetRepositoryNotFoundError,
+  ConnectorNotFoundError,
+  ConnectorValidationError,
+  ConnectorDeviceRevokedError,
+} from "./control-store.js";
 import {
   DeviceEnrollmentStore,
   normalizeDeviceUserCode,
@@ -9,8 +18,18 @@ import {
   DeviceEnrollmentValidationError,
 } from "./enrollment-store.js";
 import { createDeviceAuthMiddleware } from "./device-auth.js";
-import type { IdentityStore } from "../identity/store.js";
+import {
+  IdentityDbUnavailable,
+  IdentityDbContextClosed,
+  type IdentityStore,
+} from "../identity/store.js";
 import type { UserSessionManager } from "../auth/user-session.js";
+import {
+  parseRegisterTargetInput,
+  toConnectorTargetProjection,
+  TargetValidationError,
+  TARGET_ERROR_CODES,
+} from "./target-schema.js";
 
 export interface ConnectorRouterOptions {
   controlStore: ConnectorControlStore;
@@ -367,6 +386,272 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
 
       controlStore.revokeDevice(auth.device_id);
       res.status(200).json({ ok: true });
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 5. Native API: Workspace Discovery (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.get(
+    "/api/connector/workspaces",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (_req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      try {
+        const memberships = identityStore.listWorkspaceMembershipsForUser(auth.user_id);
+        const workspaces = [];
+        for (const m of memberships) {
+          const ws = identityStore.findWorkspaceById(m.workspace_id);
+          if (!ws) continue;
+          const binding = identityStore.findRepositoryBindingByWorkspaceId(m.workspace_id);
+          workspaces.push({
+            id: ws.id,
+            role: m.role,
+            workspace_repository: binding
+              ? {
+                  provider: "github",
+                  external_id: binding.github_repository_id,
+                  full_name: binding.full_name,
+                  branch: binding.branch ?? null,
+                }
+              : null,
+          });
+        }
+        res.status(200).json({ workspaces });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 6. Native API: Target Catalogue & Query (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.get(
+    "/api/connector/targets",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const workspaceId = typeof req.query.workspace_id === "string" ? req.query.workspace_id.trim() : undefined;
+      try {
+        const items = controlStore.listTargetsVisibleToDevice(auth.device_id, { workspaceId });
+        const targets = items.map((item) =>
+          toConnectorTargetProjection(item.target, item.thisBinding, item.activeBindingCount),
+        );
+        res.status(200).json({ targets });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 7. Native API: Register Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.post(
+    "/api/connector/targets/register",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      let input;
+      try {
+        input = parseRegisterTargetInput(req.body);
+      } catch (err) {
+        if (err instanceof TargetValidationError) {
+          res.status(400).json({ error: err.code, message: err.message });
+          return;
+        }
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Invalid JSON input." });
+        return;
+      }
+
+      try {
+        const result = controlStore.registerExecutionTargetForDevice({
+          deviceId: auth.device_id,
+          workspaceId: input.workspaceId,
+          alias: input.alias,
+          displayName: input.displayName,
+          kind: input.kind,
+          repositorySource: input.repositorySource,
+        });
+
+        const status = result.targetCreated ? 201 : 200;
+        res.status(status).json({
+          target: {
+            id: result.target.id,
+            workspace_id: result.target.workspace_id,
+            alias: result.target.alias,
+            display_name: result.target.display_name,
+            kind: result.target.kind,
+            repository: result.target.repository_provider
+              ? {
+                  provider: result.target.repository_provider,
+                  external_id: result.target.repository_external_id!,
+                  full_name: result.target.repository_full_name!,
+                }
+              : null,
+            disabled: result.target.disabled_at_ms !== null,
+          },
+          binding: {
+            id: result.binding.id,
+            enabled: result.binding.disabled_at_ms === null,
+          },
+          target_created: result.targetCreated,
+          binding_created: result.bindingCreated,
+          replayed: result.replayed,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.TARGET_CREATE_FORBIDDEN, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetConflictError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_ALIAS_CONFLICT, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetDisabledError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_DISABLED, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetRepositoryNotFoundError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_REPOSITORY_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.WORKSPACE_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorValidationError) {
+          res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 8. Native API: Bind Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.post(
+    "/api/connector/targets/:target_id/bind",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const targetId = req.params.target_id;
+      if (!targetId || typeof targetId !== "string") {
+        res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND });
+        return;
+      }
+
+      if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Unexpected fields in bind request." });
+        return;
+      }
+
+      try {
+        const result = controlStore.bindTargetForDevice({
+          deviceId: auth.device_id,
+          targetId,
+        });
+
+        res.status(200).json({
+          target_id: targetId,
+          binding_id: result.binding.id,
+          enabled: result.binding.disabled_at_ms === null,
+          replayed: result.replayed,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetDisabledError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_DISABLED, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 9. Native API: Unbind Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.post(
+    "/api/connector/targets/:target_id/unbind",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const targetId = req.params.target_id;
+      if (!targetId || typeof targetId !== "string") {
+        res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND });
+        return;
+      }
+
+      if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Unexpected fields in unbind request." });
+        return;
+      }
+
+      try {
+        controlStore.unbindTargetForDevice({
+          deviceId: auth.device_id,
+          targetId,
+        });
+        res.status(200).json({ ok: true });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
     },
   );
 
