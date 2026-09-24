@@ -1,5 +1,4 @@
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,15 +6,17 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::client::{ClientError, ConnectorClient, ConnectorTargetProjection};
-use crate::config::{ConfigError, LocalConfig};
+use crate::client::{ClientError, ConnectorClient, ConnectorTargetProjection, PendingJobCandidate};
+use crate::config::{load_bound_profile, ConfigError, ProfileError};
 use crate::credential::{CredentialError, DeviceCredential};
 use crate::enrollment::{now_utc_ms, PendingEnrollmentSession};
 use crate::local_state::{remove_durable, ExecutionLock};
-use crate::outbox::{flush_outbox, OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION};
+use crate::outbox::{
+    compute_report_sha256, flush_outbox, OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION,
+};
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{
-    ActiveAttempt, ExecutionAdapter, SchedulerError, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ActiveAttempt, AttemptPhase, ExecutionAdapter, SchedulerError, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use crate::targets::verify_local_repository;
 
@@ -23,6 +24,8 @@ use crate::targets::verify_local_repository;
 pub enum DaemonError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("Config error: {0}")]
     Config(#[from] ConfigError),
     #[error("Credential error: {0}")]
@@ -39,10 +42,24 @@ pub enum DaemonError {
     NotLoggedIn,
     #[error("Authentication required: Device credential was revoked or rejected by server")]
     AuthRequired,
+    #[error("Local credential server mismatch: config origin is '{expected}', but credential origin is '{actual}' (LOCAL_CREDENTIAL_SERVER_MISMATCH)")]
+    LocalCredentialServerMismatch { expected: String, actual: String },
     #[error("Active attempt requires execution adapter not present in V1.6 (EXECUTION_ADAPTER_REQUIRED)")]
     ExecutionAdapterRequired,
     #[error("Durable state recovery required: {0} (RECOVERY_REQUIRED)")]
     RecoveryRequired(String),
+}
+
+use std::future::Future;
+use std::pin::Pin;
+
+pub type DaemonAsyncHook<T> =
+    Arc<dyn Fn(&T) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Default, Clone)]
+pub struct DaemonHooks {
+    pub after_candidate_selected: Option<DaemonAsyncHook<PendingJobCandidate>>,
+    pub after_claim_intent_persisted: Option<DaemonAsyncHook<ActiveAttempt>>,
 }
 
 fn generate_claim_token() -> String {
@@ -55,10 +72,29 @@ fn generate_claim_token() -> String {
     hex
 }
 
+fn parse_iso_or_millis(s: &str) -> Option<i64> {
+    if let Ok(ts) = s.parse::<i64>() {
+        return Some(ts);
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp_millis())
+        .ok()
+        .or_else(|| Some(chrono::Utc::now().timestamp_millis()))
+}
+
 pub async fn run_daemon(
     paths: &ConnectorPaths,
     adapter: Arc<dyn ExecutionAdapter>,
     max_iterations: Option<usize>,
+) -> Result<(), DaemonError> {
+    run_daemon_with_hooks(paths, adapter, max_iterations, DaemonHooks::default()).await
+}
+
+pub async fn run_daemon_with_hooks(
+    paths: &ConnectorPaths,
+    adapter: Arc<dyn ExecutionAdapter>,
+    max_iterations: Option<usize>,
+    hooks: DaemonHooks,
 ) -> Result<(), DaemonError> {
     paths.ensure_dirs()?;
 
@@ -73,12 +109,17 @@ pub async fn run_daemon(
 
     println!("Acquired daemon lock. Starting connector recovery sequence...");
 
-    // 2. Load config and credential
-    let mut config = LocalConfig::load(&paths.config_file())?
-        .ok_or_else(|| DaemonError::RecoveryRequired("Missing config.json".into()))?;
+    // 2. Load bound profile (enforcing config.server_url == credential.server_origin)
+    let profile = load_bound_profile(paths).map_err(|e| match e {
+        ProfileError::NotLoggedIn => DaemonError::NotLoggedIn,
+        ProfileError::LocalCredentialServerMismatch { expected, actual } => {
+            DaemonError::LocalCredentialServerMismatch { expected, actual }
+        }
+        other => DaemonError::RecoveryRequired(other.to_string()),
+    })?;
 
-    let cred = DeviceCredential::load(&paths.credential_file())?.ok_or(DaemonError::NotLoggedIn)?;
-
+    let mut config = profile.config;
+    let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
     // 3. Reconcile enrollment & credential coexistence
@@ -87,7 +128,11 @@ pub async fn run_daemon(
             && sess.reserved_device_id == cred.device_id
             && sess.reserved_credential_id == cred.credential_id
         {
-            let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
             let _ = remove_durable(&paths.enrollment_file());
         }
     }
@@ -109,7 +154,7 @@ pub async fn run_daemon(
     // 5. Active Attempt Recovery
     if let Some(mut active) = ActiveAttempt::load(&paths.active_attempt_file())? {
         println!(
-            "Recovering in-flight attempt '{}' in phase '{}'...",
+            "Recovering in-flight attempt '{}' in phase '{:?}'...",
             active.attempt_id, active.phase
         );
 
@@ -121,8 +166,8 @@ pub async fn run_daemon(
             )));
         }
 
-        match active.phase.as_str() {
-            "claim_intent" => {
+        match active.phase {
+            AttemptPhase::ClaimIntent => {
                 // Replay claim with exact same IDs
                 match client
                     .claim_job(
@@ -138,10 +183,16 @@ pub async fn run_daemon(
                         if resp.job.job_id != active.job_id
                             || resp.job.workspace_id != active.workspace_id
                             || resp.job.target_id != active.target_id
-                            || resp.attempt.attempt_id != active.attempt_id
                         {
+                            active.phase = AttemptPhase::RecoveryRequired;
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            active.save(&paths.active_attempt_file())?;
                             return Err(DaemonError::RecoveryRequired(
-                                "Claim response intent identity mismatch".into(),
+                                "Server claimed job payload mismatch with local intent".into(),
                             ));
                         }
 
@@ -151,21 +202,25 @@ pub async fn run_daemon(
                             &resp.job.target_id,
                             resp.job.resource_id.as_deref(),
                             &resp.job.prompt,
-                            resp.job.acceptance.as_deref(),
-                            resp.job.execution_timeout_seconds,
-                            resp.job.result_target.as_deref(),
+                            &resp.job.acceptance,
+                            resp.job.timeout_seconds,
+                            &resp.job.result_target,
                         );
 
-                        active.phase = "claimed".into();
+                        active.phase = AttemptPhase::Claimed;
                         active.resource_id = resp.job.resource_id;
                         active.prompt = Some(resp.job.prompt);
-                        active.acceptance = resp.job.acceptance;
-                        active.execution_timeout_seconds = Some(resp.job.execution_timeout_seconds);
-                        active.result_target = resp.job.result_target;
+                        active.acceptance = Some(resp.job.acceptance);
+                        active.execution_timeout_seconds = Some(resp.job.timeout_seconds);
+                        active.result_target = Some(resp.job.result_target);
                         active.payload_sha256 = Some(payload_hash);
-                        active.claimed_at_ms = Some(resp.attempt.claimed_at_ms);
+                        active.claimed_at_ms = parse_iso_or_millis(&resp.attempt.claimed_at);
 
-                        let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
                         active.save(&paths.active_attempt_file())?;
                         println!("Claim intent successfully reconciled to claimed.");
                     }
@@ -174,7 +229,11 @@ pub async fn run_daemon(
                             || code == "JOB_EXPIRED"
                             || code == "JOB_NOT_FOUND" =>
                     {
-                        let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
                         remove_durable(&paths.active_attempt_file())?;
                         println!("Job was consumed by another worker or expired. Cleared local claim intent.");
                     }
@@ -182,8 +241,12 @@ pub async fn run_daemon(
                         ref code,
                         ref message,
                     }) if code == "IDEMPOTENCY_CONFLICT" => {
-                        active.phase = "recovery_required".into();
-                        let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                        active.phase = AttemptPhase::RecoveryRequired;
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
                         active.save(&paths.active_attempt_file())?;
                         return Err(DaemonError::RecoveryRequired(format!(
                             "Idempotency conflict: {message}"
@@ -197,39 +260,69 @@ pub async fn run_daemon(
                     }
                 }
             }
-            "finalized_local" => {
+            AttemptPhase::FinalizedLocal => {
+                // Item 19: Startup finalized_local recovery must prove correlation
                 let hist_file = paths.history_file(&active.job_id, &active.attempt_id);
                 let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
 
                 if hist_file.exists() {
-                    // Delivery already succeeded, finish active attempt removal
-                    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
-                    remove_durable(&paths.active_attempt_file())?;
-                    println!("Active attempt was already delivered. Completed local active attempt cleanup.");
+                    let hist_content = fs::read_to_string(&hist_file)?;
+                    let hist: crate::outbox::SanitizedHistoryRecord =
+                        serde_json::from_str(&hist_content)?;
+                    if hist.job_id == active.job_id
+                        && hist.attempt_id == active.attempt_id
+                        && hist.target_id == active.target_id
+                        && Some(&hist.terminal_report_sha256)
+                            == active.terminal_report_sha256.as_ref()
+                    {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        remove_durable(&paths.active_attempt_file())?;
+                        println!("Active attempt was already delivered. Completed local active attempt cleanup.");
+                    } else {
+                        return Err(DaemonError::RecoveryRequired(
+                            "History record does not match active attempt correlation".into(),
+                        ));
+                    }
                 } else if outbox_file.exists() {
-                    // Flush outbox
-                    let _ = flush_outbox(paths, &client, &cred).await;
+                    let outbox = OutboxRecord::load(&outbox_file).map_err(|e| {
+                        DaemonError::RecoveryRequired(format!("failed to load outbox: {e}"))
+                    })?;
+                    let digest = compute_report_sha256(&outbox.report);
+                    if outbox.job_id == active.job_id
+                        && outbox.attempt_id == active.attempt_id
+                        && Some(&digest) == active.terminal_report_sha256.as_ref()
+                    {
+                        let _ = flush_outbox(paths, &client, &cred).await;
+                    } else {
+                        return Err(DaemonError::RecoveryRequired(
+                            "Outbox record does not match active attempt correlation".into(),
+                        ));
+                    }
                 } else {
                     return Err(DaemonError::RecoveryRequired(
-                        "Attempt in finalized_local but neither outbox record nor history file exists".into(),
+                        "Attempt in finalized_local but neither valid history nor outbox file exists".into(),
                     ));
                 }
             }
-            "claimed" | "start_intent" | "started" | "dispatch_intent" | "running" => {
+            AttemptPhase::Claimed
+            | AttemptPhase::StartIntent
+            | AttemptPhase::Started
+            | AttemptPhase::Running => {
                 if !adapter.is_ready().await {
                     eprintln!(
-                        "Attempt '{}' is held in phase '{}' waiting for execution adapter.",
+                        "Attempt '{}' is held in phase '{:?}' waiting for execution adapter.",
                         active.attempt_id, active.phase
                     );
                 } else {
-                    // Test execution adapter flow
                     let target = config.targets.get(&active.target_id).cloned();
                     if let Some(target) = target {
                         match adapter.execute(&active, &target).await {
-                            Ok(report_val) => {
-                                let mut hasher = Sha256::new();
-                                hasher.update(serde_json::to_vec(&report_val).unwrap());
-                                let digest = format!("{:x}", hasher.finalize());
+                            Ok(report) => {
+                                let digest = compute_report_sha256(&report);
 
                                 let outbox_rec = OutboxRecord {
                                     schema_version: OUTBOX_SCHEMA_VERSION,
@@ -238,16 +331,24 @@ pub async fn run_daemon(
                                     job_id: active.job_id.clone(),
                                     attempt_id: active.attempt_id.clone(),
                                     claim_token: active.claim_token.clone(),
-                                    report: report_val,
+                                    report,
                                     created_at_ms: now_utc_ms(),
                                 };
 
                                 let outbox_file =
                                     paths.outbox_file(&active.job_id, &active.attempt_id);
-                                outbox_rec.save(&outbox_file)?;
+                                outbox_rec
+                                    .save(&outbox_file)
+                                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
 
-                                active.phase = "finalized_local".into();
+                                active.phase = AttemptPhase::FinalizedLocal;
                                 active.terminal_report_sha256 = Some(digest);
+
+                                let _lock = ExecutionLock::acquire_with_retry(
+                                    &paths.state_lock_file(),
+                                    Duration::from_secs(5),
+                                    Duration::from_millis(50),
+                                )?;
                                 active.save(&paths.active_attempt_file())?;
 
                                 let _ = flush_outbox(paths, &client, &cred).await;
@@ -259,47 +360,40 @@ pub async fn run_daemon(
                     }
                 }
             }
-            "recovery_required" => {
+            AttemptPhase::RecoveryRequired => {
                 return Err(DaemonError::RecoveryRequired(
-                    "Active attempt is marked recovery_required".into(),
+                    "Active attempt is in recovery_required phase".into(),
                 ));
-            }
-            other => {
-                return Err(DaemonError::RecoveryRequired(format!(
-                    "Unknown attempt phase '{other}'"
-                )));
             }
         }
     }
 
-    // 6. Flush Outbox before entering idle loop
+    // 6. Outbox Recovery
     let _ = flush_outbox(paths, &client, &cred).await;
 
-    println!("Connector daemon entering idle loop...");
+    println!("Connector recovery complete. Entering main polling loop.");
 
-    let mut iterations = 0;
+    // 7. Main Polling Loop
+    let mut iteration_count = 0;
     loop {
         if let Some(max) = max_iterations {
-            if iterations >= max {
-                break;
+            if iteration_count >= max {
+                println!(
+                    "Reached maximum iterations ({}). Daemon exiting cleanly.",
+                    max
+                );
+                return Ok(());
             }
         }
-        iterations += 1;
+        iteration_count += 1;
 
-        // Atomically reload config and control
-        if let Some(latest_cfg) = LocalConfig::load(&paths.config_file())? {
-            config = latest_cfg;
-        }
-
+        // Check if paused via control.json
         let paused = if paths.control_file().exists() {
-            if let Ok(content) = fs::read_to_string(paths.control_file()) {
-                serde_json::from_str::<serde_json::Value>(&content)
-                    .ok()
-                    .and_then(|v| v.get("paused").and_then(|p| p.as_bool()))
-                    .unwrap_or(false)
-            } else {
-                false
-            }
+            fs::read_to_string(paths.control_file())
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| v.get("paused").and_then(|p| p.as_bool()))
+                .unwrap_or(false)
         } else {
             false
         };
@@ -309,14 +403,17 @@ pub async fn run_daemon(
             continue;
         }
 
-        // Concurrency = 1 guard: if active attempt exists, do not claim new jobs
+        // Concurrency = 1 guard: if active attempt or outbox records exist, do not query pending!
         if paths.active_attempt_file().exists() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        // Outbox guard: flush outbox before new work
-        if paths.outbox_dir().exists() && fs::read_dir(paths.outbox_dir())?.next().is_some() {
+        let has_outbox = paths.outbox_dir().exists()
+            && fs::read_dir(paths.outbox_dir())
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        if has_outbox {
             let _ = flush_outbox(paths, &client, &cred).await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
@@ -338,6 +435,11 @@ pub async fn run_daemon(
             std::collections::BTreeMap::new();
         for st in server_targets {
             target_snapshot.insert(st.target_id.clone(), st);
+        }
+
+        // Refresh local config
+        if let Ok(Some(refreshed_config)) = crate::config::LocalConfig::load(&paths.config_file()) {
+            config = refreshed_config;
         }
 
         // Query pending jobs
@@ -411,28 +513,99 @@ pub async fn run_daemon(
         }
 
         if let Some(cand) = selected_candidate {
+            if let Some(ref hook) = hooks.after_candidate_selected {
+                hook(&cand).await;
+            }
+
             let attempt_id = format!("att-{}", Uuid::new_v4());
             let claim_token = generate_claim_token();
 
-            // Acquire state.lock to serialize candidate selection and claim intent writing
-            let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+            // Acquire state.lock with bounded retry (Item 12)
+            let _lock = match ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(3),
+                Duration::from_millis(50),
+            ) {
+                Ok(l) => l,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    eprintln!("State lock busy during candidate claim preparation. Retrying...");
+                    continue;
+                }
+                Err(e) => return Err(DaemonError::Io(e)),
+            };
 
-            // Revalidate: no active attempt exists and target still mapped
-            if paths.active_attempt_file().exists() || !config.targets.contains_key(&cand.target_id)
+            // Reload from disk (Item 9):
+            let disk_cred = DeviceCredential::load(&paths.credential_file())?;
+            let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
+            let disk_active = ActiveAttempt::load(&paths.active_attempt_file())?;
+            let disk_paused = if paths.control_file().exists() {
+                fs::read_to_string(paths.control_file())
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .and_then(|v| v.get("paused").and_then(|p| p.as_bool()))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            // Require credential still exists (Item 10)
+            let disk_cred = match disk_cred {
+                Some(c) => c,
+                None => {
+                    // Credential missing (logout occurred!)
+                    return Err(DaemonError::AuthRequired);
+                }
+            };
+
+            if disk_cred.device_id != cred.device_id
+                || disk_cred.server_origin != cred.server_origin
             {
+                return Err(DaemonError::AuthRequired);
+            }
+
+            let disk_config = match disk_config {
+                Some(cfg) => cfg,
+                None => continue,
+            };
+
+            let normalized_config_origin =
+                crate::config::normalize_server_origin(&disk_config.server_url).map_err(|_e| {
+                    DaemonError::LocalCredentialServerMismatch {
+                        expected: disk_config.server_url.clone(),
+                        actual: disk_cred.server_origin.clone(),
+                    }
+                })?;
+
+            if normalized_config_origin != disk_cred.server_origin {
+                return Err(DaemonError::LocalCredentialServerMismatch {
+                    expected: normalized_config_origin,
+                    actual: disk_cred.server_origin.clone(),
+                });
+            }
+
+            if disk_paused {
+                continue;
+            }
+
+            if disk_active.is_some() {
+                continue;
+            }
+
+            // Require candidate target still locally mapped (Item 11)
+            if !disk_config.targets.contains_key(&cand.target_id) {
                 continue;
             }
 
             let attempt = ActiveAttempt {
                 schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
-                server_origin: cred.server_origin.clone(),
-                device_id: cred.device_id.clone(),
+                server_origin: disk_cred.server_origin.clone(),
+                device_id: disk_cred.device_id.clone(),
                 job_id: cand.job_id.clone(),
                 workspace_id: cand.workspace_id.clone(),
                 target_id: cand.target_id.clone(),
                 attempt_id: attempt_id.clone(),
                 claim_token: claim_token.clone(),
-                phase: "claim_intent".into(),
+                phase: AttemptPhase::ClaimIntent,
                 resource_id: None,
                 prompt: None,
                 acceptance: None,
@@ -447,51 +620,46 @@ pub async fn run_daemon(
             attempt.save(&paths.active_attempt_file())?;
             drop(_lock);
 
+            if let Some(ref hook) = hooks.after_claim_intent_persisted {
+                hook(&attempt).await;
+            }
+
             // Dispatch claim request
             match client
                 .claim_job(&cred, &cand.job_id, &attempt_id, &claim_token)
                 .await
             {
                 Ok(resp) => {
-                    // Verify full intent identity
-                    if resp.job.job_id != cand.job_id
-                        || resp.job.workspace_id != cand.workspace_id
-                        || resp.job.target_id != cand.target_id
-                        || resp.attempt.attempt_id != attempt_id
-                    {
-                        eprintln!("Full intent identity mismatch in claim response! Marking recovery_required.");
-                        let mut att = ActiveAttempt::load(&paths.active_attempt_file())?.unwrap();
-                        att.phase = "recovery_required".into();
-                        att.save(&paths.active_attempt_file())?;
-                        continue;
-                    }
-
                     let payload_hash = ActiveAttempt::compute_payload_sha256(
                         &resp.job.job_id,
                         &resp.job.workspace_id,
                         &resp.job.target_id,
                         resp.job.resource_id.as_deref(),
                         &resp.job.prompt,
-                        resp.job.acceptance.as_deref(),
-                        resp.job.execution_timeout_seconds,
-                        resp.job.result_target.as_deref(),
+                        &resp.job.acceptance,
+                        resp.job.timeout_seconds,
+                        &resp.job.result_target,
                     );
 
-                    let mut att = ActiveAttempt::load(&paths.active_attempt_file())?.unwrap();
-                    att.phase = "claimed".into();
+                    let mut att = attempt;
+                    att.phase = AttemptPhase::Claimed;
                     att.resource_id = resp.job.resource_id;
                     att.prompt = Some(resp.job.prompt);
-                    att.acceptance = resp.job.acceptance;
-                    att.execution_timeout_seconds = Some(resp.job.execution_timeout_seconds);
-                    att.result_target = resp.job.result_target;
+                    att.acceptance = Some(resp.job.acceptance);
+                    att.execution_timeout_seconds = Some(resp.job.timeout_seconds);
+                    att.result_target = Some(resp.job.result_target);
                     att.payload_sha256 = Some(payload_hash);
-                    att.claimed_at_ms = Some(resp.attempt.claimed_at_ms);
+                    att.claimed_at_ms = parse_iso_or_millis(&resp.attempt.claimed_at);
 
-                    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
                     att.save(&paths.active_attempt_file())?;
                     println!(
-                        "Successfully claimed job '{}' (attempt '{}').",
-                        cand.job_id, attempt_id
+                        "Successfully claimed job '{}'. Attempt '{}' now in phase 'claimed'.",
+                        cand.job_id, att.attempt_id
                     );
                 }
                 Err(ClientError::JobError { ref code, .. })
@@ -499,30 +667,39 @@ pub async fn run_daemon(
                         || code == "JOB_EXPIRED"
                         || code == "JOB_NOT_FOUND" =>
                 {
-                    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
                     remove_durable(&paths.active_attempt_file())?;
+                    println!(
+                        "Candidate job was claimed by another worker or expired. Cleared local claim intent."
+                    );
                 }
                 Err(ClientError::JobError {
                     ref code,
                     ref message,
                 }) if code == "IDEMPOTENCY_CONFLICT" => {
-                    let mut att = ActiveAttempt::load(&paths.active_attempt_file())?.unwrap();
-                    att.phase = "recovery_required".into();
-                    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut att = attempt;
+                    att.phase = AttemptPhase::RecoveryRequired;
                     att.save(&paths.active_attempt_file())?;
-                    eprintln!("Idempotency conflict claiming job: {}", message);
+                    return Err(DaemonError::RecoveryRequired(format!(
+                        "Idempotency conflict: {message}"
+                    )));
                 }
+                Err(ClientError::Unauthorized) => return Err(DaemonError::AuthRequired),
                 Err(e) => {
-                    eprintln!(
-                        "Network/server error claiming job '{}': {}. Retaining claim intent.",
-                        cand.job_id, e
-                    );
+                    eprintln!("Failed to claim job: {}. Intent remains for replay.", e);
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
-
-    Ok(())
 }

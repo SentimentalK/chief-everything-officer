@@ -128,6 +128,29 @@ pub struct DeviceBindingPart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorTargetWire {
+    pub id: String,
+    pub workspace_id: String,
+    pub alias: String,
+    pub display_name: String,
+    pub kind: String,
+    pub repository: Option<TargetRepositoryPart>,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorTargetItemWire {
+    pub target: ConnectorTargetWire,
+    pub this_device_binding: Option<DeviceBindingPart>,
+    pub active_binding_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetsResponse {
+    pub targets: Vec<ConnectorTargetItemWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorTargetProjection {
     pub target_id: String,
     pub workspace_id: String,
@@ -136,15 +159,24 @@ pub struct ConnectorTargetProjection {
     pub kind: String,
     pub repository: Option<TargetRepositoryPart>,
     pub disabled: bool,
-    pub disabled_at: Option<String>,
     pub this_device_binding: Option<DeviceBindingPart>,
     pub active_binding_count: u32,
-    pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TargetsResponse {
-    pub targets: Vec<ConnectorTargetProjection>,
+impl From<ConnectorTargetItemWire> for ConnectorTargetProjection {
+    fn from(wire: ConnectorTargetItemWire) -> Self {
+        Self {
+            target_id: wire.target.id,
+            workspace_id: wire.target.workspace_id,
+            alias: wire.target.alias,
+            display_name: wire.target.display_name,
+            kind: wire.target.kind,
+            repository: wire.target.repository,
+            disabled: wire.target.disabled,
+            this_device_binding: wire.this_device_binding,
+            active_binding_count: wire.active_binding_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,22 +196,11 @@ pub struct RegisterTargetRepoSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterTargetResponse {
-    pub target: ConnectorTargetProjectionTarget,
+    pub target: ConnectorTargetWire,
     pub binding: DeviceBindingPart,
     pub target_created: bool,
     pub binding_created: bool,
     pub replayed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectorTargetProjectionTarget {
-    pub id: String,
-    pub workspace_id: String,
-    pub alias: String,
-    pub display_name: String,
-    pub kind: String,
-    pub repository: Option<TargetRepositoryPart>,
-    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,9 +214,11 @@ pub struct BindTargetResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingJobCandidate {
     pub job_id: String,
-    pub target_id: String,
     pub workspace_id: String,
-    pub created_at_ms: i64,
+    pub target_id: String,
+    pub resource_id: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,49 +227,39 @@ pub struct PendingJobsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaimJobResponseJob {
-    pub job_id: String,
-    pub workspace_id: String,
-    pub target_id: String,
-    pub user_id: String,
-    pub prompt: String,
-    pub acceptance: Option<String>,
-    pub resource_id: Option<String>,
-    pub execution_timeout_seconds: u32,
-    pub result_target: Option<String>,
-    pub status: String,
+pub struct ClaimAttemptWire {
+    pub attempt_id: String,
+    pub phase: String,
+    pub claimed_at: String,
+    pub started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaimJobResponseAttempt {
-    pub attempt_id: String,
-    pub phase: String,
-    pub claimed_at_ms: i64,
+pub struct ClaimedJobWire {
+    pub job_id: String,
+    pub workspace_id: String,
+    pub target_id: String,
+    pub resource_id: Option<String>,
+    pub prompt: String,
+    pub acceptance: String,
+    pub timeout_seconds: u32,
+    pub result_target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimJobResponse {
-    pub job: ClaimJobResponseJob,
-    pub attempt: ClaimJobResponseAttempt,
+    pub ok: bool,
     pub replayed: bool,
+    pub server_time: String,
+    pub attempt: ClaimAttemptWire,
+    pub job: ClaimedJobWire,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartJobResponse {
-    pub job_id: String,
-    pub attempt_id: String,
-    pub phase: String,
-    pub started_at_ms: i64,
+pub struct JobMutationAck {
+    pub ok: bool,
     pub replayed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReportJobResponse {
-    pub job_id: String,
-    pub attempt_id: String,
-    pub status: String,
-    pub terminal: bool,
-    pub replayed: bool,
+    pub server_time: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +508,7 @@ impl ConnectorClient {
 
         if status.is_success() {
             let res: TargetsResponse = serde_json::from_str(&text)?;
-            Ok(res.targets)
+            Ok(res.targets.into_iter().map(Into::into).collect())
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)
         } else if status.is_server_error() {
@@ -747,7 +760,7 @@ impl ConnectorClient {
         job_id: &str,
         attempt_id: &str,
         claim_token: &str,
-    ) -> Result<StartJobResponse, ClientError> {
+    ) -> Result<JobMutationAck, ClientError> {
         let headers = self.auth_headers(credential)?;
         let url = format!("{}/api/connector/jobs/{}/start", self.server_origin, job_id);
         let body = serde_json::json!({
@@ -768,7 +781,7 @@ impl ConnectorClient {
         let text = resp.text().await?;
 
         if status.is_success() {
-            let res: StartJobResponse = serde_json::from_str(&text)?;
+            let res: JobMutationAck = serde_json::from_str(&text)?;
             Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)
@@ -799,8 +812,8 @@ impl ConnectorClient {
         job_id: &str,
         attempt_id: &str,
         claim_token: &str,
-        report: &serde_json::Value,
-    ) -> Result<ReportJobResponse, ClientError> {
+        report: &crate::execution_contract::ExecutionReport,
+    ) -> Result<JobMutationAck, ClientError> {
         let headers = self.auth_headers(credential)?;
         let url = format!(
             "{}/api/connector/jobs/{}/report",
@@ -825,7 +838,7 @@ impl ConnectorClient {
         let text = resp.text().await?;
 
         if status.is_success() {
-            let res: ReportJobResponse = serde_json::from_str(&text)?;
+            let res: JobMutationAck = serde_json::from_str(&text)?;
             Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)

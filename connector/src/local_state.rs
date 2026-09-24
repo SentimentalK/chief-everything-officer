@@ -44,6 +44,48 @@ impl ExecutionLock {
         Ok(ExecutionLock { _file: file })
     }
 
+    /// Attempts acquisition with bounded synchronous retry on `WouldBlock`.
+    pub fn acquire_with_retry(
+        lock_path: &Path,
+        max_duration: std::time::Duration,
+        poll_interval: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        let start = std::time::Instant::now();
+        loop {
+            match Self::acquire(lock_path) {
+                Ok(lock) => return Ok(lock),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= max_duration {
+                        return Err(e);
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Attempts acquisition with bounded asynchronous retry on `WouldBlock`.
+    pub async fn acquire_with_retry_async(
+        lock_path: &Path,
+        max_duration: std::time::Duration,
+        poll_interval: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        let start = std::time::Instant::now();
+        loop {
+            match Self::acquire(lock_path) {
+                Ok(lock) => return Ok(lock),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= max_duration {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Checks whether the lock is currently held by another process without holding it.
     pub fn is_locked(lock_path: &Path) -> bool {
         match Self::acquire(lock_path) {

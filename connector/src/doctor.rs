@@ -47,8 +47,31 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
     // 1. Filesystem directories and permissions
     check_filesystem(paths, &mut checks);
 
-    // 2. Credential validation & expiry
-    let cred = check_credentials(paths, &mut checks);
+    // 2. Bound profile & Credential validation & expiry
+    let bound_profile = crate::config::load_bound_profile(paths);
+    let cred = match bound_profile {
+        Ok(profile) => {
+            checks.push(DiagnosticCheck {
+                name: "Config & Credential Origin".into(),
+                severity: DiagnosticSeverity::Pass,
+                message: format!("Bound to origin '{}'", profile.credential.server_origin),
+            });
+            check_credentials(paths, &mut checks);
+            Some(profile.credential)
+        }
+        Err(crate::config::ProfileError::LocalCredentialServerMismatch { expected, actual }) => {
+            checks.push(DiagnosticCheck {
+                name: "Config & Credential Origin".into(),
+                severity: DiagnosticSeverity::Fail,
+                message: format!(
+                    "LOCAL_CREDENTIAL_SERVER_MISMATCH: config origin is '{expected}', but credential origin is '{actual}'"
+                ),
+            });
+            check_credentials(paths, &mut checks);
+            None
+        }
+        Err(_) => check_credentials(paths, &mut checks),
+    };
 
     // 3. Git tool & identity
     check_git_tooling(&mut checks);
@@ -63,7 +86,7 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
         checks.push(DiagnosticCheck {
             name: "Server Auth Probe".into(),
             severity: DiagnosticSeverity::Fail,
-            message: "Cannot probe server: device is not logged in".into(),
+            message: "Cannot probe server: device is not logged in or credential mismatch".into(),
         });
     }
 

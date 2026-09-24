@@ -113,8 +113,7 @@ pub fn normalize_server_origin(input: &str) -> Result<String, ConfigError> {
         .host_str()
         .ok_or_else(|| ConfigError::InvalidServerUrl("missing host in server URL".into()))?;
 
-    let is_loopback =
-        host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+    let is_loopback = host == "127.0.0.1" || host == "::1" || host == "[::1]";
 
     match parsed.scheme() {
         "https" => {}
@@ -142,6 +141,53 @@ pub fn normalize_server_origin(input: &str) -> Result<String, ConfigError> {
     Ok(origin)
 }
 
+use crate::credential::{CredentialError, DeviceCredential};
+use crate::paths::ConnectorPaths;
+
+#[derive(Debug, Clone)]
+pub struct BoundProfile {
+    pub config: LocalConfig,
+    pub credential: DeviceCredential,
+}
+
+#[derive(Error, Debug)]
+pub enum ProfileError {
+    #[error("Not logged in. Please run `ceo-connector login` first.")]
+    NotLoggedIn,
+    #[error("Configuration not found. Please run `ceo-connector login` first.")]
+    ConfigNotFound,
+    #[error("Local credential server mismatch: config origin is '{expected}', but credential origin is '{actual}' (LOCAL_CREDENTIAL_SERVER_MISMATCH)")]
+    LocalCredentialServerMismatch { expected: String, actual: String },
+    #[error("Config error: {0}")]
+    Config(#[from] ConfigError),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Credential error: {0}")]
+    Credential(#[from] CredentialError),
+}
+
+/// Loads both config and credential, verifying that config.server_url matches credential.server_origin.
+pub fn load_bound_profile(paths: &ConnectorPaths) -> Result<BoundProfile, ProfileError> {
+    let credential =
+        DeviceCredential::load(&paths.credential_file())?.ok_or(ProfileError::NotLoggedIn)?;
+    let config = match LocalConfig::load(&paths.config_file())? {
+        Some(cfg) => cfg,
+        None => LocalConfig::new(credential.server_origin.clone())?,
+    };
+
+    let normalized_config_origin =
+        normalize_server_origin(&config.server_url).map_err(ProfileError::Config)?;
+
+    if normalized_config_origin != credential.server_origin {
+        return Err(ProfileError::LocalCredentialServerMismatch {
+            expected: normalized_config_origin,
+            actual: credential.server_origin,
+        });
+    }
+
+    Ok(BoundProfile { config, credential })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +211,8 @@ mod tests {
             "http://[::1]:8080"
         );
 
+        // Disallow localhost http (literal 127.0.0.1 or ::1 required)
+        assert!(normalize_server_origin("http://localhost:4000").is_err());
         // Disallow public http
         assert!(normalize_server_origin("http://ceo.example.com").is_err());
         // Disallow paths

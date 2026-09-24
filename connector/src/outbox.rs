@@ -4,14 +4,24 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+use sha2::{Digest, Sha256};
+
 use crate::client::{ClientError, ConnectorClient};
 use crate::credential::DeviceCredential;
+use crate::execution_contract::ExecutionReport;
 use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
 use crate::paths::ConnectorPaths;
-use crate::scheduler::ActiveAttempt;
+use crate::scheduler::{ActiveAttempt, AttemptPhase};
 
 pub const OUTBOX_SCHEMA_VERSION: u32 = 1;
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
+
+pub fn compute_report_sha256(report: &ExecutionReport) -> String {
+    let bytes = serde_json::to_vec(report).expect("report serialization failed");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
 
 #[derive(Error, Debug)]
 pub enum OutboxError {
@@ -28,6 +38,8 @@ pub enum OutboxError {
         actual_server: String,
         actual_device: String,
     },
+    #[error("Invalid report contract: {0}")]
+    InvalidReport(String),
     #[error("Authentication required / 401 Unauthorized")]
     AuthRequired,
     #[error("Terminal conflict or invalid report lifecycle: {0} (RECOVERY_REQUIRED)")]
@@ -45,7 +57,7 @@ pub struct OutboxRecord {
     pub job_id: String,
     pub attempt_id: String,
     pub claim_token: String,
-    pub report: serde_json::Value,
+    pub report: ExecutionReport,
     pub created_at_ms: i64,
 }
 
@@ -58,7 +70,7 @@ impl fmt::Debug for OutboxRecord {
             .field("job_id", &self.job_id)
             .field("attempt_id", &self.attempt_id)
             .field("claim_token", &"[REDACTED]")
-            .field("report", &self.report)
+            .field("report", &"[REDACTED]")
             .field("created_at_ms", &self.created_at_ms)
             .finish()
     }
@@ -74,6 +86,7 @@ pub struct SanitizedHistoryRecord {
     pub status: String,
     pub receipt_sha256: Option<String>,
     pub duration_ms: Option<u64>,
+    pub terminal_report_sha256: String,
     pub recorded_at_ms: i64,
 }
 
@@ -84,10 +97,17 @@ impl OutboxRecord {
         if record.schema_version != OUTBOX_SCHEMA_VERSION {
             return Err(OutboxError::UnsupportedSchemaVersion(record.schema_version));
         }
+        record
+            .report
+            .validate()
+            .map_err(|e| OutboxError::InvalidReport(e.to_string()))?;
         Ok(record)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), OutboxError> {
+        self.report
+            .validate()
+            .map_err(|e| OutboxError::InvalidReport(e.to_string()))?;
         atomic_write_json(path, self)?;
         Ok(())
     }
@@ -122,34 +142,61 @@ pub async fn deliver_outbox_record(
         .await;
 
     match report_res {
-        Ok(resp) => {
+        Ok(_ack) => {
+            let report_sha256 = compute_report_sha256(&record.report);
+
             // Success (HTTP 200 or replayed)! Perform durable terminal cleanup under state.lock
-            let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+            )?;
 
-            // Extract target_id from active-attempt or report
-            let target_id = ActiveAttempt::load(&paths.active_attempt_file())
-                .ok()
-                .flatten()
-                .filter(|a| a.job_id == record.job_id && a.attempt_id == record.attempt_id)
-                .map(|a| a.target_id)
-                .unwrap_or_else(|| "unknown".into());
+            // Verify active attempt correlation (phase finalized_local + digests match)
+            let active_opt = ActiveAttempt::load(&paths.active_attempt_file()).map_err(|e| {
+                OutboxError::RecoveryRequired(format!("failed to load active attempt: {e}"))
+            })?;
 
-            let receipt_sha256 = record
-                .report
-                .get("receipt_sha256")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let target_id = if let Some(active) = active_opt {
+                if active.job_id != record.job_id || active.attempt_id != record.attempt_id {
+                    return Err(OutboxError::RecoveryRequired(format!(
+                        "Active attempt '{}/{}' does not match outbox '{}/{}'",
+                        active.job_id, active.attempt_id, record.job_id, record.attempt_id
+                    )));
+                }
+                if active.phase != AttemptPhase::FinalizedLocal {
+                    return Err(OutboxError::RecoveryRequired(format!(
+                        "Active attempt phase '{:?}' is not finalized_local",
+                        active.phase
+                    )));
+                }
+                if active.terminal_report_sha256.as_deref() != Some(&report_sha256) {
+                    return Err(OutboxError::RecoveryRequired(format!(
+                        "Active attempt terminal_report_sha256 mismatch: active '{:?}' vs outbox '{}'",
+                        active.terminal_report_sha256, report_sha256
+                    )));
+                }
+                active.target_id
+            } else {
+                return Err(OutboxError::RecoveryRequired(
+                    "Active attempt missing during outbox delivery cleanup".into(),
+                ));
+            };
 
-            let duration_ms = record.report.get("duration_ms").and_then(|v| v.as_u64());
+            let status_str = match record.report.execution_status {
+                crate::execution_contract::ExecutionStatus::COMPLETED => "completed",
+                _ => "failed",
+            };
 
             let history = SanitizedHistoryRecord {
                 schema_version: HISTORY_SCHEMA_VERSION,
                 job_id: record.job_id.clone(),
                 attempt_id: record.attempt_id.clone(),
                 target_id,
-                status: resp.status,
-                receipt_sha256,
-                duration_ms,
+                status: status_str.to_string(),
+                receipt_sha256: Some(record.report.receipt_sha256.clone()),
+                duration_ms: Some(record.report.duration_ms),
+                terminal_report_sha256: report_sha256,
                 recorded_at_ms: chrono::Utc::now().timestamp_millis(),
             };
 
@@ -160,12 +207,8 @@ pub async fn deliver_outbox_record(
             // 2. Durably unlink outbox record
             remove_durable(outbox_file)?;
 
-            // 3. Durably unlink active attempt if it matches this job/attempt
-            if let Ok(Some(active)) = ActiveAttempt::load(&paths.active_attempt_file()) {
-                if active.job_id == record.job_id && active.attempt_id == record.attempt_id {
-                    remove_durable(&paths.active_attempt_file())?;
-                }
-            }
+            // 3. Durably unlink active attempt
+            remove_durable(&paths.active_attempt_file())?;
 
             Ok(())
         }

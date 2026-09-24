@@ -1,0 +1,81 @@
+{
+  "identity": {
+    "user_id": "usr_contract_gate",
+    "device": {
+      "id": "dev_contract_gate",
+      "display_name": "Gate Device",
+      "platform": "linux-x86_64"
+    },
+    "credential": {
+      "id": "dcr_contract_gate",
+      "expires_at_ms": 1727220000000
+    }
+  },
+  "targets": {
+    "targets": [
+      {
+        "target": {
+          "id": "tgt_contract_gate",
+          "workspace_id": "ws_contract_gate",
+          "alias": "gate-target",
+          "display_name": "Gate Target",
+          "kind": "coding",
+          "repository": {
+            "provider": "github",
+            "external_id": "repo_12345",
+            "full_name": "owner/repo"
+          },
+          "disabled": false
+        },
+        "this_device_binding": {
+          "id": "dtb_contract_gate",
+          "enabled": true
+        },
+        "active_binding_count": 1
+      }
+    ]
+  },
+  "pending": {
+    "jobs": [
+      {
+        "job_id": "job_contract_gate",
+        "workspace_id": "ws_contract_gate",
+        "target_id": "tgt_contract_gate",
+        "resource_id": "res_contract_gate",
+        "created_at": "2026-09-24T19:00:00.000Z",
+        "expires_at": "2026-09-24T20:00:00.000Z"
+      }
+    ]
+  },
+  "claim": {
+    "ok": true,
+    "replayed": false,
+    "server_time": "2026-09-24T19:00:01.000Z",
+    "attempt": {
+      "attempt_id": "att-11111111-2222-3333-4444-555555555555",
+      "phase": "claimed",
+      "claimed_at": "2026-09-24T19:00:01.000Z",
+      "started_at": null
+    },
+    "job": {
+      "job_id": "job_contract_gate",
+      "workspace_id": "ws_contract_gate",
+      "target_id": "tgt_contract_gate",
+      "resource_id": "res_contract_gate",
+      "prompt": "Gate prompt",
+      "acceptance": "Gate acceptance",
+      "timeout_seconds": 600,
+      "result_target": "none"
+    }
+  },
+  "start": {
+    "ok": true,
+    "replayed": false,
+    "server_time": "2026-09-24T19:00:02.000Z"
+  },
+  "report": {
+    "ok": true,
+    "replayed": false,
+    "server_time": "2026-09-24T19:00:03.000Z"
+  }
+}

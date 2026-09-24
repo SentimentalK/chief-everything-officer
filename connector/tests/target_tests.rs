@@ -290,20 +290,20 @@ async fn target_bind_and_remove_lifecycle() {
                 200,
                 &serde_json::json!({
                     "targets": [{
-                        "target_id": "tgt_existing",
-                        "workspace_id": "ws_1",
-                        "alias": "bound-target",
-                        "display_name": "Bound Target",
-                        "kind": "general_automation",
-                        "repository": null,
-                        "disabled": false,
-                        "disabled_at": null,
+                        "target": {
+                            "id": "tgt_existing",
+                            "workspace_id": "ws_1",
+                            "alias": "bound-target",
+                            "display_name": "Bound Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": false
+                        },
                         "this_device_binding": {
                             "id": "bnd_new",
                             "enabled": true
                         },
-                        "active_binding_count": 1,
-                        "created_at": "2026-09-24T00:00:00Z"
+                        "active_binding_count": 1
                     }]
                 }),
             );

@@ -4,6 +4,7 @@ pub mod credential;
 pub mod daemon;
 pub mod doctor;
 pub mod enrollment;
+pub mod execution_contract;
 pub mod local_state;
 pub mod outbox;
 pub mod paths;

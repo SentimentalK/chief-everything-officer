@@ -46,12 +46,43 @@ async fn doctor_detects_expired_credential() {
     .unwrap();
     expired_cred.save(&paths.credential_file()).unwrap();
 
+    let config = LocalConfig::new("http://127.0.0.1:4000".into()).unwrap();
+    config.save(&paths.config_file()).unwrap();
+
     let report = run_doctor(&paths, true).await;
     assert!(!report.overall_passed);
     assert!(report
         .checks
         .iter()
         .any(|c| c.name == "Credential Expiry" && c.severity == DiagnosticSeverity::Fail));
+}
+
+#[tokio::test]
+async fn doctor_detects_server_origin_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        "http://127.0.0.1:4000".into(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let config = LocalConfig::new("https://other.server.com".into()).unwrap();
+    config.save(&paths.config_file()).unwrap();
+
+    let report = run_doctor(&paths, true).await;
+    assert!(!report.overall_passed);
+    assert!(report
+        .checks
+        .iter()
+        .any(|c| c.message.contains("LOCAL_CREDENTIAL_SERVER_MISMATCH")));
 }
 
 #[tokio::test]
@@ -78,17 +109,17 @@ async fn doctor_detects_missing_path_and_disabled_target() {
                 200,
                 &serde_json::json!({
                     "targets": [{
-                        "target_id": "tgt_disabled",
-                        "workspace_id": "ws_1",
-                        "alias": "disabled-target",
-                        "display_name": "Disabled Target",
-                        "kind": "general_automation",
-                        "repository": null,
-                        "disabled": true, // Disabled!
-                        "disabled_at": "2026-09-24T00:00:00Z",
+                        "target": {
+                            "id": "tgt_disabled",
+                            "workspace_id": "ws_1",
+                            "alias": "disabled-target",
+                            "display_name": "Disabled Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": true
+                        },
                         "this_device_binding": { "id": "bnd_1", "enabled": true },
-                        "active_binding_count": 0,
-                        "created_at": "2026-09-24T00:00:00Z"
+                        "active_binding_count": 0
                     }]
                 }),
             );
@@ -168,21 +199,21 @@ async fn doctor_healthy_report_detects_git_and_targets() {
                 200,
                 &serde_json::json!({
                     "targets": [{
-                        "target_id": "tgt_healthy",
-                        "workspace_id": "ws_1",
-                        "alias": "healthy-target",
-                        "display_name": "Healthy Target",
-                        "kind": "coding",
-                        "repository": {
-                            "provider": "github",
-                            "external_id": "1",
-                            "full_name": "org/repo"
+                        "target": {
+                            "id": "tgt_healthy",
+                            "workspace_id": "ws_1",
+                            "alias": "healthy-target",
+                            "display_name": "Healthy Target",
+                            "kind": "coding",
+                            "repository": {
+                                "provider": "github",
+                                "external_id": "1",
+                                "full_name": "org/repo"
+                            },
+                            "disabled": false
                         },
-                        "disabled": false,
-                        "disabled_at": null,
                         "this_device_binding": { "id": "bnd_1", "enabled": true },
-                        "active_binding_count": 1,
-                        "created_at": "2026-09-24T00:00:00Z"
+                        "active_binding_count": 1
                     }]
                 }),
             );

@@ -38,20 +38,20 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
                 200,
                 &serde_json::json!({
                     "targets": [{
-                        "target_id": "tgt_1",
-                        "workspace_id": "ws_1",
-                        "alias": "dev-target",
-                        "display_name": "Dev Target",
-                        "kind": "general_automation",
-                        "repository": null,
-                        "disabled": false,
-                        "disabled_at": null,
+                        "target": {
+                            "id": "tgt_1",
+                            "workspace_id": "ws_1",
+                            "alias": "dev-target",
+                            "display_name": "Dev Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": false
+                        },
                         "this_device_binding": {
                             "id": "bnd_1",
                             "enabled": true
                         },
-                        "active_binding_count": 1,
-                        "created_at": "2026-09-24T00:00:00Z"
+                        "active_binding_count": 1
                     }]
                 }),
             );
@@ -64,9 +64,11 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
                 &serde_json::json!({
                     "jobs": [{
                         "job_id": "job_pending_100",
-                        "target_id": "tgt_1",
                         "workspace_id": "ws_1",
-                        "created_at_ms": 1700000000000i64
+                        "target_id": "tgt_1",
+                        "resource_id": null,
+                        "created_at": "2026-09-24T12:00:00.000Z",
+                        "expires_at": null
                     }]
                 }),
             );
@@ -74,7 +76,30 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
 
         if req.path.contains("/claim") && req.method == "POST" {
             claim_calls_clone.fetch_add(1, Ordering::SeqCst);
-            return MockResponse::json(200, &serde_json::json!({ "ok": true }));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": "att-1",
+                        "phase": "claimed",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": null
+                    },
+                    "job": {
+                        "job_id": "job_pending_100",
+                        "workspace_id": "ws_1",
+                        "target_id": "tgt_1",
+                        "resource_id": null,
+                        "prompt": "Test prompt",
+                        "acceptance": "Test acceptance",
+                        "timeout_seconds": 3600,
+                        "result_target": "none"
+                    }
+                }),
+            );
         }
 
         MockResponse {
@@ -150,17 +175,17 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
                 200,
                 &serde_json::json!({
                     "targets": [{
-                        "target_id": "tgt_1",
-                        "workspace_id": "ws_1",
-                        "alias": "dev-target",
-                        "display_name": "Dev Target",
-                        "kind": "general_automation",
-                        "repository": null,
-                        "disabled": false,
-                        "disabled_at": null,
+                        "target": {
+                            "id": "tgt_1",
+                            "workspace_id": "ws_1",
+                            "alias": "dev-target",
+                            "display_name": "Dev Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": false
+                        },
                         "this_device_binding": { "id": "bnd_1", "enabled": true },
-                        "active_binding_count": 1,
-                        "created_at": "2026-09-24T00:00:00Z"
+                        "active_binding_count": 1
                     }]
                 }),
             );
@@ -172,9 +197,11 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
                 &serde_json::json!({
                     "jobs": [{
                         "job_id": "job_crash_1",
-                        "target_id": "tgt_1",
                         "workspace_id": "ws_1",
-                        "created_at_ms": 1700000000000i64
+                        "target_id": "tgt_1",
+                        "resource_id": null,
+                        "created_at": "2026-09-24T12:00:00.000Z",
+                        "expires_at": null
                     }]
                 }),
             );
@@ -212,24 +239,25 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
                 return MockResponse::json(
                     200,
                     &serde_json::json!({
+                        "ok": true,
+                        "replayed": true,
+                        "server_time": "2026-09-24T12:00:00.000Z",
+                        "attempt": {
+                            "attempt_id": att_id,
+                            "phase": "claimed",
+                            "claimed_at": "2026-09-24T12:00:00.000Z",
+                            "started_at": null
+                        },
                         "job": {
                             "job_id": "job_crash_1",
                             "workspace_id": "ws_1",
                             "target_id": "tgt_1",
-                            "user_id": "usr_1",
-                            "prompt": "Run tasks",
-                            "acceptance": null,
                             "resource_id": null,
-                            "execution_timeout_seconds": 3600,
-                            "result_target": null,
-                            "status": "active"
-                        },
-                        "attempt": {
-                            "attempt_id": att_id,
-                            "phase": "claimed",
-                            "claimed_at_ms": 1700000000000i64
-                        },
-                        "replayed": true
+                            "prompt": "Run tasks",
+                            "acceptance": "acceptance criteria",
+                            "timeout_seconds": 3600,
+                            "result_target": "none"
+                        }
                     }),
                 );
             }
@@ -272,10 +300,25 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
     );
     config.save(&paths.config_file()).unwrap();
 
+    let fake_report = ceo_connector::execution_contract::ExecutionReport {
+        schema_version: 2,
+        execution_status: ceo_connector::execution_contract::ExecutionStatus::COMPLETED,
+        business_outcome: ceo_connector::execution_contract::BusinessOutcome::UNVERIFIED,
+        task_dispatched: true,
+        finished_at_ms: 1700000005000,
+        duration_ms: 5000,
+        executor: ceo_connector::execution_contract::ExecutionReportExecutor {
+            executor_type: "fake".into(),
+            version: "1.0.0".into(),
+        },
+        receipt_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        error: None,
+    };
+
     // 1. Run with ready fake adapter for 1 iteration (first attempt fails with 503)
     let adapter = Arc::new(FakeExecutionAdapter {
         ready: true,
-        report_to_produce: serde_json::json!({ "execution_status": "success" }),
+        report_to_produce: fake_report,
     });
     run_daemon(&paths, adapter.clone(), Some(1)).await.unwrap();
 
@@ -283,7 +326,10 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
     let attempt = ActiveAttempt::load(&paths.active_attempt_file())
         .unwrap()
         .unwrap();
-    assert_eq!(attempt.phase, "claim_intent");
+    assert_eq!(
+        attempt.phase,
+        ceo_connector::scheduler::AttemptPhase::ClaimIntent
+    );
     assert_eq!(attempt.job_id, "job_crash_1");
 
     // 2. Restart daemon: startup recovery replays the EXACT SAME attempt_id and claim_token

@@ -10,7 +10,7 @@ use crate::client::{
     RegisterTargetRepoSource, TargetRepositoryPart,
 };
 use crate::config::{ConfigError, LocalConfig, LocalTarget};
-use crate::credential::{CredentialError, DeviceCredential};
+use crate::credential::CredentialError;
 use crate::local_state::ExecutionLock;
 use crate::paths::ConnectorPaths;
 
@@ -42,6 +42,25 @@ pub enum TargetError {
     TargetBindingInactive(String),
     #[error("Device not logged in. Please run `ceo-connector login` first.")]
     NotLoggedIn,
+    #[error("Local credential server mismatch: config origin is '{expected}', but credential origin is '{actual}' (LOCAL_CREDENTIAL_SERVER_MISMATCH)")]
+    LocalCredentialServerMismatch { expected: String, actual: String },
+    #[error("Profile or state lock is currently busy. Please retry shortly. (PROFILE_BUSY)")]
+    ProfileBusy,
+}
+
+impl From<crate::config::ProfileError> for TargetError {
+    fn from(err: crate::config::ProfileError) -> Self {
+        match err {
+            crate::config::ProfileError::NotLoggedIn => TargetError::NotLoggedIn,
+            crate::config::ProfileError::ConfigNotFound => TargetError::NotLoggedIn,
+            crate::config::ProfileError::LocalCredentialServerMismatch { expected, actual } => {
+                TargetError::LocalCredentialServerMismatch { expected, actual }
+            }
+            crate::config::ProfileError::Config(e) => TargetError::Config(e),
+            crate::config::ProfileError::Credential(e) => TargetError::Credential(e),
+            crate::config::ProfileError::Io(e) => TargetError::Io(e),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +208,9 @@ pub async fn target_add(
     use_workspace_repository: bool,
 ) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
-    let cred = DeviceCredential::load(&paths.credential_file())?.ok_or(TargetError::NotLoggedIn)?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let mut config = profile.config;
+    let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
     let local_path = PathBuf::from(path_input);
@@ -235,8 +256,18 @@ pub async fn target_add(
         repository: repo_source,
     };
 
-    // Acquire state.lock to serialize local mutations
-    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+    // Acquire state.lock with bounded retry
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(TargetError::ProfileBusy)
+        }
+        Err(e) => return Err(TargetError::Io(e)),
+    };
 
     let res = client.register_target(&cred, &input).await?;
 
@@ -246,9 +277,6 @@ pub async fn target_add(
     }
 
     // Atomically update local config
-    let mut config = LocalConfig::load(&paths.config_file())?
-        .unwrap_or_else(|| LocalConfig::new(cred.server_origin.clone()).unwrap());
-
     config.targets.insert(
         res.target.id.clone(),
         LocalTarget {
@@ -276,7 +304,9 @@ pub async fn target_bind(
     path_input: &str,
 ) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
-    let cred = DeviceCredential::load(&paths.credential_file())?.ok_or(TargetError::NotLoggedIn)?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let mut config = profile.config;
+    let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
     let local_path = PathBuf::from(path_input);
@@ -286,7 +316,17 @@ pub async fn target_bind(
     let canonical_path = fs::canonicalize(&local_path)?;
     let canonical_str = canonical_path.to_string_lossy().to_string();
 
-    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(TargetError::ProfileBusy)
+        }
+        Err(e) => return Err(TargetError::Io(e)),
+    };
     check_active_attempt_target_in_use(paths, target_id)?;
 
     // Bind on server
@@ -306,9 +346,6 @@ pub async fn target_bind(
     if let Some(ref repo) = target.repository {
         verify_local_repository(&canonical_path, repo)?;
     }
-
-    let mut config = LocalConfig::load(&paths.config_file())?
-        .unwrap_or_else(|| LocalConfig::new(cred.server_origin.clone()).unwrap());
 
     config.targets.insert(
         target_id.to_string(),
@@ -331,20 +368,30 @@ pub async fn target_bind(
 
 pub async fn target_remove(paths: &ConnectorPaths, target_id: &str) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
-    let cred = DeviceCredential::load(&paths.credential_file())?.ok_or(TargetError::NotLoggedIn)?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let mut config = profile.config;
+    let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
-    let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(TargetError::ProfileBusy)
+        }
+        Err(e) => return Err(TargetError::Io(e)),
+    };
     check_active_attempt_target_in_use(paths, target_id)?;
 
     // Unbind on server first
     client.unbind_target(&cred, target_id).await?;
 
     // Then update local config
-    if let Some(mut config) = LocalConfig::load(&paths.config_file())? {
-        if config.targets.remove(target_id).is_some() {
-            config.save(&paths.config_file())?;
-        }
+    if config.targets.remove(target_id).is_some() {
+        config.save(&paths.config_file())?;
     }
 
     println!("Target '{}' binding removed.", target_id);
@@ -352,13 +399,23 @@ pub async fn target_remove(paths: &ConnectorPaths, target_id: &str) -> Result<()
 }
 
 pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<(), TargetError> {
-    let config = LocalConfig::load(&paths.config_file())?.unwrap_or_else(|| LocalConfig {
-        schema_version: 1,
-        server_url: "".into(),
-        targets: BTreeMap::new(),
-    });
+    let bound_profile = if paths.credential_file().exists() {
+        Some(crate::config::load_bound_profile(paths)?)
+    } else {
+        None
+    };
 
-    let cred = DeviceCredential::load(&paths.credential_file())?;
+    let (config, cred) = if let Some(p) = bound_profile {
+        (p.config, Some(p.credential))
+    } else {
+        let cfg = LocalConfig::load(&paths.config_file())?.unwrap_or_else(|| LocalConfig {
+            schema_version: 1,
+            server_url: "".into(),
+            targets: BTreeMap::new(),
+        });
+        (cfg, None)
+    };
+
     let server_targets: Vec<ConnectorTargetProjection> = if let Some(ref c) = cred {
         let client = ConnectorClient::new(&c.server_origin)?;
         client.list_targets(c, None).await.unwrap_or_default()
