@@ -131,16 +131,56 @@ async fn main() -> ExitCode {
             }
         },
         Commands::Run => {
-            eprintln!("'run' daemon implementation belongs to V1.6c");
-            return ExitCode::FAILURE;
+            let adapter =
+                std::sync::Arc::new(ceo_connector::scheduler::UnavailableExecutionAdapter);
+            if let Err(e) = ceo_connector::daemon::run_daemon(&paths, adapter, None).await {
+                eprintln!("Daemon terminated with error: {}", e);
+                return ExitCode::FAILURE;
+            }
         }
         Commands::Pause => {
-            eprintln!("'pause' implementation belongs to V1.6c");
-            return ExitCode::FAILURE;
+            let _lock = match ceo_connector::local_state::ExecutionLock::acquire(
+                &paths.state_lock_file(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to acquire state lock: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = ceo_connector::local_state::atomic_write_json(
+                &paths.control_file(),
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "paused": true
+                }),
+            ) {
+                eprintln!("Failed to write control file: {}", e);
+                return ExitCode::FAILURE;
+            }
+            println!("Connector job acquisition paused.");
         }
         Commands::Resume => {
-            eprintln!("'resume' implementation belongs to V1.6c");
-            return ExitCode::FAILURE;
+            let _lock = match ceo_connector::local_state::ExecutionLock::acquire(
+                &paths.state_lock_file(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to acquire state lock: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = ceo_connector::local_state::atomic_write_json(
+                &paths.control_file(),
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "paused": false
+                }),
+            ) {
+                eprintln!("Failed to write control file: {}", e);
+                return ExitCode::FAILURE;
+            }
+            println!("Connector job acquisition resumed.");
         }
         Commands::Target { sub } => match sub {
             TargetSubcommands::List { json } => {

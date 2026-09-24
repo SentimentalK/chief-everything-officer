@@ -1,8 +1,11 @@
 pub mod client;
 pub mod config;
 pub mod credential;
+pub mod daemon;
 pub mod enrollment;
 pub mod local_state;
+pub mod outbox;
 pub mod paths;
+pub mod scheduler;
 pub mod status;
 pub mod targets;

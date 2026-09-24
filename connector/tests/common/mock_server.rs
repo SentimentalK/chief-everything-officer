@@ -16,6 +16,7 @@ pub struct MockRequest {
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl MockRequest {
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
