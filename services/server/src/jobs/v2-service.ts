@@ -90,18 +90,28 @@ export interface HostJobDetail extends HostJobSummary {
   report?: {
     execution_status: ExecutionStatus;
     business_outcome: BusinessOutcome;
+    task_dispatched: boolean;
     finished_at: string;
     duration_ms: number;
+    executor: {
+      type: string;
+      version: string;
+    };
+    receipt_sha256: string;
     error: {
       stage: string;
       code: string;
       message: string;
     } | null;
+    received_at: string;
   } | null;
   result?: {
     target: "resource";
+    attempt_id: string;
+    payload_sha256: string;
     resource_id: string;
     commit: string;
+    received_at: string;
   } | null;
   task?: {
     prompt: string;
@@ -712,8 +722,14 @@ export class JobCoordinatorV2 {
         ? {
             execution_status: attempt.report.execution_status,
             business_outcome: attempt.report.business_outcome,
+            task_dispatched: attempt.report.task_dispatched,
             finished_at: new Date(attempt.report.finished_at_ms).toISOString(),
             duration_ms: attempt.report.duration_ms,
+            executor: {
+              type: attempt.report.executor.type,
+              version: attempt.report.executor.version,
+            },
+            receipt_sha256: attempt.report.receipt_sha256,
             error: attempt.report.error
               ? {
                   stage: attempt.report.error.stage,
@@ -721,13 +737,17 @@ export class JobCoordinatorV2 {
                   message: attempt.report.error.message,
                 }
               : null,
+            received_at: new Date(attempt.report.received_at_ms).toISOString(),
           }
         : null,
       result: attempt?.result
         ? {
-            target: "resource",
+            target: attempt.result.target,
+            attempt_id: attempt.result.attempt_id,
+            payload_sha256: attempt.result.payload_sha256,
             resource_id: attempt.result.resource_id,
             commit: attempt.result.commit,
+            received_at: new Date(attempt.result.received_at_ms).toISOString(),
           }
         : null,
     };

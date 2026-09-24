@@ -1173,10 +1173,13 @@ export class ConnectorControlStore {
       return targets.map((target) => {
         const thisBinding = (bindingStmt.get(deviceId, target.id) as DeviceTargetBindingRecord | undefined) ?? null;
         const countRow = countStmt.get(target.workspace_id, target.id) as { cnt: number } | undefined;
+        const rawActiveBindingCount = countRow?.cnt ?? 0;
+        const effectiveActiveBindingCount =
+          target.disabled_at_ms === null ? rawActiveBindingCount : 0;
         return {
           target,
           thisBinding,
-          activeBindingCount: countRow?.cnt ?? 0,
+          activeBindingCount: effectiveActiveBindingCount,
         };
       });
     });
@@ -1236,10 +1239,13 @@ export class ConnectorControlStore {
       return rows.map((r) => {
         const { workspace_role, ...target } = r;
         const countRow = countStmt.get(target.workspace_id, target.id) as { cnt: number } | undefined;
+        const rawActiveBindingCount = countRow?.cnt ?? 0;
+        const effectiveActiveBindingCount =
+          target.disabled_at_ms === null ? rawActiveBindingCount : 0;
         return {
           target,
           workspaceRole: workspace_role,
-          activeBindingCount: countRow?.cnt ?? 0,
+          activeBindingCount: effectiveActiveBindingCount,
         };
       });
     });

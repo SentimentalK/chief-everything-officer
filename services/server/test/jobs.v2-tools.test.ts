@@ -216,6 +216,56 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(disabled.active_binding_count).toBe(0);
     });
 
+    it("dynamically zeroes active_binding_count when target is disabled, and restores on re-enable", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      // 1. Before disable: targetA1 has active_binding_count = 1
+      const res1 = await client.callTool({
+        name: "execution_targets",
+        arguments: {},
+      });
+      const content1 = JSON.parse((res1.content as any)[0].text);
+      const t1Before = content1.targets.find((t: any) => t.target_id === targetA1.id);
+      expect(t1Before.disabled).toBe(false);
+      expect(t1Before.active_binding_count).toBe(1);
+
+      const rowsBefore = controlStore.listTargetsForUser(userAliceId, { workspaceId: workspaceAId });
+      expect(rowsBefore.find((r) => r.target.id === targetA1.id)!.activeBindingCount).toBe(1);
+
+      // 2. Disable targetA1
+      controlStore.disableExecutionTarget(targetA1.id, Date.now());
+
+      const res2 = await client.callTool({
+        name: "execution_targets",
+        arguments: { include_disabled: true },
+      });
+      const content2 = JSON.parse((res2.content as any)[0].text);
+      const t1Disabled = content2.targets.find((t: any) => t.target_id === targetA1.id);
+      expect(t1Disabled.disabled).toBe(true);
+      expect(t1Disabled.active_binding_count).toBe(0);
+
+      const rowsDisabled = controlStore.listTargetsForUser(userAliceId, { workspaceId: workspaceAId });
+      expect(rowsDisabled.find((r) => r.target.id === targetA1.id)!.activeBindingCount).toBe(0);
+
+      // 3. Re-enable targetA1 without recreating binding
+      controlStore.enableExecutionTarget(targetA1.id, Date.now());
+
+      const res3 = await client.callTool({
+        name: "execution_targets",
+        arguments: {},
+      });
+      const content3 = JSON.parse((res3.content as any)[0].text);
+      const t1Reenabled = content3.targets.find((t: any) => t.target_id === targetA1.id);
+      expect(t1Reenabled.disabled).toBe(false);
+      expect(t1Reenabled.active_binding_count).toBe(1);
+
+      const rowsReenabled = controlStore.listTargetsForUser(userAliceId, { workspaceId: workspaceAId });
+      expect(rowsReenabled.find((r) => r.target.id === targetA1.id)!.activeBindingCount).toBe(1);
+    });
+
     it("succeeds even when coordinator/Redis is unavailable", async () => {
       const { client } = await createConnectedClient({
         userId: userAliceId,
@@ -605,8 +655,131 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(content.ok).toBe(true);
       expect(content.state).toBe("terminal");
       expect(content.expires_at).toBeNull();
-      expect(content.report.execution_status).toBe("COMPLETED");
-      expect(content.report.business_outcome).toBe("UNVERIFIED");
+      expect(content.execution).toEqual({
+        attempt_id: attemptId,
+        phase: "terminal",
+        claimed_at: expect.any(String),
+        started_at: expect.any(String),
+      });
+      expect((content.execution as any).claim_token).toBeUndefined();
+      expect((content.execution as any).claim_token_sha256).toBeUndefined();
+      expect((content.execution as any).target_binding_id).toBeUndefined();
+
+      expect(content.report).toEqual({
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at: expect.any(String),
+        duration_ms: 500,
+        executor: { type: "test", version: "1.0.0" },
+        receipt_sha256: "0".repeat(64),
+        error: null,
+        received_at: expect.any(String),
+      });
+    });
+
+    it("exposes complete durable result receipt in job_get while job_list remains lightweight", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      const subRes = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task with result",
+          acceptance: "Criteria",
+          resource_id: "res-11111111-1111-1111-1111-111111111111",
+          result_target: "resource",
+        },
+      });
+      const jobId = JSON.parse((subRes.content as any)[0].text).job_id;
+
+      // Device enroll & claim & report
+      const dev = controlStore.createDevice({ userId: userAliceId, displayName: "D-Res", platform: "linux" });
+      controlStore.createDeviceCredential({
+        deviceId: dev.id,
+        secretDigest: crypto.createHash("sha256").update("c".repeat(64)).digest("hex"),
+        expiresAtMs: Date.now() + 3600_000,
+      });
+      controlStore.upsertDeviceTargetBinding({ deviceId: dev.id, targetId: targetA1.id });
+
+      const attemptId = `att-${crypto.randomUUID()}`;
+      const claimToken = crypto.randomBytes(32).toString("hex");
+      await coordinator.claimJob(dev.id, jobId, attemptId, claimToken);
+      await coordinator.startJob(dev.id, jobId, attemptId, claimToken);
+      await coordinator.reportJob(dev.id, jobId, attemptId, claimToken, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 300,
+        executor: { type: "orca", version: "2.0.0" },
+        receipt_sha256: "1".repeat(64),
+        error: null,
+      });
+
+      // Inject valid Attempt.result into Redis store
+      const attemptKey = `ceo:attempt:v1:${attemptId}`;
+      const rawAttempt = JSON.parse((await fakeRedis.get(attemptKey))!);
+      rawAttempt.result = {
+        target: "resource",
+        attempt_id: attemptId,
+        payload_sha256: "2".repeat(64),
+        resource_id: "res-11111111-1111-1111-1111-111111111111",
+        commit: "abc123commit",
+        received_at_ms: 1700000000000,
+      };
+      await fakeRedis.set(attemptKey, JSON.stringify(rawAttempt));
+
+      // 1. job_get exposes full result detail
+      const getRes = await client.callTool({
+        name: "job_get",
+        arguments: { job_id: jobId },
+      });
+      const getContent = JSON.parse((getRes.content as any)[0].text);
+      expect(getContent.ok).toBe(true);
+      expect(getContent.result).toEqual({
+        target: "resource",
+        attempt_id: attemptId,
+        payload_sha256: "2".repeat(64),
+        resource_id: "res-11111111-1111-1111-1111-111111111111",
+        commit: "abc123commit",
+        received_at: new Date(1700000000000).toISOString(),
+      });
+
+      // 2. job_list remains lightweight and does NOT expose result receipt or report internals
+      const listRes = await client.callTool({
+        name: "job_list",
+        arguments: {},
+      });
+      const listText = (listRes.content as any)[0].text;
+      expect(listText).not.toContain("2".repeat(64)); // payload_sha256
+      expect(listText).not.toContain("abc123commit"); // commit
+      expect(listText).not.toContain("1".repeat(64)); // receipt_sha256
+      expect(listText).not.toContain("orca"); // executor.type
+
+      const listContent = JSON.parse(listText);
+      const listItem = listContent.jobs.find((j: any) => j.job_id === jobId);
+      expect(listItem).toBeDefined();
+      expect(listItem.job_id).toBe(jobId);
+      expect(listItem.state).toBe("terminal");
+      expect(listItem.execution_status).toBe("COMPLETED");
+      expect(listItem.business_outcome).toBe("UNVERIFIED");
+      expect(listItem.result).toBeUndefined();
+      expect(listItem.report).toBeUndefined();
+      expect(listItem.execution).toBeUndefined();
+      expect(listItem.task).toBeUndefined();
+
+      // 3. Verify audit traces do not leak result or report internal payload
+      const traces = getAuditTraces(workspaceAId);
+      const getTrace = traces.find((t) => t.tool_name === "job_get");
+      expect(getTrace).toBeDefined();
+      expect(getTrace!.output_json).not.toContain("abc123commit");
+      expect(getTrace!.output_json).not.toContain("2".repeat(64));
     });
 
     it("fails closed with QUEUE_UNAVAILABLE and CORRUPT_TARGET_STATE when target is deleted", async () => {

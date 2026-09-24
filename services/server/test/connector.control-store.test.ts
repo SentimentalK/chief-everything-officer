@@ -930,4 +930,50 @@ describe("ConnectorControlStore - Execution Target Registry & Device Bindings", 
       }),
     ).toThrow(ConnectorNotFoundError);
   });
+
+  it("listTargetsVisibleToDevice and listTargetsForUser dynamically zero activeBindingCount when target is disabled", () => {
+    // Target created and dev1 bound
+    const reg = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "target-toggle-count",
+      displayName: "Toggle Count Target",
+      kind: "coding",
+      repositorySource: null,
+    });
+    const targetId = reg.target.id;
+
+    // 1. Initially enabled: activeBindingCount is 1
+    const userTargetsBefore = connectorStore.listTargetsForUser(testUserId, { workspaceId: testWorkspaceId });
+    const uItemBefore = userTargetsBefore.find((t) => t.target.id === targetId);
+    expect(uItemBefore).toBeDefined();
+    expect(uItemBefore!.activeBindingCount).toBe(1);
+
+    const devTargetsBefore = connectorStore.listTargetsVisibleToDevice(dev1.id, { workspaceId: testWorkspaceId });
+    const dItemBefore = devTargetsBefore.find((t) => t.target.id === targetId);
+    expect(dItemBefore).toBeDefined();
+    expect(dItemBefore!.activeBindingCount).toBe(1);
+
+    // 2. Disable target: activeBindingCount becomes 0
+    connectorStore.disableExecutionTarget(targetId);
+
+    const userTargetsDisabled = connectorStore.listTargetsForUser(testUserId, { workspaceId: testWorkspaceId });
+    const uItemDisabled = userTargetsDisabled.find((t) => t.target.id === targetId);
+    expect(uItemDisabled!.activeBindingCount).toBe(0);
+
+    const devTargetsDisabled = connectorStore.listTargetsVisibleToDevice(dev1.id, { workspaceId: testWorkspaceId });
+    const dItemDisabled = devTargetsDisabled.find((t) => t.target.id === targetId);
+    expect(dItemDisabled!.activeBindingCount).toBe(0);
+
+    // 3. Re-enable target: activeBindingCount restored to 1 without binding recreation
+    connectorStore.enableExecutionTarget(targetId);
+
+    const userTargetsRestored = connectorStore.listTargetsForUser(testUserId, { workspaceId: testWorkspaceId });
+    const uItemRestored = userTargetsRestored.find((t) => t.target.id === targetId);
+    expect(uItemRestored!.activeBindingCount).toBe(1);
+
+    const devTargetsRestored = connectorStore.listTargetsVisibleToDevice(dev1.id, { workspaceId: testWorkspaceId });
+    const dItemRestored = devTargetsRestored.find((t) => t.target.id === targetId);
+    expect(dItemRestored!.activeBindingCount).toBe(1);
+  });
 });

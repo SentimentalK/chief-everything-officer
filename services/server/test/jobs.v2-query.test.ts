@@ -595,5 +595,86 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
       expect((summary as any).result).toBeUndefined();
       expect((summary as any).execution_timeout_seconds).toBeUndefined();
     });
+
+    it("projects complete report and result fields in HostJobDetail while HostJobSummary omits them", async () => {
+      const scopeA = { user_id: userAliceId, workspace_id: workspaceAId };
+      const sub = await coordinator.submit(scopeA, {
+        request_id: `req-${crypto.randomUUID()}`,
+        target_id: targetA1.id,
+        prompt: "Task with full metadata",
+        acceptance: "Criteria",
+        resource_id: "res-22222222-2222-2222-2222-222222222222",
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      });
+
+      const device = controlStore.createDevice({ userId: userAliceId, displayName: "Dev-Full", platform: "linux" });
+      controlStore.createDeviceCredential({
+        deviceId: device.id,
+        secretDigest: crypto.createHash("sha256").update("d".repeat(64)).digest("hex"),
+        expiresAtMs: Date.now() + 3600_000,
+      });
+      controlStore.upsertDeviceTargetBinding({ deviceId: device.id, targetId: targetA1.id });
+
+      const attemptId = `att-${crypto.randomUUID()}`;
+      const token = crypto.randomBytes(32).toString("hex");
+      await coordinator.claimJob(device.id, sub.job.job_id, attemptId, token);
+      await coordinator.startJob(device.id, sub.job.job_id, attemptId, token);
+      await coordinator.reportJob(device.id, sub.job.job_id, attemptId, token, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: 1700000000000,
+        duration_ms: 450,
+        executor: { type: "orca", version: "3.2.1" },
+        receipt_sha256: "3".repeat(64),
+        error: null,
+      });
+
+      // Attach result to the attempt
+      const attemptKey = `ceo:attempt:v1:${attemptId}`;
+      const rawAttempt = JSON.parse((await fakeRedis.get(attemptKey))!);
+      rawAttempt.result = {
+        target: "resource",
+        attempt_id: attemptId,
+        payload_sha256: "4".repeat(64),
+        resource_id: "res-22222222-2222-2222-2222-222222222222",
+        commit: "fedcba987",
+        received_at_ms: 1700000005000,
+      };
+      await fakeRedis.set(attemptKey, JSON.stringify(rawAttempt));
+
+      // HostJobDetail
+      const detail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(detail.report).toEqual({
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at: new Date(1700000000000).toISOString(),
+        duration_ms: 450,
+        executor: { type: "orca", version: "3.2.1" },
+        receipt_sha256: "3".repeat(64),
+        error: null,
+        received_at: expect.any(String),
+      });
+      expect(detail.result).toEqual({
+        target: "resource",
+        attempt_id: attemptId,
+        payload_sha256: "4".repeat(64),
+        resource_id: "res-22222222-2222-2222-2222-222222222222",
+        commit: "fedcba987",
+        received_at: new Date(1700000005000).toISOString(),
+      });
+
+      // HostJobSummary from listJobsForHost
+      const list = await coordinator.listJobsForHost(scopeA, { limit: 10 });
+      const summary = list.jobs.find((j) => j.job_id === sub.job.job_id)!;
+      expect(summary.execution_status).toBe("COMPLETED");
+      expect(summary.business_outcome).toBe("UNVERIFIED");
+      expect((summary as any).report).toBeUndefined();
+      expect((summary as any).result).toBeUndefined();
+      expect((summary as any).execution).toBeUndefined();
+    });
   });
 });
