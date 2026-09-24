@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+use crate::client::ClaimJobResponse;
 use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
@@ -29,7 +30,9 @@ pub enum SchedulerError {
     },
     #[error("Active attempt payload integrity hash mismatch (LOCAL_STATE_INVALID)")]
     PayloadHashMismatch,
-    #[error("Corrupt active attempt state: {0}")]
+    #[error("Claim response correlation mismatch: {0} (RECOVERY_REQUIRED)")]
+    ClaimCorrelationMismatch(String),
+    #[error("Corrupt active attempt state: {0} (LOCAL_STATE_INVALID)")]
     CorruptState(String),
 }
 
@@ -139,12 +142,9 @@ impl ActiveAttempt {
             ));
         }
 
-        if self.attempt_id.is_empty()
-            || !self.attempt_id.starts_with("att-")
-            || self.attempt_id.len() > 128
-        {
+        if !is_valid_attempt_id(&self.attempt_id) {
             return Err(SchedulerError::CorruptState(format!(
-                "invalid attempt_id format: '{}'",
+                "invalid attempt_id format: '{}' (must be att-<uuid> or att_<uuid>)",
                 self.attempt_id
             )));
         }
@@ -316,5 +316,187 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         _target: &LocalTarget,
     ) -> Result<ExecutionReport, String> {
         Ok(self.report_to_produce.clone())
+    }
+}
+
+pub fn is_valid_attempt_id(id: &str) -> bool {
+    let suffix = if let Some(s) = id.strip_prefix("att-") {
+        s
+    } else if let Some(s) = id.strip_prefix("att_") {
+        s
+    } else {
+        return false;
+    };
+    uuid::Uuid::parse_str(suffix).is_ok()
+}
+
+pub fn parse_timestamp_strict(s: &str) -> Result<i64, String> {
+    if let Ok(ts) = s.parse::<i64>() {
+        return Ok(ts);
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| format!("invalid RFC3339 timestamp '{s}': {e}"))
+}
+
+pub fn validate_claim_response(
+    intent: &ActiveAttempt,
+    response: &ClaimJobResponse,
+) -> Result<(), SchedulerError> {
+    if !response.ok {
+        return Err(SchedulerError::ClaimCorrelationMismatch(
+            "response.ok is false".into(),
+        ));
+    }
+    if response.job.job_id != intent.job_id {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "job_id mismatch: expected '{}', got '{}'",
+            intent.job_id, response.job.job_id
+        )));
+    }
+    if response.job.workspace_id != intent.workspace_id {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "workspace_id mismatch: expected '{}', got '{}'",
+            intent.workspace_id, response.job.workspace_id
+        )));
+    }
+    if response.job.target_id != intent.target_id {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "target_id mismatch: expected '{}', got '{}'",
+            intent.target_id, response.job.target_id
+        )));
+    }
+    if response.attempt.attempt_id != intent.attempt_id {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "attempt_id mismatch: expected '{}', got '{}'",
+            intent.attempt_id, response.attempt.attempt_id
+        )));
+    }
+    if response.attempt.phase != "claimed" {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "attempt.phase mismatch: expected 'claimed', got '{}'",
+            response.attempt.phase
+        )));
+    }
+    if let Err(e) = parse_timestamp_strict(&response.attempt.claimed_at) {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "attempt.claimed_at is invalid: {e}"
+        )));
+    }
+    if let Err(e) = parse_timestamp_strict(&response.server_time) {
+        return Err(SchedulerError::ClaimCorrelationMismatch(format!(
+            "server_time is invalid: {e}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{ClaimAttemptWire, ClaimedJobWire};
+
+    #[test]
+    fn test_is_valid_attempt_id() {
+        assert!(is_valid_attempt_id(
+            "att-00000000-0000-0000-0000-000000000001"
+        ));
+        assert!(is_valid_attempt_id(
+            "att_00000000-0000-0000-0000-000000000001"
+        ));
+        assert!(!is_valid_attempt_id("00000000-0000-0000-0000-000000000001"));
+        assert!(!is_valid_attempt_id("att-12345"));
+        assert!(!is_valid_attempt_id("att_invalid"));
+        assert!(!is_valid_attempt_id(""));
+    }
+
+    #[test]
+    fn test_parse_timestamp_strict() {
+        assert_eq!(
+            parse_timestamp_strict("1727220000000").unwrap(),
+            1727220000000
+        );
+        assert_eq!(
+            parse_timestamp_strict("2026-09-24T19:00:00.000Z").unwrap(),
+            1790276400000
+        );
+        assert!(parse_timestamp_strict("invalid-timestamp").is_err());
+    }
+
+    #[test]
+    fn test_validate_claim_response_ok() {
+        let intent = ActiveAttempt {
+            schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            server_origin: "https://server.test".into(),
+            device_id: "dev_1".into(),
+            job_id: "job-1".into(),
+            workspace_id: "ws-1".into(),
+            target_id: "tgt-1".into(),
+            attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+            claim_token: "tok1".into(),
+            phase: AttemptPhase::ClaimIntent,
+            resource_id: None,
+            prompt: None,
+            acceptance: None,
+            execution_timeout_seconds: None,
+            result_target: None,
+            payload_sha256: None,
+            claimed_at_ms: None,
+            terminal_report_sha256: None,
+        };
+
+        let resp = ClaimJobResponse {
+            ok: true,
+            replayed: false,
+            server_time: "2026-09-24T19:00:01.000Z".into(),
+            attempt: ClaimAttemptWire {
+                attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+                phase: "claimed".into(),
+                claimed_at: "2026-09-24T19:00:01.000Z".into(),
+                started_at: None,
+            },
+            job: ClaimedJobWire {
+                job_id: "job-1".into(),
+                workspace_id: "ws-1".into(),
+                target_id: "tgt-1".into(),
+                resource_id: None,
+                prompt: "prompt".into(),
+                acceptance: "acceptance".into(),
+                timeout_seconds: 600,
+                result_target: "none".into(),
+            },
+        };
+
+        assert!(validate_claim_response(&intent, &resp).is_ok());
+    }
+
+    #[test]
+    fn test_active_attempt_validate_invalid_attempt_id() {
+        let mut intent = ActiveAttempt {
+            schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            server_origin: "https://server.test".into(),
+            device_id: "dev_1".into(),
+            job_id: "job-1".into(),
+            workspace_id: "ws-1".into(),
+            target_id: "tgt-1".into(),
+            attempt_id: "att-invalid".into(),
+            claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            phase: AttemptPhase::ClaimIntent,
+            resource_id: None,
+            prompt: None,
+            acceptance: None,
+            execution_timeout_seconds: None,
+            result_target: None,
+            payload_sha256: None,
+            claimed_at_ms: None,
+            terminal_report_sha256: None,
+        };
+
+        assert!(matches!(
+            intent.validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        intent.attempt_id = "att-00000000-0000-0000-0000-000000000001".into();
+        assert!(intent.validate().is_ok());
     }
 }

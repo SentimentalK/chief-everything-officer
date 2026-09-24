@@ -49,13 +49,19 @@ async fn server_contract_gate_connector_deserialization() {
         if req.path.starts_with("/api/connector/jobs/pending") && req.method == "GET" {
             return MockResponse::json(200, &fixtures_clone["pending"]);
         }
-        if req.path == "/api/connector/jobs/job_contract_gate/claim" && req.method == "POST" {
+        if req.path == "/api/connector/jobs/job-00000000-0000-0000-0000-000000000001/claim"
+            && req.method == "POST"
+        {
             return MockResponse::json(200, &fixtures_clone["claim"]);
         }
-        if req.path == "/api/connector/jobs/job_contract_gate/start" && req.method == "POST" {
+        if req.path == "/api/connector/jobs/job-00000000-0000-0000-0000-000000000001/start"
+            && req.method == "POST"
+        {
             return MockResponse::json(200, &fixtures_clone["start"]);
         }
-        if req.path == "/api/connector/jobs/job_contract_gate/report" && req.method == "POST" {
+        if req.path == "/api/connector/jobs/job-00000000-0000-0000-0000-000000000001/report"
+            && req.method == "POST"
+        {
             return MockResponse::json(200, &fixtures_clone["report"]);
         }
         MockResponse {
@@ -69,7 +75,7 @@ async fn server_contract_gate_connector_deserialization() {
     let cred = DeviceCredential::new(
         server.origin(),
         "usr_contract_gate".into(),
-        "dev_contract_gate".into(),
+        "dev_00000000-0000-0000-0000-000000000001".into(),
         "dcr_contract_gate".into(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         1727220000000,
@@ -79,7 +85,7 @@ async fn server_contract_gate_connector_deserialization() {
     // 1. /api/connector/identity
     let ident: DeviceIdentityResponse = client.identity(&cred).await.unwrap();
     assert_eq!(ident.user_id, "usr_contract_gate");
-    assert_eq!(ident.device.id, "dev_contract_gate");
+    assert_eq!(ident.device.id, "dev_00000000-0000-0000-0000-000000000001");
     assert_eq!(ident.device.display_name, "Gate Device");
     assert_eq!(ident.device.platform, "linux-x86_64");
     assert_eq!(ident.credential.id, "dcr_contract_gate");
@@ -88,7 +94,10 @@ async fn server_contract_gate_connector_deserialization() {
     // 2. /api/connector/targets
     let targets: Vec<ConnectorTargetProjection> = client.list_targets(&cred, None).await.unwrap();
     assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].target_id, "tgt_contract_gate");
+    assert_eq!(
+        targets[0].target_id,
+        "tgt_00000000-0000-0000-0000-000000000001"
+    );
     assert_eq!(targets[0].workspace_id, "ws_contract_gate");
     assert_eq!(targets[0].alias, "gate-target");
     assert_eq!(targets[0].display_name, "Gate Target");
@@ -103,10 +112,19 @@ async fn server_contract_gate_connector_deserialization() {
     // 3. /api/connector/jobs/pending
     let pending: Vec<PendingJobCandidate> = client.pending_jobs(&cred, Some(20)).await.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].job_id, "job_contract_gate");
+    assert_eq!(
+        pending[0].job_id,
+        "job-00000000-0000-0000-0000-000000000001"
+    );
     assert_eq!(pending[0].workspace_id, "ws_contract_gate");
-    assert_eq!(pending[0].target_id, "tgt_contract_gate");
-    assert_eq!(pending[0].resource_id.as_deref(), Some("res_contract_gate"));
+    assert_eq!(
+        pending[0].target_id,
+        "tgt_00000000-0000-0000-0000-000000000001"
+    );
+    assert_eq!(
+        pending[0].resource_id.as_deref(),
+        Some("res-00000000-0000-0000-0000-000000000001")
+    );
     assert_eq!(pending[0].created_at, "2026-09-24T19:00:00.000Z");
     assert_eq!(
         pending[0].expires_at.as_deref(),
@@ -118,7 +136,7 @@ async fn server_contract_gate_connector_deserialization() {
     let claim: ClaimJobResponse = client
         .claim_job(
             &cred,
-            "job_contract_gate",
+            "job-00000000-0000-0000-0000-000000000001",
             "att-11111111-2222-3333-4444-555555555555",
             claim_token,
         )
@@ -131,9 +149,12 @@ async fn server_contract_gate_connector_deserialization() {
         "att-11111111-2222-3333-4444-555555555555"
     );
     assert_eq!(claim.attempt.phase, "claimed");
-    assert_eq!(claim.job.job_id, "job_contract_gate");
+    assert_eq!(claim.job.job_id, "job-00000000-0000-0000-0000-000000000001");
     assert_eq!(claim.job.workspace_id, "ws_contract_gate");
-    assert_eq!(claim.job.target_id, "tgt_contract_gate");
+    assert_eq!(
+        claim.job.target_id,
+        "tgt_00000000-0000-0000-0000-000000000001"
+    );
     assert_eq!(claim.job.prompt, "Gate prompt");
     assert_eq!(claim.job.acceptance, "Gate acceptance");
     assert_eq!(claim.job.timeout_seconds, 600);
@@ -142,7 +163,7 @@ async fn server_contract_gate_connector_deserialization() {
     let start: JobMutationAck = client
         .start_job(
             &cred,
-            "job_contract_gate",
+            "job-00000000-0000-0000-0000-000000000001",
             "att-11111111-2222-3333-4444-555555555555",
             claim_token,
         )
@@ -157,7 +178,7 @@ async fn server_contract_gate_connector_deserialization() {
     let report_ack: JobMutationAck = client
         .report_job(
             &cred,
-            "job_contract_gate",
+            "job-00000000-0000-0000-0000-000000000001",
             "att-11111111-2222-3333-4444-555555555555",
             claim_token,
             &report_payload,

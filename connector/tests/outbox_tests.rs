@@ -117,13 +117,13 @@ async fn report_delivery_terminal_cleanup() {
         server_origin: server.origin(),
         device_id: "dev_1".into(),
         job_id: "job_10".into(),
-        attempt_id: "att-10".into(),
+        attempt_id: "att-00000000-0000-0000-0000-000000000010".into(),
         claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
         report,
         created_at_ms: 1000,
     };
 
-    let outbox_file = paths.outbox_file("job_10", "att-10");
+    let outbox_file = paths.outbox_file("job_10", "att-00000000-0000-0000-0000-000000000010");
     record.save(&outbox_file).unwrap();
 
     // Plant active attempt in finalized_local matching report digest
@@ -136,7 +136,7 @@ async fn report_delivery_terminal_cleanup() {
             "job_id": "job_10",
             "workspace_id": "ws_1",
             "target_id": "tgt_1",
-            "attempt_id": "att-10",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000010",
             "claim_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "phase": "finalized_local",
             "terminal_report_sha256": report_sha256
@@ -149,7 +149,7 @@ async fn report_delivery_terminal_cleanup() {
         .unwrap();
 
     // 1. Sanitized history record exists and has terminal_report_sha256
-    let hist_file = paths.history_file("job_10", "att-10");
+    let hist_file = paths.history_file("job_10", "att-00000000-0000-0000-0000-000000000010");
     assert!(hist_file.exists());
     let hist_content = std::fs::read_to_string(&hist_file).unwrap();
     assert!(hist_content.contains(&report_sha256));
@@ -209,13 +209,13 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
     // - history record was already written with terminal_report_sha256
     // - outbox record was already unlinked
     // - process crashed before active-attempt.json was unlinked
-    let hist_file = paths.history_file("job_crashed", "att-crashed");
+    let hist_file = paths.history_file("job_crashed", "att-00000000-0000-0000-0000-000000000099");
     atomic_write_json(
         &hist_file,
         &serde_json::json!({
             "schema_version": 1,
             "job_id": "job_crashed",
-            "attempt_id": "att-crashed",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000099",
             "target_id": "tgt_1",
             "status": "completed",
             "receipt_sha256": digest,
@@ -235,7 +235,7 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
             "job_id": "job_crashed",
             "workspace_id": "ws_1",
             "target_id": "tgt_1",
-            "attempt_id": "att-crashed",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000099",
             "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "phase": "finalized_local",
             "terminal_report_sha256": digest
@@ -248,4 +248,173 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
 
     // Startup recovery reconciled active attempt cleanup from history because correlation was proven!
     assert!(!paths.active_attempt_file().exists());
+}
+
+#[tokio::test]
+async fn crash_window_history_written_outbox_still_present_replays_safely() {
+    let server = MockServer::start().await;
+    let report_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let report_calls_clone = report_calls.clone();
+
+    server.add_handler(move |req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_1",
+                    "device": { "id": "dev_1", "display_name": "Dev", "platform": "linux-x86_64" },
+                    "credential": { "id": "dcr_1", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path == "/api/connector/jobs/job_crash_win/report" && req.method == "POST" {
+            report_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Server responds with replayed = true
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": true,
+                    "server_time": "2026-09-24T12:00:00.000Z"
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let config = LocalConfig::new(server.origin()).unwrap();
+    config.save(&paths.config_file()).unwrap();
+
+    let report = sample_report();
+    let report_sha256 = compute_report_sha256(&report);
+
+    // 1. History already written
+    let hist_file = paths.history_file("job_crash_win", "att-00000000-0000-0000-0000-000000000001");
+    atomic_write_json(
+        &hist_file,
+        &serde_json::json!({
+            "schema_version": 1,
+            "job_id": "job_crash_win",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000001",
+            "target_id": "tgt_1",
+            "status": "completed",
+            "receipt_sha256": report.receipt_sha256,
+            "duration_ms": report.duration_ms,
+            "terminal_report_sha256": report_sha256,
+            "recorded_at_ms": 1000
+        }),
+    )
+    .unwrap();
+
+    // 2. Outbox still present (crash happened before unlinking outbox)
+    let outbox_record = OutboxRecord {
+        schema_version: 1,
+        server_origin: server.origin(),
+        device_id: "dev_1".into(),
+        job_id: "job_crash_win".into(),
+        attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        report: report.clone(),
+        created_at_ms: 1000,
+    };
+    let outbox_file =
+        paths.outbox_file("job_crash_win", "att-00000000-0000-0000-0000-000000000001");
+    outbox_record.save(&outbox_file).unwrap();
+
+    // 3. Active attempt still present in finalized_local
+    atomic_write_json(
+        &paths.active_attempt_file(),
+        &serde_json::json!({
+            "schema_version": 1,
+            "server_origin": server.origin(),
+            "device_id": "dev_1",
+            "job_id": "job_crash_win",
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000001",
+            "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "phase": "finalized_local",
+            "terminal_report_sha256": report_sha256
+        }),
+    )
+    .unwrap();
+
+    // Restart daemon
+    let adapter = Arc::new(UnavailableExecutionAdapter);
+    run_daemon(&paths, adapter, Some(1)).await.unwrap();
+
+    // Assert:
+    // Report was replayed safely to server
+    assert_eq!(report_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // History remains valid and idempotent
+    assert!(hist_file.exists());
+    let hist_content = std::fs::read_to_string(&hist_file).unwrap();
+    assert!(hist_content.contains(&report_sha256));
+    // Outbox unlinked (no stranded outbox)
+    assert!(!outbox_file.exists());
+    // Active attempt unlinked
+    assert!(!paths.active_attempt_file().exists());
+}
+
+#[test]
+fn invalid_numeric_report_cannot_be_persisted_into_outbox() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let mut report = sample_report();
+    report.duration_ms = -1;
+
+    let record = OutboxRecord {
+        schema_version: 1,
+        server_origin: "http://127.0.0.1:4000".into(),
+        device_id: "dev_1".into(),
+        job_id: "job_inv".into(),
+        attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        report,
+        created_at_ms: 1000,
+    };
+
+    let outbox_file = paths.outbox_file("job_inv", "att-00000000-0000-0000-0000-000000000001");
+    let err = record.save(&outbox_file).unwrap_err();
+    assert!(matches!(err, OutboxError::InvalidReport(_)));
+    assert!(!outbox_file.exists());
+
+    // Also test > MAX_SAFE_INTEGER
+    let mut report2 = sample_report();
+    report2.finished_at_ms = ceo_connector::execution_contract::MAX_SAFE_INTEGER + 1;
+    let record2 = OutboxRecord {
+        schema_version: 1,
+        server_origin: "http://127.0.0.1:4000".into(),
+        device_id: "dev_1".into(),
+        job_id: "job_inv2".into(),
+        attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        report: report2,
+        created_at_ms: 1000,
+    };
+    let outbox_file2 = paths.outbox_file("job_inv2", "att-00000000-0000-0000-0000-000000000001");
+    let err2 = record2.save(&outbox_file2).unwrap_err();
+    assert!(matches!(err2, OutboxError::InvalidReport(_)));
+    assert!(!outbox_file2.exists());
 }

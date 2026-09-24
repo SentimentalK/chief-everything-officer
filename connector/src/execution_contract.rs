@@ -40,6 +40,8 @@ pub struct ExecutionReportError {
     pub message: String,
 }
 
+pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReport {
@@ -48,7 +50,7 @@ pub struct ExecutionReport {
     pub business_outcome: BusinessOutcome,
     pub task_dispatched: bool,
     pub finished_at_ms: i64,
-    pub duration_ms: u64,
+    pub duration_ms: i64,
     pub executor: ExecutionReportExecutor,
     pub receipt_sha256: String,
     pub error: Option<ExecutionReportError>,
@@ -58,6 +60,10 @@ pub struct ExecutionReport {
 pub enum ExecutionReportValidationError {
     #[error("Invalid schema_version: expected 2, got {0}")]
     InvalidSchemaVersion(u32),
+    #[error("Invalid finished_at_ms: must be between 0 and {MAX_SAFE_INTEGER}, got {0}")]
+    InvalidFinishedAt(i64),
+    #[error("Invalid duration_ms: must be between 0 and {MAX_SAFE_INTEGER}, got {0}")]
+    InvalidDuration(i64),
     #[error("Completed report must not have error")]
     CompletedReportHasError,
     #[error("Non-completed report must include error")]
@@ -79,6 +85,18 @@ impl ExecutionReport {
         if self.schema_version != REPORT_SCHEMA_VERSION {
             return Err(ExecutionReportValidationError::InvalidSchemaVersion(
                 self.schema_version,
+            ));
+        }
+
+        if self.finished_at_ms < 0 || self.finished_at_ms > MAX_SAFE_INTEGER {
+            return Err(ExecutionReportValidationError::InvalidFinishedAt(
+                self.finished_at_ms,
+            ));
+        }
+
+        if self.duration_ms < 0 || self.duration_ms > MAX_SAFE_INTEGER {
+            return Err(ExecutionReportValidationError::InvalidDuration(
+                self.duration_ms,
             ));
         }
 
@@ -163,5 +181,67 @@ impl ExecutionReport {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_sample_report() -> ExecutionReport {
+        ExecutionReport {
+            schema_version: 2,
+            execution_status: ExecutionStatus::COMPLETED,
+            business_outcome: BusinessOutcome::UNVERIFIED,
+            task_dispatched: true,
+            finished_at_ms: 1727220000000,
+            duration_ms: 1500,
+            executor: ExecutionReportExecutor {
+                executor_type: "agent".into(),
+                version: "1.0.0".into(),
+            },
+            receipt_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn valid_report_passes_validation() {
+        let rep = valid_sample_report();
+        assert!(rep.validate().is_ok());
+    }
+
+    #[test]
+    fn numeric_bounds_validation() {
+        let mut rep = valid_sample_report();
+        rep.finished_at_ms = -1;
+        assert_eq!(
+            rep.validate(),
+            Err(ExecutionReportValidationError::InvalidFinishedAt(-1))
+        );
+
+        rep.finished_at_ms = MAX_SAFE_INTEGER + 1;
+        assert_eq!(
+            rep.validate(),
+            Err(ExecutionReportValidationError::InvalidFinishedAt(
+                MAX_SAFE_INTEGER + 1
+            ))
+        );
+
+        rep.finished_at_ms = 1727220000000;
+        rep.duration_ms = -1;
+        assert_eq!(
+            rep.validate(),
+            Err(ExecutionReportValidationError::InvalidDuration(-1))
+        );
+
+        rep.duration_ms = MAX_SAFE_INTEGER + 1;
+        assert_eq!(
+            rep.validate(),
+            Err(ExecutionReportValidationError::InvalidDuration(
+                MAX_SAFE_INTEGER + 1
+            ))
+        );
     }
 }

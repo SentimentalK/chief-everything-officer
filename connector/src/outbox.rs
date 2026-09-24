@@ -85,7 +85,7 @@ pub struct SanitizedHistoryRecord {
     pub target_id: String,
     pub status: String,
     pub receipt_sha256: Option<String>,
-    pub duration_ms: Option<u64>,
+    pub duration_ms: Option<i64>,
     pub terminal_report_sha256: String,
     pub recorded_at_ms: i64,
 }

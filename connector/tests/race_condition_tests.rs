@@ -125,6 +125,8 @@ async fn race_remove_wins_prevents_claim() {
         }
         if req.path == "/api/connector/jobs/job_race/claim" && req.method == "POST" {
             claim_count_clone.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = req.json().unwrap();
+            let att_id = body.get("attempt_id").unwrap().as_str().unwrap().to_string();
             return MockResponse::json(
                 200,
                 &serde_json::json!({
@@ -132,7 +134,7 @@ async fn race_remove_wins_prevents_claim() {
                     "replayed": false,
                     "server_time": "2026-09-24T19:00:01.000Z",
                     "attempt": {
-                        "attempt_id": "att_race",
+                        "attempt_id": att_id,
                         "phase": "claimed",
                         "claimed_at": "2026-09-24T19:00:01.000Z",
                         "started_at": null
@@ -244,6 +246,8 @@ async fn race_daemon_wins_rejects_target_remove() {
         }
         if req.path == "/api/connector/jobs/job_race/claim" && req.method == "POST" {
             claim_count_clone.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = req.json().unwrap();
+            let att_id = body.get("attempt_id").unwrap().as_str().unwrap().to_string();
             return MockResponse::json(
                 200,
                 &serde_json::json!({
@@ -251,7 +255,7 @@ async fn race_daemon_wins_rejects_target_remove() {
                     "replayed": false,
                     "server_time": "2026-09-24T19:00:01.000Z",
                     "attempt": {
-                        "attempt_id": "att_race",
+                        "attempt_id": att_id,
                         "phase": "claimed",
                         "claimed_at": "2026-09-24T19:00:01.000Z",
                         "started_at": null

@@ -12,11 +12,13 @@ use crate::credential::{CredentialError, DeviceCredential};
 use crate::enrollment::{now_utc_ms, PendingEnrollmentSession};
 use crate::local_state::{remove_durable, ExecutionLock};
 use crate::outbox::{
-    compute_report_sha256, flush_outbox, OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION,
+    compute_report_sha256, deliver_outbox_record, flush_outbox, OutboxError, OutboxRecord,
+    OUTBOX_SCHEMA_VERSION,
 };
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{
-    ActiveAttempt, AttemptPhase, ExecutionAdapter, SchedulerError, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    parse_timestamp_strict, validate_claim_response, ActiveAttempt, AttemptPhase, ExecutionAdapter,
+    SchedulerError, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use crate::targets::verify_local_repository;
 
@@ -70,16 +72,6 @@ fn generate_claim_token() -> String {
         hex.push_str(&format!("{:02x}", b));
     }
     hex
-}
-
-fn parse_iso_or_millis(s: &str) -> Option<i64> {
-    if let Ok(ts) = s.parse::<i64>() {
-        return Some(ts);
-    }
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.timestamp_millis())
-        .ok()
-        .or_else(|| Some(chrono::Utc::now().timestamp_millis()))
 }
 
 pub async fn run_daemon(
@@ -179,21 +171,22 @@ pub async fn run_daemon_with_hooks(
                     .await
                 {
                     Ok(resp) => {
-                        // Verify full intent identity
-                        if resp.job.job_id != active.job_id
-                            || resp.job.workspace_id != active.workspace_id
-                            || resp.job.target_id != active.target_id
-                        {
-                            active.phase = AttemptPhase::RecoveryRequired;
+                        if let Err(e) = validate_claim_response(&active, &resp) {
                             let _lock = ExecutionLock::acquire_with_retry(
                                 &paths.state_lock_file(),
                                 Duration::from_secs(5),
                                 Duration::from_millis(50),
                             )?;
-                            active.save(&paths.active_attempt_file())?;
-                            return Err(DaemonError::RecoveryRequired(
-                                "Server claimed job payload mismatch with local intent".into(),
-                            ));
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file()) {
+                                    Ok(Some(c)) => c,
+                                    _ => active,
+                                };
+                            current.phase = AttemptPhase::RecoveryRequired;
+                            current.save(&paths.active_attempt_file())?;
+                            return Err(DaemonError::RecoveryRequired(format!(
+                                "Claim replay correlation validation failed: {e}"
+                            )));
                         }
 
                         let payload_hash = ActiveAttempt::compute_payload_sha256(
@@ -207,21 +200,28 @@ pub async fn run_daemon_with_hooks(
                             &resp.job.result_target,
                         );
 
-                        active.phase = AttemptPhase::Claimed;
-                        active.resource_id = resp.job.resource_id;
-                        active.prompt = Some(resp.job.prompt);
-                        active.acceptance = Some(resp.job.acceptance);
-                        active.execution_timeout_seconds = Some(resp.job.timeout_seconds);
-                        active.result_target = Some(resp.job.result_target);
-                        active.payload_sha256 = Some(payload_hash);
-                        active.claimed_at_ms = parse_iso_or_millis(&resp.attempt.claimed_at);
+                        let claimed_at_ms = parse_timestamp_strict(&resp.attempt.claimed_at)
+                            .map_err(DaemonError::RecoveryRequired)?;
 
                         let _lock = ExecutionLock::acquire_with_retry(
                             &paths.state_lock_file(),
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        active.save(&paths.active_attempt_file())?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
+                            Ok(Some(c)) => c,
+                            _ => active,
+                        };
+                        current.phase = AttemptPhase::Claimed;
+                        current.resource_id = resp.job.resource_id;
+                        current.prompt = Some(resp.job.prompt);
+                        current.acceptance = Some(resp.job.acceptance);
+                        current.execution_timeout_seconds = Some(resp.job.timeout_seconds);
+                        current.result_target = Some(resp.job.result_target);
+                        current.payload_sha256 = Some(payload_hash);
+                        current.claimed_at_ms = Some(claimed_at_ms);
+
+                        current.save(&paths.active_attempt_file())?;
                         println!("Claim intent successfully reconciled to claimed.");
                     }
                     Err(ClientError::JobError { ref code, .. })
@@ -265,7 +265,44 @@ pub async fn run_daemon_with_hooks(
                 let hist_file = paths.history_file(&active.job_id, &active.attempt_id);
                 let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
 
-                if hist_file.exists() {
+                if outbox_file.exists() {
+                    let outbox = OutboxRecord::load(&outbox_file).map_err(|e| {
+                        DaemonError::RecoveryRequired(format!("failed to load outbox: {e}"))
+                    })?;
+                    let digest = compute_report_sha256(&outbox.report);
+                    if outbox.job_id == active.job_id
+                        && outbox.attempt_id == active.attempt_id
+                        && Some(&digest) == active.terminal_report_sha256.as_ref()
+                    {
+                        match deliver_outbox_record(paths, &client, &cred, &outbox_file, &outbox)
+                            .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "Successfully delivered outbox record and completed cleanup."
+                                );
+                            }
+                            Err(crate::outbox::OutboxError::AuthRequired) => {
+                                return Err(DaemonError::AuthRequired);
+                            }
+                            Err(crate::outbox::OutboxError::RecoveryRequired(msg)) => {
+                                return Err(DaemonError::RecoveryRequired(msg));
+                            }
+                            Err(crate::outbox::OutboxError::Retryable(msg)) => {
+                                eprintln!(
+                                    "Retryable error delivering outbox during recovery: {msg}"
+                                );
+                            }
+                            Err(e) => {
+                                return Err(DaemonError::RecoveryRequired(e.to_string()));
+                            }
+                        }
+                    } else {
+                        return Err(DaemonError::RecoveryRequired(
+                            "Outbox record does not match active attempt correlation".into(),
+                        ));
+                    }
+                } else if hist_file.exists() {
                     let hist_content = fs::read_to_string(&hist_file)?;
                     let hist: crate::outbox::SanitizedHistoryRecord =
                         serde_json::from_str(&hist_content)?;
@@ -285,21 +322,6 @@ pub async fn run_daemon_with_hooks(
                     } else {
                         return Err(DaemonError::RecoveryRequired(
                             "History record does not match active attempt correlation".into(),
-                        ));
-                    }
-                } else if outbox_file.exists() {
-                    let outbox = OutboxRecord::load(&outbox_file).map_err(|e| {
-                        DaemonError::RecoveryRequired(format!("failed to load outbox: {e}"))
-                    })?;
-                    let digest = compute_report_sha256(&outbox.report);
-                    if outbox.job_id == active.job_id
-                        && outbox.attempt_id == active.attempt_id
-                        && Some(&digest) == active.terminal_report_sha256.as_ref()
-                    {
-                        let _ = flush_outbox(paths, &client, &cred).await;
-                    } else {
-                        return Err(DaemonError::RecoveryRequired(
-                            "Outbox record does not match active attempt correlation".into(),
                         ));
                     }
                 } else {
@@ -630,6 +652,23 @@ pub async fn run_daemon_with_hooks(
                 .await
             {
                 Ok(resp) => {
+                    if let Err(e) = validate_claim_response(&attempt, &resp) {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
+                            Ok(Some(c)) => c,
+                            _ => attempt,
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(format!(
+                            "Claim response validation failed: {e}"
+                        )));
+                    }
+
                     let payload_hash = ActiveAttempt::compute_payload_sha256(
                         &resp.job.job_id,
                         &resp.job.workspace_id,
@@ -641,25 +680,31 @@ pub async fn run_daemon_with_hooks(
                         &resp.job.result_target,
                     );
 
-                    let mut att = attempt;
-                    att.phase = AttemptPhase::Claimed;
-                    att.resource_id = resp.job.resource_id;
-                    att.prompt = Some(resp.job.prompt);
-                    att.acceptance = Some(resp.job.acceptance);
-                    att.execution_timeout_seconds = Some(resp.job.timeout_seconds);
-                    att.result_target = Some(resp.job.result_target);
-                    att.payload_sha256 = Some(payload_hash);
-                    att.claimed_at_ms = parse_iso_or_millis(&resp.attempt.claimed_at);
+                    let claimed_at_ms = parse_timestamp_strict(&resp.attempt.claimed_at)
+                        .map_err(DaemonError::RecoveryRequired)?;
 
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    att.save(&paths.active_attempt_file())?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
+                        Ok(Some(c)) => c,
+                        _ => attempt,
+                    };
+                    current.phase = AttemptPhase::Claimed;
+                    current.resource_id = resp.job.resource_id;
+                    current.prompt = Some(resp.job.prompt);
+                    current.acceptance = Some(resp.job.acceptance);
+                    current.execution_timeout_seconds = Some(resp.job.timeout_seconds);
+                    current.result_target = Some(resp.job.result_target);
+                    current.payload_sha256 = Some(payload_hash);
+                    current.claimed_at_ms = Some(claimed_at_ms);
+
+                    current.save(&paths.active_attempt_file())?;
                     println!(
                         "Successfully claimed job '{}'. Attempt '{}' now in phase 'claimed'.",
-                        cand.job_id, att.attempt_id
+                        cand.job_id, current.attempt_id
                     );
                 }
                 Err(ClientError::JobError { ref code, .. })
