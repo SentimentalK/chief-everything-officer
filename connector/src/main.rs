@@ -142,10 +142,50 @@ async fn main() -> ExitCode {
             eprintln!("'resume' implementation belongs to V1.6c");
             return ExitCode::FAILURE;
         }
-        Commands::Target { .. } => {
-            eprintln!("'target' CLI implementation belongs to V1.6b");
-            return ExitCode::FAILURE;
-        }
+        Commands::Target { sub } => match sub {
+            TargetSubcommands::List { json } => {
+                if let Err(e) = ceo_connector::targets::target_list(&paths, json).await {
+                    eprintln!("Target list failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            TargetSubcommands::Add {
+                workspace,
+                alias,
+                display_name,
+                kind,
+                path,
+                workspace_repository,
+            } => {
+                if let Err(e) = ceo_connector::targets::target_add(
+                    &paths,
+                    &workspace,
+                    &alias,
+                    &display_name,
+                    &kind,
+                    &path,
+                    workspace_repository,
+                )
+                .await
+                {
+                    eprintln!("Target add failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            TargetSubcommands::Bind { target_id, path } => {
+                if let Err(e) = ceo_connector::targets::target_bind(&paths, &target_id, &path).await
+                {
+                    eprintln!("Target bind failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            TargetSubcommands::Remove { target_id } => {
+                if let Err(e) = ceo_connector::targets::target_remove(&paths, &target_id).await {
+                    eprintln!("Target remove failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        },
         Commands::Doctor => {
             eprintln!("'doctor' CLI implementation belongs to V1.6d");
             return ExitCode::FAILURE;

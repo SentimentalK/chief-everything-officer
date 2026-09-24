@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 
 pub type RequestHandler = Arc<dyn Fn(&MockRequest) -> MockResponse + Send + Sync>;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MockRequest {
     pub method: String,
@@ -39,6 +40,7 @@ impl MockResponse {
     }
 }
 
+#[allow(dead_code)]
 pub struct MockServer {
     addr: SocketAddr,
     handlers: Arc<Mutex<Vec<RequestHandler>>>,
@@ -46,6 +48,7 @@ pub struct MockServer {
     _handle: JoinHandle<()>,
 }
 
+#[allow(dead_code)]
 impl MockServer {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
