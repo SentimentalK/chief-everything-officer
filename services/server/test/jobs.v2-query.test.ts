@@ -467,4 +467,133 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
       expect(listRunning.jobs.some((j) => j.job_id === subQueued.job.job_id)).toBe(false);
     });
   });
+
+  describe("Target linkage integrity and host projections", () => {
+    it("fails closed with CORRUPT_TARGET_STATE when target is missing from control store", async () => {
+      const scopeA = { user_id: userAliceId, workspace_id: workspaceAId };
+
+      const sub = await coordinator.submit(scopeA, {
+        request_id: `req-${crypto.randomUUID()}`,
+        target_id: targetA1.id,
+        prompt: "Task",
+        acceptance: "Criteria",
+        resource_id: null,
+        execution_timeout_seconds: 3600,
+        result_target: "none",
+      });
+
+      // Delete target from control plane SQLite
+      identityStore.withDb((db) => {
+        db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetA1.id);
+      });
+
+      await expect(coordinator.getJobForHost(scopeA, sub.job.job_id)).rejects.toThrow(
+        /CORRUPT_TARGET_STATE/,
+      );
+
+      await expect(coordinator.listJobsForHost(scopeA, { limit: 10 })).rejects.toThrow(
+        /CORRUPT_TARGET_STATE/,
+      );
+    });
+
+    it("verifies expires_at lifecycle (non-null only for queued and expired)", async () => {
+      const scopeA = { user_id: userAliceId, workspace_id: workspaceAId };
+
+      const sub = await coordinator.submit(scopeA, {
+        request_id: `req-${crypto.randomUUID()}`,
+        target_id: targetA1.id,
+        prompt: "Lifecycle Task",
+        acceptance: "Criteria",
+        resource_id: null,
+        execution_timeout_seconds: 3600,
+        result_target: "none",
+      });
+
+      // 1. Queued: expires_at is non-null ISO string
+      const queuedDetail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(queuedDetail.state).toBe("queued");
+      expect(queuedDetail.expires_at).toBeTruthy();
+      expect(new Date(queuedDetail.expires_at!).getTime()).toBe(sub.job.claim_deadline_ms);
+
+      // 2. Active / claimed: expires_at is null
+      const device = controlStore.createDevice({
+        userId: userAliceId,
+        displayName: "Dev1",
+        platform: "linux",
+      });
+      const secret = "a".repeat(64);
+      controlStore.createDeviceCredential({
+        deviceId: device.id,
+        secretDigest: crypto.createHash("sha256").update(secret).digest("hex"),
+        expiresAtMs: Date.now() + 3600_000,
+      });
+      controlStore.upsertDeviceTargetBinding({ deviceId: device.id, targetId: targetA1.id });
+
+      const attemptId = `att-${crypto.randomUUID()}`;
+      const claimToken = crypto.randomBytes(32).toString("hex");
+      await coordinator.claimJob(device.id, sub.job.job_id, attemptId, claimToken);
+
+      const claimedDetail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(claimedDetail.state).toBe("claimed");
+      expect(claimedDetail.expires_at).toBeNull();
+
+      // 3. Running: expires_at is null
+      await coordinator.startJob(device.id, sub.job.job_id, attemptId, claimToken);
+      const runningDetail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(runningDetail.state).toBe("running");
+      expect(runningDetail.expires_at).toBeNull();
+
+      // 4. Terminal: expires_at is null
+      await coordinator.reportJob(device.id, sub.job.job_id, attemptId, claimToken, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 200,
+        executor: { type: "test", version: "1.0.0" },
+        receipt_sha256: "0".repeat(64),
+        error: null,
+      });
+      const terminalDetail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(terminalDetail.state).toBe("terminal");
+      expect(terminalDetail.expires_at).toBeNull();
+    });
+
+    it("enforces separation between lightweight summary and full detail", async () => {
+      const scopeA = { user_id: userAliceId, workspace_id: workspaceAId };
+      const reqId = `req-${crypto.randomUUID()}`;
+
+      const sub = await coordinator.submit(scopeA, {
+        request_id: reqId,
+        target_id: targetA1.id,
+        prompt: "Super secret prompt",
+        acceptance: "Super secret acceptance",
+        resource_id: null,
+        execution_timeout_seconds: 120,
+        result_target: "none",
+      });
+
+      // HostJobDetail includes request_id and execution_timeout_seconds
+      const detail = await coordinator.getJobForHost(scopeA, sub.job.job_id, { include_task: true });
+      expect(detail.request_id).toBe(reqId);
+      expect(detail.execution_timeout_seconds).toBe(120);
+      expect(detail.target_alias).toBe("target-a1");
+      expect(detail.task?.prompt).toBe("Super secret prompt");
+
+      // HostJobSummary from listJobsForHost does not expose task, execution, report, or result
+      const list = await coordinator.listJobsForHost(scopeA, { limit: 10 });
+      expect(list.jobs).toHaveLength(1);
+      const summary = list.jobs[0];
+      expect(summary.job_id).toBe(sub.job.job_id);
+      expect(summary.request_id).toBe(reqId);
+      expect(summary.target_alias).toBe("target-a1");
+      expect(summary.state).toBe("queued");
+      expect((summary as any).task).toBeUndefined();
+      expect((summary as any).execution).toBeUndefined();
+      expect((summary as any).report).toBeUndefined();
+      expect((summary as any).result).toBeUndefined();
+      expect((summary as any).execution_timeout_seconds).toBeUndefined();
+    });
+  });
 });

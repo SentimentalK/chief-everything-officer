@@ -29,6 +29,7 @@ import type {
 } from "./resource/types.js";
 import { registerJobTools } from "./jobs/tools.js";
 import { registerConnectorJobTools } from "./jobs/v2-tools.js";
+import { installJobToolValidationAuditInterceptor } from "./jobs/tool-audit.js";
 import type { JobService } from "./jobs/service.js";
 import type { JobCoordinatorV2 } from "./jobs/v2-service.js";
 import type { ConnectorControlStore } from "./connector/control-store.js";
@@ -551,6 +552,13 @@ export function createMcpServer(
       identityStore: connectorJobs.identityStore,
       scope: { user_id: identity.user_id, workspace_id: identity.workspace_id },
       auditStore: auditStore ?? null,
+    });
+  }
+
+  if (identity && (jobs || connectorJobs)) {
+    installJobToolValidationAuditInterceptor(server, auditStore ?? null, {
+      user_id: identity.user_id,
+      workspace_id: identity.workspace_id,
     });
   }
 

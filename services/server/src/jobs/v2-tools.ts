@@ -24,7 +24,6 @@ import {
   sanitizeJobId,
   sanitizeTargetId,
   recordSafeJobAuditTrace,
-  installJobToolValidationAuditInterceptor,
   type SafeJobAuditLog,
 } from "./tool-audit.js";
 import {
@@ -140,12 +139,14 @@ const jobSubmitSchema = z
     prompt: z.string().min(1).describe("Task goal and necessary inputs"),
     acceptance: z.string().min(1).describe("Concrete criteria for task completion"),
     resource_id: z.string().nullable().optional().default(null).describe("Optional resource ID (res-<uuid>)"),
-    execution_timeout_seconds: z
+    timeout_seconds: z
       .number()
       .int()
+      .min(60)
+      .max(7200)
       .optional()
       .default(3600)
-      .describe("Timeout in seconds (60-7200, default 3600)"),
+      .describe("Execution timeout in seconds (60-7200, default 3600)"),
     result_target: z
       .enum(["none", "resource"])
       .optional()
@@ -207,7 +208,7 @@ export function registerConnectorJobTools(
     {
       title: "List execution targets",
       description:
-        "List execution targets available to the authenticated workspace for job dispatch. Aliases are descriptive; jobs must be dispatched by target_id.",
+        "List execution targets available to the authenticated workspace for job dispatch. Aliases are descriptive; jobs must be dispatched by target_id. active_binding_count indicates how many enrolled devices are currently bound to the target (eligible to claim jobs), not whether a worker daemon is currently online or idle.",
       inputSchema: executionTargetsSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -229,6 +230,17 @@ export function registerConnectorJobTools(
           alias: r.target.alias,
           display_name: r.target.display_name,
           kind: r.target.kind,
+          repository:
+            r.target.repository_provider &&
+            r.target.repository_external_id &&
+            r.target.repository_full_name
+              ? {
+                  provider: r.target.repository_provider,
+                  external_id: r.target.repository_external_id,
+                  full_name: r.target.repository_full_name,
+                }
+              : null,
+          active_binding_count: r.activeBindingCount,
           disabled: r.target.disabled_at_ms !== null,
           disabled_at: r.target.disabled_at_ms
             ? new Date(r.target.disabled_at_ms).toISOString()
@@ -281,6 +293,10 @@ export function registerConnectorJobTools(
       const tgtId = sanitizeTargetId(body.target_id);
       const promptBytes = typeof body.prompt === "string" ? utf8ByteLength(body.prompt) : null;
       const accBytes = typeof body.acceptance === "string" ? utf8ByteLength(body.acceptance) : null;
+      const timeoutSeconds =
+        typeof body.timeout_seconds === "number"
+          ? body.timeout_seconds
+          : 3600;
       const resultTarget =
         body.result_target === "none" || body.result_target === "resource"
           ? body.result_target
@@ -289,14 +305,13 @@ export function registerConnectorJobTools(
         typeof body.target_id === "string" &&
         typeof body.prompt === "string" &&
         typeof body.acceptance === "string" &&
-        typeof body.execution_timeout_seconds === "number" &&
         resultTarget
           ? businessDigestV2({
               target_id: body.target_id,
               prompt: body.prompt,
               acceptance: body.acceptance,
               resource_id: typeof body.resource_id === "string" ? body.resource_id : null,
-              execution_timeout_seconds: body.execution_timeout_seconds,
+              execution_timeout_seconds: timeoutSeconds,
               result_target: resultTarget,
             })
           : null;
@@ -330,7 +345,7 @@ export function registerConnectorJobTools(
           prompt: String(body.prompt),
           acceptance: String(body.acceptance),
           resource_id: (body.resource_id as string | null) ?? null,
-          execution_timeout_seconds: Number(body.execution_timeout_seconds ?? 3600),
+          execution_timeout_seconds: timeoutSeconds,
           result_target: (resultTarget ?? "none") as "none" | "resource",
         });
 
@@ -351,6 +366,7 @@ export function registerConnectorJobTools(
           ok: true,
           replayed: res.status === "replayed",
           job_id: detail.job_id,
+          request_id: detail.request_id,
           target_id: detail.target_id,
           target_alias: detail.target_alias,
           state: detail.state,
@@ -527,6 +543,4 @@ export function registerConnectorJobTools(
       }
     }) as unknown as any,
   );
-
-  installJobToolValidationAuditInterceptor(server, ctx.auditStore, scope);
 }

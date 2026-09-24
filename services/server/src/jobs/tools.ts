@@ -16,7 +16,6 @@ import {
   sanitizeRequestId,
   sanitizeJobId,
   recordSafeJobAuditTrace,
-  installJobToolValidationAuditInterceptor,
   type SafeJobAuditLog,
 } from "./tool-audit.js";
 
@@ -159,8 +158,6 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
       }
     }) as unknown as any,
   );
-
-  installJobToolValidationAuditInterceptor(server, ctx.auditStore, scope);
 }
 
 function errInfo(error: unknown): { code: string; message: string; reason?: string } {

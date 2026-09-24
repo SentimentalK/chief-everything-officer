@@ -13,6 +13,7 @@ import { ConnectorControlStore } from "../src/connector/control-store.js";
 import { RedisJobStoreV2 } from "../src/jobs/v2-store.js";
 import { JobCoordinatorV2 } from "../src/jobs/v2-service.js";
 import { registerConnectorJobTools } from "../src/jobs/v2-tools.js";
+import { installJobToolValidationAuditInterceptor } from "../src/jobs/tool-audit.js";
 import { createFakeRedisRunner } from "./helpers/fake-redis-runner.js";
 import { AuditStore } from "../src/audit.js";
 
@@ -93,7 +94,22 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       alias: "target-alpha-1",
       displayName: "Target Alpha 1",
       kind: "coding",
+      repositoryProvider: "github",
+      repositoryExternalId: "repo_123",
+      repositoryFullName: "acme/repo-alpha",
     });
+
+    // Bind a device to targetA1 to give it active_binding_count = 1
+    const dev = controlStore.createDevice({
+      userId: userAliceId,
+      displayName: "Alice Dev",
+      platform: "linux",
+    });
+    controlStore.upsertDeviceTargetBinding({
+      deviceId: dev.id,
+      targetId: targetA1.id,
+    });
+
     targetA2Disabled = controlStore.createExecutionTarget({
       workspaceId: workspaceAId,
       alias: "target-alpha-disabled",
@@ -132,6 +148,10 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       scope: { user_id: options.userId, workspace_id: options.workspaceId },
       auditStore,
     });
+    installJobToolValidationAuditInterceptor(server, auditStore, {
+      user_id: options.userId,
+      workspace_id: options.workspaceId,
+    });
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "test-mcp-client", version: "1.0.0" });
@@ -165,6 +185,12 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(content.targets[0].target_id).toBe(targetA1.id);
       expect(content.targets[0].alias).toBe("target-alpha-1");
       expect(content.targets[0].disabled).toBe(false);
+      expect(content.targets[0].repository).toEqual({
+        provider: "github",
+        external_id: "repo_123",
+        full_name: "acme/repo-alpha",
+      });
+      expect(content.targets[0].active_binding_count).toBe(1);
     });
 
     it("includes disabled targets when include_disabled is true", async () => {
@@ -186,6 +212,8 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(disabled).toBeDefined();
       expect(disabled.disabled).toBe(true);
       expect(disabled.disabled_at).toBeTruthy();
+      expect(disabled.repository).toBeNull();
+      expect(disabled.active_binding_count).toBe(0);
     });
 
     it("succeeds even when coordinator/Redis is unavailable", async () => {
@@ -276,7 +304,7 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
           target_id: targetA1.id,
           prompt: "Run audit task",
           acceptance: "Exit code 0",
-          execution_timeout_seconds: 120,
+          timeout_seconds: 120,
           result_target: "none",
         },
       });
@@ -285,6 +313,7 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       const content = JSON.parse((res.content as any)[0].text);
       expect(content.ok).toBe(true);
       expect(content.job_id).toMatch(/^job-/);
+      expect(content.request_id).toBe(requestId);
       expect(content.target_id).toBe(targetA1.id);
       expect(content.target_alias).toBe("target-alpha-1");
       expect(content.state).toBe("queued");
@@ -405,6 +434,30 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(trace.tool_name).toBe("job_submit");
       expect(trace.error_message).toBe("INVALID_INPUT");
     });
+
+    it("strictly rejects internal execution_timeout_seconds with INVALID_INPUT", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      const res = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task",
+          acceptance: "Criteria",
+          execution_timeout_seconds: 120,
+        },
+      });
+
+      expect(res.isError).toBe(true);
+      const traces = getAuditTraces(workspaceAId);
+      const trace = traces[0];
+      expect(trace.tool_name).toBe("job_submit");
+      expect(trace.error_message).toBe("INVALID_INPUT");
+    });
   });
 
   describe("job_get tool", () => {
@@ -434,9 +487,12 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       const content1 = JSON.parse((getRes1.content as any)[0].text);
       expect(content1.ok).toBe(true);
       expect(content1.job_id).toBe(jobId);
+      expect(content1.request_id).toBeTruthy();
       expect(content1.target_id).toBe(targetA1.id);
       expect(content1.target_alias).toBe("target-alpha-1");
       expect(content1.state).toBe("queued");
+      expect(content1.expires_at).toBeTruthy();
+      expect(content1.execution_timeout_seconds).toBe(3600);
       expect(content1.task).toBeUndefined();
 
       // Call job_get with include_task=true
@@ -548,8 +604,41 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       const content = JSON.parse((getRes.content as any)[0].text);
       expect(content.ok).toBe(true);
       expect(content.state).toBe("terminal");
+      expect(content.expires_at).toBeNull();
       expect(content.report.execution_status).toBe("COMPLETED");
       expect(content.report.business_outcome).toBe("UNVERIFIED");
+    });
+
+    it("fails closed with QUEUE_UNAVAILABLE and CORRUPT_TARGET_STATE when target is deleted", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      const subRes = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task",
+          acceptance: "Criteria",
+        },
+      });
+      const jobId = JSON.parse((subRes.content as any)[0].text).job_id;
+
+      identityStore.withDb((db) => {
+        db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetA1.id);
+      });
+
+      const getRes = await client.callTool({
+        name: "job_get",
+        arguments: { job_id: jobId },
+      });
+      expect(getRes.isError).toBe(true);
+      const content = JSON.parse((getRes.content as any)[0].text);
+      expect(content.ok).toBe(false);
+      expect(content.code).toBe("QUEUE_UNAVAILABLE");
+      expect(content.reason).toBe("CORRUPT_TARGET_STATE");
     });
   });
 
@@ -593,7 +682,106 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(listContent.jobs.length).toBe(2);
       // Newest first
       expect(listContent.jobs[0].job_id).toBe(job2Id);
+      expect(listContent.jobs[0].request_id).toBeTruthy();
+      expect(listContent.jobs[0].target_alias).toBe("target-alpha-1");
+      expect(listContent.jobs[0].state).toBe("queued");
+      expect(listContent.jobs[0].expires_at).toBeTruthy();
+      expect(listContent.jobs[0].task).toBeUndefined();
+      expect(listContent.jobs[0].report).toBeUndefined();
+      expect(listContent.jobs[0].execution).toBeUndefined();
       expect(listContent.jobs[1].job_id).toBe(job1Id);
+    });
+
+    it("withholds report and error message details from job_list summary", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      const subRes = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Sensitive Task",
+          acceptance: "Criteria",
+        },
+      });
+      const jobId = JSON.parse((subRes.content as any)[0].text).job_id;
+
+      // Claim and report error with sensitive message
+      const dev = controlStore.createDevice({ userId: userAliceId, displayName: "D2", platform: "linux" });
+      controlStore.createDeviceCredential({
+        deviceId: dev.id,
+        secretDigest: crypto.createHash("sha256").update("b".repeat(64)).digest("hex"),
+        expiresAtMs: Date.now() + 3600_000,
+      });
+      controlStore.upsertDeviceTargetBinding({ deviceId: dev.id, targetId: targetA1.id });
+      const attId = `att-${crypto.randomUUID()}`;
+      const tok = crypto.randomBytes(32).toString("hex");
+      await coordinator.claimJob(dev.id, jobId, attId, tok);
+      await coordinator.startJob(dev.id, jobId, attId, tok);
+      await coordinator.reportJob(dev.id, jobId, attId, tok, {
+        schema_version: 2,
+        execution_status: "FAILED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 100,
+        executor: { type: "test", version: "1.0.0" },
+        receipt_sha256: "0".repeat(64),
+        error: {
+          stage: "execution",
+          code: "COMMAND_FAILED",
+          message: "SECRET_PASSWORD_OR_PATH_LEAK /secret/id_rsa failed",
+        },
+      });
+
+      const listRes = await client.callTool({
+        name: "job_list",
+        arguments: {},
+      });
+      const text = (listRes.content as any)[0].text;
+      expect(text).not.toContain("SECRET_PASSWORD_OR_PATH_LEAK");
+      const listContent = JSON.parse(text);
+      const item = listContent.jobs.find((j: any) => j.job_id === jobId);
+      expect(item).toBeDefined();
+      expect(item.state).toBe("terminal");
+      expect(item.execution_status).toBe("FAILED");
+      expect(item.business_outcome).toBe("UNVERIFIED");
+      expect(item.expires_at).toBeNull();
+      expect(item.report).toBeUndefined();
+    });
+
+    it("fails closed with QUEUE_UNAVAILABLE and CORRUPT_TARGET_STATE when target is deleted", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task",
+          acceptance: "Criteria",
+        },
+      });
+
+      identityStore.withDb((db) => {
+        db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetA1.id);
+      });
+
+      const listRes = await client.callTool({
+        name: "job_list",
+        arguments: {},
+      });
+      expect(listRes.isError).toBe(true);
+      const content = JSON.parse((listRes.content as any)[0].text);
+      expect(content.ok).toBe(false);
+      expect(content.code).toBe("QUEUE_UNAVAILABLE");
+      expect(content.reason).toBe("CORRUPT_TARGET_STATE");
     });
 
     it("returns QUEUE_UNAVAILABLE when coordinator is null", async () => {

@@ -21,6 +21,7 @@ import {
   StoreError,
 } from "../src/jobs/redis-store.js";
 import { registerJobTools, sanitizeRequestId, sanitizeJobId } from "../src/jobs/tools.js";
+import { installJobToolValidationAuditInterceptor } from "../src/jobs/tool-audit.js";
 import { JobService, JobError } from "../src/jobs/service.js";
 import type { AuditStore, TraceRecordInput } from "../src/audit.js";
 
@@ -388,6 +389,10 @@ describe("MCP protocol layer enforcement and audit tracing", () => {
       service: mockJobService,
       scope: { user_id: "usr_test", workspace_id: "ws_test" },
       auditStore: mockAuditStore,
+    });
+    installJobToolValidationAuditInterceptor(server, mockAuditStore, {
+      user_id: "usr_test",
+      workspace_id: "ws_test",
     });
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

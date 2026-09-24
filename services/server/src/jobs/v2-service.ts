@@ -33,7 +33,10 @@ import {
   V2IdempotencyConflictError,
   V2StoreError,
 } from "./v2-store.js";
-import type { ConnectorControlStore } from "../connector/control-store.js";
+import type {
+  ConnectorControlStore,
+  ExecutionTargetRecord,
+} from "../connector/control-store.js";
 import type { IdentityStore } from "../identity/store.js";
 import { assertHostWorkspaceAccess } from "./tool-audit.js";
 
@@ -47,15 +50,37 @@ export interface ListJobsQuery {
   cursor?: string | null;
 }
 
+export function loadHostJobTarget(
+  controlStore: ConnectorControlStore,
+  job: JobRecordV2,
+): ExecutionTargetRecord {
+  const target = controlStore.getExecutionTarget(job.target_id);
+  if (!target || target.id !== job.target_id || target.workspace_id !== job.workspace_id) {
+    throw new V2StoreError(
+      "QUEUE_UNAVAILABLE",
+      `Job '${job.job_id}' references missing or invalid execution target '${job.target_id}'.`,
+      "CORRUPT_TARGET_STATE",
+    );
+  }
+  return target;
+}
+
 export interface HostJobSummary {
   job_id: string;
+  request_id: string;
   target_id: string;
-  target_alias: string | null;
+  target_alias: string;
   state: HostJobState;
+  execution_status: ExecutionStatus | null;
+  business_outcome: BusinessOutcome | null;
   created_at: string;
   expires_at: string | null;
   resource_id: string | null;
   result_target: ResultTarget;
+}
+
+export interface HostJobDetail extends HostJobSummary {
+  execution_timeout_seconds: number;
   execution?: {
     attempt_id: string;
     phase: string;
@@ -78,9 +103,6 @@ export interface HostJobSummary {
     resource_id: string;
     commit: string;
   } | null;
-}
-
-export interface HostJobDetail extends HostJobSummary {
   task?: {
     prompt: string;
     acceptance: string;
@@ -656,15 +678,24 @@ export class JobCoordinatorV2 {
     }
 
     const hostState = deriveHostJobState(job, attempt, this.nowMs());
-    const target = this.controlStore.getExecutionTarget(job.target_id);
+    const target = loadHostJobTarget(this.controlStore, job);
+
+    const expiresAt =
+      hostState === "queued" || hostState === "expired"
+        ? new Date(job.claim_deadline_ms).toISOString()
+        : null;
 
     const detail: HostJobDetail = {
       job_id: job.job_id,
+      request_id: job.request_id,
       target_id: job.target_id,
-      target_alias: target?.alias ?? null,
+      target_alias: target.alias,
       state: hostState,
+      execution_status: attempt?.report?.execution_status ?? null,
+      business_outcome: attempt?.report?.business_outcome ?? null,
       created_at: new Date(job.created_at_ms).toISOString(),
-      expires_at: new Date(job.claim_deadline_ms).toISOString(),
+      expires_at: expiresAt,
+      execution_timeout_seconds: job.execution_timeout_seconds,
       resource_id: job.resource_id,
       result_target: job.result_target,
       execution: attempt
@@ -873,49 +904,25 @@ export class JobCoordinatorV2 {
           }
         }
 
-        const target = this.controlStore.getExecutionTarget(job.target_id);
+        const target = loadHostJobTarget(this.controlStore, job);
+
+        const expiresAt =
+          hostState === "queued" || hostState === "expired"
+            ? new Date(job.claim_deadline_ms).toISOString()
+            : null;
 
         const summary: HostJobSummary = {
           job_id: job.job_id,
+          request_id: job.request_id,
           target_id: job.target_id,
-          target_alias: target?.alias ?? null,
+          target_alias: target.alias,
           state: hostState,
+          execution_status: attempt?.report?.execution_status ?? null,
+          business_outcome: attempt?.report?.business_outcome ?? null,
           created_at: new Date(job.created_at_ms).toISOString(),
-          expires_at: new Date(job.claim_deadline_ms).toISOString(),
+          expires_at: expiresAt,
           resource_id: job.resource_id,
           result_target: job.result_target,
-          execution: attempt
-            ? {
-                attempt_id: attempt.attempt_id,
-                phase: attempt.phase,
-                claimed_at: new Date(attempt.claimed_at_ms).toISOString(),
-                started_at: attempt.started_at_ms
-                  ? new Date(attempt.started_at_ms).toISOString()
-                  : null,
-              }
-            : null,
-          report: attempt?.report
-            ? {
-                execution_status: attempt.report.execution_status,
-                business_outcome: attempt.report.business_outcome,
-                finished_at: new Date(attempt.report.finished_at_ms).toISOString(),
-                duration_ms: attempt.report.duration_ms,
-                error: attempt.report.error
-                  ? {
-                      stage: attempt.report.error.stage,
-                      code: attempt.report.error.code,
-                      message: attempt.report.error.message,
-                    }
-                  : null,
-              }
-            : null,
-          result: attempt?.result
-            ? {
-                target: "resource",
-                resource_id: attempt.result.resource_id,
-                commit: attempt.result.commit,
-              }
-            : null,
         };
 
         jobs.push(summary);
