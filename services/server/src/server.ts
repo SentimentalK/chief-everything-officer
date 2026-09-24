@@ -37,6 +37,9 @@ import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
 import { createJobAssignmentRouter } from "./jobs/router.js";
 import type { JobAuthScope } from "./jobs/service.js";
+import { RedisJobStoreV2 } from "./jobs/v2-store.js";
+import { JobCoordinatorV2 } from "./jobs/v2-service.js";
+import { createConnectorJobsRouter } from "./jobs/v2-router.js";
 import { resolveResourceLocation } from "./resource/locator.js";
 import { WorkspaceRuntimeRegistry } from "./runtime/registry.js";
 import type { WorkspaceRuntime } from "./runtime/types.js";
@@ -130,6 +133,20 @@ const jobBridge = openJobBridge({
   const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
   return loc !== null;
 });
+
+const v2Store = jobBridge.runner ? new RedisJobStoreV2(jobBridge.runner) : null;
+const v2Coordinator = v2Store
+  ? new JobCoordinatorV2({
+      store: v2Store,
+      controlStore: connectorControlStore,
+      identityStore: identityService.storeInstance,
+      resourceExists: async (scope, resourceId) => {
+        const runtime = await runtimeRegistry.get(scope.workspaceId);
+        const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
+        return loc !== null;
+      },
+    })
+  : null;
 
 const app = createMcpExpressApp({ host: config.bindHost });
 
@@ -226,6 +243,15 @@ if (config.publicOrigin) {
   );
 } else {
   process.stdout.write("Connector enrollment router disabled: publicOrigin is not configured\n");
+}
+
+if (v2Coordinator) {
+  app.use(
+    "/api/connector/jobs",
+    createHostGuard(config.allowedHosts),
+    createOriginGuard(config.allowedOrigins),
+    createConnectorJobsRouter(v2Coordinator, connectorControlStore, identityService.storeInstance),
+  );
 }
 
 // GitHub OAuth authorization router (when configured)

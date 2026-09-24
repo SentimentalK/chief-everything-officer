@@ -10,6 +10,17 @@ import {
   ExecutionContractError,
 } from "./execution-contract.js";
 
+export {
+  type ResultTarget,
+  type PersistedExecutionReport,
+  type PersistedJobResult,
+  validatePersistedExecutionReport,
+  validatePersistedJobResult,
+  isWhitespaceOnly,
+  utf8ByteLength,
+  ExecutionContractError,
+};
+
 export const JOBS_V2_SCHEMA_VERSION = 6 as const;
 export const ATTEMPT_V1_SCHEMA_VERSION = 1 as const;
 export const STREAM_V2_SCHEMA_VERSION = 2 as const;
@@ -52,6 +63,10 @@ export function attemptKeyV1(attempt_id: string): string {
 
 export function requestKeyV2(user_id: string, workspace_id: string, request_id: string): string {
   return `ceo:request:v2:${user_id}:${workspace_id}:${request_id}`;
+}
+
+export function targetQueueKeyV1(target_id: string): string {
+  return `ceo:target:v1:${target_id}:jobs`;
 }
 
 export type JobRecordV2Status = "preparing" | "queued" | "active" | "terminal";

@@ -1,9 +1,10 @@
 import { createClient } from "redis";
 import { JobService, type JobAuthScope, type JobServiceDeps } from "./service.js";
-import { RedisJobStore, createRedisRunnerFromClient, StoreError } from "./redis-store.js";
+import { RedisJobStore, createRedisRunnerFromClient, StoreError, type RedisRunner } from "./redis-store.js";
 
 export interface JobBridge {
   service: JobService | null;
+  runner: RedisRunner | null;
   dispose(): Promise<void>;
 }
 
@@ -26,7 +27,7 @@ export function openJobBridge(
   resourceExists?: JobResourceExists,
 ): JobBridge {
   if (!cfg.bridgeEnabled) {
-    return { service: null, dispose: async () => void 0 };
+    return { service: null, runner: null, dispose: async () => void 0 };
   }
   if (!cfg.redisUrl) {
     // Enabled but misconfigured: not disabled; surface as unavailable forever.
@@ -43,9 +44,11 @@ export function openJobBridge(
       scriptLoad: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
       evalsha: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
       scriptExists: async () => false,
+      zrangeWithScores: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
+      zrem: async () => { throw new StoreError("QUEUE_UNAVAILABLE", "Redis URL not configured."); },
     };
     const deps: JobServiceDeps = { store: new RedisJobStore(never), resourceExists };
-    return { service: new JobService(deps, () => true), dispose: async () => void 0 };
+    return { service: new JobService(deps, () => true), runner: never, dispose: async () => void 0 };
   }
 
   // The runner owns the whole connection lifecycle (initial connect + one fresh
@@ -78,6 +81,7 @@ export function openJobBridge(
   const service = new JobService({ store, resourceExists }, () => true);
   return {
     service,
+    runner,
     dispose: () => runner.dispose(),
   };
 }
