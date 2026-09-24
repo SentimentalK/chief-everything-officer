@@ -56,7 +56,11 @@ enum Commands {
     },
 
     /// Run environment and configuration diagnostics
-    Doctor,
+    Doctor {
+        /// Output in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,9 +230,11 @@ async fn main() -> ExitCode {
                 }
             }
         },
-        Commands::Doctor => {
-            eprintln!("'doctor' CLI implementation belongs to V1.6d");
-            return ExitCode::FAILURE;
+        Commands::Doctor { json } => {
+            let report = ceo_connector::doctor::run_doctor(&paths, json).await;
+            if !report.overall_passed {
+                return ExitCode::FAILURE;
+            }
         }
     }
 
