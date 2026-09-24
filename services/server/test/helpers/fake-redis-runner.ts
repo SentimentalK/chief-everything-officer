@@ -82,12 +82,56 @@ export function createFakeRedisRunner(): RedisRunner {
       }
       return removed;
     },
+    async zadd(key: string, score: number, member: string) {
+      let zset = zsets.get(key);
+      if (!zset) {
+        zset = new Map();
+        zsets.set(key, zset);
+      }
+      zset.set(member, score);
+      return 1;
+    },
     async evalsha(shaKey: string, keyCount: number, keys: string[], args: string[]) {
       const script = scriptMap.get(shaKey);
       if (!script) {
         const err = new Error("NOSCRIPT No matching script");
         (err as unknown as { code: string }).code = "NOSCRIPT";
         throw err;
+      }
+
+      if (script.includes("local P = 'ceo:job:'")) {
+        // Legacy CREATE_SCRIPT
+        // KEYS[1] = requestKey, KEYS[2] = streamKey
+        const [reqKey, streamKey] = keys;
+        const [digest, prepJson, jobId, userId, workspaceId, schemaVersion] = args;
+        const reqVal = strings.get(reqKey);
+        if (reqVal) {
+          const ph = JSON.parse(reqVal);
+          const job = strings.get(`ceo:job:${ph.job_id}`);
+          if (!job) return "INCOMPLETE";
+          const jd = JSON.parse(job);
+          if (jd.user_id !== userId || jd.workspace_id !== workspaceId) return "INCOMPLETE";
+          if (jd.request_digest !== digest) return "CONFLICT";
+          return "REPLAY";
+        }
+        strings.set(reqKey, JSON.stringify({ job_id: jobId, request_digest: digest }));
+        const prepared = JSON.parse(prepJson);
+        const entryId = `${Date.now()}-${++streamSeq}`;
+        const stream = streams.get(streamKey) ?? [];
+        stream.push({
+          id: entryId,
+          fields: {
+            schema_version: Number(schemaVersion),
+            job_id: jobId,
+            user_id: prepared.user_id,
+            workspace_id: prepared.workspace_id,
+          },
+        });
+        streams.set(streamKey, stream);
+        prepared.status = "queued";
+        prepared.stream_entry_id = entryId;
+        strings.set(`ceo:job:${jobId}`, JSON.stringify(prepared));
+        return "NEW";
       }
 
       // Check script identity by matching distinctive patterns in the script
@@ -100,24 +144,7 @@ export function createFakeRedisRunner(): RedisRunner {
 
         const reqVal = strings.get(reqKey);
         if (reqVal) {
-          const jobVal = strings.get(jobKey);
-          if (!jobVal) return JSON.stringify({ error: "CORRUPT_SUBMISSION_REFERENCE" });
-          let jd: any;
-          try {
-            jd = JSON.parse(jobVal);
-          } catch {
-            return JSON.stringify({ error: "MALFORMED_JOB_RECORD" });
-          }
-          if (jd.user_id !== userId || jd.workspace_id !== workspaceId || jd.request_id !== requestId) {
-            return JSON.stringify({ error: "IDEMPOTENCY_CONFLICT" });
-          }
-          if (jd.status === "preparing") {
-            return JSON.stringify({ error: "INCOMPLETE_SUBMISSION" });
-          }
-          if (jd.request_digest === requestDigest) {
-            return JSON.stringify({ status: "replayed", job_id: jd.job_id });
-          }
-          return JSON.stringify({ error: "IDEMPOTENCY_CONFLICT" });
+          return JSON.stringify({ status: "existing_request", job_id: reqVal });
         }
 
         // New job collision check
@@ -290,6 +317,23 @@ export function createFakeRedisRunner(): RedisRunner {
         if (!attRaw) return JSON.stringify({ error: "ATTEMPT_NOT_FOUND" });
         const attempt = JSON.parse(attRaw);
 
+        if (
+          attempt.schema_version !== 1 ||
+          typeof attempt.claimed_at_ms !== "number" ||
+          typeof attempt.target_binding_id !== "string" ||
+          !attempt.target_binding_id ||
+          typeof attempt.claim_token_sha256 !== "string" ||
+          attempt.claim_token_sha256.length !== 64
+        ) {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+        if (attempt.phase === "claimed" && (attempt.started_at_ms !== null && attempt.started_at_ms !== undefined)) {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+        if (attempt.phase === "running" && typeof attempt.started_at_ms !== "number") {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+
         if (job.status !== "active" || job.latest_attempt_id !== attemptId) {
           return JSON.stringify({ error: "JOB_NOT_ACTIVE" });
         }
@@ -334,6 +378,23 @@ export function createFakeRedisRunner(): RedisRunner {
         if (!attRaw) return JSON.stringify({ error: "ATTEMPT_NOT_FOUND" });
         const attempt = JSON.parse(attRaw);
 
+        if (
+          attempt.schema_version !== 1 ||
+          typeof attempt.claimed_at_ms !== "number" ||
+          typeof attempt.target_binding_id !== "string" ||
+          !attempt.target_binding_id ||
+          typeof attempt.claim_token_sha256 !== "string" ||
+          attempt.claim_token_sha256.length !== 64
+        ) {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+        if (attempt.phase === "claimed" && (attempt.started_at_ms !== null && attempt.started_at_ms !== undefined)) {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+        if (attempt.phase === "running" && typeof attempt.started_at_ms !== "number") {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+
         if (job.latest_attempt_id !== attemptId) {
           return JSON.stringify({ error: "ATTEMPT_MISMATCH" });
         }
@@ -360,6 +421,24 @@ export function createFakeRedisRunner(): RedisRunner {
 
         if (rep.schema_version !== 2) {
           return JSON.stringify({ error: "INVALID_REPORT_SCHEMA_VERSION" });
+        }
+
+        if (typeof rep.finished_at_ms !== "number" || rep.finished_at_ms < 0) {
+          return JSON.stringify({ error: "INVALID_REPORT_FINISHED_AT" });
+        }
+        if (typeof rep.duration_ms !== "number" || rep.duration_ms < 0) {
+          return JSON.stringify({ error: "INVALID_REPORT_DURATION" });
+        }
+        if (typeof rep.receipt_sha256 !== "string" || rep.receipt_sha256.length !== 64) {
+          return JSON.stringify({ error: "INVALID_REPORT_RECEIPT_SHA256" });
+        }
+        if (!rep.executor || typeof rep.executor.type !== "string" || typeof rep.executor.version !== "string") {
+          return JSON.stringify({ error: "INVALID_REPORT_EXECUTOR" });
+        }
+        if (rep.execution_status !== "COMPLETED") {
+          if (!rep.error || typeof rep.error.stage !== "string" || typeof rep.error.code !== "string" || typeof rep.error.message !== "string") {
+            return JSON.stringify({ error: "INVALID_REPORT_ERROR_SHAPE" });
+          }
         }
 
         if (attempt.phase === "terminal") {

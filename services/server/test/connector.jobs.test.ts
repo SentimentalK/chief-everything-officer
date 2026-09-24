@@ -725,5 +725,179 @@ describe("Connector Jobs Protocol (/api/connector/jobs)", () => {
       expect(savedAttempt?.user_id).toBe("usr_submitter_partner");
       expect(savedAttempt?.device_id).toBe(aliceDeviceId);
     });
+
+    it("handles concurrent submit with same request_id returning exactly one Job", async () => {
+      const requestId = "req-00000000-0000-0000-0000-000000000060";
+      const payload = {
+        request_id: requestId,
+        target_id: targetA.id,
+        prompt: "concurrent prompt",
+        acceptance: "acceptance ok",
+        resource_id: null,
+        execution_timeout_seconds: 120,
+        result_target: "none" as const,
+      };
+
+      const [res1, res2] = await Promise.all([
+        coordinator.submit({ user_id: userAliceId, workspace_id: workspaceId }, payload),
+        coordinator.submit({ user_id: userAliceId, workspace_id: workspaceId }, payload),
+      ]);
+
+      expect(res1.job.job_id).toBe(res2.job.job_id);
+      const statuses = [res1.status, res2.status].sort();
+      expect(statuses).toEqual(["created", "replayed"]);
+
+      // Verify Redis state: exactly 1 request mapping, 1 job, 1 stream entry, 1 target queue member
+      const runner = (v2Store as any).redis;
+      const reqVal = await runner.get(`ceo:request:v2:${userAliceId}:${workspaceId}:${requestId}`);
+      expect(reqVal).toBe(res1.job.job_id);
+
+      const streamLen = await runner.xlen("ceo:jobs:v2");
+      expect(streamLen).toBe(1);
+
+      const targetJobs = await v2Store.getQueuedJobIdsForTarget(targetA.id, 10);
+      expect(targetJobs).toHaveLength(1);
+      expect(targetJobs[0]?.job_id).toBe(res1.job.job_id);
+    });
+
+    it("enforces independent 7-day claim deadline regardless of execution timeout", async () => {
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+      // Timeout 60s
+      const job60 = await coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000061",
+          target_id: targetA.id,
+          prompt: "task 60s",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 60,
+          result_target: "none",
+        },
+      );
+      expect(job60.job.claim_deadline_ms - job60.job.created_at_ms).toBe(SEVEN_DAYS_MS);
+
+      // Timeout 7200s
+      const job7200 = await coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000062",
+          target_id: targetA.id,
+          prompt: "task 7200s",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 7200,
+          result_target: "none",
+        },
+      );
+      expect(job7200.job.claim_deadline_ms - job7200.job.created_at_ms).toBe(SEVEN_DAYS_MS);
+    });
+
+    it("allows claim for 2-day-old job but rejects and prunes expired 7-day job", async () => {
+      const now = Date.now();
+      const twoDaysAgo = now - 2 * 24 * 60 * 60 * 1000;
+      const eightDaysAgo = now - 8 * 24 * 60 * 60 * 1000;
+
+      // Submit job 1 (simulate created 2 days ago)
+      const j1 = await coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000063",
+          target_id: targetA.id,
+          prompt: "2 day old task",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+      const runner = (v2Store as any).redis;
+      const j1Record = {
+        ...j1.job,
+        created_at_ms: twoDaysAgo,
+        claim_deadline_ms: twoDaysAgo + 7 * 24 * 60 * 60 * 1000,
+      };
+      await runner.set(`ceo:job:v2:${j1.job.job_id}`, JSON.stringify(j1Record));
+
+      // Submit job 2 (simulate created 8 days ago - expired)
+      const j2 = await coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000064",
+          target_id: targetA.id,
+          prompt: "8 day old task",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+      const j2Record = {
+        ...j2.job,
+        created_at_ms: eightDaysAgo,
+        claim_deadline_ms: eightDaysAgo + 7 * 24 * 60 * 60 * 1000,
+      };
+      await runner.set(`ceo:job:v2:${j2.job.job_id}`, JSON.stringify(j2Record));
+
+      // Pending jobs for Alice: should include j1 but prune and exclude j2
+      const pending = await coordinator.getPendingJobs(aliceDeviceId, 20);
+      const pendingIds = pending.map((p) => p.job_id);
+      expect(pendingIds).toContain(j1.job.job_id);
+      expect(pendingIds).not.toContain(j2.job.job_id);
+
+      // Attempting to claim j2 returns 410 JOB_EXPIRED
+      const claimRes = await fetch(`${baseUrl}/api/connector/jobs/${j2.job.job_id}/claim`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${aliceDevToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          attempt_id: "att_00000000-0000-0000-0000-000000000064",
+          claim_token: "a".repeat(64),
+        }),
+      });
+      expect(claimRes.status).toBe(410);
+      const claimData = await claimRes.json();
+      expect(claimData.error).toBe("JOB_EXPIRED");
+    });
+
+    it("validates target queue association and prunes foreign target jobs from queue", async () => {
+      // Bob submits job for Target B in bobWorkspaceId
+      const jobB = await coordinator.submit(
+        { user_id: userBobId, workspace_id: bobWorkspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000070",
+          target_id: targetB.id,
+          prompt: "task on target B",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+
+      // Simulate corruption: Target B job is injected into Target A's queue
+      const runner = (v2Store as any).redis;
+      await (runner as any).zadd(`ceo:target:v1:${targetA.id}:jobs`, Date.now(), jobB.job.job_id);
+
+      // Alice's device is only eligible for Target A
+      const pendingAlice = await coordinator.getPendingJobs(aliceDeviceId, 20);
+      const pendingIds = pendingAlice.map((p) => p.job_id);
+
+      // Must NOT return jobB
+      expect(pendingIds).not.toContain(jobB.job.job_id);
+
+      // Incorrect Target A queue entry is pruned
+      const targetAQueueAfter = await v2Store.getQueuedJobIdsForTarget(targetA.id, 10);
+      expect(targetAQueueAfter.map((r) => r.job_id)).not.toContain(jobB.job.job_id);
+
+      // Job B record remains intact
+      const intactJobB = await v2Store.getJob(jobB.job.job_id);
+      expect(intactJobB).not.toBeNull();
+      expect(intactJobB?.target_id).toBe(targetB.id);
+      expect(intactJobB?.status).toBe("queued");
+    });
   });
 });

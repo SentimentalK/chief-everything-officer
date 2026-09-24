@@ -35,6 +35,7 @@ import {
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
 import { openJobBridge } from "./jobs/bridge.js";
+import { openNeutralRedisRunner } from "./jobs/redis-runner.js";
 import { createJobAssignmentRouter } from "./jobs/router.js";
 import type { JobAuthScope } from "./jobs/service.js";
 import { RedisJobStoreV2 } from "./jobs/v2-store.js";
@@ -123,18 +124,27 @@ const userSessionManager = new UserSessionManager({
 const connectorControlStore = new ConnectorControlStore(identityService.storeInstance);
 const deviceEnrollmentStore = new DeviceEnrollmentStore();
 
-// Optional worker-bridge job layer (disabled unless configured). Resource
-// existence for new tasks is checked against repo contents of the requested workspace runtime.
-const jobBridge = openJobBridge({
-  bridgeEnabled: config.bridgeEnabled,
-  redisUrl: config.redisUrl,
-}, async (scope, resourceId) => {
-  const runtime = await runtimeRegistry.get(scope.workspace_id);
-  const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
-  return loc !== null;
-});
+// Neutral Redis transport (lifecycle owned by neutral queue infrastructure)
+const redisTransport = openNeutralRedisRunner(config.redisUrl);
+const redisRunner = redisTransport?.runner ?? null;
 
-const v2Store = jobBridge.runner ? new RedisJobStoreV2(jobBridge.runner) : null;
+// Optional legacy worker-bridge job layer (disabled unless configured). Resource
+// existence for new tasks is checked against repo contents of the requested workspace runtime.
+const jobBridge = openJobBridge(
+  {
+    bridgeEnabled: config.bridgeEnabled,
+    redisUrl: config.redisUrl,
+  },
+  async (scope, resourceId) => {
+    const runtime = await runtimeRegistry.get(scope.workspace_id);
+    const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
+    return loc !== null;
+  },
+  redisRunner,
+);
+
+// V2 Connector Job Coordinator (independent of legacy bridgeEnabled, active whenever Redis is configured)
+const v2Store = redisRunner ? new RedisJobStoreV2(redisRunner) : null;
 const v2Coordinator = v2Store
   ? new JobCoordinatorV2({
       store: v2Store,
@@ -506,6 +516,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     dcrStore?.close();
     identityService.close();
     void jobBridge.dispose();
+    if (redisTransport) void redisTransport.dispose();
     listener.close(() => process.exit(0));
   });
 }

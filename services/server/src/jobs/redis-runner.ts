@@ -1,4 +1,5 @@
 import {
+  createClient,
   ClientClosedError,
   ClientOfflineError,
   ConnectionTimeoutError,
@@ -8,6 +9,47 @@ import {
   type RedisClientType,
 } from "redis";
 import { KEY_STREAM } from "./schema.js";
+
+export interface NeutralRedisTransport {
+  runner: RedisRunner;
+  dispose(): Promise<void>;
+}
+
+export function openNeutralRedisRunner(
+  redisUrl?: string,
+  options?: {
+    connectTimeoutMs?: number;
+    opTimeoutMs?: number;
+    onClientError?: (err: unknown) => void;
+  },
+): NeutralRedisTransport | null {
+  if (!redisUrl) return null;
+  const connectTimeout = options?.connectTimeoutMs ?? 2000;
+  const runner = createRedisRunnerFromClient(
+    () =>
+      createClient({
+        url: redisUrl,
+        socket: {
+          connectTimeout,
+          reconnectStrategy: (retries: number) => Math.min(retries * 500, 5000),
+        },
+        disableOfflineQueue: true,
+        commandsQueueMaxLength: 64,
+      }),
+    {
+      opTimeoutMs: options?.opTimeoutMs ?? DEFAULT_REDIS_OP_TIMEOUT_MS,
+      onClientError: options?.onClientError ?? ((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`redis-runner: redis error: ${msg}\n`);
+      }),
+    },
+  );
+
+  return {
+    runner,
+    dispose: () => runner.dispose(),
+  };
+}
 
 export interface RedisRunner {
   ready(): boolean;

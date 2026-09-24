@@ -33,6 +33,7 @@ export const MIN_TIMEOUT_SECONDS = 60;
 export const MAX_TIMEOUT_SECONDS = 7200;
 export const MAX_PROMPT_BYTES = 64 * 1024;
 export const MAX_ACCEPTANCE_BYTES = 8 * 1024;
+export const JOB_CLAIM_TTL_MS_V2 = 7 * 24 * 60 * 60 * 1000;
 
 export const JOB_ID_V2_RE = /^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const REQUEST_ID_V2_RE = /^(?:req-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

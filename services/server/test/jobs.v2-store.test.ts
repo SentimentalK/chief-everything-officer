@@ -606,4 +606,52 @@ describe.skipIf(!URL)("RedisJobStoreV2 (real Redis integration, CI-gated)", () =
 
     expect(replayRes.status).toBe("replayed");
   });
+
+  it("handles concurrent submit with two different candidate job IDs under real Redis", async () => {
+    const jobA = makeJobRecord({ job_id: "job-00000000-0000-0000-0000-00000000000a" });
+    const jobB = makeJobRecord({ job_id: "job-00000000-0000-0000-0000-00000000000b" });
+    // Same request_id, same user, same workspace, same digest
+    expect(jobA.request_id).toBe(jobB.request_id);
+    expect(jobA.request_digest).toBe(jobB.request_digest);
+
+    const [resA, resB] = await Promise.all([
+      store.createJob(jobA, jobA.request_id),
+      store.createJob(jobB, jobB.request_id),
+    ]);
+
+    expect(resA.job_id).toBe(resB.job_id);
+    const statuses = [resA.status, resB.status].sort();
+    expect(statuses).toEqual(["created", "replayed"]);
+
+    // Exactly 1 job exists, matching the winner ID
+    const winnerId = resA.job_id;
+    const loserId = winnerId === jobA.job_id ? jobB.job_id : jobA.job_id;
+
+    const winnerJob = await store.getJob(winnerId);
+    expect(winnerJob).not.toBeNull();
+    expect(winnerJob?.status).toBe("queued");
+
+    const loserJob = await store.getJob(loserId);
+    expect(loserJob).toBeNull();
+
+    // Stream has 1 entry, Target queue has 1 member
+    const streamLen = await client.xLen(KEY_STREAM_V2);
+    expect(streamLen).toBe(1);
+
+    const tqMembers = await client.zRange(targetQueueKeyV1(jobA.target_id), 0, -1);
+    expect(tqMembers).toEqual([winnerId]);
+  });
+
+  it("recovers from NOSCRIPT when script cache is flushed under real Redis", async () => {
+    const job = makeJobRecord();
+    await store.createJob(job, job.request_id);
+
+    // Flush script cache in Redis
+    await client.scriptFlush();
+
+    // Next operation succeeds transparently by reloading script
+    const replayRes = await store.createJob(job, job.request_id);
+    expect(replayRes.status).toBe("replayed");
+    expect(replayRes.job_id).toBe(job.job_id);
+  });
 });

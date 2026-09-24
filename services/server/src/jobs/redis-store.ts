@@ -25,6 +25,8 @@ import {
   type RedisRunnerOptions,
   DEFAULT_REDIS_OP_TIMEOUT_MS,
   createRedisRunnerFromClient,
+  type NeutralRedisTransport,
+  openNeutralRedisRunner,
 } from "./redis-runner.js";
 
 export {
@@ -34,6 +36,8 @@ export {
   type RedisRunnerOptions,
   DEFAULT_REDIS_OP_TIMEOUT_MS,
   createRedisRunnerFromClient,
+  type NeutralRedisTransport,
+  openNeutralRedisRunner,
 };
 
 export interface AuthScope {

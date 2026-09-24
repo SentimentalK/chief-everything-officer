@@ -218,6 +218,42 @@ export class RedisJobStoreV2 {
       throw new V2StoreError("QUEUE_UNAVAILABLE", `Creation failed: ${err}`, err);
     }
 
+    if (parsed.status === "existing_request") {
+      const existingJobId = String(parsed.job_id);
+      const rawJob = await this.redis.get(jobKeyV2(existingJobId));
+      if (!rawJob) {
+        throw new V2StoreError("QUEUE_UNAVAILABLE", "Request placeholder references a missing Job.", "CORRUPT_SUBMISSION_REFERENCE");
+      }
+      let existingJob: JobRecordV2;
+      try {
+        existingJob = parseJobRecordV2(rawJob);
+      } catch (parseErr) {
+        throw new V2StoreError("QUEUE_UNAVAILABLE", `Existing job record is malformed: ${(parseErr as Error).message}`, "MALFORMED_JOB_RECORD");
+      }
+
+      if (
+        existingJob.user_id !== job.user_id ||
+        existingJob.workspace_id !== job.workspace_id ||
+        existingJob.request_id !== requestId
+      ) {
+        throw new V2IdempotencyConflictError("Existing job identity mismatch.");
+      }
+
+      if (existingJob.status === "preparing") {
+        throw new V2StoreError("QUEUE_UNAVAILABLE", "Previous submission with this request ID was incomplete.", "INCOMPLETE_SUBMISSION");
+      }
+
+      if (existingJob.request_digest !== job.request_digest) {
+        throw new V2IdempotencyConflictError("A job with this request ID already exists with different parameters.");
+      }
+
+      return {
+        status: "replayed",
+        job_id: existingJob.job_id,
+        stream_entry_id: existingJob.stream_entry_id ?? undefined,
+      };
+    }
+
     return {
       status: parsed.status as "created" | "replayed",
       job_id: String(parsed.job_id),
@@ -321,7 +357,12 @@ export class RedisJobStoreV2 {
     if (parsed.error) {
       const err = String(parsed.error);
       if (err === "JOB_NOT_FOUND") throw new V2JobNotFoundError();
-      if (err === "ATTEMPT_NOT_FOUND" || err === "JOB_NOT_ACTIVE" || err === "IDENTITY_MISMATCH") {
+      if (
+        err === "ATTEMPT_NOT_FOUND" ||
+        err === "JOB_NOT_ACTIVE" ||
+        err === "IDENTITY_MISMATCH" ||
+        err === "CORRUPT_ATTEMPT_RECORD"
+      ) {
         throw new V2AttemptLifecycleError(err, `Start validation failed: ${err}`);
       }
       if (err === "INVALID_ATTEMPT_PHASE") {
@@ -381,6 +422,7 @@ export class RedisJobStoreV2 {
         err === "IDENTITY_MISMATCH" ||
         err === "INVALID_JOB_STATUS" ||
         err === "INVALID_ATTEMPT_PHASE" ||
+        err === "CORRUPT_ATTEMPT_RECORD" ||
         err === "DISPATCHED_REPORT_REQUIRES_RUNNING" ||
         err.startsWith("INVALID_") ||
         err.includes("REPORT")

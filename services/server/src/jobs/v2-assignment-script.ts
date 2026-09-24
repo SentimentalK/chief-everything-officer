@@ -14,37 +14,20 @@ end
 if badtype(KEYS[1], 'string') then
   return redis.error_reply('WRONGTYPE_REQ_KEY')
 end
+
+local existing_job_id = redis.call('GET', KEYS[1])
+if existing_job_id then
+  return cjson.encode({ status = 'existing_request', job_id = existing_job_id })
+end
+
+if badtype(KEYS[2], 'string') then
+  return redis.error_reply('WRONGTYPE_JOB_KEY')
+end
 if badtype(KEYS[3], 'stream') then
   return redis.error_reply('WRONGTYPE_STREAM_KEY')
 end
 if badtype(KEYS[4], 'zset') then
   return redis.error_reply('WRONGTYPE_TARGET_QUEUE')
-end
-
-local req = redis.call('GET', KEYS[1])
-if req then
-  if badtype(KEYS[2], 'string') then
-    return redis.error_reply('WRONGTYPE_JOB_KEY')
-  end
-  local job = redis.call('GET', KEYS[2])
-  if not job then
-    return cjson.encode({ error = 'CORRUPT_SUBMISSION_REFERENCE' })
-  end
-  local okjd, jd = pcall(cjson.decode, job)
-  if not okjd then
-    return cjson.encode({ error = 'MALFORMED_JOB_RECORD' })
-  end
-  if jd.user_id ~= ARGV[2] or jd.workspace_id ~= ARGV[3] or jd.request_id ~= ARGV[9] then
-    return cjson.encode({ error = 'IDEMPOTENCY_CONFLICT' })
-  end
-  if jd.status == 'preparing' then
-    return cjson.encode({ error = 'INCOMPLETE_SUBMISSION' })
-  end
-  if jd.request_digest == ARGV[7] then
-    return cjson.encode({ status = 'replayed', job_id = jd.job_id })
-  else
-    return cjson.encode({ error = 'IDEMPOTENCY_CONFLICT' })
-  end
 end
 
 -- New submission: verify Key 2 does not already exist (job_id collision protection)
@@ -232,6 +215,20 @@ if not oka then
   return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
 end
 
+if attempt.schema_version ~= 1 or
+   type(attempt.claimed_at_ms) ~= 'number' or
+   type(attempt.target_binding_id) ~= 'string' or attempt.target_binding_id == '' or
+   type(attempt.claim_token_sha256) ~= 'string' or string.len(attempt.claim_token_sha256) ~= 64 then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+
+if attempt.phase == 'claimed' and (attempt.started_at_ms ~= nil and attempt.started_at_ms ~= cjson.null) then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+if attempt.phase == 'running' and type(attempt.started_at_ms) ~= 'number' then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+
 if job.status ~= 'active' or job.latest_attempt_id ~= ARGV[1] then
   return cjson.encode({ error = 'JOB_NOT_ACTIVE' })
 end
@@ -296,6 +293,20 @@ if not oka then
   return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
 end
 
+if attempt.schema_version ~= 1 or
+   type(attempt.claimed_at_ms) ~= 'number' or
+   type(attempt.target_binding_id) ~= 'string' or attempt.target_binding_id == '' or
+   type(attempt.claim_token_sha256) ~= 'string' or string.len(attempt.claim_token_sha256) ~= 64 then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+
+if attempt.phase == 'claimed' and (attempt.started_at_ms ~= nil and attempt.started_at_ms ~= cjson.null) then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+if attempt.phase == 'running' and type(attempt.started_at_ms) ~= 'number' then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+
 if job.latest_attempt_id ~= ARGV[1] then
   return cjson.encode({ error = 'ATTEMPT_MISMATCH' })
 end
@@ -338,12 +349,30 @@ if type(rep.task_dispatched) ~= 'boolean' then
   return cjson.encode({ error = 'INVALID_TASK_DISPATCHED' })
 end
 
+if type(rep.finished_at_ms) ~= 'number' or rep.finished_at_ms < 0 then
+  return cjson.encode({ error = 'INVALID_REPORT_FINISHED_AT' })
+end
+
+if type(rep.duration_ms) ~= 'number' or rep.duration_ms < 0 then
+  return cjson.encode({ error = 'INVALID_REPORT_DURATION' })
+end
+
+if type(rep.receipt_sha256) ~= 'string' or string.len(rep.receipt_sha256) ~= 64 then
+  return cjson.encode({ error = 'INVALID_REPORT_RECEIPT_SHA256' })
+end
+
+if type(rep.executor) ~= 'table' or type(rep.executor.type) ~= 'string' or type(rep.executor.version) ~= 'string' then
+  return cjson.encode({ error = 'INVALID_REPORT_EXECUTOR' })
+end
+
 if rep.execution_status == 'COMPLETED' and (rep.error ~= nil and rep.error ~= cjson.null) then
   return cjson.encode({ error = 'COMPLETED_REPORT_HAS_ERROR' })
 end
 
-if rep.execution_status ~= 'COMPLETED' and (rep.error == nil or rep.error == cjson.null) then
-  return cjson.encode({ error = 'NON_COMPLETED_REPORT_MISSING_ERROR' })
+if rep.execution_status ~= 'COMPLETED' then
+  if type(rep.error) ~= 'table' or type(rep.error.stage) ~= 'string' or type(rep.error.code) ~= 'string' or type(rep.error.message) ~= 'string' then
+    return cjson.encode({ error = 'INVALID_REPORT_ERROR_SHAPE' })
+  end
 end
 
 if not rep.task_dispatched and rep.business_outcome ~= 'NOT_STARTED' then

@@ -4,6 +4,7 @@ import {
   type AttemptRecordV1,
   type ResultTarget,
   JOBS_V2_SCHEMA_VERSION,
+  JOB_CLAIM_TTL_MS_V2,
   businessDigestV2,
   ATTEMPT_ID_V2_RE,
   HEX_64_RE,
@@ -271,7 +272,7 @@ export class JobCoordinatorV2 {
     // Step 3: Create Job
     const jobId = `job-${crypto.randomUUID()}`;
     const now = this.nowMs();
-    const claimDeadlineMs = now + Math.max(3600 * 1000, input.execution_timeout_seconds * 1000);
+    const claimDeadlineMs = now + JOB_CLAIM_TTL_MS_V2;
 
     const jobRecord: JobRecordV2 = {
       schema_version: JOBS_V2_SCHEMA_VERSION,
@@ -332,6 +333,13 @@ export class JobCoordinatorV2 {
         continue;
       }
       if (job.claim_deadline_ms > 0 && now >= job.claim_deadline_ms) {
+        await this.store.pruneTargetQueue(candidate.target_id, candidate.job_id).catch(() => 0);
+        continue;
+      }
+      if (job.target_id !== candidate.target_id) {
+        process.stderr.write(
+          `jobs-v2: queue corruption: job ${job.job_id} target_id '${job.target_id}' does not match queue target '${candidate.target_id}'; pruning from queue.\n`,
+        );
         await this.store.pruneTargetQueue(candidate.target_id, candidate.job_id).catch(() => 0);
         continue;
       }

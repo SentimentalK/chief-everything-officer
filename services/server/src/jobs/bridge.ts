@@ -1,6 +1,10 @@
-import { createClient } from "redis";
 import { JobService, type JobAuthScope, type JobServiceDeps } from "./service.js";
-import { RedisJobStore, createRedisRunnerFromClient, StoreError, type RedisRunner } from "./redis-store.js";
+import {
+  RedisJobStore,
+  StoreError,
+  type RedisRunner,
+  openNeutralRedisRunner,
+} from "./redis-store.js";
 
 export interface JobBridge {
   service: JobService | null;
@@ -16,22 +20,31 @@ const CONNECT_TIMEOUT_MS = 2000;
 
 /**
  * Builds the optional worker-bridge job layer. When the bridge is disabled no
- * service is created (tools report BRIDGE_DISABLED). When enabled we own ONE
- * shared node-redis client with offline queue disabled and bounded connect/op
- * timeouts; readiness is read live so QUEUE_UNAVAILABLE is surfaced until the
- * backend recovers, after which tools become usable again. HTTP startup never
- * blocks on the connect (client connects in the background).
+ * service is created (tools report BRIDGE_DISABLED). When enabled and a shared
+ * runner is provided, it reuses that runner (lifecycle owned externally).
+ * When enabled without a shared runner, we own ONE shared runner; HTTP startup
+ * never blocks on the connect (client connects in the background).
  */
 export function openJobBridge(
   cfg: { bridgeEnabled: boolean; redisUrl?: string },
   resourceExists?: JobResourceExists,
+  sharedRunner?: RedisRunner | null,
 ): JobBridge {
   if (!cfg.bridgeEnabled) {
     return { service: null, runner: null, dispose: async () => void 0 };
   }
+  if (sharedRunner) {
+    const store = new RedisJobStore(sharedRunner);
+    const service = new JobService({ store, resourceExists }, () => true);
+    return {
+      service,
+      runner: sharedRunner,
+      dispose: async () => void 0,
+    };
+  }
   if (!cfg.redisUrl) {
     // Enabled but misconfigured: not disabled; surface as unavailable forever.
-    const never = {
+    const never: RedisRunner = {
       ready: () => false,
       get: async () => null,
       set: async () => void 0,
@@ -51,37 +64,19 @@ export function openJobBridge(
     return { service: new JobService(deps, () => true), runner: never, dispose: async () => void 0 };
   }
 
-  // The runner owns the whole connection lifecycle (initial connect + one fresh
-  // client per timeout reset); the factory must mint a NEW unconnected client
-  // per call. The runner attaches the 'error' listener and catches connect
-  // failures, routing them to onClientError below; readiness is read live so
-  // QUEUE_UNAVAILABLE surfaces until the backend recovers.
-  const runner = createRedisRunnerFromClient(
-    () =>
-      createClient({
-        url: cfg.redisUrl,
-        socket: {
-          connectTimeout: CONNECT_TIMEOUT_MS,
-          // Do not buffer offline commands: a datastore fault must surface as an
-          // error, never silently commit after recovery.
-          reconnectStrategy: (retries: number) => Math.min(retries * 500, 5000),
-        },
-        disableOfflineQueue: true,
-        commandsQueueMaxLength: 64,
-      }),
-    {
-      opTimeoutMs: 2500,
-      onClientError: (err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`bridge: redis error: ${msg}\n`);
-      },
+  const transport = openNeutralRedisRunner(cfg.redisUrl, {
+    connectTimeoutMs: CONNECT_TIMEOUT_MS,
+    opTimeoutMs: 2500,
+    onClientError: (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`bridge: redis error: ${msg}\n`);
     },
-  );
-  const store = new RedisJobStore(runner);
+  })!;
+  const store = new RedisJobStore(transport.runner);
   const service = new JobService({ store, resourceExists }, () => true);
   return {
     service,
-    runner,
-    dispose: () => runner.dispose(),
+    runner: transport.runner,
+    dispose: () => transport.dispose(),
   };
 }
