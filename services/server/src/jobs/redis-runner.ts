@@ -61,6 +61,8 @@ export interface RedisRunner {
   xlen(key: string): Promise<number>;
   /** XRANGE over a stream from an EXCLUSIVE start with a bounded COUNT. */
   xrange(key: string, afterExclusive: string, count: number): Promise<Array<[string, string[]]>>;
+  /** XREVRANGE over a stream from a high bound (exclusive if beforeExclusive is non-null, else +) down to - with a bounded COUNT. */
+  xrevrange(key: string, beforeExclusive: string | null, count: number): Promise<Array<[string, string[]]>>;
   /** Load a Lua script; returns its sha1. */
   scriptLoad(script: string): Promise<string>;
   /** EVALSHA for our script; caller owns NOSCRIPT reload. */
@@ -284,6 +286,27 @@ export function createRedisRunnerFromClient(
           key,
           `(${afterExclusive}`,
           "+",
+          "COUNT",
+          String(count),
+        ]);
+        const rows = Array.isArray(out) ? out : [];
+        return rows.map((row) => {
+          const arr = Array.isArray(row) ? row : [];
+          const id = arr[0] === null ? "" : String(arr[0]);
+          const flat = (Array.isArray(arr[1]) ? arr[1] : []) as unknown[];
+          const fields = flat.map((f) => (f === null ? "" : String(f)));
+          return [id, fields] as [string, string[]];
+        });
+      });
+    },
+    async xrevrange(key, beforeExclusive, count) {
+      return execute("XREVRANGE", async (client) => {
+        const end = beforeExclusive ? `(${beforeExclusive}` : "+";
+        const out = await client.sendCommand([
+          "XREVRANGE",
+          key,
+          end,
+          "-",
           "COUNT",
           String(count),
         ]);

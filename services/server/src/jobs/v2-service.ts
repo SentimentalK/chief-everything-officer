@@ -11,15 +11,20 @@ import {
   REQUEST_ID_V2_RE,
   TARGET_ID_V2_RE,
   RESOURCE_ID_V2_RE,
+  JOB_ID_V2_RE,
+  STREAM_ENTRY_ID_RE,
   MIN_TIMEOUT_SECONDS,
   MAX_TIMEOUT_SECONDS,
   MAX_PROMPT_BYTES,
   MAX_ACCEPTANCE_BYTES,
   utf8ByteLength,
   isWhitespaceOnly,
+  validateStreamEntryV2,
 } from "./v2-schema.js";
 import {
   type ExecutionReport,
+  type ExecutionStatus,
+  type BusinessOutcome,
   executionReportSchema,
 } from "./execution-contract.js";
 import {
@@ -30,6 +35,120 @@ import {
 } from "./v2-store.js";
 import type { ConnectorControlStore } from "../connector/control-store.js";
 import type { IdentityStore } from "../identity/store.js";
+import { assertHostWorkspaceAccess } from "./tool-audit.js";
+
+export type HostJobState = "queued" | "expired" | "claimed" | "running" | "terminal";
+
+export interface ListJobsQuery {
+  target_id?: string | null;
+  state?: HostJobState | null;
+  execution_status?: ExecutionStatus | null;
+  limit?: number;
+  cursor?: string | null;
+}
+
+export interface HostJobSummary {
+  job_id: string;
+  target_id: string;
+  target_alias: string | null;
+  state: HostJobState;
+  created_at: string;
+  expires_at: string | null;
+  resource_id: string | null;
+  result_target: ResultTarget;
+  execution?: {
+    attempt_id: string;
+    phase: string;
+    claimed_at: string;
+    started_at: string | null;
+  } | null;
+  report?: {
+    execution_status: ExecutionStatus;
+    business_outcome: BusinessOutcome;
+    finished_at: string;
+    duration_ms: number;
+    error: {
+      stage: string;
+      code: string;
+      message: string;
+    } | null;
+  } | null;
+  result?: {
+    target: "resource";
+    resource_id: string;
+    commit: string;
+  } | null;
+}
+
+export interface HostJobDetail extends HostJobSummary {
+  task?: {
+    prompt: string;
+    acceptance: string;
+    timeout_seconds: number;
+  };
+}
+
+export const JOB_LIST_DEFAULT_LIMIT = 20;
+export const JOB_LIST_MAX_LIMIT = 50;
+export const JOB_LIST_SCAN_BATCH = 64;
+export const JOB_LIST_MAX_SCANNED = 256;
+
+export function deriveHostJobState(
+  job: JobRecordV2,
+  attempt: AttemptRecordV1 | null,
+  nowMs: number,
+): HostJobState {
+  if (job.status === "preparing") {
+    throw new V2StoreError(
+      "QUEUE_UNAVAILABLE",
+      `Job '${job.job_id}' is in preparing status.`,
+      "CORRUPT_JOB_STATE",
+    );
+  }
+
+  if (job.status === "queued") {
+    return nowMs < job.claim_deadline_ms ? "queued" : "expired";
+  }
+
+  if (job.status === "active") {
+    if (!attempt) {
+      throw new V2StoreError(
+        "QUEUE_UNAVAILABLE",
+        `Active job '${job.job_id}' has no attempt record.`,
+        "CORRUPT_JOB_STATE",
+      );
+    }
+    if (attempt.phase === "claimed") return "claimed";
+    if (attempt.phase === "running") return "running";
+    throw new V2StoreError(
+      "QUEUE_UNAVAILABLE",
+      `Active job '${job.job_id}' has unexpected attempt phase '${attempt.phase}'.`,
+      "CORRUPT_JOB_STATE",
+    );
+  }
+
+  if (job.status === "terminal") {
+    if (!attempt) {
+      throw new V2StoreError(
+        "QUEUE_UNAVAILABLE",
+        `Terminal job '${job.job_id}' has no attempt record.`,
+        "CORRUPT_JOB_STATE",
+      );
+    }
+    if (attempt.phase === "terminal") return "terminal";
+    throw new V2StoreError(
+      "QUEUE_UNAVAILABLE",
+      `Terminal job '${job.job_id}' has unexpected attempt phase '${attempt.phase}'.`,
+      "CORRUPT_JOB_STATE",
+    );
+  }
+
+  throw new V2StoreError(
+    "QUEUE_UNAVAILABLE",
+    `Job '${job.job_id}' has unrecognized status '${job.status}'.`,
+    "CORRUPT_JOB_STATE",
+  );
+}
 
 export interface JobSubmitScopeV2 {
   user_id: string;
@@ -494,5 +613,334 @@ export class JobCoordinatorV2 {
       replayed: res.status === "replayed",
       server_time: new Date(res.server_time_ms).toISOString(),
     };
+  }
+
+  async getJobForHost(
+    scope: JobSubmitScopeV2,
+    jobId: string,
+    options?: { include_task?: boolean },
+  ): Promise<HostJobDetail> {
+    assertHostWorkspaceAccess(this.identityStore, scope);
+
+    if (!jobId || !JOB_ID_V2_RE.test(jobId)) {
+      throw new JobValidationError("Invalid job_id format.");
+    }
+
+    const job = await this.store.getJob(jobId);
+    if (!job || job.workspace_id !== scope.workspace_id) {
+      throw new V2JobNotFoundError();
+    }
+
+    let attempt: AttemptRecordV1 | null = null;
+    if (job.latest_attempt_id) {
+      attempt = await this.store.getAttempt(job.latest_attempt_id);
+      if (!attempt) {
+        throw new V2StoreError(
+          "QUEUE_UNAVAILABLE",
+          `Job references missing attempt: ${job.latest_attempt_id}`,
+          "CORRUPT_ATTEMPT_LINKAGE",
+        );
+      }
+      if (
+        attempt.job_id !== job.job_id ||
+        attempt.workspace_id !== job.workspace_id ||
+        attempt.target_id !== job.target_id ||
+        attempt.user_id !== job.user_id
+      ) {
+        throw new V2StoreError(
+          "QUEUE_UNAVAILABLE",
+          `Attempt linkage mismatch: ${attempt.attempt_id}`,
+          "CORRUPT_ATTEMPT_LINKAGE",
+        );
+      }
+    }
+
+    const hostState = deriveHostJobState(job, attempt, this.nowMs());
+    const target = this.controlStore.getExecutionTarget(job.target_id);
+
+    const detail: HostJobDetail = {
+      job_id: job.job_id,
+      target_id: job.target_id,
+      target_alias: target?.alias ?? null,
+      state: hostState,
+      created_at: new Date(job.created_at_ms).toISOString(),
+      expires_at: new Date(job.claim_deadline_ms).toISOString(),
+      resource_id: job.resource_id,
+      result_target: job.result_target,
+      execution: attempt
+        ? {
+            attempt_id: attempt.attempt_id,
+            phase: attempt.phase,
+            claimed_at: new Date(attempt.claimed_at_ms).toISOString(),
+            started_at: attempt.started_at_ms
+              ? new Date(attempt.started_at_ms).toISOString()
+              : null,
+          }
+        : null,
+      report: attempt?.report
+        ? {
+            execution_status: attempt.report.execution_status,
+            business_outcome: attempt.report.business_outcome,
+            finished_at: new Date(attempt.report.finished_at_ms).toISOString(),
+            duration_ms: attempt.report.duration_ms,
+            error: attempt.report.error
+              ? {
+                  stage: attempt.report.error.stage,
+                  code: attempt.report.error.code,
+                  message: attempt.report.error.message,
+                }
+              : null,
+          }
+        : null,
+      result: attempt?.result
+        ? {
+            target: "resource",
+            resource_id: attempt.result.resource_id,
+            commit: attempt.result.commit,
+          }
+        : null,
+    };
+
+    if (options?.include_task) {
+      detail.task = {
+        prompt: job.prompt,
+        acceptance: job.acceptance,
+        timeout_seconds: job.execution_timeout_seconds,
+      };
+    }
+
+    return detail;
+  }
+
+  async listJobsForHost(
+    scope: JobSubmitScopeV2,
+    query: ListJobsQuery = {},
+  ): Promise<{ jobs: HostJobSummary[]; next_cursor: string | null }> {
+    assertHostWorkspaceAccess(this.identityStore, scope);
+
+    if (query.target_id !== undefined && query.target_id !== null) {
+      if (!TARGET_ID_V2_RE.test(query.target_id)) {
+        throw new JobValidationError("Invalid target_id format.");
+      }
+      const target = this.controlStore.getExecutionTarget(query.target_id);
+      if (!target || target.workspace_id !== scope.workspace_id) {
+        throw new TargetNotFoundError();
+      }
+    }
+
+    if (query.cursor !== undefined && query.cursor !== null) {
+      if (!STREAM_ENTRY_ID_RE.test(query.cursor)) {
+        throw new JobValidationError("Invalid cursor format.");
+      }
+    }
+
+    const limit = Math.min(
+      Math.max(1, query.limit ?? JOB_LIST_DEFAULT_LIMIT),
+      JOB_LIST_MAX_LIMIT,
+    );
+
+    let currentCursor: string | null = query.cursor ?? null;
+    const jobs: HostJobSummary[] = [];
+    let totalScanned = 0;
+    let nextCursor: string | null = null;
+
+    while (jobs.length < limit && totalScanned < JOB_LIST_MAX_SCANNED) {
+      const batchToFetch = Math.min(
+        JOB_LIST_SCAN_BATCH,
+        JOB_LIST_MAX_SCANNED - totalScanned,
+      );
+      const entries = await this.store.readJobStreamReverse(currentCursor, batchToFetch);
+      if (entries.length === 0) {
+        nextCursor = null;
+        break;
+      }
+
+      for (const entry of entries) {
+        totalScanned++;
+        currentCursor = entry.id;
+
+        // Two-phase tenant isolation:
+        // Step 1: Read raw workspace_id
+        const rawWs = entry.fields["workspace_id"];
+        if (
+          typeof rawWs !== "string" ||
+          !rawWs ||
+          isWhitespaceOnly(rawWs) ||
+          rawWs.length > 128
+        ) {
+          throw new V2StoreError(
+            "QUEUE_UNAVAILABLE",
+            `Corrupt stream entry: invalid workspace_id in entry ${entry.id}`,
+            "CORRUPT_JOB_INDEX",
+          );
+        }
+
+        if (rawWs !== scope.workspace_id) {
+          // Foreign workspace: skip immediately without loading Job or doing full validation
+          if (totalScanned >= JOB_LIST_MAX_SCANNED) {
+            nextCursor = entry.id;
+            break;
+          }
+          continue;
+        }
+
+        // Step 2: Authenticated workspace stream entry: strict validation
+        let streamEntry;
+        try {
+          streamEntry = validateStreamEntryV2(entry.fields);
+        } catch (e) {
+          throw new V2StoreError(
+            "QUEUE_UNAVAILABLE",
+            `Corrupt stream entry for workspace: ${(e as Error).message}`,
+            "CORRUPT_JOB_INDEX",
+          );
+        }
+
+        // Step 3: Load Job
+        const job = await this.store.getJob(streamEntry.job_id);
+        if (!job) {
+          throw new V2StoreError(
+            "QUEUE_UNAVAILABLE",
+            `Stream points to non-existent job: ${streamEntry.job_id}`,
+            "CORRUPT_JOB_INDEX",
+          );
+        }
+
+        if (
+          job.job_id !== streamEntry.job_id ||
+          job.user_id !== streamEntry.user_id ||
+          job.workspace_id !== streamEntry.workspace_id ||
+          job.target_id !== streamEntry.target_id ||
+          job.created_at_ms !== streamEntry.created_at_ms
+        ) {
+          throw new V2StoreError(
+            "QUEUE_UNAVAILABLE",
+            `Stream entry mismatch with job record: ${job.job_id}`,
+            "CORRUPT_JOB_INDEX",
+          );
+        }
+
+        // If target_id filter was provided
+        if (query.target_id && job.target_id !== query.target_id) {
+          if (totalScanned >= JOB_LIST_MAX_SCANNED) {
+            nextCursor = entry.id;
+            break;
+          }
+          continue;
+        }
+
+        let attempt: AttemptRecordV1 | null = null;
+        if (job.latest_attempt_id) {
+          attempt = await this.store.getAttempt(job.latest_attempt_id);
+          if (!attempt) {
+            throw new V2StoreError(
+              "QUEUE_UNAVAILABLE",
+              `Job references missing attempt: ${job.latest_attempt_id}`,
+              "CORRUPT_ATTEMPT_LINKAGE",
+            );
+          }
+          if (
+            attempt.job_id !== job.job_id ||
+            attempt.workspace_id !== job.workspace_id ||
+            attempt.target_id !== job.target_id ||
+            attempt.user_id !== job.user_id
+          ) {
+            throw new V2StoreError(
+              "QUEUE_UNAVAILABLE",
+              `Attempt linkage mismatch: ${attempt.attempt_id}`,
+              "CORRUPT_ATTEMPT_LINKAGE",
+            );
+          }
+        }
+
+        const hostState = deriveHostJobState(job, attempt, this.nowMs());
+        if (query.state && hostState !== query.state) {
+          if (totalScanned >= JOB_LIST_MAX_SCANNED) {
+            nextCursor = entry.id;
+            break;
+          }
+          continue;
+        }
+
+        if (query.execution_status) {
+          const execStatus = attempt?.report?.execution_status;
+          if (execStatus !== query.execution_status) {
+            if (totalScanned >= JOB_LIST_MAX_SCANNED) {
+              nextCursor = entry.id;
+              break;
+            }
+            continue;
+          }
+        }
+
+        const target = this.controlStore.getExecutionTarget(job.target_id);
+
+        const summary: HostJobSummary = {
+          job_id: job.job_id,
+          target_id: job.target_id,
+          target_alias: target?.alias ?? null,
+          state: hostState,
+          created_at: new Date(job.created_at_ms).toISOString(),
+          expires_at: new Date(job.claim_deadline_ms).toISOString(),
+          resource_id: job.resource_id,
+          result_target: job.result_target,
+          execution: attempt
+            ? {
+                attempt_id: attempt.attempt_id,
+                phase: attempt.phase,
+                claimed_at: new Date(attempt.claimed_at_ms).toISOString(),
+                started_at: attempt.started_at_ms
+                  ? new Date(attempt.started_at_ms).toISOString()
+                  : null,
+              }
+            : null,
+          report: attempt?.report
+            ? {
+                execution_status: attempt.report.execution_status,
+                business_outcome: attempt.report.business_outcome,
+                finished_at: new Date(attempt.report.finished_at_ms).toISOString(),
+                duration_ms: attempt.report.duration_ms,
+                error: attempt.report.error
+                  ? {
+                      stage: attempt.report.error.stage,
+                      code: attempt.report.error.code,
+                      message: attempt.report.error.message,
+                    }
+                  : null,
+              }
+            : null,
+          result: attempt?.result
+            ? {
+                target: "resource",
+                resource_id: attempt.result.resource_id,
+                commit: attempt.result.commit,
+              }
+            : null,
+        };
+
+        jobs.push(summary);
+
+        if (jobs.length >= limit) {
+          nextCursor = entry.id;
+          break;
+        }
+
+        if (totalScanned >= JOB_LIST_MAX_SCANNED) {
+          nextCursor = entry.id;
+          break;
+        }
+      }
+
+      if (
+        entries.length < batchToFetch &&
+        jobs.length < limit &&
+        totalScanned < JOB_LIST_MAX_SCANNED
+      ) {
+        nextCursor = null;
+        break;
+      }
+    }
+
+    return { jobs, next_cursor: nextCursor };
   }
 }

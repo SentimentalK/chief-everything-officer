@@ -48,6 +48,27 @@ export function createFakeRedisRunner(): RedisRunner {
       }
       return out;
     },
+    async xrevrange(key: string, beforeExclusive: string | null, count: number) {
+      const stream = streams.get(key) ?? [];
+      const out: Array<[string, string[]]> = [];
+      let foundBefore = !beforeExclusive;
+      for (let i = stream.length - 1; i >= 0; i--) {
+        const entry = stream[i];
+        if (!foundBefore) {
+          if (entry.id === beforeExclusive) {
+            foundBefore = true;
+          }
+          continue;
+        }
+        const flat: string[] = [];
+        for (const [k, v] of Object.entries(entry.fields)) {
+          flat.push(k, String(v));
+        }
+        out.push([entry.id, flat]);
+        if (out.length >= count) break;
+      }
+      return out;
+    },
     async scriptLoad(script: string) {
       const s = sha(script);
       scriptMap.set(s, script);

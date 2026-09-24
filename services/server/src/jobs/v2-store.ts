@@ -31,7 +31,8 @@ export class V2StoreError extends StoreError {
     public readonly reasonCode?: string,
     details: Record<string, unknown> = {},
   ) {
-    super(code, message, { reasonCode, ...details });
+    const fullMessage = reasonCode && !message.includes(reasonCode) ? `${message} (${reasonCode})` : message;
+    super(code, fullMessage, { reasonCode, ...details });
     this.name = "V2StoreError";
   }
 }
@@ -454,5 +455,23 @@ export class RedisJobStoreV2 {
     this.checkReady();
     if (jobIds.length === 0) return 0;
     return await this.redis.zrem(targetQueueKeyV1(targetId), ...jobIds);
+  }
+
+  async readJobStreamReverse(
+    beforeExclusive: string | null,
+    count: number,
+  ): Promise<Array<{ id: string; fields: Record<string, string> }>> {
+    this.checkReady();
+    const rows = await this.redis.xrevrange(KEY_STREAM_V2, beforeExclusive, count);
+    return rows.map(([id, flat]) => {
+      const fields: Record<string, string> = {};
+      for (let i = 0; i < flat.length; i += 2) {
+        const key = flat[i];
+        if (key !== undefined) {
+          fields[key] = flat[i + 1] ?? "";
+        }
+      }
+      return { id, fields };
+    });
   }
 }

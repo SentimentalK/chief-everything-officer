@@ -495,6 +495,11 @@ app.all(
             auditStore,
             identity: mcpIdentity,
             jobs: { service: jobBridge.service },
+            connectorJobs: {
+              coordinator: v2Coordinator,
+              controlStore: connectorControlStore,
+              identityStore: identityService.storeInstance,
+            },
             resourceService: runtime.resourceService,
           }),
         // 2025-era hosts still send initialize; this is the SDK's standard fallback.

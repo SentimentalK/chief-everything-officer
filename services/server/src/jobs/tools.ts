@@ -12,6 +12,16 @@ import {
   JOB_ID_RE,
 } from "./schema.js";
 
+import {
+  sanitizeRequestId,
+  sanitizeJobId,
+  recordSafeJobAuditTrace,
+  installJobToolValidationAuditInterceptor,
+  type SafeJobAuditLog,
+} from "./tool-audit.js";
+
+export { sanitizeRequestId, sanitizeJobId };
+
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   structuredContent: Record<string, unknown>;
@@ -32,55 +42,16 @@ function result(value: Record<string, unknown>, isError = false): ToolResult {
   };
 }
 
-interface SafeLog {
-  request_id?: string | null;
-  job_id?: string | null;
-  request_digest?: string | null;
-  prompt_bytes?: number | null;
-  acceptance_bytes?: number | null;
-  result_target?: "none" | "resource" | null;
-  error_code?: string | null;
-}
-
-export function sanitizeRequestId(val: unknown): string | null {
-  return typeof val === "string" && REQUEST_ID_RE.test(val) ? val : null;
-}
-
-export function sanitizeJobId(val: unknown): string | null {
-  return typeof val === "string" && JOB_ID_RE.test(val) ? val : null;
-}
-
-function logTrace(ctx: ToolContext, toolName: string, status: "success" | "error", latencyMs: number, safe: SafeLog): void {
-  if (!ctx.auditStore) return;
-  const sanitizedReqId = sanitizeRequestId(safe.request_id);
-  const sanitizedJobId = sanitizeJobId(safe.job_id);
-
-  ctx.auditStore.recordTrace({
-    workspace_id: ctx.scope.workspace_id,
-    timestamp_ms: Date.now(),
-    tool_name: toolName,
+function logTrace(ctx: ToolContext, toolName: string, status: "success" | "error", latencyMs: number, safe: SafeJobAuditLog): void {
+  recordSafeJobAuditTrace(
+    ctx.auditStore,
+    ctx.scope.workspace_id,
+    ctx.scope.user_id,
+    toolName,
     status,
-    error_message: safe.error_code ?? null,
-    operation_request_id: sanitizedReqId,
-    input_json: JSON.stringify("full prompt/input withheld; digest: " + (safe.request_digest ?? "")),
-    output_json: JSON.stringify({
-      ok: status === "success",
-      scope: { user_id: ctx.scope.user_id, workspace_id: ctx.scope.workspace_id },
-      job_id: sanitizedJobId,
-      request_id: sanitizedReqId,
-      request_digest: safe.request_digest ?? null,
-      prompt_bytes: safe.prompt_bytes ?? null,
-      acceptance_bytes: safe.acceptance_bytes ?? null,
-      result_target: safe.result_target ?? null,
-      error_code: safe.error_code ?? null,
-    }),
-    semantic_output_json: JSON.stringify({
-      ok: status === "success",
-      job_id: sanitizedJobId,
-      request_id: sanitizedReqId,
-    }),
-    latency_ms: latencyMs,
-  });
+    latencyMs,
+    safe,
+  );
 }
 
 export function registerJobTools(server: McpServer, ctx: ToolContext): void {
@@ -189,43 +160,7 @@ export function registerJobTools(server: McpServer, ctx: ToolContext): void {
     }) as unknown as any,
   );
 
-  // Intercept low-level tools/call to ensure schema validation errors occurring before
-  // tool handlers record an audit trace with sanitized IDs and withheld prompts.
-  const innerServer = (server as any).server;
-  if (innerServer && typeof innerServer._requestHandlers?.get === "function" && !innerServer.__toolsCallInterceptedForJobs) {
-    innerServer.__toolsCallInterceptedForJobs = true;
-    const originalCallHandler = innerServer._requestHandlers.get("tools/call");
-    if (typeof originalCallHandler === "function") {
-      innerServer._requestHandlers.set("tools/call", async (request: any, extra: any) => {
-        const started = Date.now();
-        const res = await originalCallHandler(request, extra);
-        if (
-          res?.isError &&
-          !res.structuredContent &&
-          (request?.params?.name === "worker_submit" || request?.params?.name === "worker_get")
-        ) {
-          const args = (request.params?.arguments ?? {}) as Record<string, unknown>;
-          const reqId = sanitizeRequestId(args.request_id);
-          const jobId = sanitizeJobId(args.job_id);
-          const promptBytes = typeof args.prompt === "string" ? utf8ByteLength(args.prompt) : null;
-          const accBytes = typeof args.acceptance === "string" ? utf8ByteLength(args.acceptance) : null;
-          const resultTarget =
-            args.result_target === "none" || args.result_target === "resource"
-              ? args.result_target
-              : null;
-          logTrace(ctx, request.params.name, "error", Date.now() - started, {
-            request_id: reqId,
-            job_id: jobId,
-            prompt_bytes: promptBytes,
-            acceptance_bytes: accBytes,
-            result_target: resultTarget,
-            error_code: "INVALID_INPUT",
-          });
-        }
-        return res;
-      });
-    }
-  }
+  installJobToolValidationAuditInterceptor(server, ctx.auditStore, scope);
 }
 
 function errInfo(error: unknown): { code: string; message: string; reason?: string } {
