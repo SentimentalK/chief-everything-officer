@@ -76,8 +76,8 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
     // 3. Git tool & identity
     check_git_tooling(&mut checks);
 
-    // 4. Orca discovery
-    check_orca_cli(&mut checks);
+    // 4. Orca discovery and runtime status
+    check_orca_cli(&mut checks).await;
 
     // 5. Server reachability, identity, workspaces, targets
     if let Some(ref c) = cred {
@@ -316,26 +316,86 @@ fn check_git_tooling(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
-    let orca_version = Command::new("orca").arg("--version").output();
-    match orca_version {
-        Ok(output) if output.status.success() => {
-            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
+    let client = crate::orca::client::OrcaCliClient::default();
+    match client.status().await {
+        Ok(status) if status.ok => {
+            if let Some(res) = status.result {
+                let ver = res
+                    .runtime
+                    .app_version
+                    .unwrap_or_else(|| "unknown".into());
+                let app_running = res.app.running;
+                let runtime_state = res.runtime.state;
+                if app_running && runtime_state == "ready" {
+                    checks.push(DiagnosticCheck {
+                        name: "Orca CLI & Runtime".into(),
+                        severity: DiagnosticSeverity::Pass,
+                        message: format!("Version {ver}, desktop app running, runtime ready"),
+                    });
+                } else if app_running {
+                    checks.push(DiagnosticCheck {
+                        name: "Orca CLI & Runtime".into(),
+                        severity: DiagnosticSeverity::Warn,
+                        message: format!(
+                            "Version {ver}, desktop app running, runtime state: {runtime_state}"
+                        ),
+                    });
+                } else {
+                    checks.push(DiagnosticCheck {
+                        name: "Orca CLI & Runtime".into(),
+                        severity: DiagnosticSeverity::Warn,
+                        message: format!(
+                            "Version {ver}, desktop app not running (start Orca before running daemon)"
+                        ),
+                    });
+                }
+            } else {
+                checks.push(DiagnosticCheck {
+                    name: "Orca CLI & Runtime".into(),
+                    severity: DiagnosticSeverity::Pass,
+                    message: "Orca CLI status ok".into(),
+                });
+            }
+        }
+        Ok(_) => {
             checks.push(DiagnosticCheck {
-                name: "Orca CLI Executable".into(),
-                severity: DiagnosticSeverity::Pass,
-                message: format!("Detected version {ver}"),
+                name: "Orca CLI & Runtime".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: "Orca status reported ok=false".into(),
             });
         }
-        _ => {
+        Err(crate::orca::client::OrcaError::Io(err))
+            if err.kind() == std::io::ErrorKind::NotFound =>
+        {
             checks.push(DiagnosticCheck {
-                name: "Orca CLI Executable".into(),
+                name: "Orca CLI & Runtime".into(),
                 severity: DiagnosticSeverity::Warn,
                 message: "Orca CLI not found in PATH (required for V1.7 execution)".into(),
             });
         }
+        Err(e) => {
+            let ver = Command::new("orca").arg("--version").output();
+            if let Ok(out) = ver {
+                if out.status.success() {
+                    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    checks.push(DiagnosticCheck {
+                        name: "Orca CLI & Runtime".into(),
+                        severity: DiagnosticSeverity::Warn,
+                        message: format!("Detected {v}, but status probe failed: {e}"),
+                    });
+                    return;
+                }
+            }
+            checks.push(DiagnosticCheck {
+                name: "Orca CLI & Runtime".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!("Orca CLI probe failed: {e}"),
+            });
+        }
     }
 }
+
 
 async fn check_server_integration(
     paths: &ConnectorPaths,

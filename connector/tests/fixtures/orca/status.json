@@ -1,0 +1,24 @@
+{
+  "id": "local-status",
+  "ok": true,
+  "result": {
+    "target": {
+      "kind": "local"
+    },
+    "app": {
+      "running": true,
+      "pid": 1386907,
+      "desktopWindowStatus": "available"
+    },
+    "runtime": {
+      "state": "ready",
+      "reachable": true,
+      "connectionState": "connected",
+      "runtimeId": "ecde337b-2214-4bdb-b09b-458b5f8d8cc7",
+      "appVersion": "1.4.209"
+    }
+  },
+  "_meta": {
+    "runtimeId": "ecde337b-2214-4bdb-b09b-458b5f8d8cc7"
+  }
+}

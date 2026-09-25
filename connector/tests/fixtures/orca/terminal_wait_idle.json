@@ -1,0 +1,15 @@
+{
+  "id": "19bfa780-e3a5-4eb8-b99f-3d964f51e37b",
+  "ok": true,
+  "result": {
+    "wait": {
+      "handle": "term_593ff419-ea4d-45eb-9ac0-f4d37b91ac38",
+      "condition": "tui-idle",
+      "satisfied": true,
+      "elapsedMs": 4200
+    }
+  },
+  "_meta": {
+    "runtimeId": "ecde337b-2214-4bdb-b09b-458b5f8d8cc7"
+  }
+}
