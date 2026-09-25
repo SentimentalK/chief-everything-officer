@@ -77,7 +77,7 @@ impl OrcaCliClient {
         tokio::select! {
             _ = &mut timeout_fut => {
                 let _ = child.kill().await;
-                return Err(OrcaError::Timeout(timeout));
+                Err(OrcaError::Timeout(timeout))
             }
             res = async {
                 let mut stdout_take = stdout_handle.take(MAX_CLI_BUFFER_BYTES as u64);
@@ -155,17 +155,27 @@ impl OrcaCliClient {
         command: Option<&str>,
         cwd: Option<&Path>,
     ) -> Result<OrcaTerminalItem, OrcaError> {
-        let mut args = vec!["terminal", "create", "--worktree", worktree_selector, "--title", title, "--json"];
+        let mut args = vec![
+            "terminal",
+            "create",
+            "--worktree",
+            worktree_selector,
+            "--title",
+            title,
+            "--json",
+        ];
         if let Some(cmd) = command {
             args.push("--command");
             args.push(cmd);
         }
-        let raw = self.execute_command(&args, cwd, self.default_timeout).await?;
+        let raw = self
+            .execute_command(&args, cwd, self.default_timeout)
+            .await?;
         let resp: OrcaTerminalCreateResponse =
             serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-        resp.result
-            .map(|r| r.terminal)
-            .ok_or_else(|| OrcaError::Orca("terminal create returned missing terminal object".into()))
+        resp.result.map(|r| r.terminal).ok_or_else(|| {
+            OrcaError::Orca("terminal create returned missing terminal object".into())
+        })
     }
 
     pub async fn send_terminal_prompt(
@@ -196,7 +206,9 @@ impl OrcaCliClient {
             args.push(req_id);
         }
 
-        let raw = self.execute_command(&args, None, self.default_timeout).await?;
+        let raw = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
         serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
     }
 
@@ -224,8 +236,17 @@ impl OrcaCliClient {
     }
 
     pub async fn close_terminal(&self, terminal_handle: &str) -> Result<(), OrcaError> {
-        let args = vec!["terminal", "close", "--terminal", terminal_handle, "--tab", "--json"];
-        let raw = self.execute_command(&args, None, self.default_timeout).await?;
+        let args = vec![
+            "terminal",
+            "close",
+            "--terminal",
+            terminal_handle,
+            "--tab",
+            "--json",
+        ];
+        let raw = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
         let _resp: OrcaTerminalCloseResponse =
             serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
         Ok(())

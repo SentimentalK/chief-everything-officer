@@ -321,10 +321,7 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
     match client.status().await {
         Ok(status) if status.ok => {
             if let Some(res) = status.result {
-                let ver = res
-                    .runtime
-                    .app_version
-                    .unwrap_or_else(|| "unknown".into());
+                let ver = res.runtime.app_version.unwrap_or_else(|| "unknown".into());
                 let app_running = res.app.running;
                 let runtime_state = res.runtime.state;
                 if app_running && runtime_state == "ready" {
@@ -395,7 +392,6 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
         }
     }
 }
-
 
 async fn check_server_integration(
     paths: &ConnectorPaths,

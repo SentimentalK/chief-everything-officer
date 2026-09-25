@@ -125,12 +125,7 @@ fi
     let status = client.status().await.unwrap();
     assert!(status.ok);
     assert_eq!(
-        status
-            .result
-            .unwrap()
-            .runtime
-            .app_version
-            .as_deref(),
+        status.result.unwrap().runtime.app_version.as_deref(),
         Some("1.4.209")
     );
 

@@ -10,11 +10,11 @@ use crate::client::{ClientError, ConnectorClient, ConnectorTargetProjection, Pen
 use crate::config::{load_bound_profile, ConfigError, ProfileError};
 use crate::credential::{CredentialError, DeviceCredential};
 use crate::enrollment::{now_utc_ms, PendingEnrollmentSession};
-use crate::local_state::{remove_durable, ExecutionLock};
 use crate::execution_contract::{
     BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionReportExecutor,
     ExecutionStatus, REPORT_SCHEMA_VERSION,
 };
+use crate::local_state::{remove_durable, ExecutionLock};
 use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
     compute_report_sha256, deliver_outbox_record, flush_outbox, OutboxError, OutboxRecord,
@@ -443,7 +443,12 @@ pub async fn drive_active_attempt(
         AttemptPhase::ClaimIntent => {
             // Replay claim intent
             match client
-                .claim_job(cred, &active.job_id, &active.attempt_id, &active.claim_token)
+                .claim_job(
+                    cred,
+                    &active.job_id,
+                    &active.attempt_id,
+                    &active.claim_token,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -570,7 +575,8 @@ pub async fn drive_active_attempt(
                     error: Some(ExecutionReportError {
                         stage: "orchestration".into(),
                         code: "RESULT_TARGET_UNSUPPORTED".into(),
-                        message: "result_target 'resource' is unsupported in V1.7 (requires V1.8)".into(),
+                        message: "result_target 'resource' is unsupported in V1.7 (requires V1.8)"
+                            .into(),
                     }),
                     executor: ExecutionReportExecutor {
                         executor_type: "ceo-connector".into(),
@@ -578,7 +584,9 @@ pub async fn drive_active_attempt(
                     },
                     receipt_sha256,
                 };
-                report.validate().map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+                report
+                    .validate()
+                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
                 let digest = compute_report_sha256(&report);
 
                 let outbox_rec = OutboxRecord {
@@ -592,7 +600,9 @@ pub async fn drive_active_attempt(
                     created_at_ms: now_utc_ms(),
                 };
                 let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
-                outbox_rec.save(&outbox_file).map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+                outbox_rec
+                    .save(&outbox_file)
+                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
 
                 let _lock = ExecutionLock::acquire_with_retry(
                     &paths.state_lock_file(),
@@ -628,7 +638,12 @@ pub async fn drive_active_attempt(
         }
         AttemptPhase::StartIntent => {
             match client
-                .start_job(cred, &active.job_id, &active.attempt_id, &active.claim_token)
+                .start_job(
+                    cred,
+                    &active.job_id,
+                    &active.attempt_id,
+                    &active.claim_token,
+                )
                 .await
             {
                 Ok(ack) => {
@@ -729,7 +744,10 @@ pub async fn drive_active_attempt(
             }
 
             let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
-            let target = match disk_config.as_ref().and_then(|c| c.targets.get(&active.target_id)) {
+            let target = match disk_config
+                .as_ref()
+                .and_then(|c| c.targets.get(&active.target_id))
+            {
                 Some(t) => t.clone(),
                 None => {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -761,10 +779,24 @@ pub async fn drive_active_attempt(
                         Some(c) if c.attempt_id == active.attempt_id => c,
                         _ => return Ok(true),
                     };
-                    if let Some(ref mut exec) = current.executor {
-                        exec.worktree_id = Some(worktree_id);
-                        exec.terminal_id = Some(terminal_id);
-                    }
+                    let exec = current.executor.get_or_insert_with(|| {
+                        crate::scheduler::AttemptExecutorState {
+                            executor_type: "orca".into(),
+                            orca_version: None,
+                            worktree_id: None,
+                            terminal_id: None,
+                            dispatch_send_count: 0,
+                            dispatch_started_at_ms: None,
+                            execution_deadline_ms: None,
+                            dispatch_request_id: None,
+                            dispatch_accepted_at_ms: None,
+                            runtime_completion_kind: None,
+                            runtime_completed_at_ms: None,
+                            runtime_error: None,
+                        }
+                    });
+                    exec.worktree_id = Some(worktree_id);
+                    exec.terminal_id = Some(terminal_id);
                     current.phase = AttemptPhase::Prepared;
                     current.save(&paths.active_attempt_file())?;
                     println!(
@@ -818,7 +850,11 @@ pub async fn drive_active_attempt(
             Ok(true)
         }
         AttemptPhase::DispatchIntent => {
-            let terminal_id = match active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+            let terminal_id = match active
+                .executor
+                .as_ref()
+                .and_then(|e| e.terminal_id.as_ref())
+            {
                 Some(tid) => tid.clone(),
                 None => {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -944,9 +980,7 @@ pub async fn drive_active_attempt(
                             eprintln!("Dispatch rejected before acceptance: {reason}. Intent remains for retry/budget check.");
                             Ok(true)
                         }
-                        crate::scheduler::DispatchOutcome::AmbiguousTransportFailure {
-                            error,
-                        } => {
+                        crate::scheduler::DispatchOutcome::AmbiguousTransportFailure { error } => {
                             eprintln!("Ambiguous transport failure during dispatch: {error}. Intent remains for reconciliation.");
                             Ok(true)
                         }
@@ -985,7 +1019,11 @@ pub async fn drive_active_attempt(
             Ok(true)
         }
         AttemptPhase::Waiting => {
-            let terminal_id = match active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+            let terminal_id = match active
+                .executor
+                .as_ref()
+                .and_then(|e| e.terminal_id.as_ref())
+            {
                 Some(tid) => tid.clone(),
                 None => {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -1005,7 +1043,11 @@ pub async fn drive_active_attempt(
                 }
             };
 
-            let deadline_ms = match active.executor.as_ref().and_then(|e| e.execution_deadline_ms) {
+            let deadline_ms = match active
+                .executor
+                .as_ref()
+                .and_then(|e| e.execution_deadline_ms)
+            {
                 Some(dl) => dl,
                 None => {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -1085,7 +1127,11 @@ pub async fn drive_active_attempt(
         }
         AttemptPhase::OutcomeRecorded => {
             // NEVER wait or dispatch again!
-            if let Some(ref tid) = active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+            if let Some(tid) = active
+                .executor
+                .as_ref()
+                .and_then(|e| e.terminal_id.as_ref())
+            {
                 let _ = adapter.close(tid).await;
             }
 
@@ -1118,7 +1164,9 @@ pub async fn drive_active_attempt(
             };
 
             let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
-            let completed_ms = exec_state.runtime_completed_at_ms.unwrap_or_else(now_utc_ms);
+            let completed_ms = exec_state
+                .runtime_completed_at_ms
+                .unwrap_or_else(now_utc_ms);
             let duration_ms = (completed_ms - started_ms).max(0);
 
             let receipt = ExecutionReceipt {
@@ -1236,8 +1284,7 @@ pub async fn drive_active_attempt(
                 if hist.job_id == active.job_id
                     && hist.attempt_id == active.attempt_id
                     && hist.target_id == active.target_id
-                    && Some(&hist.terminal_report_sha256)
-                        == active.terminal_report_sha256.as_ref()
+                    && Some(&hist.terminal_report_sha256) == active.terminal_report_sha256.as_ref()
                 {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
@@ -1254,15 +1301,14 @@ pub async fn drive_active_attempt(
                 }
             } else {
                 Err(DaemonError::RecoveryRequired(
-                    "Attempt in finalized_local but neither valid history nor outbox file exists".into(),
+                    "Attempt in finalized_local but neither valid history nor outbox file exists"
+                        .into(),
                 ))
             }
         }
-        AttemptPhase::RecoveryRequired => {
-            Err(DaemonError::RecoveryRequired(
-                "Active attempt is in recovery_required phase".into(),
-            ))
-        }
+        AttemptPhase::RecoveryRequired => Err(DaemonError::RecoveryRequired(
+            "Active attempt is in recovery_required phase".into(),
+        )),
         AttemptPhase::LegacyRunning => {
             let _lock = ExecutionLock::acquire_with_retry(
                 &paths.state_lock_file(),

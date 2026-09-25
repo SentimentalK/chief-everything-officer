@@ -293,9 +293,8 @@ impl ActiveAttempt {
         let version = val
             .get("schema_version")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                SchedulerError::CorruptState("missing schema_version field".into())
-            })? as u32;
+            .ok_or_else(|| SchedulerError::CorruptState("missing schema_version field".into()))?
+            as u32;
 
         let attempt = match version {
             1 => {
@@ -360,7 +359,6 @@ impl ActiveAttempt {
         Ok(Some(attempt))
     }
 
-
     pub fn save(&self, path: &Path) -> Result<(), SchedulerError> {
         self.validate()?;
         atomic_write_json(path, self)?;
@@ -377,9 +375,16 @@ pub enum DispatchReconciliation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOutcome {
-    Accepted { request_id: String, accepted_at_ms: i64 },
-    KnownRejectedBeforeAcceptance { reason: String },
-    AmbiguousTransportFailure { error: String },
+    Accepted {
+        request_id: String,
+        accepted_at_ms: i64,
+    },
+    KnownRejectedBeforeAcceptance {
+        reason: String,
+    },
+    AmbiguousTransportFailure {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,10 +428,7 @@ pub trait ExecutionAdapter: Send + Sync {
         remaining_timeout: std::time::Duration,
     ) -> Result<WaitOutcome, String>;
 
-    async fn close(
-        &self,
-        terminal_id: &str,
-    ) -> Result<(), String>;
+    async fn close(&self, terminal_id: &str) -> Result<(), String>;
 }
 
 /// Production fallback execution adapter: explicitly not ready, preventing premature claim.
