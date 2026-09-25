@@ -544,13 +544,42 @@ async fn run_claim_mismatch_case(
         async fn is_ready(&self) -> bool {
             true
         }
-        async fn execute(
+        async fn prepare(
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<ceo_connector::execution_contract::ExecutionReport, String> {
+        ) -> Result<(String, String), String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
+        }
+        async fn reconcile_dispatch(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+        ) -> Result<ceo_connector::scheduler::DispatchReconciliation, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(ceo_connector::scheduler::DispatchReconciliation::DefinitelyNotDispatched)
+        }
+        async fn dispatch(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+            _retry_request_id: Option<&str>,
+        ) -> Result<ceo_connector::scheduler::DispatchOutcome, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Err("should not execute".into())
+        }
+        async fn wait(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+            _remaining_timeout: std::time::Duration,
+        ) -> Result<ceo_connector::scheduler::WaitOutcome, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Err("should not execute".into())
+        }
+        async fn close(&self, _terminal_id: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -751,13 +780,42 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
         async fn is_ready(&self) -> bool {
             true
         }
-        async fn execute(
+        async fn prepare(
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<ceo_connector::execution_contract::ExecutionReport, String> {
+        ) -> Result<(String, String), String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
+        }
+        async fn reconcile_dispatch(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+        ) -> Result<ceo_connector::scheduler::DispatchReconciliation, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(ceo_connector::scheduler::DispatchReconciliation::DefinitelyNotDispatched)
+        }
+        async fn dispatch(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+            _retry_request_id: Option<&str>,
+        ) -> Result<ceo_connector::scheduler::DispatchOutcome, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Err("should not execute".into())
+        }
+        async fn wait(
+            &self,
+            _attempt: &ActiveAttempt,
+            _terminal_id: &str,
+            _remaining_timeout: std::time::Duration,
+        ) -> Result<ceo_connector::scheduler::WaitOutcome, String> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Err("should not execute".into())
+        }
+        async fn close(&self, _terminal_id: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 

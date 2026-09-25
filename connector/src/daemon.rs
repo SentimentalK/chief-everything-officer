@@ -11,6 +11,11 @@ use crate::config::{load_bound_profile, ConfigError, ProfileError};
 use crate::credential::{CredentialError, DeviceCredential};
 use crate::enrollment::{now_utc_ms, PendingEnrollmentSession};
 use crate::local_state::{remove_durable, ExecutionLock};
+use crate::execution_contract::{
+    BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionReportExecutor,
+    ExecutionStatus, REPORT_SCHEMA_VERSION,
+};
+use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
     compute_report_sha256, deliver_outbox_record, flush_outbox, OutboxError, OutboxRecord,
     OUTBOX_SCHEMA_VERSION,
@@ -144,250 +149,8 @@ pub async fn run_daemon_with_hooks(
     }
 
     // 5. Active Attempt Recovery
-    if let Some(mut active) = ActiveAttempt::load(&paths.active_attempt_file())? {
-        println!(
-            "Recovering in-flight attempt '{}' in phase '{:?}'...",
-            active.attempt_id, active.phase
-        );
-
-        // Verify attempt matches current device/server
-        if active.server_origin != cred.server_origin || active.device_id != cred.device_id {
-            return Err(DaemonError::RecoveryRequired(format!(
-                "Active attempt bound to device '{}' / origin '{}', but current credential is '{}' / '{}'",
-                active.device_id, active.server_origin, cred.device_id, cred.server_origin
-            )));
-        }
-
-        match active.phase {
-            AttemptPhase::ClaimIntent => {
-                // Replay claim with exact same IDs
-                match client
-                    .claim_job(
-                        &cred,
-                        &active.job_id,
-                        &active.attempt_id,
-                        &active.claim_token,
-                    )
-                    .await
-                {
-                    Ok(resp) => {
-                        if let Err(e) = validate_claim_response(&active, &resp) {
-                            let _lock = ExecutionLock::acquire_with_retry(
-                                &paths.state_lock_file(),
-                                Duration::from_secs(5),
-                                Duration::from_millis(50),
-                            )?;
-                            let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file()) {
-                                    Ok(Some(c)) => c,
-                                    _ => active,
-                                };
-                            current.phase = AttemptPhase::RecoveryRequired;
-                            current.save(&paths.active_attempt_file())?;
-                            return Err(DaemonError::RecoveryRequired(format!(
-                                "Claim replay correlation validation failed: {e}"
-                            )));
-                        }
-
-                        let payload_hash = ActiveAttempt::compute_payload_sha256(
-                            &resp.job.job_id,
-                            &resp.job.workspace_id,
-                            &resp.job.target_id,
-                            resp.job.resource_id.as_deref(),
-                            &resp.job.prompt,
-                            &resp.job.acceptance,
-                            resp.job.timeout_seconds,
-                            &resp.job.result_target,
-                        );
-
-                        let claimed_at_ms = parse_timestamp_strict(&resp.attempt.claimed_at)
-                            .map_err(DaemonError::RecoveryRequired)?;
-
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
-                            Ok(Some(c)) => c,
-                            _ => active,
-                        };
-                        current.phase = AttemptPhase::Claimed;
-                        current.resource_id = resp.job.resource_id;
-                        current.prompt = Some(resp.job.prompt);
-                        current.acceptance = Some(resp.job.acceptance);
-                        current.execution_timeout_seconds = Some(resp.job.timeout_seconds);
-                        current.result_target = Some(resp.job.result_target);
-                        current.payload_sha256 = Some(payload_hash);
-                        current.claimed_at_ms = Some(claimed_at_ms);
-
-                        current.save(&paths.active_attempt_file())?;
-                        println!("Claim intent successfully reconciled to claimed.");
-                    }
-                    Err(ClientError::JobError { ref code, .. })
-                        if code == "JOB_ALREADY_CLAIMED"
-                            || code == "JOB_EXPIRED"
-                            || code == "JOB_NOT_FOUND" =>
-                    {
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        remove_durable(&paths.active_attempt_file())?;
-                        println!("Job was consumed by another worker or expired. Cleared local claim intent.");
-                    }
-                    Err(ClientError::JobError {
-                        ref code,
-                        ref message,
-                    }) if code == "IDEMPOTENCY_CONFLICT" => {
-                        active.phase = AttemptPhase::RecoveryRequired;
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        active.save(&paths.active_attempt_file())?;
-                        return Err(DaemonError::RecoveryRequired(format!(
-                            "Idempotency conflict: {message}"
-                        )));
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Transport/server error during claim intent recovery: {}. Will retry.",
-                            e
-                        );
-                    }
-                }
-            }
-            AttemptPhase::FinalizedLocal => {
-                // Item 19: Startup finalized_local recovery must prove correlation
-                let hist_file = paths.history_file(&active.job_id, &active.attempt_id);
-                let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
-
-                if outbox_file.exists() {
-                    let outbox = OutboxRecord::load(&outbox_file).map_err(|e| {
-                        DaemonError::RecoveryRequired(format!("failed to load outbox: {e}"))
-                    })?;
-                    let digest = compute_report_sha256(&outbox.report);
-                    if outbox.job_id == active.job_id
-                        && outbox.attempt_id == active.attempt_id
-                        && Some(&digest) == active.terminal_report_sha256.as_ref()
-                    {
-                        match deliver_outbox_record(paths, &client, &cred, &outbox_file, &outbox)
-                            .await
-                        {
-                            Ok(()) => {
-                                println!(
-                                    "Successfully delivered outbox record and completed cleanup."
-                                );
-                            }
-                            Err(crate::outbox::OutboxError::AuthRequired) => {
-                                return Err(DaemonError::AuthRequired);
-                            }
-                            Err(crate::outbox::OutboxError::RecoveryRequired(msg)) => {
-                                return Err(DaemonError::RecoveryRequired(msg));
-                            }
-                            Err(crate::outbox::OutboxError::Retryable(msg)) => {
-                                eprintln!(
-                                    "Retryable error delivering outbox during recovery: {msg}"
-                                );
-                            }
-                            Err(e) => {
-                                return Err(DaemonError::RecoveryRequired(e.to_string()));
-                            }
-                        }
-                    } else {
-                        return Err(DaemonError::RecoveryRequired(
-                            "Outbox record does not match active attempt correlation".into(),
-                        ));
-                    }
-                } else if hist_file.exists() {
-                    let hist_content = fs::read_to_string(&hist_file)?;
-                    let hist: crate::outbox::SanitizedHistoryRecord =
-                        serde_json::from_str(&hist_content)?;
-                    if hist.job_id == active.job_id
-                        && hist.attempt_id == active.attempt_id
-                        && hist.target_id == active.target_id
-                        && Some(&hist.terminal_report_sha256)
-                            == active.terminal_report_sha256.as_ref()
-                    {
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        remove_durable(&paths.active_attempt_file())?;
-                        println!("Active attempt was already delivered. Completed local active attempt cleanup.");
-                    } else {
-                        return Err(DaemonError::RecoveryRequired(
-                            "History record does not match active attempt correlation".into(),
-                        ));
-                    }
-                } else {
-                    return Err(DaemonError::RecoveryRequired(
-                        "Attempt in finalized_local but neither valid history nor outbox file exists".into(),
-                    ));
-                }
-            }
-            AttemptPhase::Claimed
-            | AttemptPhase::StartIntent
-            | AttemptPhase::Started
-            | AttemptPhase::Running => {
-                if !adapter.is_ready().await {
-                    eprintln!(
-                        "Attempt '{}' is held in phase '{:?}' waiting for execution adapter.",
-                        active.attempt_id, active.phase
-                    );
-                } else {
-                    let target = config.targets.get(&active.target_id).cloned();
-                    if let Some(target) = target {
-                        match adapter.execute(&active, &target).await {
-                            Ok(report) => {
-                                let digest = compute_report_sha256(&report);
-
-                                let outbox_rec = OutboxRecord {
-                                    schema_version: OUTBOX_SCHEMA_VERSION,
-                                    server_origin: cred.server_origin.clone(),
-                                    device_id: cred.device_id.clone(),
-                                    job_id: active.job_id.clone(),
-                                    attempt_id: active.attempt_id.clone(),
-                                    claim_token: active.claim_token.clone(),
-                                    report,
-                                    created_at_ms: now_utc_ms(),
-                                };
-
-                                let outbox_file =
-                                    paths.outbox_file(&active.job_id, &active.attempt_id);
-                                outbox_rec
-                                    .save(&outbox_file)
-                                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
-
-                                active.phase = AttemptPhase::FinalizedLocal;
-                                active.terminal_report_sha256 = Some(digest);
-
-                                let _lock = ExecutionLock::acquire_with_retry(
-                                    &paths.state_lock_file(),
-                                    Duration::from_secs(5),
-                                    Duration::from_millis(50),
-                                )?;
-                                active.save(&paths.active_attempt_file())?;
-
-                                let _ = flush_outbox(paths, &client, &cred).await;
-                            }
-                            Err(e) => {
-                                eprintln!("Execution adapter failed: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-            AttemptPhase::RecoveryRequired => {
-                return Err(DaemonError::RecoveryRequired(
-                    "Active attempt is in recovery_required phase".into(),
-                ));
-            }
-        }
+    if paths.active_attempt_file().exists() {
+        let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
     }
 
     // 6. Outbox Recovery
@@ -425,9 +188,10 @@ pub async fn run_daemon_with_hooks(
             continue;
         }
 
-        // Concurrency = 1 guard: if active attempt or outbox records exist, do not query pending!
+        // Concurrency = 1 guard: if active attempt exists, advance it!
         if paths.active_attempt_file().exists() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
@@ -636,6 +400,7 @@ pub async fn run_daemon_with_hooks(
                 payload_sha256: None,
                 claimed_at_ms: None,
                 terminal_report_sha256: None,
+                executor: None,
             };
 
             // Fsync claim intent BEFORE network call!
@@ -646,26 +411,56 @@ pub async fn run_daemon_with_hooks(
                 hook(&attempt).await;
             }
 
-            // Dispatch claim request
+            // Immediately drive the claim intent to network claim and execution
+            let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+pub async fn drive_active_attempt(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    adapter: &Arc<dyn ExecutionAdapter>,
+    _hooks: &DaemonHooks,
+) -> Result<bool, DaemonError> {
+    let active_opt = ActiveAttempt::load(&paths.active_attempt_file())?;
+    let active = match active_opt {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+
+    if active.device_id != cred.device_id || active.server_origin != cred.server_origin {
+        return Err(DaemonError::RecoveryRequired(format!(
+            "Active attempt identity mismatch: expected server '{}' / device '{}', but got '{}' / '{}'",
+            cred.server_origin, cred.device_id, active.server_origin, active.device_id
+        )));
+    }
+
+    match active.phase {
+        AttemptPhase::ClaimIntent => {
+            // Replay claim intent
             match client
-                .claim_job(&cred, &cand.job_id, &attempt_id, &claim_token)
+                .claim_job(cred, &active.job_id, &active.attempt_id, &active.claim_token)
                 .await
             {
                 Ok(resp) => {
-                    if let Err(e) = validate_claim_response(&attempt, &resp) {
+                    if let Err(e) = validate_claim_response(&active, &resp) {
                         let _lock = ExecutionLock::acquire_with_retry(
                             &paths.state_lock_file(),
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
-                            Ok(Some(c)) => c,
-                            _ => attempt,
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
                         };
                         current.phase = AttemptPhase::RecoveryRequired;
                         current.save(&paths.active_attempt_file())?;
                         return Err(DaemonError::RecoveryRequired(format!(
-                            "Claim response validation failed: {e}"
+                            "Claim replay correlation validation failed: {e}"
                         )));
                     }
 
@@ -679,7 +474,6 @@ pub async fn run_daemon_with_hooks(
                         resp.job.timeout_seconds,
                         &resp.job.result_target,
                     );
-
                     let claimed_at_ms = parse_timestamp_strict(&resp.attempt.claimed_at)
                         .map_err(DaemonError::RecoveryRequired)?;
 
@@ -688,9 +482,9 @@ pub async fn run_daemon_with_hooks(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file()) {
-                        Ok(Some(c)) => c,
-                        _ => attempt,
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
                     };
                     current.phase = AttemptPhase::Claimed;
                     current.resource_id = resp.job.resource_id;
@@ -700,12 +494,9 @@ pub async fn run_daemon_with_hooks(
                     current.result_target = Some(resp.job.result_target);
                     current.payload_sha256 = Some(payload_hash);
                     current.claimed_at_ms = Some(claimed_at_ms);
-
                     current.save(&paths.active_attempt_file())?;
-                    println!(
-                        "Successfully claimed job '{}'. Attempt '{}' now in phase 'claimed'.",
-                        cand.job_id, current.attempt_id
-                    );
+                    println!("Claim intent successfully reconciled to claimed.");
+                    Ok(true)
                 }
                 Err(ClientError::JobError { ref code, .. })
                     if code == "JOB_ALREADY_CLAIMED"
@@ -718,9 +509,8 @@ pub async fn run_daemon_with_hooks(
                         Duration::from_millis(50),
                     )?;
                     remove_durable(&paths.active_attempt_file())?;
-                    println!(
-                        "Candidate job was claimed by another worker or expired. Cleared local claim intent."
-                    );
+                    println!("Job was consumed by another worker or expired. Cleared local claim intent.");
+                    Ok(false)
                 }
                 Err(ClientError::JobError {
                     ref code,
@@ -731,20 +521,761 @@ pub async fn run_daemon_with_hooks(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut att = attempt;
-                    att.phase = AttemptPhase::RecoveryRequired;
-                    att.save(&paths.active_attempt_file())?;
-                    return Err(DaemonError::RecoveryRequired(format!(
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    Err(DaemonError::RecoveryRequired(format!(
                         "Idempotency conflict: {message}"
-                    )));
+                    )))
                 }
-                Err(ClientError::Unauthorized) => return Err(DaemonError::AuthRequired),
                 Err(e) => {
-                    eprintln!("Failed to claim job: {}. Intent remains for replay.", e);
+                    eprintln!(
+                        "Transport/server error during claim intent recovery: {}. Will retry.",
+                        e
+                    );
+                    Ok(true)
                 }
             }
         }
+        AttemptPhase::Claimed => {
+            // Guard: unsupported result_target = "resource"
+            if active.result_target.as_deref() == Some("resource") {
+                eprintln!("Job has unsupported result_target='resource'. Blocking execution before /start.");
+                let receipt = ExecutionReceipt {
+                    schema_version: ExecutionReceipt::SCHEMA_VERSION,
+                    job_id: active.job_id.clone(),
+                    attempt_id: active.attempt_id.clone(),
+                    target_id: active.target_id.clone(),
+                    orca_version: env!("CARGO_PKG_VERSION").into(),
+                    worktree_id: None,
+                    terminal_id: None,
+                    dispatch_request_id: None,
+                    task_dispatched: false,
+                    runtime_completion_kind: None,
+                    dispatch_started_at_ms: None,
+                    runtime_completed_at_ms: None,
+                };
+                let receipt_sha256 = receipt.compute_sha256();
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+                let report = ExecutionReport {
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    execution_status: ExecutionStatus::BLOCKED,
+                    business_outcome: BusinessOutcome::NOT_STARTED,
+                    task_dispatched: false,
+                    finished_at_ms: now_utc_ms(),
+                    duration_ms: 0,
+                    error: Some(ExecutionReportError {
+                        stage: "orchestration".into(),
+                        code: "RESULT_TARGET_UNSUPPORTED".into(),
+                        message: "result_target 'resource' is unsupported in V1.7 (requires V1.8)".into(),
+                    }),
+                    executor: ExecutionReportExecutor {
+                        executor_type: "ceo-connector".into(),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                    },
+                    receipt_sha256,
+                };
+                report.validate().map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+                let digest = compute_report_sha256(&report);
+
+                let outbox_rec = OutboxRecord {
+                    schema_version: OUTBOX_SCHEMA_VERSION,
+                    server_origin: cred.server_origin.clone(),
+                    device_id: cred.device_id.clone(),
+                    job_id: active.job_id.clone(),
+                    attempt_id: active.attempt_id.clone(),
+                    claim_token: active.claim_token.clone(),
+                    report,
+                    created_at_ms: now_utc_ms(),
+                };
+                let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
+                outbox_rec.save(&outbox_file).map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+
+                let _lock = ExecutionLock::acquire_with_retry(
+                    &paths.state_lock_file(),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                )?;
+                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                    Some(c) if c.attempt_id == active.attempt_id => c,
+                    _ => return Ok(true),
+                };
+                current.phase = AttemptPhase::FinalizedLocal;
+                current.terminal_report_sha256 = Some(digest);
+                current.save(&paths.active_attempt_file())?;
+                drop(_lock);
+
+                let _ = flush_outbox(paths, client, cred).await;
+                return Ok(true);
+            }
+
+            // Normal path: advance to StartIntent
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            current.phase = AttemptPhase::StartIntent;
+            current.save(&paths.active_attempt_file())?;
+            Ok(true)
+        }
+        AttemptPhase::StartIntent => {
+            match client
+                .start_job(cred, &active.job_id, &active.attempt_id, &active.claim_token)
+                .await
+            {
+                Ok(ack) => {
+                    if !ack.ok {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(
+                            "Start job response reported ok=false".into(),
+                        ));
+                    }
+
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::Started;
+                    if current.executor.is_none() {
+                        current.executor = Some(crate::scheduler::AttemptExecutorState {
+                            executor_type: "orca".into(),
+                            orca_version: None,
+                            worktree_id: None,
+                            terminal_id: None,
+                            dispatch_send_count: 0,
+                            dispatch_started_at_ms: None,
+                            execution_deadline_ms: None,
+                            dispatch_request_id: None,
+                            dispatch_accepted_at_ms: None,
+                            runtime_completion_kind: None,
+                            runtime_completed_at_ms: None,
+                            runtime_error: None,
+                        });
+                    }
+                    current.save(&paths.active_attempt_file())?;
+                    println!("Notified server of start for job '{}'", active.job_id);
+                    Ok(true)
+                }
+                Err(ClientError::JobError {
+                    ref code,
+                    ref message,
+                }) if code == "IDEMPOTENCY_CONFLICT"
+                    || code == "ATTEMPT_MISMATCH"
+                    || code == "JOB_NOT_CLAIMED" =>
+                {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    Err(DaemonError::RecoveryRequired(format!(
+                        "Start job failed closed: {message}"
+                    )))
+                }
+                Err(ClientError::Unauthorized) => Err(DaemonError::AuthRequired),
+                Err(e) => {
+                    eprintln!("Failed to notify server of start: {e}. Retrying on next loop.");
+                    Ok(true)
+                }
+            }
+        }
+        AttemptPhase::Started => {
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            current.phase = AttemptPhase::PrepareIntent;
+            current.save(&paths.active_attempt_file())?;
+            Ok(true)
+        }
+        AttemptPhase::PrepareIntent => {
+            if !adapter.is_ready().await {
+                eprintln!("Execution adapter not ready. Waiting...");
+                return Ok(true);
+            }
+
+            let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
+            let target = match disk_config.as_ref().and_then(|c| c.targets.get(&active.target_id)) {
+                Some(t) => t.clone(),
+                None => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(format!(
+                        "Target '{}' no longer mapped locally",
+                        active.target_id
+                    )));
+                }
+            };
+
+            match adapter.prepare(&active, &target).await {
+                Ok((worktree_id, terminal_id)) => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    if let Some(ref mut exec) = current.executor {
+                        exec.worktree_id = Some(worktree_id);
+                        exec.terminal_id = Some(terminal_id);
+                    }
+                    current.phase = AttemptPhase::Prepared;
+                    current.save(&paths.active_attempt_file())?;
+                    println!(
+                        "Attempt '{}' prepared with worktree and terminal.",
+                        active.attempt_id
+                    );
+                    Ok(true)
+                }
+                Err(e) => {
+                    if e.contains("RECOVERY_REQUIRED") {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(e));
+                    }
+                    eprintln!("Execution prepare error: {e}. Will retry.");
+                    Ok(true)
+                }
+            }
+        }
+        AttemptPhase::Prepared => {
+            let now = now_utc_ms();
+            let timeout_seconds = active.execution_timeout_seconds.unwrap_or(600);
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            if let Some(ref mut exec) = current.executor {
+                if exec.dispatch_started_at_ms.is_none() {
+                    exec.dispatch_started_at_ms = Some(now);
+                }
+                if exec.execution_deadline_ms.is_none() {
+                    exec.execution_deadline_ms = Some(now + timeout_seconds as i64 * 1000);
+                }
+            }
+            current.phase = AttemptPhase::DispatchIntent;
+            current.save(&paths.active_attempt_file())?;
+            Ok(true)
+        }
+        AttemptPhase::DispatchIntent => {
+            let terminal_id = match active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+                Some(tid) => tid.clone(),
+                None => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(
+                        "Dispatch intent missing terminal_id".into(),
+                    ));
+                }
+            };
+
+            // Reconcile dispatch state
+            let reconciliation = match adapter.reconcile_dispatch(&active, &terminal_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error during dispatch reconciliation: {e}");
+                    return Ok(true);
+                }
+            };
+
+            match reconciliation {
+                crate::scheduler::DispatchReconciliation::Accepted { request_id } => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    if let Some(ref mut exec) = current.executor {
+                        exec.dispatch_request_id = Some(request_id);
+                        if exec.dispatch_accepted_at_ms.is_none() {
+                            exec.dispatch_accepted_at_ms = Some(now_utc_ms());
+                        }
+                    }
+                    current.phase = AttemptPhase::Dispatched;
+                    current.save(&paths.active_attempt_file())?;
+                    Ok(true)
+                }
+                crate::scheduler::DispatchReconciliation::DefinitelyNotDispatched => {
+                    let send_count = active
+                        .executor
+                        .as_ref()
+                        .map(|e| e.dispatch_send_count)
+                        .unwrap_or(0);
+                    if send_count >= 2 {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(
+                            "Exceeded maximum dispatch send budget (max 2 sends)".into(),
+                        ));
+                    }
+
+                    // Increment send count durable before dispatch!
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    if let Some(ref mut exec) = current.executor {
+                        exec.dispatch_send_count += 1;
+                    }
+                    current.save(&paths.active_attempt_file())?;
+                    drop(_lock);
+
+                    let outcome = match adapter.dispatch(&active, &terminal_id, None).await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("Dispatch execution error: {e}");
+                            return Ok(true);
+                        }
+                    };
+
+                    match outcome {
+                        crate::scheduler::DispatchOutcome::Accepted {
+                            request_id,
+                            accepted_at_ms,
+                        } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            if let Some(ref mut exec) = current.executor {
+                                exec.dispatch_request_id = Some(request_id);
+                                exec.dispatch_accepted_at_ms = Some(accepted_at_ms);
+                            }
+                            current.phase = AttemptPhase::Dispatched;
+                            current.save(&paths.active_attempt_file())?;
+                            Ok(true)
+                        }
+                        crate::scheduler::DispatchOutcome::KnownRejectedBeforeAcceptance {
+                            reason,
+                        } => {
+                            eprintln!("Dispatch rejected before acceptance: {reason}. Intent remains for retry/budget check.");
+                            Ok(true)
+                        }
+                        crate::scheduler::DispatchOutcome::AmbiguousTransportFailure {
+                            error,
+                        } => {
+                            eprintln!("Ambiguous transport failure during dispatch: {error}. Intent remains for reconciliation.");
+                            Ok(true)
+                        }
+                    }
+                }
+                crate::scheduler::DispatchReconciliation::Ambiguous => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    Err(DaemonError::RecoveryRequired(
+                        "Ambiguous dispatch state detected: RECOVERY_REQUIRED".into(),
+                    ))
+                }
+            }
+        }
+        AttemptPhase::Dispatched => {
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            current.phase = AttemptPhase::Waiting;
+            current.save(&paths.active_attempt_file())?;
+            Ok(true)
+        }
+        AttemptPhase::Waiting => {
+            let terminal_id = match active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+                Some(tid) => tid.clone(),
+                None => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(
+                        "Waiting phase missing terminal_id".into(),
+                    ));
+                }
+            };
+
+            let deadline_ms = match active.executor.as_ref().and_then(|e| e.execution_deadline_ms) {
+                Some(dl) => dl,
+                None => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(
+                        "Waiting phase missing execution_deadline_ms".into(),
+                    ));
+                }
+            };
+
+            let now = now_utc_ms();
+            let remaining_ms = deadline_ms - now;
+            let wait_outcome = if remaining_ms <= 0 {
+                crate::scheduler::WaitOutcome::TimedOut { elapsed_ms: 0 }
+            } else {
+                adapter
+                    .wait(
+                        &active,
+                        &terminal_id,
+                        Duration::from_millis(remaining_ms as u64),
+                    )
+                    .await
+                    .map_err(|e| DaemonError::RecoveryRequired(format!("Wait failure: {e}")))?
+            };
+
+            let now = now_utc_ms();
+            let (kind, err) = match wait_outcome {
+                crate::scheduler::WaitOutcome::TuiIdle { .. } => ("tui_idle".to_string(), None),
+                crate::scheduler::WaitOutcome::TimedOut { .. } => (
+                    "timed_out".to_string(),
+                    Some(ExecutionReportError {
+                        stage: "runtime".into(),
+                        code: "EXECUTION_TIMEOUT".into(),
+                        message: "Execution exceeded durable timeout deadline".into(),
+                    }),
+                ),
+                crate::scheduler::WaitOutcome::Interrupted { reason } => (
+                    "interrupted".to_string(),
+                    Some(ExecutionReportError {
+                        stage: "runtime".into(),
+                        code: "TERMINAL_EXITED".into(),
+                        message: reason,
+                    }),
+                ),
+            };
+
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            if let Some(ref mut exec) = current.executor {
+                exec.runtime_completion_kind = Some(kind);
+                exec.runtime_completed_at_ms = Some(now);
+                exec.runtime_error = err;
+            }
+            current.phase = AttemptPhase::OutcomeRecorded;
+            current.save(&paths.active_attempt_file())?;
+            println!(
+                "Attempt '{}' runtime completed. Phase advanced to OutcomeRecorded.",
+                active.attempt_id
+            );
+            Ok(true)
+        }
+        AttemptPhase::OutcomeRecorded => {
+            // NEVER wait or dispatch again!
+            if let Some(ref tid) = active.executor.as_ref().and_then(|e| e.terminal_id.as_ref()) {
+                let _ = adapter.close(tid).await;
+            }
+
+            let exec_state = active.executor.as_ref().ok_or_else(|| {
+                DaemonError::RecoveryRequired("OutcomeRecorded phase missing executor state".into())
+            })?;
+
+            let (status, outcome, err) = match exec_state.runtime_completion_kind.as_deref() {
+                Some("tui_idle") => (
+                    ExecutionStatus::COMPLETED,
+                    BusinessOutcome::UNVERIFIED,
+                    None,
+                ),
+                Some("timed_out") => (
+                    ExecutionStatus::TIMED_OUT,
+                    BusinessOutcome::FAILED,
+                    exec_state.runtime_error.clone(),
+                ),
+                _ => (
+                    ExecutionStatus::FAILED,
+                    BusinessOutcome::FAILED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "runtime".into(),
+                            code: "EXECUTION_FAILED".into(),
+                            message: "Execution interrupted or failed".into(),
+                        })
+                    }),
+                ),
+            };
+
+            let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
+            let completed_ms = exec_state.runtime_completed_at_ms.unwrap_or_else(now_utc_ms);
+            let duration_ms = (completed_ms - started_ms).max(0);
+
+            let receipt = ExecutionReceipt {
+                schema_version: ExecutionReceipt::SCHEMA_VERSION,
+                job_id: active.job_id.clone(),
+                attempt_id: active.attempt_id.clone(),
+                target_id: active.target_id.clone(),
+                orca_version: exec_state
+                    .orca_version
+                    .clone()
+                    .unwrap_or_else(|| "1.4.209".into()),
+                worktree_id: exec_state.worktree_id.clone(),
+                terminal_id: exec_state.terminal_id.clone(),
+                dispatch_request_id: exec_state.dispatch_request_id.clone(),
+                task_dispatched: exec_state.dispatch_request_id.is_some(),
+                runtime_completion_kind: exec_state.runtime_completion_kind.clone(),
+                dispatch_started_at_ms: exec_state.dispatch_started_at_ms,
+                runtime_completed_at_ms: exec_state.runtime_completed_at_ms,
+            };
+            let receipt_sha256 = receipt.compute_sha256();
+
+            let report = ExecutionReport {
+                schema_version: REPORT_SCHEMA_VERSION,
+                execution_status: status,
+                business_outcome: outcome,
+                task_dispatched: exec_state.dispatch_request_id.is_some(),
+                finished_at_ms: completed_ms,
+                duration_ms,
+                error: err,
+                executor: ExecutionReportExecutor {
+                    executor_type: "orca".into(),
+                    version: exec_state
+                        .orca_version
+                        .clone()
+                        .unwrap_or_else(|| "1.4.209".into()),
+                },
+                receipt_sha256,
+            };
+            report
+                .validate()
+                .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+            let digest = compute_report_sha256(&report);
+
+            let outbox_rec = OutboxRecord {
+                schema_version: OUTBOX_SCHEMA_VERSION,
+                server_origin: cred.server_origin.clone(),
+                device_id: cred.device_id.clone(),
+                job_id: active.job_id.clone(),
+                attempt_id: active.attempt_id.clone(),
+                claim_token: active.claim_token.clone(),
+                report,
+                created_at_ms: now_utc_ms(),
+            };
+            let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
+            outbox_rec
+                .save(&outbox_file)
+                .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            current.phase = AttemptPhase::FinalizedLocal;
+            current.terminal_report_sha256 = Some(digest);
+            current.save(&paths.active_attempt_file())?;
+            drop(_lock);
+
+            let _ = flush_outbox(paths, client, cred).await;
+            Ok(true)
+        }
+        AttemptPhase::FinalizedLocal => {
+            let hist_file = paths.history_file(&active.job_id, &active.attempt_id);
+            let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
+
+            if outbox_file.exists() {
+                let outbox = OutboxRecord::load(&outbox_file).map_err(|e| {
+                    DaemonError::RecoveryRequired(format!("failed to load outbox: {e}"))
+                })?;
+                let digest = compute_report_sha256(&outbox.report);
+                if outbox.job_id == active.job_id
+                    && outbox.attempt_id == active.attempt_id
+                    && Some(&digest) == active.terminal_report_sha256.as_ref()
+                {
+                    match deliver_outbox_record(paths, client, cred, &outbox_file, &outbox).await {
+                        Ok(()) => {
+                            println!("Successfully delivered outbox record and completed cleanup.");
+                            Ok(true)
+                        }
+                        Err(crate::outbox::OutboxError::AuthRequired) => {
+                            Err(DaemonError::AuthRequired)
+                        }
+                        Err(crate::outbox::OutboxError::RecoveryRequired(msg)) => {
+                            Err(DaemonError::RecoveryRequired(msg))
+                        }
+                        Err(crate::outbox::OutboxError::Retryable(msg)) => {
+                            eprintln!("Retryable error delivering outbox: {msg}");
+                            Ok(true)
+                        }
+                        Err(e) => Err(DaemonError::RecoveryRequired(e.to_string())),
+                    }
+                } else {
+                    Err(DaemonError::RecoveryRequired(
+                        "Outbox record does not match active attempt correlation".into(),
+                    ))
+                }
+            } else if hist_file.exists() {
+                let hist_content = fs::read_to_string(&hist_file)?;
+                let hist: crate::outbox::SanitizedHistoryRecord =
+                    serde_json::from_str(&hist_content)?;
+                if hist.job_id == active.job_id
+                    && hist.attempt_id == active.attempt_id
+                    && hist.target_id == active.target_id
+                    && Some(&hist.terminal_report_sha256)
+                        == active.terminal_report_sha256.as_ref()
+                {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    remove_durable(&paths.active_attempt_file())?;
+                    println!("Active attempt was already delivered. Completed local active attempt cleanup.");
+                    Ok(false)
+                } else {
+                    Err(DaemonError::RecoveryRequired(
+                        "History record does not match active attempt correlation".into(),
+                    ))
+                }
+            } else {
+                Err(DaemonError::RecoveryRequired(
+                    "Attempt in finalized_local but neither valid history nor outbox file exists".into(),
+                ))
+            }
+        }
+        AttemptPhase::RecoveryRequired => {
+            Err(DaemonError::RecoveryRequired(
+                "Active attempt is in recovery_required phase".into(),
+            ))
+        }
+        AttemptPhase::LegacyRunning => {
+            let _lock = ExecutionLock::acquire_with_retry(
+                &paths.state_lock_file(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )?;
+            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                Some(c) if c.attempt_id == active.attempt_id => c,
+                _ => return Ok(true),
+            };
+            current.phase = AttemptPhase::Started;
+            current.save(&paths.active_attempt_file())?;
+            Ok(true)
+        }
     }
 }

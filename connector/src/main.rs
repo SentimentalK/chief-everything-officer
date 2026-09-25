@@ -136,7 +136,7 @@ async fn main() -> ExitCode {
         },
         Commands::Run => {
             let adapter =
-                std::sync::Arc::new(ceo_connector::scheduler::UnavailableExecutionAdapter);
+                std::sync::Arc::new(ceo_connector::orca::OrcaExecutionAdapter::default());
             if let Err(e) = ceo_connector::daemon::run_daemon(&paths, adapter, None).await {
                 eprintln!("Daemon terminated with error: {}", e);
                 return ExitCode::FAILURE;

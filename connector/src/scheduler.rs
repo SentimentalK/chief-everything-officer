@@ -11,7 +11,7 @@ use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
-pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 1;
+pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -43,9 +43,16 @@ pub enum AttemptPhase {
     Claimed,
     StartIntent,
     Started,
-    Running,
+    PrepareIntent,
+    Prepared,
+    DispatchIntent,
+    Dispatched,
+    Waiting,
+    OutcomeRecorded,
     FinalizedLocal,
     RecoveryRequired,
+    #[serde(rename = "running")]
+    LegacyRunning,
 }
 
 #[derive(Serialize)]
@@ -58,6 +65,35 @@ struct CanonicalPayload<'a> {
     acceptance: &'a str,
     execution_timeout_seconds: u32,
     result_target: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptExecutorState {
+    #[serde(rename = "type")]
+    pub executor_type: String, // "orca" or "ceo-connector"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orca_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default)]
+    pub dispatch_send_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_started_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_deadline_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_accepted_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_completion_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<crate::execution_contract::ExecutionReportError>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +116,8 @@ pub struct ActiveAttempt {
     pub payload_sha256: Option<String>,
     pub claimed_at_ms: Option<i64>,
     pub terminal_report_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<AttemptExecutorState>,
 }
 
 impl fmt::Debug for ActiveAttempt {
@@ -102,6 +140,7 @@ impl fmt::Debug for ActiveAttempt {
             .field("payload_sha256", &self.payload_sha256)
             .field("claimed_at_ms", &self.claimed_at_ms)
             .field("terminal_report_sha256", &self.terminal_report_sha256)
+            .field("executor", &self.executor)
             .finish()
     }
 }
@@ -175,7 +214,12 @@ impl ActiveAttempt {
             AttemptPhase::Claimed
             | AttemptPhase::StartIntent
             | AttemptPhase::Started
-            | AttemptPhase::Running => {
+            | AttemptPhase::PrepareIntent
+            | AttemptPhase::Prepared
+            | AttemptPhase::DispatchIntent
+            | AttemptPhase::Dispatched
+            | AttemptPhase::Waiting
+            | AttemptPhase::OutcomeRecorded => {
                 let prompt = self.prompt.as_deref().ok_or_else(|| {
                     SchedulerError::CorruptState(
                         "claimed/pre-terminal attempt missing prompt".into(),
@@ -232,8 +276,8 @@ impl ActiveAttempt {
                     ));
                 }
             }
-            AttemptPhase::RecoveryRequired => {
-                // Remains blocking
+            AttemptPhase::RecoveryRequired | AttemptPhase::LegacyRunning => {
+                // Remains blocking or will be migrated
             }
         }
 
@@ -245,10 +289,77 @@ impl ActiveAttempt {
             return Ok(None);
         }
         let content = fs::read_to_string(path)?;
-        let attempt: ActiveAttempt = serde_json::from_str(&content)?;
+        let val: serde_json::Value = serde_json::from_str(&content)?;
+        let version = val
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                SchedulerError::CorruptState("missing schema_version field".into())
+            })? as u32;
+
+        let attempt = match version {
+            1 => {
+                #[derive(Deserialize)]
+                #[allow(dead_code)]
+                struct ActiveAttemptV1 {
+                    pub schema_version: u32,
+                    pub server_origin: String,
+                    pub device_id: String,
+                    pub job_id: String,
+                    pub workspace_id: String,
+                    pub target_id: String,
+                    pub attempt_id: String,
+                    pub claim_token: String,
+                    pub phase: AttemptPhase,
+                    pub resource_id: Option<String>,
+                    pub prompt: Option<String>,
+                    pub acceptance: Option<String>,
+                    pub execution_timeout_seconds: Option<u32>,
+                    pub result_target: Option<String>,
+                    pub payload_sha256: Option<String>,
+                    pub claimed_at_ms: Option<i64>,
+                    pub terminal_report_sha256: Option<String>,
+                }
+                let v1: ActiveAttemptV1 = serde_json::from_value(val)?;
+                let phase = match v1.phase {
+                    AttemptPhase::LegacyRunning => AttemptPhase::Started,
+                    p => p,
+                };
+                ActiveAttempt {
+                    schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+                    server_origin: v1.server_origin,
+                    device_id: v1.device_id,
+                    job_id: v1.job_id,
+                    workspace_id: v1.workspace_id,
+                    target_id: v1.target_id,
+                    attempt_id: v1.attempt_id,
+                    claim_token: v1.claim_token,
+                    phase,
+                    resource_id: v1.resource_id,
+                    prompt: v1.prompt,
+                    acceptance: v1.acceptance,
+                    execution_timeout_seconds: v1.execution_timeout_seconds,
+                    result_target: v1.result_target,
+                    payload_sha256: v1.payload_sha256,
+                    claimed_at_ms: v1.claimed_at_ms,
+                    terminal_report_sha256: v1.terminal_report_sha256,
+                    executor: None,
+                }
+            }
+            2 => {
+                let mut att: ActiveAttempt = serde_json::from_value(val)?;
+                if att.phase == AttemptPhase::LegacyRunning {
+                    att.phase = AttemptPhase::Started;
+                }
+                att
+            }
+            other => return Err(SchedulerError::UnsupportedSchemaVersion(other)),
+        };
+
         attempt.validate()?;
         Ok(Some(attempt))
     }
+
 
     pub fn save(&self, path: &Path) -> Result<(), SchedulerError> {
         self.validate()?;
@@ -257,22 +368,68 @@ impl ActiveAttempt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchReconciliation {
+    Accepted { request_id: String },
+    DefinitelyNotDispatched,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    Accepted { request_id: String, accepted_at_ms: i64 },
+    KnownRejectedBeforeAcceptance { reason: String },
+    AmbiguousTransportFailure { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOutcome {
+    TuiIdle { elapsed_ms: u64 },
+    TimedOut { elapsed_ms: u64 },
+    Interrupted { reason: String },
+}
+
 /// Boundary trait for job execution adapters.
-/// V1.6 uses `UnavailableExecutionAdapter` (never claims).
-/// Tests use `FakeExecutionAdapter`.
-/// V1.7 implements `OrcaExecutionAdapter`.
+/// V1.6 used monolithic execute().
+/// V1.7 implements fine-grained prepare, dispatch, wait, close stages.
 #[async_trait]
 pub trait ExecutionAdapter: Send + Sync {
     fn name(&self) -> &'static str;
     async fn is_ready(&self) -> bool;
-    async fn execute(
+
+    async fn prepare(
         &self,
         attempt: &ActiveAttempt,
         target: &LocalTarget,
-    ) -> Result<ExecutionReport, String>;
+    ) -> Result<(String, String), String>; // (worktree_id, terminal_id)
+
+    async fn reconcile_dispatch(
+        &self,
+        attempt: &ActiveAttempt,
+        terminal_id: &str,
+    ) -> Result<DispatchReconciliation, String>;
+
+    async fn dispatch(
+        &self,
+        attempt: &ActiveAttempt,
+        terminal_id: &str,
+        retry_request_id: Option<&str>,
+    ) -> Result<DispatchOutcome, String>;
+
+    async fn wait(
+        &self,
+        attempt: &ActiveAttempt,
+        terminal_id: &str,
+        remaining_timeout: std::time::Duration,
+    ) -> Result<WaitOutcome, String>;
+
+    async fn close(
+        &self,
+        terminal_id: &str,
+    ) -> Result<(), String>;
 }
 
-/// Production V1.6 execution adapter: explicitly not ready, preventing premature claim.
+/// Production fallback execution adapter: explicitly not ready, preventing premature claim.
 pub struct UnavailableExecutionAdapter;
 
 #[async_trait]
@@ -285,12 +442,42 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         false
     }
 
-    async fn execute(
+    async fn prepare(
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<ExecutionReport, String> {
-        Err("Execution adapter not available in V1.6 (deferred to V1.7)".into())
+    ) -> Result<(String, String), String> {
+        Err("UnavailableExecutionAdapter cannot prepare".into())
+    }
+
+    async fn reconcile_dispatch(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+    ) -> Result<DispatchReconciliation, String> {
+        Err("UnavailableExecutionAdapter cannot reconcile dispatch".into())
+    }
+
+    async fn dispatch(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+        _retry_request_id: Option<&str>,
+    ) -> Result<DispatchOutcome, String> {
+        Err("UnavailableExecutionAdapter cannot dispatch".into())
+    }
+
+    async fn wait(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+        _remaining_timeout: std::time::Duration,
+    ) -> Result<WaitOutcome, String> {
+        Err("UnavailableExecutionAdapter cannot wait".into())
+    }
+
+    async fn close(&self, _terminal_id: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -310,12 +497,45 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         self.ready
     }
 
-    async fn execute(
+    async fn prepare(
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<ExecutionReport, String> {
-        Ok(self.report_to_produce.clone())
+    ) -> Result<(String, String), String> {
+        Ok(("wt_fake".into(), "term_fake".into()))
+    }
+
+    async fn reconcile_dispatch(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+    ) -> Result<DispatchReconciliation, String> {
+        Ok(DispatchReconciliation::DefinitelyNotDispatched)
+    }
+
+    async fn dispatch(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+        _retry_request_id: Option<&str>,
+    ) -> Result<DispatchOutcome, String> {
+        Ok(DispatchOutcome::Accepted {
+            request_id: "req_fake".into(),
+            accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    async fn wait(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+        _remaining_timeout: std::time::Duration,
+    ) -> Result<WaitOutcome, String> {
+        Ok(WaitOutcome::TuiIdle { elapsed_ms: 100 })
+    }
+
+    async fn close(&self, _terminal_id: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -443,6 +663,7 @@ mod tests {
             payload_sha256: None,
             claimed_at_ms: None,
             terminal_report_sha256: None,
+            executor: None,
         };
 
         let resp = ClaimJobResponse {
@@ -490,6 +711,7 @@ mod tests {
             payload_sha256: None,
             claimed_at_ms: None,
             terminal_report_sha256: None,
+            executor: None,
         };
 
         assert!(matches!(
@@ -498,5 +720,39 @@ mod tests {
         ));
         intent.attempt_id = "att-00000000-0000-0000-0000-000000000001".into();
         assert!(intent.validate().is_ok());
+    }
+
+    #[test]
+    fn test_active_attempt_v1_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("active-attempt.json");
+
+        // Write a valid v1 schema JSON
+        let v1_json = serde_json::json!({
+            "schema_version": 1,
+            "server_origin": "https://server.test",
+            "device_id": "dev_1",
+            "job_id": "job_1",
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000001",
+            "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "phase": "claim_intent",
+            "resource_id": null,
+            "prompt": null,
+            "acceptance": null,
+            "execution_timeout_seconds": null,
+            "result_target": null,
+            "payload_sha256": null,
+            "claimed_at_ms": null,
+            "terminal_report_sha256": null
+        });
+        std::fs::write(&path, serde_json::to_string(&v1_json).unwrap()).unwrap();
+
+        // Load must migrate schema_version to 2 with executor: None
+        let loaded = ActiveAttempt::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
+        assert!(loaded.executor.is_none());
     }
 }
