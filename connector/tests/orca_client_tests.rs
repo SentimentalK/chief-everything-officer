@@ -811,8 +811,8 @@ fi
         CleanupOutcome::RecoveryRequired { code, message } => {
             assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
             assert!(
-                message.contains("pty_killed=false"),
-                "Expected 'pty_killed=false' in message: {message}"
+                message.contains("pty_killed=Some(false)"),
+                "Expected 'pty_killed=Some(false)' in message: {message}"
             );
         }
         other => panic!("Expected RecoveryRequired, got {other:?}"),
@@ -1139,6 +1139,57 @@ fi
     )
     .await;
     assert!(matches!(out, CleanupOutcome::Retryable { .. }));
+
+    // 6. Close payload missing in response => RecoveryRequired(TERMINAL_CLOSE_PAYLOAD_MISSING)
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{}}"#,
+        0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+    )
+    .await;
+    match out {
+        CleanupOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "TERMINAL_CLOSE_PAYLOAD_MISSING");
+        }
+        other => {
+            panic!("Expected RecoveryRequired(TERMINAL_CLOSE_PAYLOAD_MISSING), got {other:?}")
+        }
+    }
+
+    // 7. ptyKilled missing in close payload => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target"}}}"#,
+        0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+    )
+    .await;
+    match out {
+        CleanupOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
+        }
+        other => {
+            panic!("Expected RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE), got {other:?}")
+        }
+    }
+
+    // 8. ptyKilled is explicitly false => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":false}}}"#,
+        0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+    )
+    .await;
+    match out {
+        CleanupOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
+        }
+        other => {
+            panic!("Expected RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE), got {other:?}")
+        }
+    }
 }
 
 #[tokio::test]

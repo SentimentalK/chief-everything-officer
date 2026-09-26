@@ -618,22 +618,33 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         let close_res = self.client.close_terminal(terminal_id).await;
         match close_res {
             Ok(resp) => {
-                if let Some(close_part) = resp.result.and_then(|r| r.close) {
-                    if close_part.handle != terminal_id {
+                let close_part = match resp.result.and_then(|r| r.close) {
+                    Some(part) => part,
+                    None => {
                         return CleanupOutcome::RecoveryRequired {
-                            code: "TERMINAL_CLOSE_CORRELATION_MISMATCH".into(),
-                            message: format!(
-                                "close handle mismatch: expected '{terminal_id}', got '{}'",
-                                close_part.handle
-                            ),
+                            code: "TERMINAL_CLOSE_PAYLOAD_MISSING".into(),
+                            message: "terminal close returned ok=true but missing close payload"
+                                .into(),
                         };
                     }
-                    if close_part.pty_killed == Some(false) {
-                        return CleanupOutcome::RecoveryRequired {
-                            code: "TERMINAL_STOP_UNVERIFIABLE".into(),
-                            message: "terminal close returned pty_killed=false".into(),
-                        };
-                    }
+                };
+                if close_part.handle != terminal_id {
+                    return CleanupOutcome::RecoveryRequired {
+                        code: "TERMINAL_CLOSE_CORRELATION_MISMATCH".into(),
+                        message: format!(
+                            "close handle mismatch: expected '{terminal_id}', got '{}'",
+                            close_part.handle
+                        ),
+                    };
+                }
+                if close_part.pty_killed != Some(true) {
+                    return CleanupOutcome::RecoveryRequired {
+                        code: "TERMINAL_STOP_UNVERIFIABLE".into(),
+                        message: format!(
+                            "terminal close returned pty_killed={:?}, expected Some(true)",
+                            close_part.pty_killed
+                        ),
+                    };
                 }
             }
             Err(OrcaError::Orca {
