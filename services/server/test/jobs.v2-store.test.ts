@@ -512,6 +512,13 @@ describe.skipIf(!URL)("RedisJobStoreV2 (real Redis integration, CI-gated)", () =
           disableOfflineQueue: true,
         }),
     );
+    const startMs = Date.now();
+    while (!runner.ready() && Date.now() - startMs < 5000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    if (!runner.ready()) {
+      throw new Error("Redis runner failed to become ready within 5000ms");
+    }
     store = new RedisJobStoreV2(runner);
   });
 
