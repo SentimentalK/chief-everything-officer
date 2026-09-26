@@ -212,19 +212,28 @@ mod tests {
         // Mismatched job_id
         assert!(matches!(
             envelope.validate_correlation("job-2", "att-1", Some("res-1")),
-            Err(ManagedResultError::CorrelationMismatch { field: "job_id", .. })
+            Err(ManagedResultError::CorrelationMismatch {
+                field: "job_id",
+                ..
+            })
         ));
 
         // Mismatched attempt_id
         assert!(matches!(
             envelope.validate_correlation("job-1", "att-2", Some("res-1")),
-            Err(ManagedResultError::CorrelationMismatch { field: "attempt_id", .. })
+            Err(ManagedResultError::CorrelationMismatch {
+                field: "attempt_id",
+                ..
+            })
         ));
 
         // Mismatched resource_id
         assert!(matches!(
             envelope.validate_correlation("job-1", "att-1", Some("res-2")),
-            Err(ManagedResultError::CorrelationMismatch { field: "resource_id", .. })
+            Err(ManagedResultError::CorrelationMismatch {
+                field: "resource_id",
+                ..
+            })
         ));
 
         // Empty summary
@@ -286,6 +295,9 @@ mod tests {
         f.write_all(&chunk).unwrap();
 
         let res = read_and_validate_from_file(&large_file, "job-1", "att-1", Some("res-1"));
-        assert!(matches!(res, Err(ManagedResultError::PayloadTooLarge { .. })));
+        assert!(matches!(
+            res,
+            Err(ManagedResultError::PayloadTooLarge { .. })
+        ));
     }
 }

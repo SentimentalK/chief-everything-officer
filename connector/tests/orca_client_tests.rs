@@ -349,7 +349,10 @@ fi
         attempt.acceptance.as_deref(),
         None,
     );
-    let outcome = adapter.dispatch(&attempt, "term_1", &prompt_text).await.unwrap();
+    let outcome = adapter
+        .dispatch(&attempt, "term_1", &prompt_text)
+        .await
+        .unwrap();
     match outcome {
         DispatchOutcome::Accepted { request_id, .. } => {
             assert_eq!(request_id, "req_send_123");
@@ -608,7 +611,10 @@ echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":false,"prompt":{
     let client1 = OrcaCliClient::new(bin1);
     let adapter1 = OrcaExecutionAdapter::new(client1);
 
-    let outcome1 = adapter1.dispatch(&attempt, "term_1", "test prompt").await.unwrap();
+    let outcome1 = adapter1
+        .dispatch(&attempt, "term_1", "test prompt")
+        .await
+        .unwrap();
     match outcome1 {
         DispatchOutcome::KnownRejectedBeforeAcceptance { .. } => {}
         other => panic!("Expected KnownRejectedBeforeAcceptance, got {other:?}"),
@@ -622,7 +628,10 @@ echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"
     let client2 = OrcaCliClient::new(bin2);
     let adapter2 = OrcaExecutionAdapter::new(client2);
 
-    let outcome2 = adapter2.dispatch(&attempt, "term_1", "test prompt").await.unwrap();
+    let outcome2 = adapter2
+        .dispatch(&attempt, "term_1", "test prompt")
+        .await
+        .unwrap();
     match outcome2 {
         DispatchOutcome::AmbiguousTransportFailure { error } => {
             assert!(error.contains("missing"));
@@ -639,7 +648,10 @@ exit 1
     let client3 = OrcaCliClient::new(bin3);
     let adapter3 = OrcaExecutionAdapter::new(client3);
 
-    let outcome3 = adapter3.dispatch(&attempt, "term_1", "test prompt").await.unwrap();
+    let outcome3 = adapter3
+        .dispatch(&attempt, "term_1", "test prompt")
+        .await
+        .unwrap();
     match outcome3 {
         DispatchOutcome::AmbiguousTransportFailure { error } => {
             assert!(error.contains("internal_failure"));
@@ -1254,7 +1266,10 @@ fi
         let bin = create_mock_orca_script(temp, &script);
         let client = OrcaCliClient::new(bin);
         let adapter = OrcaExecutionAdapter::new(client);
-        adapter.dispatch(attempt, "term_target", "test prompt").await.unwrap()
+        adapter
+            .dispatch(attempt, "term_target", "test prompt")
+            .await
+            .unwrap()
     }
 
     // 1. send.handle != requested terminal => DISPATCH_TERMINAL_CORRELATION_MISMATCH

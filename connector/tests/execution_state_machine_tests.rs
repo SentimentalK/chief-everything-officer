@@ -380,17 +380,20 @@ async fn test_resource_result_target_executes_and_collects_managed_result() {
     server.add_handler(move |req| {
         if req.path.contains("/start") {
             start_called_clone.fetch_add(1, Ordering::SeqCst);
-            return MockResponse::json(200, &serde_json::json!({
-                "ok": true,
-                "replayed": false,
-                "server_time": "2026-09-24T12:00:00.000Z",
-                "attempt": {
-                    "attempt_id": "any",
-                    "phase": "started",
-                    "claimed_at": "2026-09-24T12:00:00.000Z",
-                    "started_at": "2026-09-24T12:00:01.000Z"
-                }
-            }));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": "any",
+                        "phase": "started",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": "2026-09-24T12:00:01.000Z"
+                    }
+                }),
+            );
         }
         MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
@@ -432,7 +435,9 @@ async fn test_resource_result_target_executes_and_collects_managed_result() {
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
     loop {
-        let current = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+        let current = ActiveAttempt::load(&paths.active_attempt_file())
+            .unwrap()
+            .unwrap();
         if current.phase == AttemptPhase::FinalizedLocal {
             break;
         }
@@ -467,7 +472,9 @@ async fn test_resource_result_target_executes_and_collects_managed_result() {
     assert!(record.report.task_dispatched);
     assert!(record.report.error.is_none());
 
-    let res = record.managed_result.expect("managed result must be attached");
+    let res = record
+        .managed_result
+        .expect("managed result must be attached");
     assert_eq!(res.resource_id, "res_mock_1");
     assert_eq!(res.summary, "Updated resource content");
     assert!(record.managed_result_sha256.is_some());
@@ -487,17 +494,20 @@ async fn test_resource_result_target_missing_result_fails_closed() {
     server.add_handler(move |req| {
         if req.path.contains("/start") {
             start_called_clone.fetch_add(1, Ordering::SeqCst);
-            return MockResponse::json(200, &serde_json::json!({
-                "ok": true,
-                "replayed": false,
-                "server_time": "2026-09-24T12:00:00.000Z",
-                "attempt": {
-                    "attempt_id": "any",
-                    "phase": "started",
-                    "claimed_at": "2026-09-24T12:00:00.000Z",
-                    "started_at": "2026-09-24T12:00:01.000Z"
-                }
-            }));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": "any",
+                        "phase": "started",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": "2026-09-24T12:00:01.000Z"
+                    }
+                }),
+            );
         }
         MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
@@ -519,7 +529,9 @@ async fn test_resource_result_target_missing_result_fails_closed() {
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
     loop {
-        let current = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+        let current = ActiveAttempt::load(&paths.active_attempt_file())
+            .unwrap()
+            .unwrap();
         if current.phase == AttemptPhase::FinalizedLocal {
             break;
         }

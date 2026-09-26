@@ -117,7 +117,8 @@ impl ConnectorPaths {
     }
 
     pub fn managed_result_file(&self, attempt_id: &str) -> PathBuf {
-        self.attempt_runtime_dir(attempt_id).join("managed-result.json")
+        self.attempt_runtime_dir(attempt_id)
+            .join("managed-result.json")
     }
 
     /// Ensures the attempt-specific runtime directory exists with 0700 permissions

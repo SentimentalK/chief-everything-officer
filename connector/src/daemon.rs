@@ -1025,13 +1025,14 @@ pub async fn drive_active_attempt(
                     drop(_lock);
 
                     let prompt_text = {
-                        let managed_contract = if active.result_target.as_deref() == Some("resource") {
-                            let result_path = paths.managed_result_file(&active.attempt_id);
-                            let resource_id = active.resource_id.as_deref().unwrap_or("");
-                            Some((result_path, resource_id))
-                        } else {
-                            None
-                        };
+                        let managed_contract =
+                            if active.result_target.as_deref() == Some("resource") {
+                                let result_path = paths.managed_result_file(&active.attempt_id);
+                                let resource_id = active.resource_id.as_deref().unwrap_or("");
+                                Some((result_path, resource_id))
+                            } else {
+                                None
+                            };
                         crate::execution_contract::build_execution_prompt(
                             active.prompt.as_deref(),
                             active.acceptance.as_deref(),
@@ -1039,7 +1040,8 @@ pub async fn drive_active_attempt(
                         )
                     };
 
-                    let outcome = match adapter.dispatch(&active, &terminal_id, &prompt_text).await {
+                    let outcome = match adapter.dispatch(&active, &terminal_id, &prompt_text).await
+                    {
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("Dispatch execution error: {e}");
@@ -1346,118 +1348,116 @@ pub async fn drive_active_attempt(
 
             let task_dispatched = exec_state.dispatch_request_id.is_some();
 
-            let (status, outcome, err, managed_result, managed_result_sha256) = match exec_state.runtime_completion_kind.as_deref() {
-                Some("tui_idle") => {
-                    if active.result_target.as_deref() == Some("resource") {
-                        let result_file = paths.managed_result_file(&active.attempt_id);
-                        let expected_resource_id = active.resource_id.as_deref();
-                        match crate::managed_result::read_and_validate_from_file(
-                            &result_file,
-                            &active.job_id,
-                            &active.attempt_id,
-                            expected_resource_id,
-                        ) {
-                            Ok((envelope, sha256)) => (
+            let (status, outcome, err, managed_result, managed_result_sha256) =
+                match exec_state.runtime_completion_kind.as_deref() {
+                    Some("tui_idle") => {
+                        if active.result_target.as_deref() == Some("resource") {
+                            let result_file = paths.managed_result_file(&active.attempt_id);
+                            let expected_resource_id = active.resource_id.as_deref();
+                            match crate::managed_result::read_and_validate_from_file(
+                                &result_file,
+                                &active.job_id,
+                                &active.attempt_id,
+                                expected_resource_id,
+                            ) {
+                                Ok((envelope, sha256)) => (
+                                    ExecutionStatus::COMPLETED,
+                                    BusinessOutcome::UNVERIFIED,
+                                    None,
+                                    Some(envelope),
+                                    Some(sha256),
+                                ),
+                                Err(e) => {
+                                    let (code, msg) = match &e {
+                                        crate::managed_result::ManagedResultError::Io(err)
+                                            if err.kind() == std::io::ErrorKind::NotFound =>
+                                        {
+                                            (
+                                                "RESULT_MISSING".to_string(),
+                                                "managed-result.json was not found".to_string(),
+                                            )
+                                        }
+                                        other => ("RESULT_INVALID".to_string(), other.to_string()),
+                                    };
+                                    (
+                                        ExecutionStatus::FAILED,
+                                        BusinessOutcome::FAILED,
+                                        Some(ExecutionReportError {
+                                            stage: "result".into(),
+                                            code,
+                                            message: msg,
+                                        }),
+                                        None,
+                                        None,
+                                    )
+                                }
+                            }
+                        } else {
+                            (
                                 ExecutionStatus::COMPLETED,
                                 BusinessOutcome::UNVERIFIED,
                                 None,
-                                Some(envelope),
-                                Some(sha256),
-                            ),
-                            Err(e) => {
-                                let (code, msg) = match &e {
-                                    crate::managed_result::ManagedResultError::Io(err)
-                                        if err.kind() == std::io::ErrorKind::NotFound =>
-                                    {
-                                        (
-                                            "RESULT_MISSING".to_string(),
-                                            "managed-result.json was not found".to_string(),
-                                        )
-                                    }
-                                    other => (
-                                        "RESULT_INVALID".to_string(),
-                                        other.to_string(),
-                                    ),
-                                };
-                                (
-                                    ExecutionStatus::FAILED,
-                                    BusinessOutcome::FAILED,
-                                    Some(ExecutionReportError {
-                                        stage: "result".into(),
-                                        code,
-                                        message: msg,
-                                    }),
-                                    None,
-                                    None,
-                                )
-                            }
+                                None,
+                                None,
+                            )
                         }
-                    } else {
-                        (
-                            ExecutionStatus::COMPLETED,
-                            BusinessOutcome::UNVERIFIED,
-                            None,
-                            None,
-                            None,
-                        )
                     }
-                }
-                Some("timed_out") => (
-                    ExecutionStatus::TIMED_OUT,
-                    BusinessOutcome::UNVERIFIED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "runtime".into(),
-                            code: "EXECUTION_TIMEOUT".into(),
-                            message: "Execution timed out".into(),
-                        })
-                    }),
-                    None,
-                    None,
-                ),
-                Some("interrupted") => (
-                    ExecutionStatus::INTERRUPTED,
-                    BusinessOutcome::UNVERIFIED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "runtime".into(),
-                            code: "TERMINAL_EXITED".into(),
-                            message: "Execution interrupted".into(),
-                        })
-                    }),
-                    None,
-                    None,
-                ),
-                Some("not_started") => (
-                    ExecutionStatus::BLOCKED,
-                    BusinessOutcome::NOT_STARTED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "orchestration".into(),
-                            code: "EXECUTION_NOT_STARTED".into(),
-                            message: "Execution blocked before agent dispatch".into(),
-                        })
-                    }),
-                    None,
-                    None,
-                ),
-                other => {
-                    let _lock = ExecutionLock::acquire_with_retry(
-                        &paths.state_lock_file(),
-                        Duration::from_secs(5),
-                        Duration::from_millis(50),
-                    )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
-                    current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
-                    return Err(DaemonError::RecoveryRequired(format!(
-                        "Unknown runtime_completion_kind: {other:?}"
-                    )));
-                }
-            };
+                    Some("timed_out") => (
+                        ExecutionStatus::TIMED_OUT,
+                        BusinessOutcome::UNVERIFIED,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "runtime".into(),
+                                code: "EXECUTION_TIMEOUT".into(),
+                                message: "Execution timed out".into(),
+                            })
+                        }),
+                        None,
+                        None,
+                    ),
+                    Some("interrupted") => (
+                        ExecutionStatus::INTERRUPTED,
+                        BusinessOutcome::UNVERIFIED,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "runtime".into(),
+                                code: "TERMINAL_EXITED".into(),
+                                message: "Execution interrupted".into(),
+                            })
+                        }),
+                        None,
+                        None,
+                    ),
+                    Some("not_started") => (
+                        ExecutionStatus::BLOCKED,
+                        BusinessOutcome::NOT_STARTED,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "orchestration".into(),
+                                code: "EXECUTION_NOT_STARTED".into(),
+                                message: "Execution blocked before agent dispatch".into(),
+                            })
+                        }),
+                        None,
+                        None,
+                    ),
+                    other => {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(format!(
+                            "Unknown runtime_completion_kind: {other:?}"
+                        )));
+                    }
+                };
 
             let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
             let completed_ms = exec_state

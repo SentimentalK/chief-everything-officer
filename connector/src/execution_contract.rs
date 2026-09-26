@@ -281,7 +281,8 @@ mod tests {
 
     #[test]
     fn build_execution_prompt_none_target() {
-        let prompt = build_execution_prompt(Some("Fix bug in parser"), Some("All tests green"), None);
+        let prompt =
+            build_execution_prompt(Some("Fix bug in parser"), Some("All tests green"), None);
         assert_eq!(
             prompt,
             "TASK\n\nFix bug in parser\n\nACCEPTANCE CRITERIA\n\nAll tests green"

@@ -136,7 +136,9 @@ pub async fn deliver_outbox_record(
     }
 
     // Sequential delivery: Result ACK strictly before Report ACK
-    if let (Some(ref result), Some(ref digest)) = (&record.managed_result, &record.managed_result_sha256) {
+    if let (Some(ref result), Some(ref digest)) =
+        (&record.managed_result, &record.managed_result_sha256)
+    {
         let result_res = client
             .submit_job_result(
                 cred,

@@ -459,27 +459,33 @@ async fn outbox_delivers_managed_result_before_report() {
     server.add_handler(move |req| {
         if req.path.contains("/result") && req.method == "POST" {
             order_clone.lock().unwrap().push("result");
-            return MockResponse::json(200, &serde_json::json!({
-                "ok": true,
-                "replayed": false,
-                "server_time": "2026-09-26T12:00:00.000Z",
-                "resource_id": "res_1",
-                "commit": "abc123commit"
-            }));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-26T12:00:00.000Z",
+                    "resource_id": "res_1",
+                    "commit": "abc123commit"
+                }),
+            );
         }
         if req.path.contains("/report") && req.method == "POST" {
             order_clone.lock().unwrap().push("report");
-            return MockResponse::json(200, &serde_json::json!({
-                "ok": true,
-                "replayed": false,
-                "server_time": "2026-09-26T12:00:01.000Z",
-                "attempt": {
-                    "attempt_id": attempt_id,
-                    "phase": "finished",
-                    "claimed_at": "2026-09-26T11:59:00.000Z",
-                    "started_at": "2026-09-26T11:59:01.000Z"
-                }
-            }));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-26T12:00:01.000Z",
+                    "attempt": {
+                        "attempt_id": attempt_id,
+                        "phase": "finished",
+                        "claimed_at": "2026-09-26T11:59:00.000Z",
+                        "started_at": "2026-09-26T11:59:01.000Z"
+                    }
+                }),
+            );
         }
         MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
