@@ -140,3 +140,16 @@ Resource 的生命周期销毁必须通过官方的 `resource_delete` 工具执�
 - **无应用层墓碑（Tombstone）**：当前工作空间 HEAD 中直接删除，不保留墓碑标记文件；历史变更由底层 Git commit 自然追踪。删除后若用户再次 capture 相同来源，将作为全新 Resource 分配新 ID。
 - **禁止绕过 Resource Plane**：严禁尝试使用 `apply_change_set`、GitHub 直接操作或文件系统删除手段操作 `resources/**`。
 
+## URL 资源抓取与深度提取（Acquisition）
+
+当用户提供 URL 并表达保存或记忆意图（如“记一下”、“保存”、“收藏”、“帮我记”、“以后想看”等）：
+
+1. **先做 capture**：始终先调用 `resource_capture` 建立/复用 Resource 并提交 metadata。`resource_capture` 的成功绝不受后续 acquisition 可用性的阻碍，两项操作职责分离。
+2. **自动触发深度提取**：capture 成功后，除非用户明确表达“只记链接”或“不用抓内容”：
+   - 调用 `execution_targets()` 检查工作空间是否有可用 target（`active_binding_count > 0`）。
+   - 若存在可用 target：调用 `resource_acquire(resource_id, target_id, mode="if_missing")` 提交异步提取 Job，并告知用户：“已保存 Resource；深度内容提取任务已提交，本地 Connector 执行完毕后会自动写入 content.md（若设备离线，任务将在队列中安全等待，最多等待 7 天）。”
+   - 若无可用 target 或 Connector 队列不可用：告知用户：“链接与元数据已保存；当前暂无可用执行目标，正文尚未提取。”
+3. **不预先过滤 resource_kind**：不要根据解析出的 resource_kind 决定是否调用 acquire。URL 是否可提取字幕或正文由 `content.extract_url` 能力自行判定，不要手工设卡。
+4. **离线容忍与幂等**：Connector 离线不是错误，Job 会在队列中安全暂存（TTL 最长 7 天）；重复重试复用同一 request_id。
+
+

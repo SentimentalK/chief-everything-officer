@@ -114,9 +114,14 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
       resourceExists: (_scope, resId) => resId === resourceId,
     });
 
-    // 5. Express Router
+    // 5. Express Router with identical parser configuration as server.ts
     const app = express();
-    app.use(express.json());
+    app.use((req, res, next) => {
+      if (req.path.match(/^\/api\/connector\/jobs\/[^/]+\/result$/)) {
+        return next();
+      }
+      express.json()(req, res, next);
+    });
     app.use(
       "/api/connector/jobs",
       createConnectorJobsRouter(coordinator, controlStore, identityStore),
@@ -217,8 +222,8 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
         payload_sha256: payloadSha256,
       }),
     });
-    expect(resultRes.status).toBe(200);
     const resultJson = await resultRes.json();
+    expect(resultRes.status).toBe(200);
     expect(resultJson.ok).toBe(true);
     expect(resultJson.replayed).toBe(false);
     expect(resultJson.resource_id).toBe(resourceId);
@@ -509,5 +514,100 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     expect(hostJob.execution_status).toBe("FAILED");
     expect(hostJob.business_outcome).toBe("FAILED");
     expect(hostJob.result).toBeNull();
+  });
+
+  it("accepts large managed result payload (~1.5 MiB) on the result endpoint", async () => {
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Acquire large transcript",
+        acceptance: "Should contain large body",
+        resource_id: resourceId,
+        execution_timeout_seconds: 120,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    // 1.5 MiB content string
+    const largeContent = "a".repeat(1536 * 1024);
+    const managedResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resourceId,
+      summary: "Large 1.5 MiB transcript",
+      operations: [
+        {
+          op: "upsert_content",
+          content: largeContent,
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(managedResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: managedResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.ok).toBe(true);
+    expect(typeof json.commit).toBe("string");
+  });
+
+  it("rejects result request body exceeding 3 MiB limit with 413", async () => {
+    const jobId = `job-${crypto.randomUUID()}`;
+    // Construct a payload larger than 3 MiB
+    const oversizedBody = JSON.stringify({
+      attempt_id: `att-${crypto.randomUUID()}`,
+      claim_token: "token",
+      padding: "x".repeat(3145728 + 1024), // > 3 MiB
+    });
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: oversizedBody,
+    });
+    expect(res.status).toBe(413);
+  });
+
+  it("enforces default 100 KiB limit on non-result routes (e.g. claim endpoint)", async () => {
+    const jobId = `job-${crypto.randomUUID()}`;
+    // 120 KiB body on /claim should exceed global 100 KiB limit
+    const oversizedClaim = JSON.stringify({
+      attempt_id: `att-${crypto.randomUUID()}`,
+      claim_token: "token",
+      padding: "x".repeat(120 * 1024),
+    });
+
+    const res = await fetch(`${baseUrl}/${jobId}/claim`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: oversizedClaim,
+    });
+    expect(res.status).toBe(413);
   });
 });

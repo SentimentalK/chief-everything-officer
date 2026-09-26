@@ -184,11 +184,21 @@ impl ExecutionReport {
     }
 }
 
-/// Builds a deterministic, structured execution prompt for coding agents.
+/// Owned correlation data injected into the managed-result section of the Agent prompt.
+/// Uses owned data to avoid lifetime issues when the PathBuf is created inline at the call-site.
+#[derive(Debug, Clone)]
+pub struct ManagedContract {
+    pub path: std::path::PathBuf,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub resource_id: String,
+}
+
+/// Builds a deterministic, structured execution prompt for CEO managed-result Jobs.
 pub fn build_execution_prompt(
     task: Option<&str>,
     acceptance: Option<&str>,
-    managed_contract: Option<(&std::path::Path, &str)>,
+    managed_contract: Option<&ManagedContract>,
 ) -> String {
     let mut sections = Vec::new();
 
@@ -206,11 +216,13 @@ pub fn build_execution_prompt(
         }
     }
 
-    if let Some((path, resource_id)) = managed_contract {
+    if let Some(mc) = managed_contract {
         let contract = format!(
-            "MANAGED RESULT CONTRACT\n\nWhen your task is complete, you MUST write a single JSON file to this EXACT path:\n{}\n\nThe JSON must follow this schema:\n{{\n  \"schema_version\": 1,\n  \"resource_id\": \"{}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"replace_body\",\n      \"content\": \"<string>\"\n    }}\n  ]\n}}\n\nRules:\n1. Do not place this file in the git repository.\n2. Write only valid JSON encoded in UTF-8.\n3. Do not generate empty or partial files.",
-            path.display(),
-            resource_id
+            "MANAGED RESULT CONTRACT\n\nCEO JOB\nJob ID: {job_id}\nAttempt ID: {attempt_id}\nResource ID: {resource_id}\n\nWhen your task is complete, you MUST write a single JSON file to this EXACT path:\n{path}\n\nThe JSON must follow this schema:\n{{\n  \"schema_version\": 1,\n  \"job_id\": \"{job_id}\",\n  \"attempt_id\": \"{attempt_id}\",\n  \"resource_id\": \"{resource_id}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"upsert_content\",\n      \"content\": \"<full extracted content as string>\"\n    }}\n  ]\n}}\n\nAllowed ops: upsert_content, upsert_evidence, upsert_summary, append_interaction, patch_topics, rename\nForbidden ops: attach_source_asset\n\nRules:\n1. Do NOT place this file in the git repository.\n2. Write only valid JSON encoded in UTF-8.\n3. Do not generate empty or partial files.\n4. Do NOT call CEO Server APIs directly.\n5. Do NOT modify resources/** in the git workspace.\n6. job_id, attempt_id, resource_id are given above — do NOT guess or invent them.",
+            job_id = mc.job_id,
+            attempt_id = mc.attempt_id,
+            resource_id = mc.resource_id,
+            path = mc.path.display(),
         );
         sections.push(contract);
     }
@@ -291,14 +303,28 @@ mod tests {
 
     #[test]
     fn build_execution_prompt_with_managed_contract() {
-        let path = std::path::Path::new("/var/ceo/state/runtime/att-123/managed-result.json");
+        let mc = ManagedContract {
+            path: std::path::PathBuf::from(
+                "/var/ceo/state/runtime/att-123/managed-result.json",
+            ),
+            job_id: "job-aaaaaaaa-0000-0000-0000-000000000001".into(),
+            attempt_id: "att-123".into(),
+            resource_id: "res_456".into(),
+        };
         let prompt = build_execution_prompt(
             Some("Update docs"),
             Some("Doc matches schema"),
-            Some((path, "res_456")),
+            Some(&mc),
         );
-        assert!(prompt.starts_with("TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"));
+        assert!(prompt.starts_with(
+            "TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"
+        ));
         assert!(prompt.contains("/var/ceo/state/runtime/att-123/managed-result.json"));
         assert!(prompt.contains("\"resource_id\": \"res_456\""));
+        assert!(prompt.contains("\"job_id\": \"job-aaaaaaaa-0000-0000-0000-000000000001\""));
+        assert!(prompt.contains("\"attempt_id\": \"att-123\""));
+        // Correct op; no forbidden op
+        assert!(prompt.contains("\"op\": \"upsert_content\""));
+        assert!(!prompt.contains("replace_body"));
     }
 }

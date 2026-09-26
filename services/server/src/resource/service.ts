@@ -923,10 +923,20 @@ export class ResourceService {
     });
 
     // Inspect the recorded payload digest to prevent race condition replays of conflicting digests
-    const opResult = txResult.operation_result as any;
-    const recordedDigest = opResult?.managed_job_result?.payload_sha256;
-    if (recordedDigest && recordedDigest !== input.payloadSha256) {
-      throw new CeoError("VALIDATION_FAILED", "RESULT_CONFLICT: Existing transaction has different payload digest.");
+    const recordedDigest =
+      (txResult as any).managed_job_result?.payload_sha256 ??
+      (txResult as any).operation_result?.managed_job_result?.payload_sha256;
+    if (recordedDigest === undefined || recordedDigest === null) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        "CORRUPT_MANAGED_RESULT_TRANSACTION: recorded digest is missing.",
+      );
+    }
+    if (recordedDigest !== input.payloadSha256) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        "RESULT_CONFLICT: Existing transaction has different payload digest.",
+      );
     }
 
     const replayed = txResult.pushed === false;

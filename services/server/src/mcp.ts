@@ -32,6 +32,7 @@ import { installJobToolValidationAuditInterceptor } from "./jobs/tool-audit.js";
 import type { JobCoordinatorV2 } from "./jobs/v2-service.js";
 import type { ConnectorControlStore } from "./connector/control-store.js";
 import type { IdentityStore } from "./identity/store.js";
+import { ResourceAcquisitionService, type ResourceAcquireInput } from "./resource/acquire.js";
 
 function result(value: Record<string, unknown>, isError = false) {
   return {
@@ -534,6 +535,49 @@ export function createMcpServer(
 
   // Connector V2 Job tools (Target discovery & Host Job coordination).
   if (connectorJobs && identity) {
+    if (connectorJobs.coordinator) {
+      const acquisitionService = new ResourceAcquisitionService(
+        workspace,
+        connectorJobs.coordinator,
+      );
+      const scope = { user_id: identity.user_id, workspace_id: identity.workspace_id };
+
+      server.registerTool(
+        "resource_acquire",
+        {
+          title: "Acquire deep content for a CEO resource",
+          description:
+            "Submit an asynchronous job to extract full textual content (transcript, article body) " +
+            "for a URL-based Resource, writing the result into content.md via the managed-result contract. " +
+            "Use this after resource_capture when the user wants deep content. " +
+            "Default mode=if_missing skips if content.md already exists. " +
+            "mode=refresh re-extracts. " +
+            "If the Connector is offline, the Job queues and waits up to 7 days for execution.",
+          inputSchema: {
+            request_id: z.string().min(1).describe("Stable UUID for retry-safe idempotency"),
+            resource_id: z
+              .string()
+              .regex(/^res-[0-9a-f-]{36}$/i)
+              .describe("Target resource ID (res-<uuid>)"),
+            target_id: z
+              .string()
+              .min(1)
+              .describe("Execution target ID (tgt_<uuid>) from execution_targets()"),
+            mode: z
+              .enum(["if_missing", "refresh"])
+              .optional()
+              .default("if_missing")
+              .describe("Acquisition mode: 'if_missing' (default) skips if content exists; 'refresh' re-extracts"),
+          },
+          annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+        },
+        trace("resource_acquire", async (input: ResourceAcquireInput) => {
+          const outcome = await acquisitionService.acquire(scope, input);
+          return { ok: true, ...outcome };
+        }),
+      );
+    }
+
     registerConnectorJobTools(server, {
       coordinator: connectorJobs.coordinator,
       controlStore: connectorJobs.controlStore,

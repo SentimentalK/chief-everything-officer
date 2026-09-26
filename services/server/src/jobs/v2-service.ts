@@ -788,6 +788,17 @@ export class JobCoordinatorV2 {
     };
   }
 
+  async getJobIdByRequestId(
+    scope: JobSubmitScopeV2,
+    requestId: string,
+  ): Promise<string | null> {
+    assertHostWorkspaceAccess(this.identityStore, scope);
+    if (!requestId || !REQUEST_ID_V2_RE.test(requestId)) {
+      throw new JobValidationError("Invalid request_id format.");
+    }
+    return this.store.getRequestJobId(scope.user_id, scope.workspace_id, requestId);
+  }
+
   async getJobForHost(
     scope: JobSubmitScopeV2,
     jobId: string,

@@ -154,7 +154,13 @@ app.use("/register", protocolCors);
 app.use("/token", protocolCors);
 
 // Ordinary JSON body parser for subsequent routes (default 100 KiB)
-app.use(express.json());
+// Skips /api/connector/jobs/:job_id/result which has its own route-scoped 3 MiB parser
+app.use((req, res, next) => {
+  if (req.path.match(/^\/api\/connector\/jobs\/[^/]+\/result$/)) {
+    return next();
+  }
+  express.json()(req, res, next);
+});
 
 // Probes
 app.get("/healthz", (_req, res) => {

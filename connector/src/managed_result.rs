@@ -5,7 +5,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub const MANAGED_RESULT_SCHEMA_VERSION: u32 = 1;
-pub const MAX_MANAGED_RESULT_BYTES: usize = 64 * 1024; // 64 KiB limit
+pub const MAX_MANAGED_RESULT_BYTES: usize = 2 * 1024 * 1024; // 2 MiB limit
 
 #[derive(Error, Debug)]
 pub enum ManagedResultError {
@@ -290,8 +290,8 @@ mod tests {
         let large_file = dir.path().join("large-result.json");
 
         let mut f = fs::File::create(&large_file).unwrap();
-        // Write 65 KiB
-        let chunk = vec![b'a'; 65 * 1024];
+        // Write 2 MiB + 1 byte
+        let chunk = vec![b'a'; 2 * 1024 * 1024 + 1];
         f.write_all(&chunk).unwrap();
 
         let res = read_and_validate_from_file(&large_file, "job-1", "att-1", Some("res-1"));
@@ -299,5 +299,30 @@ mod tests {
             res,
             Err(ManagedResultError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn test_size_limit_accepts_gt_64kib() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("managed-result.json");
+
+        // Create a valid envelope with ~128 KiB content
+        let large_content = "x".repeat(128 * 1024);
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "128 KiB transcript".into(),
+            operations: vec![serde_json::json!({
+                "op": "upsert_content",
+                "content": large_content
+            })],
+        };
+
+        fs::write(&file, serde_json::to_string(&envelope).unwrap()).unwrap();
+
+        let res = read_and_validate_from_file(&file, "job-1", "att-1", Some("res-1"));
+        assert!(res.is_ok());
     }
 }

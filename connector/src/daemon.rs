@@ -1027,16 +1027,19 @@ pub async fn drive_active_attempt(
                     let prompt_text = {
                         let managed_contract =
                             if active.result_target.as_deref() == Some("resource") {
-                                let result_path = paths.managed_result_file(&active.attempt_id);
-                                let resource_id = active.resource_id.as_deref().unwrap_or("");
-                                Some((result_path, resource_id))
+                                Some(crate::execution_contract::ManagedContract {
+                                    path: paths.managed_result_file(&active.attempt_id),
+                                    job_id: active.job_id.clone(),
+                                    attempt_id: active.attempt_id.clone(),
+                                    resource_id: active.resource_id.clone().unwrap_or_default(),
+                                })
                             } else {
                                 None
                             };
                         crate::execution_contract::build_execution_prompt(
                             active.prompt.as_deref(),
                             active.acceptance.as_deref(),
-                            managed_contract.as_ref().map(|(p, r)| (p.as_path(), *r)),
+                            managed_contract.as_ref(),
                         )
                     };
 

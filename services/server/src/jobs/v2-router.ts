@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import express from "express";
 import { ZodError } from "zod/v4";
 import {
   JobCoordinatorV2,
@@ -19,6 +20,11 @@ import { CeoError } from "../errors.js";
 import type { ConnectorControlStore } from "../connector/control-store.js";
 import type { IdentityStore } from "../identity/store.js";
 import { createDeviceAuthMiddleware } from "../connector/device-auth.js";
+
+// 3 MiB: accommodates a 2 MiB managed-result payload plus the JSON wrapper
+// (attempt_id, claim_token, payload_sha256 envelope fields).
+// This constant is intentionally separate from MAX_MANAGED_RESULT_BYTES (Connector file limit).
+const MAX_RESULT_REQUEST_BYTES = 3 * 1024 * 1024;
 
 export function createConnectorJobsRouter(
   coordinator: JobCoordinatorV2,
@@ -157,7 +163,13 @@ export function createConnectorJobsRouter(
   });
 
   // POST /api/connector/jobs/:job_id/result
-  router.post("/:job_id/result", async (req: Request, res: Response) => {
+  // Uses a route-scoped 3 MiB body parser (instead of the global 100 KiB parser which is
+  // bypassed for this path in server.ts). The larger limit accommodates a 2 MiB managed-result
+  // payload inside the JSON request envelope.
+  router.post(
+    "/:job_id/result",
+    express.json({ limit: MAX_RESULT_REQUEST_BYTES }),
+    async (req: Request, res: Response) => {
     const device = res.locals.deviceIdentity;
     if (!device) {
       res.status(401).json({ error: "unauthorized" });
