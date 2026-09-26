@@ -786,7 +786,7 @@ pub async fn drive_active_attempt(
             };
 
             match adapter.prepare(&active, &target).await {
-                Ok(prep) => {
+                Ok(crate::scheduler::PrepareOutcome::Ready(prep)) => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -829,6 +829,111 @@ pub async fn drive_active_attempt(
                         active.attempt_id
                     );
                     Ok(true)
+                }
+                Ok(crate::scheduler::PrepareOutcome::Retryable { execution, reason }) => {
+                    if let Some(ident) = execution {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        let exec = current.executor.get_or_insert_with(|| {
+                            crate::scheduler::AttemptExecutorState {
+                                executor_type: "orca".into(),
+                                orca_version: None,
+                                worktree_id: None,
+                                terminal_id: None,
+                                agent_id: None,
+                                agent_ready_at_ms: None,
+                                dispatch_send_count: 0,
+                                dispatch_started_at_ms: None,
+                                execution_deadline_ms: None,
+                                dispatch_request_id: None,
+                                dispatch_accepted_at_ms: None,
+                                last_dispatch_outcome: None,
+                                dispatch_stage: None,
+                                dispatch_observation_count: 0,
+                                runtime_completion_kind: None,
+                                runtime_completed_at_ms: None,
+                                runtime_error: None,
+                            }
+                        });
+                        exec.orca_version = Some(ident.orca_version);
+                        exec.worktree_id = Some(ident.worktree_id);
+                        exec.terminal_id = Some(ident.terminal_id);
+                        exec.agent_id = Some(ident.agent_id);
+                        current.save(&paths.active_attempt_file())?;
+                    }
+                    eprintln!("Execution prepare retryable: {reason}. Retrying next loop.");
+                    Ok(true)
+                }
+                Ok(crate::scheduler::PrepareOutcome::NotReady { execution, reason }) => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    let exec = current.executor.get_or_insert_with(|| {
+                        crate::scheduler::AttemptExecutorState {
+                            executor_type: "orca".into(),
+                            orca_version: None,
+                            worktree_id: None,
+                            terminal_id: None,
+                            agent_id: None,
+                            agent_ready_at_ms: None,
+                            dispatch_send_count: 0,
+                            dispatch_started_at_ms: None,
+                            execution_deadline_ms: None,
+                            dispatch_request_id: None,
+                            dispatch_accepted_at_ms: None,
+                            last_dispatch_outcome: None,
+                            dispatch_stage: None,
+                            dispatch_observation_count: 0,
+                            runtime_completion_kind: None,
+                            runtime_completed_at_ms: None,
+                            runtime_error: None,
+                        }
+                    });
+                    exec.orca_version = Some(execution.orca_version);
+                    exec.worktree_id = Some(execution.worktree_id);
+                    exec.terminal_id = Some(execution.terminal_id);
+                    exec.agent_id = Some(execution.agent_id);
+                    exec.runtime_completion_kind = Some("not_started".into());
+                    exec.runtime_completed_at_ms = Some(now_utc_ms());
+                    exec.runtime_error = Some(ExecutionReportError {
+                        stage: "prepare".into(),
+                        code: "AGENT_NOT_READY".into(),
+                        message: reason,
+                    });
+                    current.phase = AttemptPhase::OutcomeRecorded;
+                    current.save(&paths.active_attempt_file())?;
+                    println!(
+                        "Agent failed readiness gate for attempt '{}'. Advanced to OutcomeRecorded for verified cleanup.",
+                        active.attempt_id
+                    );
+                    Ok(true)
+                }
+                Ok(crate::scheduler::PrepareOutcome::RecoveryRequired(reason)) => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    Err(DaemonError::RecoveryRequired(reason))
                 }
                 Err(e) => {
                     if e.contains("RECOVERY_REQUIRED") {
@@ -1019,106 +1124,29 @@ pub async fn drive_active_attempt(
                     }
 
                     if send_count >= 2 {
-                        let receipt = ExecutionReceipt {
-                            schema_version: ExecutionReceipt::SCHEMA_VERSION,
-                            job_id: active.job_id.clone(),
-                            attempt_id: active.attempt_id.clone(),
-                            target_id: active.target_id.clone(),
-                            orca_version: active
-                                .executor
-                                .as_ref()
-                                .and_then(|e| e.orca_version.clone())
-                                .unwrap_or_else(|| "unknown".into()),
-                            worktree_id: active
-                                .executor
-                                .as_ref()
-                                .and_then(|e| e.worktree_id.clone()),
-                            terminal_id: active
-                                .executor
-                                .as_ref()
-                                .and_then(|e| e.terminal_id.clone()),
-                            agent_id: active.executor.as_ref().and_then(|e| e.agent_id.clone()),
-                            agent_ready_at_ms: active
-                                .executor
-                                .as_ref()
-                                .and_then(|e| e.agent_ready_at_ms),
-                            dispatch_request_id: None,
-                            dispatch_stage: None,
-                            task_dispatched: false,
-                            runtime_completion_kind: None,
-                            dispatch_started_at_ms: active
-                                .executor
-                                .as_ref()
-                                .and_then(|e| e.dispatch_started_at_ms),
-                            runtime_completed_at_ms: Some(now_utc_ms()),
-                            terminal_cleanup_verified: true,
-                            terminal_closed_at_ms: None,
-                        };
-                        let receipt_sha256 = receipt.compute_sha256();
-
-                        let report = ExecutionReport {
-                            schema_version: REPORT_SCHEMA_VERSION,
-                            execution_status: ExecutionStatus::BLOCKED,
-                            business_outcome: BusinessOutcome::NOT_STARTED,
-                            task_dispatched: false,
-                            finished_at_ms: now_utc_ms(),
-                            duration_ms: 0,
-                            error: Some(ExecutionReportError {
-                                stage: "dispatch".into(),
-                                code: "DISPATCH_REJECTED".into(),
-                                message: "Exhausted maximum dispatch retry budget (proven rejected before acceptance)".into(),
-                            }),
-                            executor: ExecutionReportExecutor {
-                                executor_type: active
-                                    .executor
-                                    .as_ref()
-                                    .map(|e| e.executor_type.clone())
-                                    .unwrap_or_else(|| "orca".into()),
-                                version: active
-                                    .executor
-                                    .as_ref()
-                                    .and_then(|e| e.orca_version.clone())
-                                    .unwrap_or_else(|| "unknown".into()),
-                            },
-                            receipt_sha256,
-                        };
-                        report
-                            .validate()
-                            .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
-                        let digest = compute_report_sha256(&report);
-
-                        let outbox_rec = OutboxRecord {
-                            schema_version: OUTBOX_SCHEMA_VERSION,
-                            server_origin: cred.server_origin.clone(),
-                            device_id: cred.device_id.clone(),
-                            job_id: active.job_id.clone(),
-                            attempt_id: active.attempt_id.clone(),
-                            claim_token: active.claim_token.clone(),
-                            report,
-                            created_at_ms: now_utc_ms(),
-                        };
-
                         let _lock = ExecutionLock::acquire_with_retry(
                             &paths.state_lock_file(),
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-
-                        let outbox_file = paths
-                            .outbox_dir()
-                            .join(format!("{}.json", active.attempt_id));
-                        outbox_rec.save(&outbox_file)?;
-
                         let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
                             Some(c) if c.attempt_id == active.attempt_id => c,
                             _ => return Ok(true),
                         };
-                        current.phase = AttemptPhase::FinalizedLocal;
-                        current.terminal_report_sha256 = Some(digest);
+                        if let Some(ref mut exec) = current.executor {
+                            exec.runtime_completion_kind = Some("not_started".into());
+                            exec.runtime_completed_at_ms = Some(now_utc_ms());
+                            exec.runtime_error = Some(ExecutionReportError {
+                                stage: "dispatch".into(),
+                                code: "DISPATCH_REJECTED".into(),
+                                message: "Exhausted maximum dispatch retry budget (proven rejected before acceptance)".into(),
+                            });
+                        }
+                        current.phase = AttemptPhase::OutcomeRecorded;
                         current.save(&paths.active_attempt_file())?;
 
                         println!(
-                            "Dispatch retry budget exhausted for attempt '{}'; marked BLOCKED and queued in outbox",
+                            "Dispatch retry budget exhausted for attempt '{}'; marked not_started and advanced to OutcomeRecorded for verified cleanup",
                             active.attempt_id
                         );
                         return Ok(true);
@@ -1375,76 +1403,138 @@ pub async fn drive_active_attempt(
         }
         AttemptPhase::OutcomeRecorded => {
             // NEVER wait or dispatch again!
-            let mut terminal_cleanup_verified = true;
-            let mut terminal_closed_at_ms = None;
-            if let Some(tid) = active
+            let (terminal_cleanup_verified, terminal_closed_at_ms) = if let Some(tid) = active
                 .executor
                 .as_ref()
                 .and_then(|e| e.terminal_id.as_ref())
             {
-                let close_res = adapter.close(tid).await;
-                terminal_closed_at_ms = Some(now_utc_ms());
-                terminal_cleanup_verified = close_res.is_ok();
+                match adapter.close(tid).await {
+                    crate::scheduler::CleanupOutcome::VerifiedClosed { closed_at_ms } => {
+                        (true, Some(closed_at_ms))
+                    }
+                    crate::scheduler::CleanupOutcome::AlreadyAbsent { verified_at_ms } => {
+                        (true, Some(verified_at_ms))
+                    }
+                    crate::scheduler::CleanupOutcome::Retryable { reason } => {
+                        eprintln!("Terminal cleanup retryable: {reason}. Will retry next loop.");
+                        return Ok(true);
+                    }
+                    crate::scheduler::CleanupOutcome::RecoveryRequired { code, message } => {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(format!("{code}: {message}")));
+                    }
+                }
+            } else {
+                (true, None)
+            };
+
+            if !terminal_cleanup_verified {
+                let _lock = ExecutionLock::acquire_with_retry(
+                    &paths.state_lock_file(),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                )?;
+                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                    Some(c) if c.attempt_id == active.attempt_id => c,
+                    _ => return Ok(true),
+                };
+                current.phase = AttemptPhase::RecoveryRequired;
+                current.save(&paths.active_attempt_file())?;
+                return Err(DaemonError::RecoveryRequired(
+                    "HARD INVARIANT VIOLATION: terminal_cleanup_verified is false in OutcomeRecorded".into(),
+                ));
             }
 
             let exec_state = active.executor.as_ref().ok_or_else(|| {
                 DaemonError::RecoveryRequired("OutcomeRecorded phase missing executor state".into())
             })?;
 
-            let (status, outcome, err) = match exec_state.runtime_completion_kind.as_deref() {
-                Some("tui_idle") => (
-                    ExecutionStatus::COMPLETED,
-                    BusinessOutcome::UNVERIFIED,
-                    None,
-                ),
-                Some("timed_out") => (
-                    ExecutionStatus::TIMED_OUT,
-                    BusinessOutcome::UNVERIFIED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "runtime".into(),
-                            code: "EXECUTION_TIMEOUT".into(),
-                            message: "Execution timed out".into(),
-                        })
-                    }),
-                ),
-                Some("interrupted") => (
-                    ExecutionStatus::INTERRUPTED,
-                    BusinessOutcome::UNVERIFIED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "runtime".into(),
-                            code: "TERMINAL_EXITED".into(),
-                            message: "Execution interrupted".into(),
-                        })
-                    }),
-                ),
-                _ => (
-                    ExecutionStatus::FAILED,
-                    BusinessOutcome::FAILED,
-                    exec_state.runtime_error.clone().or_else(|| {
-                        Some(ExecutionReportError {
-                            stage: "runtime".into(),
-                            code: "EXECUTION_FAILED".into(),
-                            message: "Execution interrupted or failed".into(),
-                        })
-                    }),
-                ),
-            };
+            let (status, outcome, task_dispatched, err) =
+                match exec_state.runtime_completion_kind.as_deref() {
+                    Some("tui_idle") => (
+                        ExecutionStatus::COMPLETED,
+                        BusinessOutcome::UNVERIFIED,
+                        true,
+                        None,
+                    ),
+                    Some("timed_out") => (
+                        ExecutionStatus::TIMED_OUT,
+                        BusinessOutcome::UNVERIFIED,
+                        true,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "runtime".into(),
+                                code: "EXECUTION_TIMEOUT".into(),
+                                message: "Execution timed out".into(),
+                            })
+                        }),
+                    ),
+                    Some("interrupted") => (
+                        ExecutionStatus::INTERRUPTED,
+                        BusinessOutcome::UNVERIFIED,
+                        true,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "runtime".into(),
+                                code: "TERMINAL_EXITED".into(),
+                                message: "Execution interrupted".into(),
+                            })
+                        }),
+                    ),
+                    Some("not_started") => (
+                        ExecutionStatus::BLOCKED,
+                        BusinessOutcome::NOT_STARTED,
+                        false,
+                        exec_state.runtime_error.clone().or_else(|| {
+                            Some(ExecutionReportError {
+                                stage: "orchestration".into(),
+                                code: "EXECUTION_NOT_STARTED".into(),
+                                message: "Execution blocked before agent dispatch".into(),
+                            })
+                        }),
+                    ),
+                    other => {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(format!(
+                            "Unknown runtime_completion_kind: {other:?}"
+                        )));
+                    }
+                };
 
             let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
             let completed_ms = exec_state
                 .runtime_completed_at_ms
                 .unwrap_or_else(now_utc_ms);
-            let duration_ms = (completed_ms - started_ms).max(0);
+            let duration_ms = if task_dispatched {
+                (completed_ms - started_ms).max(0)
+            } else {
+                0
+            };
 
             let orca_version = exec_state
                 .orca_version
                 .clone()
                 .unwrap_or_else(|| "unknown".into());
-
-            let is_turn_started =
-                exec_state.dispatch_stage == Some(crate::scheduler::DispatchStage::TurnStarted);
 
             let receipt = ExecutionReceipt {
                 schema_version: ExecutionReceipt::SCHEMA_VERSION,
@@ -1460,7 +1550,7 @@ pub async fn drive_active_attempt(
                 dispatch_stage: exec_state
                     .dispatch_stage
                     .map(|s| format!("{s:?}").to_lowercase()),
-                task_dispatched: is_turn_started,
+                task_dispatched,
                 runtime_completion_kind: exec_state.runtime_completion_kind.clone(),
                 dispatch_started_at_ms: exec_state.dispatch_started_at_ms,
                 runtime_completed_at_ms: exec_state.runtime_completed_at_ms,
@@ -1473,12 +1563,12 @@ pub async fn drive_active_attempt(
                 schema_version: REPORT_SCHEMA_VERSION,
                 execution_status: status,
                 business_outcome: outcome,
-                task_dispatched: is_turn_started,
+                task_dispatched,
                 finished_at_ms: completed_ms,
                 duration_ms,
                 error: err,
                 executor: ExecutionReportExecutor {
-                    executor_type: "orca".into(),
+                    executor_type: exec_state.executor_type.clone(),
                     version: orca_version,
                 },
                 receipt_sha256,

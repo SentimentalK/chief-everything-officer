@@ -87,7 +87,7 @@ async fn test_v1_7e_tui_readiness_retry_success() {
 if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
     echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
-    echo '{{"ok":true,"result":{{"terminals":[]}}}}'
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -145,7 +145,10 @@ fi
         executor: None,
     };
 
-    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
     assert_eq!(prep.worktree_id, "wt_1");
     assert_eq!(prep.terminal_id, "term_1");
     assert_eq!(prep.agent_id, "agy");
@@ -169,7 +172,7 @@ async fn test_v1_7e_tui_readiness_exhaustion_fails_closed() {
 if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
     echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
-    echo '{{"ok":true,"result":{{"terminals":[]}}}}'
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -213,10 +216,13 @@ fi
         executor: None,
     };
 
-    let res = adapter.prepare(&attempt, &target).await;
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert!(err.contains("AGENT_NOT_READY"));
+    let res = adapter.prepare(&attempt, &target).await.unwrap();
+    match res {
+        ceo_connector::scheduler::PrepareOutcome::NotReady { reason, .. } => {
+            assert!(reason.contains("AGENT_NOT_READY"));
+        }
+        other => panic!("expected PrepareOutcome::NotReady, got {other:?}"),
+    }
 }
 
 /// Slice V1.7f Acceptance:
@@ -380,7 +386,9 @@ if [ "$1" = "terminal" ] && [ "$2" = "close" ]; then
     echo '{{"ok":true,"result":{{"close":{{"handle":"term_1","closeMode":"exact","ptyKilled":true,"ptyStopVerdict":"success"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     # Return empty list, proving terminal is completely absent
-    echo '{{"ok":true,"result":{{"terminals":[]}}}}'
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":false,"error":{{"code":"terminal_not_found","message":"not found"}}}}'
 else
     echo '{{"ok":false}}'
 fi

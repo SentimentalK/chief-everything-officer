@@ -560,7 +560,7 @@ async fn run_claim_mismatch_case(
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<ceo_connector::scheduler::PreparedExecution, String> {
+        ) -> Result<ceo_connector::scheduler::PrepareOutcome, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }
@@ -590,8 +590,10 @@ async fn run_claim_mismatch_case(
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }
-        async fn close(&self, _terminal_id: &str) -> Result<(), String> {
-            Ok(())
+        async fn close(&self, _terminal_id: &str) -> ceo_connector::scheduler::CleanupOutcome {
+            ceo_connector::scheduler::CleanupOutcome::AlreadyAbsent {
+                verified_at_ms: chrono::Utc::now().timestamp_millis(),
+            }
         }
     }
 
@@ -800,7 +802,7 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<ceo_connector::scheduler::PreparedExecution, String> {
+        ) -> Result<ceo_connector::scheduler::PrepareOutcome, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }
@@ -830,8 +832,10 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }
-        async fn close(&self, _terminal_id: &str) -> Result<(), String> {
-            Ok(())
+        async fn close(&self, _terminal_id: &str) -> ceo_connector::scheduler::CleanupOutcome {
+            ceo_connector::scheduler::CleanupOutcome::AlreadyAbsent {
+                verified_at_ms: chrono::Utc::now().timestamp_millis(),
+            }
         }
     }
 

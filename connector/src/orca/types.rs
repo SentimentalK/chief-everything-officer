@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrcaErrorPart {
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrcaFailureEnvelope {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub ok: bool,
+    pub error: OrcaErrorPart,
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaStatusResponse {
     pub ok: bool,
@@ -50,6 +69,8 @@ pub struct OrcaWorktreeListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaWorktreeListResult {
     pub worktrees: Vec<OrcaWorktreeItem>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +124,18 @@ pub struct OrcaTerminalListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaTerminalListResult {
     pub terminals: Vec<OrcaTerminalItem>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaTerminalShowResponse {
+    pub ok: bool,
+    pub result: Option<OrcaTerminalShowResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaTerminalShowResult {
+    pub terminal: OrcaTerminalItem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +175,8 @@ pub struct OrcaSendPart {
 pub struct OrcaSendPromptPart {
     pub request_id: Option<String>,
     pub stages: Option<Vec<String>>,
+    pub provider: Option<String>,
+    pub observation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,12 +205,6 @@ pub struct OrcaWaitPart {
     pub condition: Option<String>,
     pub satisfied: bool,
     pub elapsed_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrcaErrorPart {
-    pub code: Option<String>,
-    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

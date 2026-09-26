@@ -17,8 +17,9 @@ use ceo_connector::local_state::ExecutionLock;
 use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptExecutorState, AttemptPhase, DispatchOutcome, DispatchReconciliation,
-    DispatchStage, ExecutionAdapter, PreparedExecution, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
+    DispatchReconciliation, DispatchStage, ExecutionAdapter, PrepareOutcome, PreparedExecution,
+    WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
 use uuid::Uuid;
@@ -26,11 +27,11 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 struct MockAdapter {
     pub ready: bool,
-    pub prepare_result: Option<Result<PreparedExecution, String>>,
+    pub prepare_result: Option<Result<PrepareOutcome, String>>,
     pub reconcile_result: Option<Result<DispatchReconciliation, String>>,
     pub dispatch_result: Option<Result<DispatchOutcome, String>>,
     pub wait_result: Option<Result<WaitOutcome, String>>,
-    pub close_result: Option<Result<(), String>>,
+    pub close_result: Option<CleanupOutcome>,
 
     pub prepare_calls: Arc<AtomicUsize>,
     pub reconcile_calls: Arc<AtomicUsize>,
@@ -55,18 +56,18 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<PreparedExecution, String> {
+    ) -> Result<PrepareOutcome, String> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(ref res) = self.prepare_result {
             res.clone()
         } else {
-            Ok(PreparedExecution {
+            Ok(PrepareOutcome::Ready(PreparedExecution {
                 worktree_id: format!("wt_{}", attempt.attempt_id),
                 terminal_id: format!("term_{}", attempt.attempt_id),
                 orca_version: "1.4.209".into(),
                 agent_id: "agy".into(),
                 agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
-            })
+            }))
         }
     }
 
@@ -112,9 +113,13 @@ impl ExecutionAdapter for MockAdapter {
             .unwrap_or(Ok(WaitOutcome::TuiIdle { elapsed_ms: 100 }))
     }
 
-    async fn close(&self, _terminal_id: &str) -> Result<(), String> {
+    async fn close(&self, _terminal_id: &str) -> CleanupOutcome {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
-        self.close_result.clone().unwrap_or(Ok(()))
+        self.close_result
+            .clone()
+            .unwrap_or(CleanupOutcome::VerifiedClosed {
+                closed_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
     }
 }
 
@@ -629,6 +634,23 @@ async fn test_dispatch_retry_budget_exhaustion_fails_closed() {
     let a = ActiveAttempt::load(&paths.active_attempt_file())
         .unwrap()
         .unwrap();
+    assert_eq!(a.phase, AttemptPhase::OutcomeRecorded);
+
+    // Step: OutcomeRecorded -> FinalizedLocal with verified cleanup
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
     assert_eq!(a.phase, AttemptPhase::FinalizedLocal);
 
     let outbox_entries = fs::read_dir(paths.outbox_dir())
@@ -789,13 +811,13 @@ async fn test_prepare_terminal_adoption() {
     // Adapter returns existing adopted terminal ID
     let adapter = Arc::new(MockAdapter {
         ready: true,
-        prepare_result: Some(Ok(PreparedExecution {
+        prepare_result: Some(Ok(PrepareOutcome::Ready(PreparedExecution {
             worktree_id: "wt_existing".into(),
             terminal_id: "term_adopted_123".into(),
             orca_version: "1.4.209".into(),
             agent_id: "agy".into(),
             agent_ready_at_ms: 1727220000000,
-        })),
+        }))),
         ..Default::default()
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
@@ -1228,6 +1250,23 @@ async fn test_proven_rejection_allows_one_retry_then_exhausts_to_blocked() {
     assert_eq!(a2.executor.as_ref().unwrap().dispatch_send_count, 2);
 
     // Drive 4: DispatchIntent (Send #3 - Budget exhausted) -> sees send_count >= 2 -> terminal BLOCKED outbox -> FinalizedLocal
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a3 = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a3.phase, AttemptPhase::OutcomeRecorded);
+
+    // Step: OutcomeRecorded -> FinalizedLocal with verified cleanup
     let advanced = drive_active_attempt(
         &paths,
         &client,

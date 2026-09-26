@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ceo_connector::config::{LocalExecutorConfig, LocalTarget};
-use ceo_connector::orca::client::OrcaCliClient;
+use ceo_connector::orca::client::{parse_orca_json, OrcaCliClient, OrcaCommandOutput, OrcaError};
 use ceo_connector::orca::receipt::ExecutionReceipt;
 use ceo_connector::orca::types::*;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptPhase, DispatchOutcome, ExecutionAdapter, WaitOutcome,
+    ActiveAttempt, AttemptPhase, CleanupOutcome, DispatchOutcome, ExecutionAdapter, WaitOutcome,
     ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 
@@ -392,7 +392,7 @@ elif [ "$1" = "repo" ] && [ "$2" = "add" ]; then
     touch "{}"
     echo '{{"ok":true,"result":{{"repo":{{"id":"repo_123","path":"{}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
-    echo '{{"ok":true,"result":{{"terminals":[]}}}}'
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","title":"ceo:att_123"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -441,7 +441,10 @@ fi
         executor: None,
     };
 
-    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
     assert_eq!(prep.worktree_id, "wt_123");
     assert_eq!(prep.terminal_id, "term_new_123");
     assert_eq!(prep.agent_id, "agy");
@@ -514,7 +517,7 @@ if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
     echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_target_1","path":"{repo_canon}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     # Terminal matching title ceo:att_123 exists, but in wt_OTHER!
-    echo '{{"ok":true,"result":{{"terminals":[{{"handle":"term_other_worktree","title":"ceo:att_123","worktreeId":"wt_OTHER"}}]}}}}'
+    echo '{{"ok":true,"result":{{"terminals":[{{"handle":"term_other_worktree","title":"ceo:att_123","worktreeId":"wt_OTHER"}}],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","title":"ceo:att_123","worktreeId":"wt_target_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -558,7 +561,10 @@ fi
         executor: None,
     };
 
-    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
     assert_eq!(prep.worktree_id, "wt_target_1");
     // Must NOT adopt term_other_worktree
     assert_eq!(prep.terminal_id, "term_created_target");
@@ -719,4 +725,172 @@ exit 1
         msg.contains("catastrophic bus error") || msg.contains("unknown_fatal"),
         "Unexpected msg: {msg}"
     );
+}
+
+#[test]
+fn test_parse_orca_json_discriminator_first() {
+    // 1. ok: false with exit code 0 or 1 MUST return Err(OrcaError::Orca)
+    // even when T has optional fields (like OrcaTerminalListResponse)
+    let failure_output = OrcaCommandOutput {
+        exit_code: Some(1),
+        stdout:
+            r#"{"ok":false,"error":{"code":"runtime_unavailable","message":"daemon not running"}}"#
+                .to_string(),
+        stderr: String::new(),
+    };
+    let parsed: Result<OrcaTerminalListResponse, OrcaError> = parse_orca_json(failure_output);
+    match parsed {
+        Err(OrcaError::Orca { code, message, .. }) => {
+            assert_eq!(code, "runtime_unavailable");
+            assert_eq!(message, "daemon not running");
+        }
+        other => panic!("Expected OrcaError::Orca, got {other:?}"),
+    }
+
+    // 2. ok: true with exit code 1 (Orca wait unsatisfied) must parse as success T
+    let unsatisfied_wait_output = OrcaCommandOutput {
+        exit_code: Some(1),
+        stdout: r#"{"ok":true,"result":{"wait":{"handle":"term_1","condition":"tui-idle","satisfied":false,"elapsedMs":5000}}}"#.to_string(),
+        stderr: String::new(),
+    };
+    let parsed_wait: OrcaTerminalWaitResponse = parse_orca_json(unsatisfied_wait_output).unwrap();
+    assert!(parsed_wait.ok);
+    let wait_res = parsed_wait.result.unwrap().wait.unwrap();
+    assert!(!wait_res.satisfied);
+    assert_eq!(wait_res.elapsed_ms, Some(5000));
+
+    // 3. Missing or non-boolean ok field must return Protocol error
+    let missing_ok = OrcaCommandOutput {
+        exit_code: Some(0),
+        stdout: r#"{"result":{"something":"val"}}"#.to_string(),
+        stderr: String::new(),
+    };
+    let parsed_missing: Result<OrcaTerminalListResponse, OrcaError> = parse_orca_json(missing_ok);
+    assert!(matches!(parsed_missing, Err(OrcaError::Protocol(_, _))));
+
+    let string_ok = OrcaCommandOutput {
+        exit_code: Some(0),
+        stdout: r#"{"ok":"true","result":{}}"#.to_string(),
+        stderr: String::new(),
+    };
+    let parsed_string: Result<OrcaTerminalListResponse, OrcaError> = parse_orca_json(string_ok);
+    assert!(matches!(parsed_string, Err(OrcaError::Protocol(_, _))));
+
+    // 4. Empty stdout must return CommandFailed
+    let empty_output = OrcaCommandOutput {
+        exit_code: Some(127),
+        stdout: "   \n".to_string(),
+        stderr: "command not found".to_string(),
+    };
+    let parsed_empty: Result<OrcaTerminalListResponse, OrcaError> = parse_orca_json(empty_output);
+    match parsed_empty {
+        Err(OrcaError::CommandFailed { code, stderr }) => {
+            assert_eq!(code, Some(127));
+            assert_eq!(stderr, "command not found");
+        }
+        other => panic!("Expected CommandFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_cleanup_outcome_variants() {
+    let temp = tempfile::tempdir().unwrap();
+
+    // 1. pty_stop_verdict == "live" -> CleanupOutcome::RecoveryRequired
+    let script_live = r#"#!/bin/bash
+if [[ "$*" == *"terminal close"* ]]; then
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyStopVerdict":"live"}}}'
+  exit 0
+fi
+"#;
+    let bin_live = create_mock_orca_script(&temp, script_live);
+    let client_live = OrcaCliClient::new(bin_live);
+    let adapter_live = OrcaExecutionAdapter::new(client_live);
+    let outcome_live = adapter_live.close("term_1").await;
+    match outcome_live {
+        CleanupOutcome::RecoveryRequired { code, message } => {
+            assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
+            assert!(
+                message.contains("live"),
+                "Expected 'live' in message: {message}"
+            );
+        }
+        other => panic!("Expected RecoveryRequired, got {other:?}"),
+    }
+
+    // 2. pty_stop_verdict == "unverifiable" -> CleanupOutcome::RecoveryRequired
+    let script_unv = r#"#!/bin/bash
+if [[ "$*" == *"terminal close"* ]]; then
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyStopVerdict":"unverifiable"}}}'
+  exit 0
+fi
+"#;
+    let bin_unv = create_mock_orca_script(&temp, script_unv);
+    let client_unv = OrcaCliClient::new(bin_unv);
+    let adapter_unv = OrcaExecutionAdapter::new(client_unv);
+    let outcome_unv = adapter_unv.close("term_1").await;
+    match outcome_unv {
+        CleanupOutcome::RecoveryRequired { code, message } => {
+            assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
+            assert!(
+                message.contains("unverifiable"),
+                "Expected 'unverifiable' in message: {message}"
+            );
+        }
+        other => panic!("Expected RecoveryRequired, got {other:?}"),
+    }
+
+    // 3. terminal_handle_stale on show -> CleanupOutcome::RecoveryRequired
+    let script_stale = r#"#!/bin/bash
+if [[ "$*" == *"terminal close"* ]]; then
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":true}}}'
+  exit 0
+fi
+if [[ "$*" == *"terminal list"* ]]; then
+  echo '{"ok":true,"result":{"terminals":[],"truncated":false}}'
+  exit 0
+fi
+if [[ "$*" == *"terminal show"* ]]; then
+  echo '{"ok":false,"error":{"code":"terminal_handle_stale","message":"handle stale"}}'
+  exit 1
+fi
+"#;
+    let bin_stale = create_mock_orca_script(&temp, script_stale);
+    let client_stale = OrcaCliClient::new(bin_stale);
+    let adapter_stale = OrcaExecutionAdapter::new(client_stale);
+    let outcome_stale = adapter_stale.close("term_1").await;
+    match outcome_stale {
+        CleanupOutcome::RecoveryRequired { code, message } => {
+            assert_eq!(code, "TERMINAL_HANDLE_STALE");
+            assert!(
+                message.contains("stale"),
+                "Expected 'stale' in message: {message}"
+            );
+        }
+        other => panic!("Expected RecoveryRequired, got {other:?}"),
+    }
+
+    // 4. Successful close: close ok, inventory empty, show returns terminal_not_found -> VerifiedClosed
+    let script_success = r#"#!/bin/bash
+if [[ "$*" == *"terminal close"* ]]; then
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":true}}}'
+  exit 0
+fi
+if [[ "$*" == *"terminal list"* ]]; then
+  echo '{"ok":true,"result":{"terminals":[],"truncated":false}}'
+  exit 0
+fi
+if [[ "$*" == *"terminal show"* ]]; then
+  echo '{"ok":false,"error":{"code":"terminal_not_found","message":"terminal not found"}}'
+  exit 1
+fi
+"#;
+    let bin_success = create_mock_orca_script(&temp, script_success);
+    let client_success = OrcaCliClient::new(bin_success);
+    let adapter_success = OrcaExecutionAdapter::new(client_success);
+    let outcome_success = adapter_success.close("term_1").await;
+    assert!(matches!(
+        outcome_success,
+        CleanupOutcome::VerifiedClosed { .. }
+    ));
 }

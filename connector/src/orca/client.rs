@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,6 +11,13 @@ use super::types::*;
 pub const MAX_CLI_BUFFER_BYTES: usize = 512 * 1024;
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Debug, Clone)]
+pub struct OrcaCommandOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 #[derive(Error, Debug)]
 pub enum OrcaError {
     #[error("Orca executable not found or IO error: {0}")]
@@ -20,8 +28,63 @@ pub enum OrcaError {
     CommandFailed { code: Option<i32>, stderr: String },
     #[error("Failed to parse Orca JSON output: {0}. Raw output: {1}")]
     JsonParse(serde_json::Error, String),
-    #[error("Orca reported error: {0}")]
-    Orca(String),
+    #[error("Orca protocol error: {0}. Raw output: {1}")]
+    Protocol(String, String),
+    #[error("Orca reported error: {code}: {message}")]
+    Orca {
+        code: String,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+}
+
+impl OrcaError {
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            OrcaError::Orca { code, .. } => Some(code.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn is_code(&self, target_code: &str) -> bool {
+        self.error_code() == Some(target_code)
+    }
+}
+
+pub fn parse_orca_json<T: DeserializeOwned>(output: OrcaCommandOutput) -> Result<T, OrcaError> {
+    let trimmed = output.stdout.trim();
+    if trimmed.is_empty() {
+        return Err(OrcaError::CommandFailed {
+            code: output.exit_code,
+            stderr: output.stderr,
+        });
+    }
+
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| OrcaError::JsonParse(e, output.stdout.clone()))?;
+
+    let ok = value.get("ok").and_then(|v| v.as_bool()).ok_or_else(|| {
+        OrcaError::Protocol(
+            "missing or non-boolean top-level 'ok' field in response envelope".into(),
+            output.stdout.clone(),
+        )
+    })?;
+
+    if !ok {
+        let failure: OrcaFailureEnvelope = serde_json::from_value(value).map_err(|e| {
+            OrcaError::Protocol(
+                format!("failed to deserialize OrcaFailureEnvelope: {e}"),
+                output.stdout.clone(),
+            )
+        })?;
+        return Err(OrcaError::Orca {
+            code: failure.error.code,
+            message: failure.error.message,
+            data: failure.error.data,
+        });
+    }
+
+    serde_json::from_value(value).map_err(|e| OrcaError::JsonParse(e, output.stdout))
 }
 
 #[derive(Clone, Debug)]
@@ -49,12 +112,12 @@ impl OrcaCliClient {
         self
     }
 
-    async fn execute_command(
+    pub async fn execute_command(
         &self,
         args: &[&str],
         cwd: Option<&Path>,
         timeout: Duration,
-    ) -> Result<String, OrcaError> {
+    ) -> Result<OrcaCommandOutput, OrcaError> {
         let mut cmd = Command::new(&self.bin_path);
         cmd.args(args);
         if let Some(dir) = cwd {
@@ -106,39 +169,27 @@ impl OrcaCliClient {
                 let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
                 let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
 
-                if !status.success() {
-                    // Try parsing JSON error from stdout before failing with CommandFailed
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
-                        if let Some(err_obj) = val.get("error") {
-                            let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-                            let code = err_obj.get("code").and_then(|c| c.as_str()).unwrap_or("ERROR");
-                            return Err(OrcaError::Orca(format!("{code}: {msg}")));
-                        }
-                    }
-                    return Err(OrcaError::CommandFailed {
-                        code: status.code(),
-                        stderr: stderr_str,
-                    });
-                }
-
-                Ok(stdout_str)
+                Ok(OrcaCommandOutput {
+                    exit_code: status.code(),
+                    stdout: stdout_str,
+                    stderr: stderr_str,
+                })
             }
         }
     }
 
     pub async fn status(&self) -> Result<OrcaStatusResponse, OrcaError> {
-        let raw = self
+        let output = self
             .execute_command(&["status", "--json"], None, self.default_timeout)
             .await?;
-        serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
+        parse_orca_json(output)
     }
 
     pub async fn list_worktrees(&self) -> Result<Vec<OrcaWorktreeItem>, OrcaError> {
-        let raw = self
+        let output = self
             .execute_command(&["worktree", "list", "--json"], None, self.default_timeout)
             .await?;
-        let resp: OrcaWorktreeListResponse =
-            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
+        let resp: OrcaWorktreeListResponse = parse_orca_json(output)?;
         Ok(resp.result.map(|r| r.worktrees).unwrap_or_default())
     }
 
@@ -156,87 +207,84 @@ impl OrcaCliClient {
             .await;
 
         match res {
-            Ok(raw) => {
-                let resp: OrcaWorktreeShowResponse =
-                    serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-                if resp.ok {
-                    Ok(resp.result.map(|r| r.worktree))
-                } else if let Some(ref err) = resp.error {
-                    if err.code.as_deref() == Some("selector_not_found")
-                        || err.code.as_deref() == Some("not_found")
-                        || err
-                            .message
-                            .as_deref()
-                            .unwrap_or("")
-                            .contains("selector_not_found")
-                        || err.message.as_deref().unwrap_or("").contains("not_found")
-                    {
-                        Ok(None)
-                    } else {
-                        Err(OrcaError::Orca(format!(
-                            "{}: {}",
-                            err.code.as_deref().unwrap_or("ERROR"),
-                            err.message.as_deref().unwrap_or("unknown error")
-                        )))
-                    }
-                } else {
+            Ok(output) => match parse_orca_json::<OrcaWorktreeShowResponse>(output) {
+                Ok(resp) => Ok(resp.result.map(|r| r.worktree)),
+                Err(OrcaError::Orca { ref code, .. })
+                    if code == "selector_not_found" || code == "not_found" =>
+                {
                     Ok(None)
                 }
-            }
-            Err(OrcaError::Orca(ref msg))
-                if msg.contains("selector_not_found") || msg.contains("not_found") =>
-            {
-                Ok(None)
-            }
-            Err(OrcaError::CommandFailed { ref stderr, .. })
-                if stderr.contains("selector_not_found") || stderr.contains("not_found") =>
-            {
-                Ok(None)
-            }
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         }
     }
 
     pub async fn add_repo(&self, path: &Path) -> Result<OrcaRepoItem, OrcaError> {
         let path_str = path.display().to_string();
-        let raw = self
+        let output = self
             .execute_command(
                 &["repo", "add", "--path", &path_str, "--json"],
                 None,
                 self.default_timeout,
             )
             .await?;
-        let resp: OrcaRepoAddResponse =
-            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-        if resp.ok {
-            resp.result.map(|r| r.repo).ok_or_else(|| {
-                OrcaError::Orca("repo add returned ok=true but missing repo object".into())
-            })
-        } else {
-            let msg = resp
-                .error
-                .and_then(|e| e.message)
-                .unwrap_or_else(|| "unknown error".into());
-            Err(OrcaError::Orca(format!("repo add failed: {msg}")))
-        }
+        let resp: OrcaRepoAddResponse = parse_orca_json(output)?;
+        resp.result.map(|r| r.repo).ok_or_else(|| {
+            OrcaError::Protocol(
+                "repo add returned ok=true but missing repo object".into(),
+                String::new(),
+            )
+        })
     }
 
-    pub async fn list_terminals(
+    pub async fn list_terminals_result(
         &self,
         worktree_selector: Option<&str>,
-    ) -> Result<Vec<OrcaTerminalItem>, OrcaError> {
+    ) -> Result<OrcaTerminalListResult, OrcaError> {
         let mut args = vec!["terminal", "list", "--json"];
         let selector_binding;
         if let Some(w) = worktree_selector {
             selector_binding = format!("--worktree={w}");
             args.push(&selector_binding);
         }
-        let raw = self
+        let output = self
             .execute_command(&args, None, self.default_timeout)
             .await?;
-        let resp: OrcaTerminalListResponse =
-            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-        Ok(resp.result.map(|r| r.terminals).unwrap_or_default())
+        let resp: OrcaTerminalListResponse = parse_orca_json(output)?;
+        resp.result.ok_or_else(|| {
+            OrcaError::Protocol(
+                "terminal list returned ok=true but missing result".into(),
+                String::new(),
+            )
+        })
+    }
+
+    pub async fn list_terminals(
+        &self,
+        worktree_selector: Option<&str>,
+    ) -> Result<Vec<OrcaTerminalItem>, OrcaError> {
+        let res = self.list_terminals_result(worktree_selector).await?;
+        Ok(res.terminals)
+    }
+
+    pub async fn show_terminal(
+        &self,
+        terminal_handle: &str,
+    ) -> Result<Option<OrcaTerminalItem>, OrcaError> {
+        let args = vec!["terminal", "show", "--terminal", terminal_handle, "--json"];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        match parse_orca_json::<OrcaTerminalShowResponse>(output) {
+            Ok(resp) => Ok(resp.result.map(|r| r.terminal)),
+            Err(OrcaError::Orca { ref code, .. })
+                if code == "terminal_not_found" || code == "selector_not_found" =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn create_terminal(
@@ -259,13 +307,15 @@ impl OrcaCliClient {
             args.push("--command");
             args.push(cmd);
         }
-        let raw = self
+        let output = self
             .execute_command(&args, cwd, self.default_timeout)
             .await?;
-        let resp: OrcaTerminalCreateResponse =
-            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
+        let resp: OrcaTerminalCreateResponse = parse_orca_json(output)?;
         resp.result.map(|r| r.terminal).ok_or_else(|| {
-            OrcaError::Orca("terminal create returned missing terminal object".into())
+            OrcaError::Protocol(
+                "terminal create returned missing terminal object".into(),
+                String::new(),
+            )
         })
     }
 
@@ -297,10 +347,10 @@ impl OrcaCliClient {
             args.push(req_id);
         }
 
-        let raw = self
+        let output = self
             .execute_command(&args, None, self.default_timeout)
             .await?;
-        serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
+        parse_orca_json(output)
     }
 
     pub async fn wait_terminal_tui_idle(
@@ -322,8 +372,8 @@ impl OrcaCliClient {
         ];
         // Allow a slight buffer on top of --timeout-ms for the CLI process execution
         let cli_timeout = timeout + Duration::from_secs(5);
-        let raw = self.execute_command(&args, None, cli_timeout).await?;
-        serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
+        let output = self.execute_command(&args, None, cli_timeout).await?;
+        parse_orca_json(output)
     }
 
     pub async fn close_terminal(
@@ -331,9 +381,9 @@ impl OrcaCliClient {
         terminal_handle: &str,
     ) -> Result<OrcaTerminalCloseResponse, OrcaError> {
         let args = vec!["terminal", "close", "--terminal", terminal_handle, "--json"];
-        let raw = self
+        let output = self
             .execute_command(&args, None, self.default_timeout)
             .await?;
-        serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
+        parse_orca_json(output)
     }
 }

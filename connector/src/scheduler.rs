@@ -300,9 +300,16 @@ impl ActiveAttempt {
                                 "prepared attempt missing worktree_id or terminal_id".into(),
                             ));
                         }
-                        if exec.agent_id.is_none() || exec.agent_ready_at_ms.is_none() {
+                        if exec.agent_id.is_none() {
                             return Err(SchedulerError::CorruptState(
-                                "prepared attempt missing agent_id or agent_ready_at_ms".into(),
+                                "prepared attempt missing agent_id".into(),
+                            ));
+                        }
+                        if exec.runtime_completion_kind.as_deref() != Some("not_started")
+                            && exec.agent_ready_at_ms.is_none()
+                        {
+                            return Err(SchedulerError::CorruptState(
+                                "prepared attempt missing agent_ready_at_ms".into(),
                             ));
                         }
                     } else {
@@ -450,6 +457,36 @@ pub enum WaitOutcome {
     Interrupted { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedExecutionIdentity {
+    pub orca_version: String,
+    pub worktree_id: String,
+    pub terminal_id: String,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareOutcome {
+    Ready(PreparedExecution),
+    NotReady {
+        execution: PreparedExecutionIdentity,
+        reason: String,
+    },
+    Retryable {
+        execution: Option<PreparedExecutionIdentity>,
+        reason: String,
+    },
+    RecoveryRequired(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    VerifiedClosed { closed_at_ms: i64 },
+    AlreadyAbsent { verified_at_ms: i64 },
+    Retryable { reason: String },
+    RecoveryRequired { code: String, message: String },
+}
+
 /// Boundary trait for job execution adapters.
 /// V1.6 used monolithic execute().
 /// V1.7 implements fine-grained prepare, dispatch, wait, close stages.
@@ -462,7 +499,7 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         attempt: &ActiveAttempt,
         target: &LocalTarget,
-    ) -> Result<PreparedExecution, String>;
+    ) -> Result<PrepareOutcome, String>;
 
     async fn reconcile_dispatch(
         &self,
@@ -484,7 +521,7 @@ pub trait ExecutionAdapter: Send + Sync {
         remaining_timeout: std::time::Duration,
     ) -> Result<WaitOutcome, String>;
 
-    async fn close(&self, terminal_id: &str) -> Result<(), String>;
+    async fn close(&self, terminal_id: &str) -> CleanupOutcome;
 }
 
 /// Production fallback execution adapter: explicitly not ready, preventing premature claim.
@@ -504,8 +541,10 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<PreparedExecution, String> {
-        Err("UnavailableExecutionAdapter cannot prepare".into())
+    ) -> Result<PrepareOutcome, String> {
+        Ok(PrepareOutcome::RecoveryRequired(
+            "UnavailableExecutionAdapter cannot prepare".into(),
+        ))
     }
 
     async fn reconcile_dispatch(
@@ -534,8 +573,10 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         Err("UnavailableExecutionAdapter cannot wait".into())
     }
 
-    async fn close(&self, _terminal_id: &str) -> Result<(), String> {
-        Ok(())
+    async fn close(&self, _terminal_id: &str) -> CleanupOutcome {
+        CleanupOutcome::AlreadyAbsent {
+            verified_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
     }
 }
 
@@ -559,14 +600,14 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<PreparedExecution, String> {
-        Ok(PreparedExecution {
+    ) -> Result<PrepareOutcome, String> {
+        Ok(PrepareOutcome::Ready(PreparedExecution {
             orca_version: "1.4.209".into(),
             worktree_id: "wt_fake".into(),
             terminal_id: "term_fake".into(),
             agent_id: "fake_agent".into(),
             agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
-        })
+        }))
     }
 
     async fn reconcile_dispatch(
@@ -599,8 +640,10 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         Ok(WaitOutcome::TuiIdle { elapsed_ms: 100 })
     }
 
-    async fn close(&self, _terminal_id: &str) -> Result<(), String> {
-        Ok(())
+    async fn close(&self, _terminal_id: &str) -> CleanupOutcome {
+        CleanupOutcome::VerifiedClosed {
+            closed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
     }
 }
 

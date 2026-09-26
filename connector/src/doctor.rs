@@ -545,24 +545,39 @@ async fn check_server_integration(
                         Some(exec) => {
                             if let Err(e) = exec.validate() {
                                 checks.push(DiagnosticCheck {
-                                    name: format!("Target '{}' Executor", lt.alias),
+                                    name: format!("Target '{}' Executor Configuration", lt.alias),
                                     severity: DiagnosticSeverity::Fail,
                                     message: format!("Invalid executor configuration: {e}"),
                                 });
                             } else {
                                 checks.push(DiagnosticCheck {
-                                    name: format!("Target '{}' Executor", lt.alias),
+                                    name: format!("Target '{}' Executor Configuration", lt.alias),
                                     severity: DiagnosticSeverity::Pass,
                                     message: format!(
                                         "Configured for agent '{}' ({})",
                                         exec.agent_id, exec.command
                                     ),
                                 });
+
+                                let agent_found = find_in_path(&exec.command);
+                                if agent_found {
+                                    checks.push(DiagnosticCheck {
+                                        name: format!("Target '{}' Agent Availability", lt.alias),
+                                        severity: DiagnosticSeverity::Pass,
+                                        message: "Agent executable found in PATH".to_string(),
+                                    });
+                                } else {
+                                    checks.push(DiagnosticCheck {
+                                        name: format!("Target '{}' Agent Availability", lt.alias),
+                                        severity: DiagnosticSeverity::Warn,
+                                        message: "Agent executable not found in PATH".to_string(),
+                                    });
+                                }
                             }
                         }
                         None => {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}' Executor", lt.alias),
+                                name: format!("Target '{}' Executor Configuration", lt.alias),
                                 severity: DiagnosticSeverity::Fail,
                                 message: format!(
                                     "No agent executor configured. Configure one with `ceo-connector target set-agent --target-id {} --agent-id <id> --agent-command <command>`",
@@ -582,4 +597,20 @@ async fn check_server_integration(
             });
         }
     }
+}
+
+fn find_in_path(cmd: &str) -> bool {
+    let bin = cmd.split_whitespace().next().unwrap_or(cmd);
+    if bin.contains('/') {
+        return Path::new(bin).is_file();
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&paths) {
+            let full = p.join(bin);
+            if full.is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }
