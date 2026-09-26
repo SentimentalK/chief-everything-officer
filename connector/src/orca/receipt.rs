@@ -1,4 +1,3 @@
-use crate::scheduler::DispatchProof;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,9 +13,6 @@ pub struct ExecutionReceipt {
     pub agent_id: Option<String>,
     pub agent_ready_at_ms: Option<i64>,
     pub dispatch_request_id: Option<String>,
-    pub dispatch_proof: Option<DispatchProof>,
-    pub dispatch_provider: Option<String>,
-    pub dispatch_observation: Option<String>,
     pub task_dispatched: bool,
     pub runtime_completion_kind: Option<String>,
     pub dispatch_started_at_ms: Option<i64>,
@@ -26,7 +22,7 @@ pub struct ExecutionReceipt {
 }
 
 impl ExecutionReceipt {
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 4;
 
     pub fn compute_sha256(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("canonical receipt serialization");
@@ -53,9 +49,6 @@ mod tests {
             agent_id: Some("agy".into()),
             agent_ready_at_ms: Some(1727220000000),
             dispatch_request_id: Some("req-1".into()),
-            dispatch_proof: Some(DispatchProof::TurnStarted),
-            dispatch_provider: Some("codex".into()),
-            dispatch_observation: Some("supported".into()),
             task_dispatched: true,
             runtime_completion_kind: Some("tui_idle".into()),
             dispatch_started_at_ms: Some(1727220000000),

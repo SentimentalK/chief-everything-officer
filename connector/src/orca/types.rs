@@ -104,12 +104,6 @@ pub struct OrcaRepoItem {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrcaExitCause {
-    pub kind: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrcaTerminalItem {
@@ -117,13 +111,6 @@ pub struct OrcaTerminalItem {
     pub pty_id: Option<String>,
     pub worktree_id: Option<String>,
     pub title: Option<String>,
-    pub connected: Option<bool>,
-    pub writable: Option<bool>,
-    pub orphaned: Option<bool>,
-    pub exit_cause: Option<OrcaExitCause>,
-    /// Set by Orca when a known agent is running in this terminal.
-    /// e.g. `"antigravity"` for AGY sessions.
-    pub agent_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,9 +172,6 @@ pub struct OrcaSendPart {
 #[serde(rename_all = "camelCase")]
 pub struct OrcaSendPromptPart {
     pub request_id: Option<String>,
-    pub stages: Option<Vec<String>>,
-    pub provider: Option<String>,
-    pub observation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,5 +220,4 @@ pub struct OrcaClosePart {
     pub handle: String,
     pub close_mode: Option<String>,
     pub pty_killed: Option<bool>,
-    pub pty_stop_verdict: Option<String>,
 }

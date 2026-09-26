@@ -11,7 +11,7 @@ use ceo_connector::orca::types::*;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    DispatchProof, ExecutionAdapter, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ExecutionAdapter, SchedulerError, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -81,10 +81,6 @@ fn test_parse_real_fixtures() {
     assert_eq!(
         prompt.request_id.as_deref(),
         Some("c2808464-44e4-4a4e-9e7f-a31cd9d81d12")
-    );
-    assert_eq!(
-        prompt.stages.as_ref().unwrap(),
-        &vec!["input_accepted".to_string()]
     );
 
     // 5. Terminal Wait fixture
@@ -276,9 +272,6 @@ fn test_execution_receipt_hashing_and_exclusion() {
         agent_id: Some("agy".into()),
         agent_ready_at_ms: Some(1727220000000),
         dispatch_request_id: Some("req_xyz".into()),
-        dispatch_proof: Some(DispatchProof::TurnStarted),
-        dispatch_provider: Some("unsupported".into()),
-        dispatch_observation: Some("unsupported".into()),
         task_dispatched: true,
         runtime_completion_kind: Some("tui_idle".into()),
         dispatch_started_at_ms: Some(1727220000000),
@@ -351,7 +344,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.dispatch(&attempt, "term_1", None).await.unwrap();
+    let outcome = adapter.dispatch(&attempt, "term_1").await.unwrap();
     match outcome {
         DispatchOutcome::Accepted { request_id, .. } => {
             assert_eq!(request_id, "req_send_123");
@@ -610,7 +603,7 @@ echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":false,"prompt":{
     let client1 = OrcaCliClient::new(bin1);
     let adapter1 = OrcaExecutionAdapter::new(client1);
 
-    let outcome1 = adapter1.dispatch(&attempt, "term_1", None).await.unwrap();
+    let outcome1 = adapter1.dispatch(&attempt, "term_1").await.unwrap();
     match outcome1 {
         DispatchOutcome::KnownRejectedBeforeAcceptance { .. } => {}
         other => panic!("Expected KnownRejectedBeforeAcceptance, got {other:?}"),
@@ -624,7 +617,7 @@ echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"
     let client2 = OrcaCliClient::new(bin2);
     let adapter2 = OrcaExecutionAdapter::new(client2);
 
-    let outcome2 = adapter2.dispatch(&attempt, "term_1", None).await.unwrap();
+    let outcome2 = adapter2.dispatch(&attempt, "term_1").await.unwrap();
     match outcome2 {
         DispatchOutcome::AmbiguousTransportFailure { error } => {
             assert!(error.contains("missing"));
@@ -641,7 +634,7 @@ exit 1
     let client3 = OrcaCliClient::new(bin3);
     let adapter3 = OrcaExecutionAdapter::new(client3);
 
-    let outcome3 = adapter3.dispatch(&attempt, "term_1", None).await.unwrap();
+    let outcome3 = adapter3.dispatch(&attempt, "term_1").await.unwrap();
     match outcome3 {
         DispatchOutcome::AmbiguousTransportFailure { error } => {
             assert!(error.contains("internal_failure"));
@@ -803,32 +796,10 @@ fn test_parse_orca_json_discriminator_first() {
 async fn test_cleanup_outcome_variants() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. pty_stop_verdict == "live" -> CleanupOutcome::RecoveryRequired
-    let script_live = r#"#!/bin/bash
-if [[ "$*" == *"terminal close"* ]]; then
-  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyStopVerdict":"live"}}}'
-  exit 0
-fi
-"#;
-    let bin_live = create_mock_orca_script(&temp, script_live);
-    let client_live = OrcaCliClient::new(bin_live);
-    let adapter_live = OrcaExecutionAdapter::new(client_live);
-    let outcome_live = adapter_live.close("term_1").await;
-    match outcome_live {
-        CleanupOutcome::RecoveryRequired { code, message } => {
-            assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
-            assert!(
-                message.contains("live"),
-                "Expected 'live' in message: {message}"
-            );
-        }
-        other => panic!("Expected RecoveryRequired, got {other:?}"),
-    }
-
-    // 2. pty_stop_verdict == "unverifiable" -> CleanupOutcome::RecoveryRequired
+    // 1. pty_killed == false -> CleanupOutcome::RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
     let script_unv = r#"#!/bin/bash
 if [[ "$*" == *"terminal close"* ]]; then
-  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyStopVerdict":"unverifiable"}}}'
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":false}}}'
   exit 0
 fi
 "#;
@@ -840,24 +811,16 @@ fi
         CleanupOutcome::RecoveryRequired { code, message } => {
             assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
             assert!(
-                message.contains("unverifiable"),
-                "Expected 'unverifiable' in message: {message}"
+                message.contains("pty_killed=false"),
+                "Expected 'pty_killed=false' in message: {message}"
             );
         }
         other => panic!("Expected RecoveryRequired, got {other:?}"),
     }
 
-    // 3. terminal_handle_stale on show -> CleanupOutcome::RecoveryRequired
+    // 2. terminal_handle_stale on close -> CleanupOutcome::RecoveryRequired(TERMINAL_HANDLE_STALE)
     let script_stale = r#"#!/bin/bash
 if [[ "$*" == *"terminal close"* ]]; then
-  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":true}}}'
-  exit 0
-fi
-if [[ "$*" == *"terminal list"* ]]; then
-  echo '{"ok":true,"result":{"terminals":[],"truncated":false}}'
-  exit 0
-fi
-if [[ "$*" == *"terminal show"* ]]; then
   echo '{"ok":false,"error":{"code":"terminal_handle_stale","message":"handle stale"}}'
   exit 1
 fi
@@ -877,7 +840,7 @@ fi
         other => panic!("Expected RecoveryRequired, got {other:?}"),
     }
 
-    // 4. Successful close: close ok, inventory empty, show returns terminal_not_found -> VerifiedClosed
+    // 3. Successful close: close ok with pty_killed=true, inventory empty -> VerifiedClosed
     let script_success = r#"#!/bin/bash
 if [[ "$*" == *"terminal close"* ]]; then
   echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":true}}}'
@@ -886,10 +849,6 @@ fi
 if [[ "$*" == *"terminal list"* ]]; then
   echo '{"ok":true,"result":{"terminals":[],"truncated":false}}'
   exit 0
-fi
-if [[ "$*" == *"terminal show"* ]]; then
-  echo '{"ok":false,"error":{"code":"terminal_not_found","message":"terminal not found"}}'
-  exit 1
 fi
 "#;
     let bin_success = create_mock_orca_script(&temp, script_success);
@@ -990,12 +949,30 @@ fn test_validate_tui_idle_wait_protocol() {
 }
 
 #[test]
-fn test_active_attempt_v2_to_v3_migration() {
+fn test_active_attempt_v4_schema_and_rejection_of_legacy() {
     let temp = tempfile::tempdir().unwrap();
     let state_file = temp.path().join("attempt.json");
 
-    // Case 1: V2 with Dispatched and legacy turn_started fails closed to RecoveryRequired
-    let v2_turn_started_json = serde_json::json!({
+    // Case 1: V1 fails with UnsupportedSchemaVersion(1)
+    let v1_json = serde_json::json!({
+        "schema_version": 1,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_1",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "claimed"
+    });
+    fs::write(&state_file, serde_json::to_string(&v1_json).unwrap()).unwrap();
+    assert!(matches!(
+        ActiveAttempt::load(&state_file).unwrap_err(),
+        SchedulerError::UnsupportedSchemaVersion(1)
+    ));
+
+    // Case 2: V2 fails with UnsupportedSchemaVersion(2)
+    let v2_json = serde_json::json!({
         "schema_version": 2,
         "server_origin": "http://127.0.0.1:4000",
         "device_id": "dev_test",
@@ -1004,124 +981,40 @@ fn test_active_attempt_v2_to_v3_migration() {
         "target_id": "tgt_1",
         "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
         "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "phase": "dispatched",
-        "executor": {
-            "type": "orca",
-            "worktree_id": "wt_1",
-            "terminal_id": "term_1",
-            "agent_id": "agy",
-            "dispatch_send_count": 1,
-            "dispatch_request_id": "req_1",
-            "dispatch_stage": "turn_started",
-            "dispatch_observation_count": 0
-        }
+        "phase": "claimed"
     });
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&v2_turn_started_json).unwrap(),
-    )
-    .unwrap();
-    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 3);
-    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+    fs::write(&state_file, serde_json::to_string(&v2_json).unwrap()).unwrap();
+    assert!(matches!(
+        ActiveAttempt::load(&state_file).unwrap_err(),
+        SchedulerError::UnsupportedSchemaVersion(2)
+    ));
 
-    // Case 2: V2 with claim_intent migrates cleanly
-    let v2_claim_intent_json = serde_json::json!({
-        "schema_version": 2,
+    // Case 3: V3 fails with UnsupportedSchemaVersion(3)
+    let v3_json = serde_json::json!({
+        "schema_version": 3,
         "server_origin": "http://127.0.0.1:4000",
         "device_id": "dev_test",
-        "job_id": "job_2",
+        "job_id": "job_1",
         "workspace_id": "ws_1",
         "target_id": "tgt_1",
         "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
         "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "phase": "claim_intent",
-        "executor": null
+        "phase": "claimed"
     });
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&v2_claim_intent_json).unwrap(),
-    )
-    .unwrap();
-    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 3);
-    assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
+    fs::write(&state_file, serde_json::to_string(&v3_json).unwrap()).unwrap();
+    assert!(matches!(
+        ActiveAttempt::load(&state_file).unwrap_err(),
+        SchedulerError::UnsupportedSchemaVersion(3)
+    ));
 
-    // Case 2b: V2 with DispatchIntent and legacy input_accepted migrates to DispatchProof::InputAccepted
-    let prompt = "do task";
-    let acceptance = "must work";
-    let hash = ActiveAttempt::compute_payload_sha256(
-        "job_2b", "ws_1", "tgt_1", None, prompt, acceptance, 60, "none",
-    );
-    let v2_dispatch_intent_json = serde_json::json!({
-        "schema_version": 2,
-        "server_origin": "http://127.0.0.1:4000",
-        "device_id": "dev_test",
-        "job_id": "job_2b",
-        "workspace_id": "ws_1",
-        "target_id": "tgt_1",
-        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
-        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "phase": "dispatch_intent",
-        "prompt": prompt,
-        "acceptance": acceptance,
-        "execution_timeout_seconds": 60,
-        "result_target": "none",
-        "payload_sha256": hash,
-        "executor": {
-            "type": "orca",
-            "worktree_id": "wt_1",
-            "terminal_id": "term_1",
-            "agent_id": "agy",
-            "agent_ready_at_ms": 1727000000000i64,
-            "dispatch_send_count": 1,
-            "dispatch_request_id": "req_1",
-            "dispatch_stage": "input_accepted",
-            "dispatch_observation_count": 0
-        }
-    });
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&v2_dispatch_intent_json).unwrap(),
-    )
-    .unwrap();
-    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 3);
-    assert_eq!(loaded.phase, AttemptPhase::DispatchIntent);
-    assert_eq!(
-        loaded.executor.unwrap().dispatch_proof,
-        Some(DispatchProof::InputAccepted)
-    );
-
-    // Case 3: V2 with legacy "running" fails closed to RecoveryRequired
-    let v2_running_json = serde_json::json!({
-        "schema_version": 2,
-        "server_origin": "http://127.0.0.1:4000",
-        "device_id": "dev_test",
-        "job_id": "job_3",
-        "workspace_id": "ws_1",
-        "target_id": "tgt_1",
-        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
-        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "phase": "running"
-    });
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&v2_running_json).unwrap(),
-    )
-    .unwrap();
-    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 3);
-    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
-
-    // Case 4: V2 OutcomeRecorded with tui_idle and legacy turn_started fails closed to RecoveryRequired
+    // Case 4: V4 succeeds
     let prompt = "do task";
     let acceptance = "must work";
     let hash = ActiveAttempt::compute_payload_sha256(
         "job_4", "ws_1", "tgt_1", None, prompt, acceptance, 60, "none",
     );
-    let v2_outcome_recorded_json = serde_json::json!({
-        "schema_version": 2,
+    let v4_json = serde_json::json!({
+        "schema_version": 4,
         "server_origin": "http://127.0.0.1:4000",
         "device_id": "dev_test",
         "job_id": "job_4",
@@ -1143,21 +1036,18 @@ fn test_active_attempt_v2_to_v3_migration() {
             "agent_ready_at_ms": 1727000000000i64,
             "dispatch_send_count": 1,
             "dispatch_request_id": "req_1",
-            "dispatch_stage": "turn_started",
-            "dispatch_observation_count": 1,
             "runtime_completion_kind": "tui_idle",
             "runtime_completed_at_ms": 1727000010000i64
         }
     });
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&v2_outcome_recorded_json).unwrap(),
-    )
-    .unwrap();
+    fs::write(&state_file, serde_json::to_string_pretty(&v4_json).unwrap()).unwrap();
     let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 3);
-    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
-    assert_eq!(loaded.executor.unwrap().dispatch_proof, None);
+    assert_eq!(loaded.schema_version, 4);
+    assert_eq!(loaded.phase, AttemptPhase::OutcomeRecorded);
+    assert_eq!(
+        loaded.executor.unwrap().dispatch_request_id.as_deref(),
+        Some("req_1")
+    );
 }
 
 #[tokio::test]
@@ -1167,23 +1057,18 @@ async fn test_cleanup_regression_matrix() {
     async fn run_close(
         temp: &tempfile::TempDir,
         close_json: &str,
+        close_exit: i32,
         list_json: &str,
-        show_json: &str,
-        show_exit: i32,
     ) -> CleanupOutcome {
         let script = format!(
             r#"#!/bin/bash
 if [[ "$*" == *"terminal close"* ]]; then
   echo '{close_json}'
-  exit 0
+  exit {close_exit}
 fi
 if [[ "$*" == *"terminal list"* ]]; then
   echo '{list_json}'
   exit 0
-fi
-if [[ "$*" == *"terminal show"* ]]; then
-  echo '{show_json}'
-  exit {show_exit}
 fi
 "#
         );
@@ -1197,9 +1082,8 @@ fi
     let out = run_close(
         &temp,
         r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":true}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target"}}}"#,
         0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":true}}"#,
     )
     .await;
     match out {
@@ -1213,9 +1097,8 @@ fi
     let out = run_close(
         &temp,
         r#"{"ok":true,"result":{"close":{"handle":"term_wrong","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target"}}}"#,
         0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
     )
     .await;
     match out {
@@ -1227,82 +1110,35 @@ fi
         }
     }
 
-    // 3. Inventory complete + handle absent + show orphaned=true + connected=false + writable=false + exitCause=operator_close => VerifiedClosed
+    // 3. Normal close (pty_killed=true) + terminal absent from list => VerifiedClosed
     let out = run_close(
         &temp,
         r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"operator_close"}}}}"#,
         0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
     )
     .await;
     assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
 
-    // 4. Same but exitCause=signaled => VerifiedClosed
+    // 4. terminal_not_found + terminal absent from list => AlreadyAbsent
     let out = run_close(
         &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":false,"error":{"code":"terminal_not_found","message":"target terminal not found"}}"#,
+        1,
         r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"signaled"}}}}"#,
-        0,
     )
     .await;
-    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+    assert!(matches!(out, CleanupOutcome::AlreadyAbsent { .. }));
 
-    // 5. Same but exitCause=exited => VerifiedClosed
+    // 5. Terminal still in inventory after close => Retryable
     let out = run_close(
         &temp,
         r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"exited"}}}}"#,
         0,
+        r#"{"ok":true,"result":{"terminals":[{"handle":"term_target","title":"ceo:test"}],"truncated":false}}"#,
     )
     .await;
-    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
-
-    // 6. Same but exitCause=unknown => NOT VerifiedClosed
-    let out = run_close(
-        &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"unknown"}}}}"#,
-        0,
-    )
-    .await;
-    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
-
-    // 7. Same but exitCause absent => NOT VerifiedClosed
-    let out = run_close(
-        &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false}}}"#,
-        0,
-    )
-    .await;
-    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
-
-    // 8. Same but connected=true => NOT VerifiedClosed
-    let out = run_close(
-        &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":true,"writable":false,"exitCause":{"kind":"operator_close"}}}}"#,
-        0,
-    )
-    .await;
-    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
-
-    // 9. Same but writable=true => NOT VerifiedClosed
-    let out = run_close(
-        &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
-        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
-        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":true,"exitCause":{"kind":"operator_close"}}}}"#,
-        0,
-    )
-    .await;
-    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+    assert!(matches!(out, CleanupOutcome::Retryable { .. }));
 }
 
 #[tokio::test]
@@ -1310,7 +1146,7 @@ async fn test_dispatch_correlation_regression_matrix() {
     let temp = tempfile::tempdir().unwrap();
 
     let dummy_attempt = ActiveAttempt {
-        schema_version: 3,
+        schema_version: 4,
         server_origin: "http://127.0.0.1:4000".into(),
         device_id: "dev_1".into(),
         job_id: "job_1".into(),
@@ -1340,10 +1176,6 @@ async fn test_dispatch_correlation_regression_matrix() {
             dispatch_request_id: None,
             dispatch_accepted_at_ms: None,
             last_dispatch_outcome: None,
-            dispatch_proof: None,
-            dispatch_provider: None,
-            dispatch_observation: None,
-            dispatch_observation_count: 0,
             runtime_completion_kind: None,
             runtime_completed_at_ms: None,
             runtime_error: None,
@@ -1366,21 +1198,14 @@ fi
         let bin = create_mock_orca_script(temp, &script);
         let client = OrcaCliClient::new(bin);
         let adapter = OrcaExecutionAdapter::new(client);
-        let retry_req = attempt
-            .executor
-            .as_ref()
-            .and_then(|e| e.dispatch_request_id.as_deref());
-        adapter
-            .dispatch(attempt, "term_target", retry_req)
-            .await
-            .unwrap()
+        adapter.dispatch(attempt, "term_target").await.unwrap()
     }
 
     // 1. send.handle != requested terminal => DISPATCH_TERMINAL_CORRELATION_MISMATCH
     let out = run_dispatch(
         &temp,
         &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_other","accepted":true,"prompt":{"requestId":"req_expected","stages":["input_accepted"]}}}}"#,
+        r#"{"ok":true,"result":{"send":{"handle":"term_other","accepted":true,"prompt":{"requestId":"req_expected"}}}}"#,
     )
     .await;
     match out {
@@ -1390,117 +1215,43 @@ fi
         other => panic!("Expected DISPATCH_TERMINAL_CORRELATION_MISMATCH, got {other:?}"),
     }
 
-    // 2. retry request id != response prompt.requestId => DISPATCH_REQUEST_CORRELATION_MISMATCH
-    let mut retry_attempt = dummy_attempt.clone();
-    retry_attempt.executor.as_mut().unwrap().dispatch_request_id = Some("req_first".into());
-    let out = run_dispatch(
-        &temp,
-        &retry_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_different","stages":["input_accepted"]}}}}"#,
-    )
-    .await;
-    match out {
-        DispatchOutcome::RecoveryRequired { code, .. } => {
-            assert_eq!(code, "DISPATCH_REQUEST_CORRELATION_MISMATCH")
-        }
-        other => panic!("Expected DISPATCH_REQUEST_CORRELATION_MISMATCH, got {other:?}"),
-    }
-
-    // 3. provider=old-host => INCOMPATIBLE_RUNTIME
+    // 2. accepted = true with requestId => Accepted
     let out = run_dispatch(
         &temp,
         &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"old-host","stages":["input_accepted"]}}}}"#,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected"}}}}"#,
     )
     .await;
     match out {
-        DispatchOutcome::RecoveryRequired { code, .. } => {
-            assert_eq!(code, "INCOMPATIBLE_RUNTIME")
+        DispatchOutcome::Accepted { request_id, .. } => {
+            assert_eq!(request_id, "req_expected");
         }
-        other => panic!("Expected INCOMPATIBLE_RUNTIME, got {other:?}"),
+        other => panic!("Expected Accepted, got {other:?}"),
     }
 
-    // 4. observation=permission => DISPATCH_PERMISSION_BLOCKED
+    // 3. accepted = true with missing requestId => AmbiguousTransportFailure
     let out = run_dispatch(
         &temp,
         &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","observation":"permission","stages":["input_accepted"]}}}}"#,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":null}}}}"#,
     )
     .await;
     match out {
-        DispatchOutcome::RecoveryRequired { code, .. } => {
-            assert_eq!(code, "DISPATCH_PERMISSION_BLOCKED")
+        DispatchOutcome::AmbiguousTransportFailure { error } => {
+            assert!(error.contains("missing"));
         }
-        other => panic!("Expected DISPATCH_PERMISSION_BLOCKED, got {other:?}"),
+        other => panic!("Expected AmbiguousTransportFailure, got {other:?}"),
     }
 
-    // 5. observation=incarnation_replaced => DISPATCH_INCARNATION_REPLACED
+    // 4. accepted = false => KnownRejectedBeforeAcceptance
     let out = run_dispatch(
         &temp,
         &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","observation":"incarnation_replaced","stages":["input_accepted"]}}}}"#,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":false,"prompt":{"requestId":null}}}}"#,
     )
     .await;
     match out {
-        DispatchOutcome::RecoveryRequired { code, .. } => {
-            assert_eq!(code, "DISPATCH_INCARNATION_REPLACED")
-        }
-        other => panic!("Expected DISPATCH_INCARNATION_REPLACED, got {other:?}"),
-    }
-
-    // 6. provider=unsupported + observation=unsupported + input_accepted => AcceptedUnobservable
-    let out = run_dispatch(
-        &temp,
-        &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"unsupported","observation":"unsupported","stages":["input_accepted"]}}}}"#,
-    )
-    .await;
-    match out {
-        DispatchOutcome::Accepted {
-            proof,
-            provider,
-            observation,
-            ..
-        } => {
-            assert_eq!(proof, DispatchProof::AcceptedUnobservable);
-            assert_eq!(provider.as_deref(), Some("unsupported"));
-            assert_eq!(observation.as_deref(), Some("unsupported"));
-        }
-        other => panic!("Expected Accepted with AcceptedUnobservable, got {other:?}"),
-    }
-
-    // 7. supported provider + input_accepted only => InputAccepted
-    let out = run_dispatch(
-        &temp,
-        &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"claude-code","observation":"pty-screen","stages":["input_accepted"]}}}}"#,
-    )
-    .await;
-    match out {
-        DispatchOutcome::Accepted {
-            proof,
-            provider,
-            observation,
-            ..
-        } => {
-            assert_eq!(proof, DispatchProof::InputAccepted);
-            assert_eq!(provider.as_deref(), Some("claude-code"));
-            assert_eq!(observation.as_deref(), Some("pty-screen"));
-        }
-        other => panic!("Expected Accepted with InputAccepted, got {other:?}"),
-    }
-
-    // 8. stages contains turn_started => TurnStarted
-    let out = run_dispatch(
-        &temp,
-        &dummy_attempt,
-        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"claude-code","observation":"pty-screen","stages":["input_accepted","turn_started"]}}}}"#,
-    )
-    .await;
-    match out {
-        DispatchOutcome::Accepted { proof, .. } => {
-            assert_eq!(proof, DispatchProof::TurnStarted);
-        }
-        other => panic!("Expected Accepted with TurnStarted, got {other:?}"),
+        DispatchOutcome::KnownRejectedBeforeAcceptance { .. } => {}
+        other => panic!("Expected KnownRejectedBeforeAcceptance, got {other:?}"),
     }
 }

@@ -18,8 +18,8 @@ use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    DispatchProof, DispatchReconciliation, ExecutionAdapter, PrepareOutcome, PreparedExecution,
-    WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    DispatchReconciliation, ExecutionAdapter, PrepareOutcome, PreparedExecution, WaitOutcome,
+    ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
 use uuid::Uuid;
@@ -86,16 +86,12 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _terminal_id: &str,
-        _retry_request_id: Option<&str>,
     ) -> Result<DispatchOutcome, String> {
         self.dispatch_calls.fetch_add(1, Ordering::SeqCst);
         self.dispatch_result.clone().unwrap_or_else(|| {
             Ok(DispatchOutcome::Accepted {
                 request_id: "req_mock_123".into(),
                 accepted_at_ms: chrono::Utc::now().timestamp_millis(),
-                proof: DispatchProof::TurnStarted,
-                provider: Some("mock".into()),
-                observation: Some("mock".into()),
             })
         })
     }
@@ -182,10 +178,6 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         execution_deadline_ms: None,
         dispatch_request_id: None,
         dispatch_accepted_at_ms: None,
-        dispatch_proof: None,
-        dispatch_provider: None,
-        dispatch_observation: None,
-        dispatch_observation_count: 0,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
         runtime_error: None,
@@ -440,9 +432,6 @@ async fn test_outcome_recorded_crash_recovery_skips_wait_and_dispatch() {
     executor_state.execution_deadline_ms = Some(1727000060000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
-    executor_state.dispatch_provider = Some("mock".into());
-    executor_state.dispatch_observation = Some("mock".into());
     executor_state.runtime_completion_kind = Some("tui_idle".into());
     executor_state.runtime_completed_at_ms = Some(1727000010000);
 
@@ -506,15 +495,10 @@ async fn test_durable_deadline_expired_marks_timed_out_without_waiting() {
     executor_state.dispatch_started_at_ms = Some(now - 60_000);
     executor_state.execution_deadline_ms = Some(now - 1_000); // 1s in the past!
     executor_state.dispatch_request_id = Some("req_mock".into());
-    executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
-    executor_state.dispatch_provider = Some("mock".into());
-    executor_state.dispatch_observation = Some("mock".into());
-
     let active = make_test_attempt(
         &cred,
         attempt_id,
-        AttemptPhase::Dispatched,
+        AttemptPhase::Waiting,
         "none",
         Some(executor_state),
     );
@@ -526,19 +510,7 @@ async fn test_durable_deadline_expired_marks_timed_out_without_waiting() {
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
-    // Step 1: Dispatched -> Waiting
-    let advanced = drive_active_attempt(
-        &paths,
-        &client,
-        &cred,
-        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
-        &DaemonHooks::default(),
-    )
-    .await
-    .unwrap();
-    assert!(advanced);
-
-    // Step 2: Waiting with expired deadline -> marks OutcomeRecorded
+    // Step 1: Waiting with expired deadline -> marks OutcomeRecorded
     let advanced = drive_active_attempt(
         &paths,
         &client,
@@ -753,9 +725,6 @@ async fn test_zero_lock_contention_during_adapter_wait() {
     executor_state.execution_deadline_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
-    executor_state.dispatch_provider = Some("mock".into());
-    executor_state.dispatch_observation = Some("mock".into());
 
     // Start in Waiting phase so adapter.wait() is directly invoked
     let active = make_test_attempt(
@@ -812,7 +781,7 @@ async fn test_prepare_terminal_adoption() {
     let active = make_test_attempt(
         &cred,
         attempt_id.clone(),
-        AttemptPhase::Started,
+        AttemptPhase::Claimed,
         "none",
         None,
     );
@@ -832,7 +801,7 @@ async fn test_prepare_terminal_adoption() {
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
-    // Step 1: Started -> PrepareIntent
+    // Step 1: Claimed -> PrepareIntent
     let advanced = drive_active_attempt(
         &paths,
         &client,
@@ -915,10 +884,11 @@ async fn test_legacy_running_migration_fails_closed_without_execution() {
     )
     .unwrap();
 
-    let loaded = ActiveAttempt::load(&paths.active_attempt_file())
-        .unwrap()
-        .unwrap();
-    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+    let load_v1_err = ActiveAttempt::load(&paths.active_attempt_file()).unwrap_err();
+    assert!(matches!(
+        load_v1_err,
+        ceo_connector::scheduler::SchedulerError::UnsupportedSchemaVersion(1)
+    ));
 
     let adapter = Arc::new(MockAdapter {
         ready: true,
@@ -939,7 +909,7 @@ async fn test_legacy_running_migration_fails_closed_without_execution() {
     assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 0);
     assert_eq!(adapter.wait_calls.load(Ordering::SeqCst), 0);
 
-    // Case B: V2 JSON with legacy phase "running"
+    // Case B: V2 JSON fails with UnsupportedSchemaVersion(2)
     let v2_json = serde_json::json!({
         "schema_version": 2,
         "server_origin": cred.server_origin,
@@ -964,10 +934,11 @@ async fn test_legacy_running_migration_fails_closed_without_execution() {
     )
     .unwrap();
 
-    let loaded_v2 = ActiveAttempt::load(&paths.active_attempt_file())
-        .unwrap()
-        .unwrap();
-    assert_eq!(loaded_v2.phase, AttemptPhase::RecoveryRequired);
+    let load_v2_err = ActiveAttempt::load(&paths.active_attempt_file()).unwrap_err();
+    assert!(matches!(
+        load_v2_err,
+        ceo_connector::scheduler::SchedulerError::UnsupportedSchemaVersion(2)
+    ));
 
     let res_v2 = drive_active_attempt(
         &paths,
@@ -998,9 +969,6 @@ async fn test_interrupted_runtime_outcome_semantics() {
     executor_state.execution_deadline_ms = Some(now + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
-    executor_state.dispatch_provider = Some("mock".into());
-    executor_state.dispatch_observation = Some("mock".into());
 
     let active = make_test_attempt(
         &cred,

@@ -10,7 +10,7 @@ use ceo_connector::daemon::run_daemon;
 use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::paths::ConnectorPaths;
-use ceo_connector::scheduler::{ActiveAttempt, AttemptPhase, DispatchProof, ExecutionAdapter};
+use ceo_connector::scheduler::{ActiveAttempt, AttemptPhase, ExecutionAdapter};
 use common::mock_server::{MockRequest, MockResponse, MockServer};
 use uuid::Uuid;
 
@@ -770,37 +770,18 @@ async fn test_dogfood_real_agy() {
             .expect("real AGY attempt must have executor state at proof checkpoint");
 
         println!(
-            "[DOGFOOD REAL AGY] In-flight proof: {:?}, provider: {:?}, observation: {:?}, agent_id: {:?}",
-            exec.dispatch_proof, exec.dispatch_provider, exec.dispatch_observation, exec.agent_id
+            "[DOGFOOD REAL AGY] In-flight request_id: {:?}, agent_id: {:?}",
+            exec.dispatch_request_id, exec.agent_id
         );
         assert_eq!(
             exec.agent_id.as_deref(),
             Some("agy"),
             "agent_id must be 'agy'"
         );
-
-        match (
-            exec.dispatch_provider.as_deref(),
-            exec.dispatch_observation.as_deref(),
-            exec.dispatch_proof,
-        ) {
-            (
-                Some("unsupported"),
-                Some("unsupported"),
-                Some(DispatchProof::AcceptedUnobservable),
-            ) => {
-                // Truthful unsupported observation
-            }
-            (_, _, Some(DispatchProof::TurnStarted)) => {
-                // Genuine TurnStarted observation
-            }
-            other => {
-                panic!(
-                    "Unexpected dispatch proof or observation metadata: {:?}",
-                    other
-                );
-            }
-        }
+        assert!(
+            exec.dispatch_request_id.is_some(),
+            "real AGY attempt must have dispatch_request_id"
+        );
 
         // Step 2: Resume daemon until completion and cleanup
         println!("[DOGFOOD REAL AGY] Resuming daemon to completion...");
@@ -1021,11 +1002,8 @@ async fn test_dogfood_real_agy() {
             "agent_id must be 'agy'"
         );
         assert!(
-            matches!(
-                exec.dispatch_proof,
-                Some(DispatchProof::AcceptedUnobservable) | Some(DispatchProof::TurnStarted)
-            ),
-            "Waiting attempt must have valid dispatch proof"
+            exec.dispatch_request_id.is_some(),
+            "Waiting attempt must have dispatch_request_id"
         );
 
         let deadline = exec

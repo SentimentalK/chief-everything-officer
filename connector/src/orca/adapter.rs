@@ -75,64 +75,7 @@ impl OrcaExecutionAdapter {
         Self { client }
     }
 
-    /// Poll `terminal show` until `connected == true && writable == true`, up to
-    /// `max_polls` attempts with 1-second inter-poll sleep.  Returns the
-    /// timestamp (ms) at which the terminal became ready.
-    async fn poll_connected_ready(
-        &self,
-        terminal_handle: &str,
-        max_polls: u32,
-    ) -> Result<i64, ReadinessError> {
-        for attempt in 0..max_polls {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            let term = match self.client.show_terminal(terminal_handle).await {
-                Ok(Some(t)) => t,
-                Ok(None) => {
-                    return Err(ReadinessError::NotReady(format!(
-                        "AGENT_NOT_READY: terminal '{terminal_handle}' disappeared during readiness poll"
-                    )));
-                }
-                Err(e) => {
-                    return Err(ReadinessError::Retryable(format!(
-                        "readiness poll failed: {e}"
-                    )));
-                }
-            };
-            if term.connected == Some(true) && term.writable == Some(true) {
-                return Ok(chrono::Utc::now().timestamp_millis());
-            }
-        }
-        Err(ReadinessError::NotReady(format!(
-            "AGENT_NOT_READY: terminal '{terminal_handle}' did not become connected+writable after {max_polls} polls"
-        )))
-    }
-
     async fn run_readiness_gate(&self, terminal_handle: &str) -> Result<i64, ReadinessError> {
-        // Probe the terminal to learn its agent identity so we can choose the
-        // correct readiness strategy.
-        let agent_identity = match self.client.show_terminal(terminal_handle).await {
-            Ok(Some(t)) => t.agent_identity,
-            Ok(None) => {
-                return Err(ReadinessError::NotReady(format!(
-                    "AGENT_NOT_READY: terminal '{terminal_handle}' not found during initial probe"
-                )));
-            }
-            Err(e) => {
-                return Err(ReadinessError::Retryable(format!(
-                    "readiness initial probe failed: {e}"
-                )));
-            }
-        };
-
-        // AGY (and any other Orca-managed TUI agent) is never "tui-idle"
-        // because it is always running as an active process.  Use a
-        // connected+writable poll loop instead.
-        if agent_identity.as_deref() == Some("antigravity") {
-            return self.poll_connected_ready(terminal_handle, 30).await;
-        }
-
         let is_timeout = |err: &OrcaError| -> bool {
             match err {
                 OrcaError::Timeout(_) => true,
@@ -150,49 +93,20 @@ impl OrcaExecutionAdapter {
             .client
             .wait_terminal_tui_idle(terminal_handle, Duration::from_secs(60))
             .await;
-        let satisfied = match wait_res {
+        match wait_res {
             Ok(resp) => match validate_tui_idle_wait(terminal_handle, &resp) {
-                Ok(ValidatedWait::Satisfied { .. }) => true,
-                Ok(ValidatedWait::Unsatisfied { .. }) => false,
-                Err(e) => return Err(ReadinessError::ProtocolMismatch(e)),
+                Ok(ValidatedWait::Satisfied { .. }) => Ok(chrono::Utc::now().timestamp_millis()),
+                Ok(ValidatedWait::Unsatisfied { .. }) => Err(ReadinessError::NotReady(
+                    "AGENT_NOT_READY: terminal failed TUI readiness gate".into(),
+                )),
+                Err(e) => Err(ReadinessError::ProtocolMismatch(e)),
             },
-            Err(ref e) if is_timeout(e) => false,
-            Err(e) => {
-                return Err(ReadinessError::Retryable(format!(
-                    "readiness check failed: {e}"
-                )));
-            }
-        };
-
-        if satisfied {
-            return Ok(chrono::Utc::now().timestamp_millis());
-        }
-
-        // Retry with 120s
-        let retry_res = self
-            .client
-            .wait_terminal_tui_idle(terminal_handle, Duration::from_secs(120))
-            .await;
-        let satisfied = match retry_res {
-            Ok(resp) => match validate_tui_idle_wait(terminal_handle, &resp) {
-                Ok(ValidatedWait::Satisfied { .. }) => true,
-                Ok(ValidatedWait::Unsatisfied { .. }) => false,
-                Err(e) => return Err(ReadinessError::ProtocolMismatch(e)),
-            },
-            Err(ref e) if is_timeout(e) => false,
-            Err(e) => {
-                return Err(ReadinessError::Retryable(format!(
-                    "readiness retry check failed: {e}"
-                )));
-            }
-        };
-
-        if satisfied {
-            Ok(chrono::Utc::now().timestamp_millis())
-        } else {
-            Err(ReadinessError::NotReady(
-                "AGENT_NOT_READY: terminal failed TUI readiness gate after 60s and 120s".into(),
-            ))
+            Err(ref e) if is_timeout(e) => Err(ReadinessError::NotReady(
+                "AGENT_NOT_READY: terminal readiness timed out".into(),
+            )),
+            Err(e) => Err(ReadinessError::Retryable(format!(
+                "readiness check failed: {e}"
+            ))),
         }
     }
 }
@@ -519,24 +433,8 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             .as_ref()
             .and_then(|e| e.dispatch_request_id.as_ref())
         {
-            let proof = attempt
-                .executor
-                .as_ref()
-                .and_then(|e| e.dispatch_proof)
-                .unwrap_or(crate::scheduler::DispatchProof::InputAccepted);
-            let provider = attempt
-                .executor
-                .as_ref()
-                .and_then(|e| e.dispatch_provider.clone());
-            let observation = attempt
-                .executor
-                .as_ref()
-                .and_then(|e| e.dispatch_observation.clone());
             return Ok(DispatchReconciliation::Accepted {
                 request_id: req_id.clone(),
-                proof,
-                provider,
-                observation,
             });
         }
 
@@ -556,7 +454,6 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         &self,
         attempt: &ActiveAttempt,
         terminal_id: &str,
-        retry_request_id: Option<&str>,
     ) -> Result<DispatchOutcome, String> {
         // Build one deterministic Agent input from prompt and acceptance criteria
         let prompt_text = match (&attempt.prompt, &attempt.acceptance) {
@@ -568,7 +465,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
         match self
             .client
-            .send_terminal_prompt(terminal_id, &prompt_text, retry_request_id, Some(10))
+            .send_terminal_prompt(terminal_id, &prompt_text, None, Some(10))
             .await
         {
             Ok(resp) => {
@@ -585,62 +482,9 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     if send.accepted {
                         if let Some(p) = send.prompt {
                             if let Some(req_id) = p.request_id {
-                                if let Some(expected_req_id) = retry_request_id {
-                                    if req_id != expected_req_id {
-                                        return Ok(DispatchOutcome::RecoveryRequired {
-                                            code: "DISPATCH_REQUEST_CORRELATION_MISMATCH".into(),
-                                            message: format!(
-                                                "retry_request_id mismatch: expected '{expected_req_id}' but received '{req_id}'"
-                                            ),
-                                        });
-                                    }
-                                }
-                                let has_turn_started = p
-                                    .stages
-                                    .as_ref()
-                                    .map(|s| s.iter().any(|st| st == "turn_started"))
-                                    .unwrap_or(false);
-                                let has_input_accepted = p
-                                    .stages
-                                    .as_ref()
-                                    .map(|s| s.iter().any(|st| st == "input_accepted"))
-                                    .unwrap_or(false);
-                                let provider = p.provider;
-                                let observation = p.observation;
-
-                                let proof = if has_turn_started {
-                                    crate::scheduler::DispatchProof::TurnStarted
-                                } else if provider.as_deref() == Some("old-host") {
-                                    return Ok(DispatchOutcome::RecoveryRequired {
-                                        code: "INCOMPATIBLE_RUNTIME".into(),
-                                        message: "Orca provider 'old-host' does not support durable prompt receipt".into(),
-                                    });
-                                } else if observation.as_deref() == Some("permission") {
-                                    return Ok(DispatchOutcome::RecoveryRequired {
-                                        code: "DISPATCH_PERMISSION_BLOCKED".into(),
-                                        message: "Agent prompt blocked by permission requirement"
-                                            .into(),
-                                    });
-                                } else if observation.as_deref() == Some("incarnation_replaced") {
-                                    return Ok(DispatchOutcome::RecoveryRequired {
-                                        code: "DISPATCH_INCARNATION_REPLACED".into(),
-                                        message: "Agent terminal process incarnation replaced during dispatch".into(),
-                                    });
-                                } else if provider.as_deref() == Some("unsupported")
-                                    && observation.as_deref() == Some("unsupported")
-                                    && has_input_accepted
-                                {
-                                    crate::scheduler::DispatchProof::AcceptedUnobservable
-                                } else {
-                                    crate::scheduler::DispatchProof::InputAccepted
-                                };
-
                                 return Ok(DispatchOutcome::Accepted {
                                     request_id: req_id,
                                     accepted_at_ms: chrono::Utc::now().timestamp_millis(),
-                                    proof,
-                                    provider,
-                                    observation,
                                 });
                             }
                         }
@@ -784,13 +628,11 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                             ),
                         };
                     }
-                    if let Some(ref verdict) = close_part.pty_stop_verdict {
-                        if verdict == "live" || verdict == "unverifiable" {
-                            return CleanupOutcome::RecoveryRequired {
-                                code: "TERMINAL_STOP_UNVERIFIABLE".into(),
-                                message: format!("pty_stop_verdict was '{verdict}'"),
-                            };
-                        }
+                    if close_part.pty_killed == Some(false) {
+                        return CleanupOutcome::RecoveryRequired {
+                            code: "TERMINAL_STOP_UNVERIFIABLE".into(),
+                            message: "terminal close returned pty_killed=false".into(),
+                        };
                     }
                 }
             }
@@ -800,34 +642,28 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 ..
             }) => {
                 if code == "terminal_not_found" {
-                    // Verify independently via show
-                    match self.client.show_terminal(terminal_id).await {
-                        Ok(None) => {
+                    match self.client.list_terminals_result(None).await {
+                        Ok(res) => {
+                            if res.truncated {
+                                return CleanupOutcome::RecoveryRequired {
+                                    code: "TERMINAL_LIST_TRUNCATED".into(),
+                                    message: "terminal inventory was truncated by Orca".into(),
+                                };
+                            }
+                            if res.terminals.iter().any(|t| t.handle == terminal_id) {
+                                return CleanupOutcome::Retryable {
+                                    reason: format!(
+                                        "terminal close reported terminal_not_found but '{terminal_id}' still present in inventory"
+                                    ),
+                                };
+                            }
                             return CleanupOutcome::AlreadyAbsent {
                                 verified_at_ms: chrono::Utc::now().timestamp_millis(),
                             };
                         }
-                        Ok(Some(_)) => {
-                            return CleanupOutcome::RecoveryRequired {
-                                code: "TERMINAL_CLEANUP_CORRELATION_CONFLICT".into(),
-                                message:
-                                    "close reported terminal_not_found but show returned a terminal"
-                                        .into(),
-                            };
-                        }
-                        Err(OrcaError::Orca {
-                            ref code,
-                            ref message,
-                            ..
-                        }) if code == "terminal_handle_stale" => {
-                            return CleanupOutcome::RecoveryRequired {
-                                code: "TERMINAL_HANDLE_STALE".into(),
-                                message: message.clone(),
-                            };
-                        }
                         Err(e) => {
                             return CleanupOutcome::Retryable {
-                                reason: format!("show verification failed: {e}"),
+                                reason: format!("failed to list terminals during AlreadyAbsent verification: {e}"),
                             };
                         }
                     }
@@ -855,7 +691,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         }
 
         // Post-close verification:
-        // 1. Check active terminals in inventory
+        // Check active terminals in inventory
         match self.client.list_terminals_result(None).await {
             Ok(res) => {
                 if res.truncated {
@@ -879,45 +715,8 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             }
         }
 
-        // 2. Exact terminal show proof
-        match self.client.show_terminal(terminal_id).await {
-            Ok(None) => CleanupOutcome::VerifiedClosed {
-                closed_at_ms: chrono::Utc::now().timestamp_millis(),
-            },
-            Ok(Some(term)) => {
-                let is_dead = term.connected == Some(false)
-                    && term.writable == Some(false)
-                    && term.orphaned == Some(true);
-                let valid_exit = term
-                    .exit_cause
-                    .as_ref()
-                    .map(|c| matches!(c.kind.as_str(), "operator_close" | "signaled" | "exited"))
-                    .unwrap_or(false);
-
-                if is_dead && valid_exit {
-                    CleanupOutcome::VerifiedClosed {
-                        closed_at_ms: chrono::Utc::now().timestamp_millis(),
-                    }
-                } else {
-                    CleanupOutcome::Retryable {
-                        reason: format!(
-                            "terminal '{terminal_id}' not proven dead: connected={:?}, writable={:?}, orphaned={:?}, exit_cause={:?}",
-                            term.connected, term.writable, term.orphaned, term.exit_cause
-                        ),
-                    }
-                }
-            }
-            Err(OrcaError::Orca {
-                ref code,
-                ref message,
-                ..
-            }) if code == "terminal_handle_stale" => CleanupOutcome::RecoveryRequired {
-                code: "TERMINAL_HANDLE_STALE".into(),
-                message: format!("show_terminal returned stale handle after close: {message}"),
-            },
-            Err(e) => CleanupOutcome::Retryable {
-                reason: format!("show_terminal failed during cleanup verification: {e}"),
-            },
+        CleanupOutcome::VerifiedClosed {
+            closed_at_ms: chrono::Utc::now().timestamp_millis(),
         }
     }
 }

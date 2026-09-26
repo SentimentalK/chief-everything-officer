@@ -14,7 +14,7 @@ use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptExecutorState, AttemptPhase, DispatchProof, ExecutionAdapter,
+    ActiveAttempt, AttemptExecutorState, AttemptPhase, ExecutionAdapter,
     ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::MockServer;
@@ -74,9 +74,9 @@ fn setup_env(
 
 /// Slice V1.7e Acceptance:
 /// Agent TUI readiness gate:
-/// When initial 60s wait is not satisfied, retries up to 120s and succeeds.
+/// When wait is satisfied, returns Ready.
 #[tokio::test]
-async fn test_v1_7e_tui_readiness_retry_success() {
+async fn test_v1_7e_tui_readiness_success() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
@@ -90,28 +90,12 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
-elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
-    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","connected":true,"writable":true}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
-    COUNT_FILE="{}/wait_count"
-    C=0
-    if [ -f "$COUNT_FILE" ]; then
-        C=$(cat "$COUNT_FILE")
-    fi
-    C=$((C+1))
-    echo "$C" > "$COUNT_FILE"
-    if [ "$C" -eq 1 ]; then
-        # First 60s wait not satisfied
-        echo '{{"ok":true,"result":{{"wait":{{"handle":"term_1","condition":"tui-idle","satisfied":false}}}}}}'
-    else
-        # Retry 120s wait satisfied!
-        echo '{{"ok":true,"result":{{"wait":{{"handle":"term_1","condition":"tui-idle","satisfied":true}}}}}}'
-    fi
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_1","condition":"tui-idle","satisfied":true}}}}}}'
 else
     echo '{{"ok":false}}'
 fi
-"#,
-        temp.path().display()
+"#
     );
 
     let bin = create_mock_orca_script(&temp, &script);
@@ -155,9 +139,6 @@ fi
     assert_eq!(prep.terminal_id, "term_1");
     assert_eq!(prep.agent_id, "agy");
     assert!(prep.agent_ready_at_ms > 0);
-
-    let count_str = fs::read_to_string(temp.path().join("wait_count")).unwrap();
-    assert_eq!(count_str.trim(), "2");
 }
 
 /// Slice V1.7e Acceptance:
@@ -229,146 +210,6 @@ fi
     }
 }
 
-/// Slice V1.7f Acceptance:
-/// InputAccepted observation replay:
-/// When initial prompt send results in input_accepted, re-observation loop uses same request ID
-/// until TurnStarted is proven, transitioning into Dispatched with TurnStarted stage.
-#[tokio::test]
-async fn test_v1_7f_input_accepted_replays_until_turn_started() {
-    let server = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap();
-    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
-    let (_t, paths, cred, _config) = setup_env(&server.origin(), &repo_canon);
-
-    let send_count_file = temp.path().join("send_count");
-    let script = format!(
-        r#"#!/bin/bash
-if [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
-    COUNT_FILE="{}"
-    C=0
-    if [ -f "$COUNT_FILE" ]; then
-        C=$(cat "$COUNT_FILE")
-    fi
-    C=$((C+1))
-    echo "$C" > "$COUNT_FILE"
-    if [ "$C" -eq 1 ]; then
-        # First send: accepted, but only input_accepted
-        echo '{{"ok":true,"result":{{"send":{{"handle":"term_1","accepted":true,"bytesWritten":10,"prompt":{{"requestId":"req_replay_1","stages":["input_accepted"]}}}}}}}}'
-    else
-        # Re-observation: turn_started proven!
-        echo '{{"ok":true,"result":{{"send":{{"handle":"term_1","accepted":true,"bytesWritten":10,"prompt":{{"requestId":"req_replay_1","stages":["input_accepted","turn_started"]}}}}}}}}'
-    fi
-else
-    echo '{{"ok":false}}'
-fi
-"#,
-        send_count_file.display()
-    );
-
-    let bin = create_mock_orca_script(&temp, &script);
-    let client = OrcaCliClient::new(bin);
-    let adapter = Arc::new(OrcaExecutionAdapter::new(client));
-    let connector_client = ConnectorClient::new(&cred.server_origin).unwrap();
-
-    let attempt_id = format!("att-{}", Uuid::new_v4());
-    let now = chrono::Utc::now().timestamp_millis();
-    let executor_state = AttemptExecutorState {
-        executor_type: "orca".into(),
-        orca_version: Some("1.4.209".into()),
-        worktree_id: Some("wt_1".into()),
-        terminal_id: Some("term_1".into()),
-        agent_id: Some("agy".into()),
-        agent_ready_at_ms: Some(now),
-        dispatch_send_count: 0,
-        last_dispatch_outcome: None,
-        dispatch_started_at_ms: None,
-        execution_deadline_ms: None,
-        dispatch_request_id: None,
-        dispatch_accepted_at_ms: None,
-        dispatch_proof: None,
-        dispatch_provider: None,
-        dispatch_observation: None,
-        dispatch_observation_count: 0,
-        runtime_completion_kind: None,
-        runtime_completed_at_ms: None,
-        runtime_error: None,
-    };
-
-    let active = ActiveAttempt {
-        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
-        job_id: "job_1".into(),
-        attempt_id: attempt_id.clone(),
-        claim_token: "a".repeat(64),
-        device_id: cred.device_id.clone(),
-        server_origin: cred.server_origin.clone(),
-        phase: AttemptPhase::DispatchIntent,
-        workspace_id: "ws_v17".into(),
-        target_id: "tgt_v17".into(),
-        resource_id: None,
-        prompt: Some("do something".into()),
-        acceptance: Some("must pass".into()),
-        execution_timeout_seconds: Some(60),
-        result_target: Some("none".into()),
-        payload_sha256: Some(ActiveAttempt::compute_payload_sha256(
-            "job_1",
-            "ws_v17",
-            "tgt_v17",
-            None,
-            "do something",
-            "must pass",
-            60,
-            "none",
-        )),
-        claimed_at_ms: Some(now),
-        terminal_report_sha256: None,
-        executor: Some(executor_state),
-    };
-    active.save(&paths.active_attempt_file()).unwrap();
-
-    // Step 1: First dispatch returns InputAccepted -> remains in DispatchIntent with observation_count = 1
-    let advanced = drive_active_attempt(
-        &paths,
-        &connector_client,
-        &cred,
-        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
-        &DaemonHooks::default(),
-    )
-    .await
-    .unwrap();
-    assert!(advanced);
-
-    let attempt_after_first = ActiveAttempt::load(&paths.active_attempt_file())
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempt_after_first.phase, AttemptPhase::DispatchIntent);
-    let exec1 = attempt_after_first.executor.as_ref().unwrap();
-    assert_eq!(exec1.dispatch_proof, Some(DispatchProof::InputAccepted));
-    assert_eq!(exec1.dispatch_request_id.as_deref(), Some("req_replay_1"));
-    assert_eq!(exec1.dispatch_observation_count, 0);
-
-    // Step 2: Next drive re-observes the same request_id -> turn_started proven -> transitions to Dispatched
-    let advanced = drive_active_attempt(
-        &paths,
-        &connector_client,
-        &cred,
-        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
-        &DaemonHooks::default(),
-    )
-    .await
-    .unwrap();
-    assert!(advanced);
-
-    let attempt_after_second = ActiveAttempt::load(&paths.active_attempt_file())
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempt_after_second.phase, AttemptPhase::Dispatched);
-    let exec2 = attempt_after_second.executor.as_ref().unwrap();
-    assert_eq!(exec2.dispatch_proof, Some(DispatchProof::TurnStarted));
-    assert_eq!(exec2.dispatch_observation_count, 1);
-}
-
 /// Slice V1.7g Acceptance:
 /// Verified Cleanup + ExecutionReceipt V2 + Outbox Generation + Unverified Business Outcome:
 /// - Exact terminal close without --tab
@@ -422,10 +263,6 @@ fi
         execution_deadline_ms: Some(now + 60_000),
         dispatch_request_id: Some("req_clean_1".into()),
         dispatch_accepted_at_ms: Some(now - 7_000),
-        dispatch_proof: Some(DispatchProof::TurnStarted),
-        dispatch_provider: Some("unsupported".into()),
-        dispatch_observation: Some("unsupported".into()),
-        dispatch_observation_count: 1,
         runtime_completion_kind: Some("tui_idle".into()),
         runtime_completed_at_ms: Some(now - 2_000),
         runtime_error: None,
@@ -507,104 +344,4 @@ fi
     // Verify receipt_sha256 is a valid 64-character sha256 hex string correlating to execution
     assert_eq!(report.receipt_sha256.len(), 64);
     assert!(report.receipt_sha256.chars().all(|c| c.is_ascii_hexdigit()));
-}
-
-/// Slice V1.7f Acceptance:
-/// If replay observation fails to prove turn_started within observation budget (2 replays),
-/// transitions to RecoveryRequired with DISPATCH_SUBMISSION_UNPROVEN.
-#[tokio::test]
-async fn test_v1_7f_input_accepted_observation_budget_exhaustion() {
-    let server = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap();
-    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
-    let (_t, paths, cred, _config) = setup_env(&server.origin(), &repo_canon);
-
-    let script = r#"#!/bin/bash
-if [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
-    # Keeps returning only input_accepted
-    echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"bytesWritten":10,"prompt":{"requestId":"req_replay_1","stages":["input_accepted"]}}}}'
-else
-    echo '{"ok":false}'
-fi
-"#;
-
-    let bin = create_mock_orca_script(&temp, script);
-    let client = OrcaCliClient::new(bin);
-    let adapter = Arc::new(OrcaExecutionAdapter::new(client));
-    let connector_client = ConnectorClient::new(&cred.server_origin).unwrap();
-
-    let attempt_id = format!("att-{}", Uuid::new_v4());
-    let now = chrono::Utc::now().timestamp_millis();
-    let executor_state = AttemptExecutorState {
-        executor_type: "orca".into(),
-        orca_version: Some("1.4.209".into()),
-        worktree_id: Some("wt_1".into()),
-        terminal_id: Some("term_1".into()),
-        agent_id: Some("agy".into()),
-        agent_ready_at_ms: Some(now),
-        dispatch_send_count: 1,
-        last_dispatch_outcome: None,
-        dispatch_started_at_ms: Some(now - 1000),
-        execution_deadline_ms: Some(now + 60_000),
-        dispatch_request_id: Some("req_replay_1".into()),
-        dispatch_accepted_at_ms: Some(now - 500),
-        dispatch_proof: Some(DispatchProof::InputAccepted),
-        dispatch_provider: Some("unsupported".into()),
-        dispatch_observation: Some("unsupported".into()),
-        dispatch_observation_count: 2, // Budget already reached 2
-        runtime_completion_kind: None,
-        runtime_completed_at_ms: None,
-        runtime_error: None,
-    };
-
-    let active = ActiveAttempt {
-        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
-        job_id: "job_exhaust_1".into(),
-        attempt_id: attempt_id.clone(),
-        claim_token: "a".repeat(64),
-        device_id: cred.device_id.clone(),
-        server_origin: cred.server_origin.clone(),
-        phase: AttemptPhase::DispatchIntent,
-        workspace_id: "ws_v17".into(),
-        target_id: "tgt_v17".into(),
-        resource_id: None,
-        prompt: Some("do something".into()),
-        acceptance: Some("must pass".into()),
-        execution_timeout_seconds: Some(60),
-        result_target: Some("none".into()),
-        payload_sha256: Some(ActiveAttempt::compute_payload_sha256(
-            "job_exhaust_1",
-            "ws_v17",
-            "tgt_v17",
-            None,
-            "do something",
-            "must pass",
-            60,
-            "none",
-        )),
-        claimed_at_ms: Some(now),
-        terminal_report_sha256: None,
-        executor: Some(executor_state),
-    };
-    active.save(&paths.active_attempt_file()).unwrap();
-
-    let res = drive_active_attempt(
-        &paths,
-        &connector_client,
-        &cred,
-        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
-        &DaemonHooks::default(),
-    )
-    .await;
-
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert!(err.to_string().contains("DISPATCH_SUBMISSION_UNPROVEN"));
-
-    let attempt_final = ActiveAttempt::load(&paths.active_attempt_file())
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempt_final.phase, AttemptPhase::RecoveryRequired);
 }

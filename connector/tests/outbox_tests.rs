@@ -14,7 +14,7 @@ use ceo_connector::outbox::{
     compute_report_sha256, deliver_outbox_record, OutboxError, OutboxRecord,
 };
 use ceo_connector::paths::ConnectorPaths;
-use ceo_connector::scheduler::UnavailableExecutionAdapter;
+use ceo_connector::scheduler::{UnavailableExecutionAdapter, ACTIVE_ATTEMPT_SCHEMA_VERSION};
 use common::mock_server::{MockResponse, MockServer};
 
 fn sample_report() -> ExecutionReport {
@@ -130,7 +130,7 @@ async fn report_delivery_terminal_cleanup() {
     atomic_write_json(
         &paths.active_attempt_file(),
         &serde_json::json!({
-            "schema_version": 1,
+            "schema_version": ACTIVE_ATTEMPT_SCHEMA_VERSION,
             "server_origin": server.origin(),
             "device_id": "dev_1",
             "job_id": "job_10",
@@ -139,7 +139,8 @@ async fn report_delivery_terminal_cleanup() {
             "attempt_id": "att-00000000-0000-0000-0000-000000000010",
             "claim_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "phase": "finalized_local",
-            "terminal_report_sha256": report_sha256
+            "terminal_report_sha256": report_sha256,
+            "executor": null
         }),
     )
     .unwrap();
@@ -229,7 +230,7 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
     atomic_write_json(
         &paths.active_attempt_file(),
         &serde_json::json!({
-            "schema_version": 1,
+            "schema_version": ACTIVE_ATTEMPT_SCHEMA_VERSION,
             "server_origin": server.origin(),
             "device_id": "dev_1",
             "job_id": "job_crashed",
@@ -238,7 +239,8 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
             "attempt_id": "att-00000000-0000-0000-0000-000000000099",
             "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "phase": "finalized_local",
-            "terminal_report_sha256": digest
+            "terminal_report_sha256": digest,
+            "executor": null
         }),
     )
     .unwrap();
@@ -344,7 +346,7 @@ async fn crash_window_history_written_outbox_still_present_replays_safely() {
     atomic_write_json(
         &paths.active_attempt_file(),
         &serde_json::json!({
-            "schema_version": 1,
+            "schema_version": ACTIVE_ATTEMPT_SCHEMA_VERSION,
             "server_origin": server.origin(),
             "device_id": "dev_1",
             "job_id": "job_crash_win",
@@ -353,7 +355,8 @@ async fn crash_window_history_written_outbox_still_present_replays_safely() {
             "attempt_id": "att-00000000-0000-0000-0000-000000000001",
             "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "phase": "finalized_local",
-            "terminal_report_sha256": report_sha256
+            "terminal_report_sha256": report_sha256,
+            "executor": null
         }),
     )
     .unwrap();

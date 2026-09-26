@@ -560,9 +560,6 @@ pub async fn drive_active_attempt(
                     agent_id: None,
                     agent_ready_at_ms: None,
                     dispatch_request_id: None,
-                    dispatch_proof: None,
-                    dispatch_provider: None,
-                    dispatch_observation: None,
                     task_dispatched: false,
                     runtime_completion_kind: None,
                     dispatch_started_at_ms: None,
@@ -629,7 +626,7 @@ pub async fn drive_active_attempt(
                 return Ok(true);
             }
 
-            // Normal path: advance to StartIntent
+            // Normal path: advance to PrepareIntent
             let _lock = ExecutionLock::acquire_with_retry(
                 &paths.state_lock_file(),
                 Duration::from_secs(5),
@@ -639,7 +636,7 @@ pub async fn drive_active_attempt(
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
-            current.phase = AttemptPhase::StartIntent;
+            current.phase = AttemptPhase::PrepareIntent;
             current.save(&paths.active_attempt_file())?;
             Ok(true)
         }
@@ -682,29 +679,6 @@ pub async fn drive_active_attempt(
                         _ => return Ok(true),
                     };
                     current.phase = AttemptPhase::Started;
-                    if current.executor.is_none() {
-                        current.executor = Some(crate::scheduler::AttemptExecutorState {
-                            executor_type: "orca".into(),
-                            orca_version: None,
-                            worktree_id: None,
-                            terminal_id: None,
-                            agent_id: None,
-                            agent_ready_at_ms: None,
-                            dispatch_send_count: 0,
-                            dispatch_started_at_ms: None,
-                            execution_deadline_ms: None,
-                            dispatch_request_id: None,
-                            dispatch_accepted_at_ms: None,
-                            last_dispatch_outcome: None,
-                            dispatch_proof: None,
-                            dispatch_provider: None,
-                            dispatch_observation: None,
-                            dispatch_observation_count: 0,
-                            runtime_completion_kind: None,
-                            runtime_completed_at_ms: None,
-                            runtime_error: None,
-                        });
-                    }
                     current.save(&paths.active_attempt_file())?;
                     println!("Notified server of start for job '{}'", active.job_id);
                     Ok(true)
@@ -754,7 +728,7 @@ pub async fn drive_active_attempt(
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
-            current.phase = AttemptPhase::PrepareIntent;
+            current.phase = AttemptPhase::Waiting;
             current.save(&paths.active_attempt_file())?;
             Ok(true)
         }
@@ -814,10 +788,6 @@ pub async fn drive_active_attempt(
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
-                            dispatch_proof: None,
-                            dispatch_provider: None,
-                            dispatch_observation: None,
-                            dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
@@ -861,10 +831,6 @@ pub async fn drive_active_attempt(
                                 dispatch_request_id: None,
                                 dispatch_accepted_at_ms: None,
                                 last_dispatch_outcome: None,
-                                dispatch_proof: None,
-                                dispatch_provider: None,
-                                dispatch_observation: None,
-                                dispatch_observation_count: 0,
                                 runtime_completion_kind: None,
                                 runtime_completed_at_ms: None,
                                 runtime_error: None,
@@ -903,10 +869,6 @@ pub async fn drive_active_attempt(
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
-                            dispatch_proof: None,
-                            dispatch_provider: None,
-                            dispatch_observation: None,
-                            dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
@@ -956,10 +918,6 @@ pub async fn drive_active_attempt(
                                 dispatch_request_id: None,
                                 dispatch_accepted_at_ms: None,
                                 last_dispatch_outcome: None,
-                                dispatch_proof: None,
-                                dispatch_provider: None,
-                                dispatch_observation: None,
-                                dispatch_observation_count: 0,
                                 runtime_completion_kind: None,
                                 runtime_completed_at_ms: None,
                                 runtime_error: None,
@@ -1053,12 +1011,7 @@ pub async fn drive_active_attempt(
             };
 
             match reconciliation {
-                crate::scheduler::DispatchReconciliation::Accepted {
-                    request_id,
-                    proof,
-                    provider,
-                    observation,
-                } => {
+                crate::scheduler::DispatchReconciliation::Accepted { request_id } => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -1069,106 +1022,13 @@ pub async fn drive_active_attempt(
                         _ => return Ok(true),
                     };
                     if let Some(ref mut exec) = current.executor {
-                        exec.dispatch_request_id = Some(request_id.clone());
-                        exec.dispatch_proof = Some(proof);
-                        exec.dispatch_provider = provider;
-                        exec.dispatch_observation = observation;
+                        exec.dispatch_request_id = Some(request_id);
                         if exec.dispatch_accepted_at_ms.is_none() {
                             exec.dispatch_accepted_at_ms = Some(now_utc_ms());
                         }
                     }
-
-                    if proof == crate::scheduler::DispatchProof::TurnStarted
-                        || proof == crate::scheduler::DispatchProof::AcceptedUnobservable
-                    {
-                        current.phase = AttemptPhase::Dispatched;
-                        current.save(&paths.active_attempt_file())?;
-                        return Ok(true);
-                    }
-
-                    // proof == InputAccepted: check observation budget
-                    let obs_count = current
-                        .executor
-                        .as_ref()
-                        .map(|e| e.dispatch_observation_count)
-                        .unwrap_or(0);
-                    if obs_count >= 2 {
-                        current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
-                        return Err(DaemonError::RecoveryRequired(
-                            "DISPATCH_SUBMISSION_UNPROVEN: agent turn did not start within retry budget"
-                                .into(),
-                        ));
-                    }
-
-                    // Increment observation count (does NOT increment dispatch_send_count)
-                    if let Some(ref mut exec) = current.executor {
-                        exec.dispatch_observation_count += 1;
-                    }
+                    current.phase = AttemptPhase::Dispatched;
                     current.save(&paths.active_attempt_file())?;
-                    drop(_lock);
-
-                    // Replay observation using retry_request_id
-                    let outcome = match adapter
-                        .dispatch(&active, &terminal_id, Some(&request_id))
-                        .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => {
-                            eprintln!("Dispatch observation error: {e}");
-                            return Ok(true);
-                        }
-                    };
-
-                    match outcome {
-                        crate::scheduler::DispatchOutcome::Accepted {
-                            proof: new_proof,
-                            provider: new_prov,
-                            observation: new_obs,
-                            ..
-                        } => {
-                            let _lock = ExecutionLock::acquire_with_retry(
-                                &paths.state_lock_file(),
-                                Duration::from_secs(5),
-                                Duration::from_millis(50),
-                            )?;
-                            let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
-                                    Some(c) if c.attempt_id == active.attempt_id => c,
-                                    _ => return Ok(true),
-                                };
-                            if let Some(ref mut exec) = current.executor {
-                                exec.dispatch_proof = Some(new_proof);
-                                exec.dispatch_provider = new_prov;
-                                exec.dispatch_observation = new_obs;
-                            }
-                            if new_proof == crate::scheduler::DispatchProof::TurnStarted
-                                || new_proof
-                                    == crate::scheduler::DispatchProof::AcceptedUnobservable
-                            {
-                                current.phase = AttemptPhase::Dispatched;
-                            }
-                            current.save(&paths.active_attempt_file())?;
-                        }
-                        crate::scheduler::DispatchOutcome::RecoveryRequired { code, message } => {
-                            let _lock = ExecutionLock::acquire_with_retry(
-                                &paths.state_lock_file(),
-                                Duration::from_secs(5),
-                                Duration::from_millis(50),
-                            )?;
-                            let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
-                                    Some(c) if c.attempt_id == active.attempt_id => c,
-                                    _ => return Ok(true),
-                                };
-                            current.phase = AttemptPhase::RecoveryRequired;
-                            current.save(&paths.active_attempt_file())?;
-                            return Err(DaemonError::RecoveryRequired(format!(
-                                "{code}: {message}"
-                            )));
-                        }
-                        _ => {}
-                    }
                     Ok(true)
                 }
                 crate::scheduler::DispatchReconciliation::DefinitelyNotDispatched => {
@@ -1244,7 +1104,7 @@ pub async fn drive_active_attempt(
                     current.save(&paths.active_attempt_file())?;
                     drop(_lock);
 
-                    let outcome = match adapter.dispatch(&active, &terminal_id, None).await {
+                    let outcome = match adapter.dispatch(&active, &terminal_id).await {
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("Dispatch execution error: {e}");
@@ -1256,9 +1116,6 @@ pub async fn drive_active_attempt(
                         crate::scheduler::DispatchOutcome::Accepted {
                             request_id,
                             accepted_at_ms,
-                            proof,
-                            provider,
-                            observation,
                         } => {
                             let _lock = ExecutionLock::acquire_with_retry(
                                 &paths.state_lock_file(),
@@ -1273,16 +1130,9 @@ pub async fn drive_active_attempt(
                             if let Some(ref mut exec) = current.executor {
                                 exec.dispatch_request_id = Some(request_id);
                                 exec.dispatch_accepted_at_ms = Some(accepted_at_ms);
-                                exec.dispatch_proof = Some(proof);
-                                exec.dispatch_provider = provider;
-                                exec.dispatch_observation = observation;
                                 exec.last_dispatch_outcome = None;
                             }
-                            if proof == crate::scheduler::DispatchProof::TurnStarted
-                                || proof == crate::scheduler::DispatchProof::AcceptedUnobservable
-                            {
-                                current.phase = AttemptPhase::Dispatched;
-                            }
+                            current.phase = AttemptPhase::Dispatched;
                             current.save(&paths.active_attempt_file())?;
                             Ok(true)
                         }
@@ -1369,7 +1219,7 @@ pub async fn drive_active_attempt(
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
-            current.phase = AttemptPhase::Waiting;
+            current.phase = AttemptPhase::StartIntent;
             current.save(&paths.active_attempt_file())?;
             Ok(true)
         }
@@ -1398,12 +1248,11 @@ pub async fn drive_active_attempt(
                 }
             };
 
-            let dispatch_proof = active.executor.as_ref().and_then(|e| e.dispatch_proof);
-            if !matches!(
-                dispatch_proof,
-                Some(crate::scheduler::DispatchProof::TurnStarted)
-                    | Some(crate::scheduler::DispatchProof::AcceptedUnobservable)
-            ) {
+            let dispatch_request_id = active
+                .executor
+                .as_ref()
+                .and_then(|e| e.dispatch_request_id.as_ref());
+            if dispatch_request_id.is_none() {
                 let _lock = ExecutionLock::acquire_with_retry(
                     &paths.state_lock_file(),
                     Duration::from_secs(5),
@@ -1416,8 +1265,7 @@ pub async fn drive_active_attempt(
                 current.phase = AttemptPhase::RecoveryRequired;
                 current.save(&paths.active_attempt_file())?;
                 return Err(DaemonError::RecoveryRequired(
-                    "Waiting phase requires dispatch_proof in [TurnStarted, AcceptedUnobservable]"
-                        .into(),
+                    "Waiting phase requires dispatch_request_id".into(),
                 ));
             }
 
@@ -1561,11 +1409,7 @@ pub async fn drive_active_attempt(
                 DaemonError::RecoveryRequired("OutcomeRecorded phase missing executor state".into())
             })?;
 
-            let task_dispatched = matches!(
-                exec_state.dispatch_proof,
-                Some(crate::scheduler::DispatchProof::TurnStarted)
-                    | Some(crate::scheduler::DispatchProof::AcceptedUnobservable)
-            );
+            let task_dispatched = exec_state.dispatch_request_id.is_some();
 
             let (status, outcome, err) = match exec_state.runtime_completion_kind.as_deref() {
                 Some("tui_idle") => (
@@ -1650,9 +1494,6 @@ pub async fn drive_active_attempt(
                 agent_id: exec_state.agent_id.clone(),
                 agent_ready_at_ms: exec_state.agent_ready_at_ms,
                 dispatch_request_id: exec_state.dispatch_request_id.clone(),
-                dispatch_proof: exec_state.dispatch_proof,
-                dispatch_provider: exec_state.dispatch_provider.clone(),
-                dispatch_observation: exec_state.dispatch_observation.clone(),
                 task_dispatched,
                 runtime_completion_kind: exec_state.runtime_completion_kind.clone(),
                 dispatch_started_at_ms: exec_state.dispatch_started_at_ms,
