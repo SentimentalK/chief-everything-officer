@@ -304,18 +304,13 @@ mod tests {
     #[test]
     fn build_execution_prompt_with_managed_contract() {
         let mc = ManagedContract {
-            path: std::path::PathBuf::from(
-                "/var/ceo/state/runtime/att-123/managed-result.json",
-            ),
+            path: std::path::PathBuf::from("/var/ceo/state/runtime/att-123/managed-result.json"),
             job_id: "job-aaaaaaaa-0000-0000-0000-000000000001".into(),
             attempt_id: "att-123".into(),
             resource_id: "res_456".into(),
         };
-        let prompt = build_execution_prompt(
-            Some("Update docs"),
-            Some("Doc matches schema"),
-            Some(&mc),
-        );
+        let prompt =
+            build_execution_prompt(Some("Update docs"), Some("Doc matches schema"), Some(&mc));
         assert!(prompt.starts_with(
             "TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"
         ));
