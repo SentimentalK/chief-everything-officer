@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use ceo_connector::config::{LocalConfig, LocalTarget};
+use ceo_connector::config::{LocalConfig, LocalExecutorConfig, LocalTarget};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::daemon::{run_daemon_with_hooks, DaemonError, DaemonHooks};
 use ceo_connector::enrollment::logout_flow;
@@ -61,6 +61,7 @@ async fn setup_race_environment(server: &MockServer) -> (tempfile::TempDir, Conn
             alias: "race-tgt".into(),
             kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();

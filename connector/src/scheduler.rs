@@ -67,6 +67,22 @@ struct CanonicalPayload<'a> {
     result_target: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchStage {
+    InputAccepted,
+    TurnStarted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedExecution {
+    pub orca_version: String,
+    pub worktree_id: String,
+    pub terminal_id: String,
+    pub agent_id: String,
+    pub agent_ready_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptExecutorState {
@@ -78,6 +94,10 @@ pub struct AttemptExecutorState {
     pub worktree_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ready_at_ms: Option<i64>,
     #[serde(default)]
     pub dispatch_send_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +110,10 @@ pub struct AttemptExecutorState {
     pub dispatch_accepted_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dispatch_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_stage: Option<DispatchStage>,
+    #[serde(default)]
+    pub dispatch_observation_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_completion_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +285,32 @@ impl ActiveAttempt {
                 if computed != *payload_hash {
                     return Err(SchedulerError::PayloadHashMismatch);
                 }
+
+                if matches!(
+                    self.phase,
+                    AttemptPhase::Prepared
+                        | AttemptPhase::DispatchIntent
+                        | AttemptPhase::Dispatched
+                        | AttemptPhase::Waiting
+                        | AttemptPhase::OutcomeRecorded
+                ) {
+                    if let Some(ref exec) = self.executor {
+                        if exec.worktree_id.is_none() || exec.terminal_id.is_none() {
+                            return Err(SchedulerError::CorruptState(
+                                "prepared attempt missing worktree_id or terminal_id".into(),
+                            ));
+                        }
+                        if exec.agent_id.is_none() || exec.agent_ready_at_ms.is_none() {
+                            return Err(SchedulerError::CorruptState(
+                                "prepared attempt missing agent_id or agent_ready_at_ms".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(SchedulerError::CorruptState(
+                            "prepared attempt missing executor state".into(),
+                        ));
+                    }
+                }
             }
             AttemptPhase::FinalizedLocal => {
                 let hash = self.terminal_report_sha256.as_deref().ok_or_else(|| {
@@ -370,7 +420,10 @@ impl ActiveAttempt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchReconciliation {
-    Accepted { request_id: String },
+    Accepted {
+        request_id: String,
+        stage: DispatchStage,
+    },
     DefinitelyNotDispatched,
     Ambiguous,
 }
@@ -380,6 +433,7 @@ pub enum DispatchOutcome {
     Accepted {
         request_id: String,
         accepted_at_ms: i64,
+        stage: DispatchStage,
     },
     KnownRejectedBeforeAcceptance {
         reason: String,
@@ -408,7 +462,7 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         attempt: &ActiveAttempt,
         target: &LocalTarget,
-    ) -> Result<(String, String), String>; // (worktree_id, terminal_id)
+    ) -> Result<PreparedExecution, String>;
 
     async fn reconcile_dispatch(
         &self,
@@ -450,7 +504,7 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<(String, String), String> {
+    ) -> Result<PreparedExecution, String> {
         Err("UnavailableExecutionAdapter cannot prepare".into())
     }
 
@@ -505,8 +559,14 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<(String, String), String> {
-        Ok(("wt_fake".into(), "term_fake".into()))
+    ) -> Result<PreparedExecution, String> {
+        Ok(PreparedExecution {
+            orca_version: "1.4.209".into(),
+            worktree_id: "wt_fake".into(),
+            terminal_id: "term_fake".into(),
+            agent_id: "fake_agent".into(),
+            agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
     }
 
     async fn reconcile_dispatch(
@@ -526,6 +586,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         Ok(DispatchOutcome::Accepted {
             request_id: "req_fake".into(),
             accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+            stage: DispatchStage::TurnStarted,
         })
     }
 

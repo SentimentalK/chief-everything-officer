@@ -540,6 +540,37 @@ async fn check_server_integration(
                             message: "Locally mapped target not found on server".into(),
                         });
                     }
+
+                    match &lt.executor {
+                        Some(exec) => {
+                            if let Err(e) = exec.validate() {
+                                checks.push(DiagnosticCheck {
+                                    name: format!("Target '{}' Executor", lt.alias),
+                                    severity: DiagnosticSeverity::Fail,
+                                    message: format!("Invalid executor configuration: {e}"),
+                                });
+                            } else {
+                                checks.push(DiagnosticCheck {
+                                    name: format!("Target '{}' Executor", lt.alias),
+                                    severity: DiagnosticSeverity::Pass,
+                                    message: format!(
+                                        "Configured for agent '{}' ({})",
+                                        exec.agent_id, exec.command
+                                    ),
+                                });
+                            }
+                        }
+                        None => {
+                            checks.push(DiagnosticCheck {
+                                name: format!("Target '{}' Executor", lt.alias),
+                                severity: DiagnosticSeverity::Fail,
+                                message: format!(
+                                    "No agent executor configured. Configure one with `ceo-connector target set-agent --target-id {} --agent-id <id> --agent-command <command>`",
+                                    tid
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }

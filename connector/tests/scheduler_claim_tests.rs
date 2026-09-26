@@ -135,6 +135,10 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
             alias: "dev-target".into(),
             kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
+                    .unwrap(),
+            ),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -296,6 +300,10 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
             alias: "dev-target".into(),
             kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
+                    .unwrap(),
+            ),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -529,6 +537,10 @@ async fn run_claim_mismatch_case(
             alias: "dev-target".into(),
             kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
+                    .unwrap(),
+            ),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -548,7 +560,7 @@ async fn run_claim_mismatch_case(
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<(String, String), String> {
+        ) -> Result<ceo_connector::scheduler::PreparedExecution, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }
@@ -747,6 +759,10 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
             alias: "dev-target".into(),
             kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
+                    .unwrap(),
+            ),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -784,7 +800,7 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
-        ) -> Result<(String, String), String> {
+        ) -> Result<ceo_connector::scheduler::PreparedExecution, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
         }

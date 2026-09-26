@@ -124,6 +124,8 @@ async fn target_add_general_automation_and_repo_null_coding() {
         "general_automation",
         &target_dir.to_string_lossy(),
         false,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -137,6 +139,8 @@ async fn target_add_general_automation_and_repo_null_coding() {
         "coding",
         &target_dir.to_string_lossy(),
         false,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -240,6 +244,8 @@ async fn target_add_with_workspace_repository_verification() {
         "coding",
         &matching_repo.to_string_lossy(),
         true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -262,6 +268,8 @@ async fn target_add_with_workspace_repository_verification() {
         "coding",
         &mismatched_repo.to_string_lossy(),
         true,
+        None,
+        None,
     )
     .await
     .unwrap_err();
@@ -339,9 +347,15 @@ async fn target_bind_and_remove_lifecycle() {
     fs::create_dir_all(&target_dir).unwrap();
 
     // Bind target
-    target_bind(&paths, "tgt_existing", &target_dir.to_string_lossy())
-        .await
-        .unwrap();
+    target_bind(
+        &paths,
+        "tgt_existing",
+        &target_dir.to_string_lossy(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let config = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     assert!(config.targets.contains_key("tgt_existing"));
@@ -377,6 +391,7 @@ async fn active_target_mutation_rejected_with_target_in_use() {
             alias: "in-use".into(),
             kind: "coding".into(),
             local_path: "/path/to/repo".into(),
+            executor: None,
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -403,7 +418,19 @@ async fn active_target_mutation_rejected_with_target_in_use() {
     // Attempt bind tgt_in_use
     let test_dir = temp.path().join("new_dir");
     fs::create_dir_all(&test_dir).unwrap();
-    let err = target_bind(&paths, "tgt_in_use", &test_dir.to_string_lossy())
+    let err = target_bind(
+        &paths,
+        "tgt_in_use",
+        &test_dir.to_string_lossy(),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, TargetError::TargetInUse(tid) if tid == "tgt_in_use"));
+
+    // Attempt set-agent on tgt_in_use rejected with TARGET_IN_USE
+    let err = ceo_connector::targets::target_set_agent(&paths, "tgt_in_use", "agy", "agy")
         .await
         .unwrap_err();
     assert!(matches!(err, TargetError::TargetInUse(tid) if tid == "tgt_in_use"));

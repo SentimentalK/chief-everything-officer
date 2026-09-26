@@ -84,6 +84,10 @@ enum TargetSubcommands {
         path: String,
         #[arg(long, default_value_t = false)]
         workspace_repository: bool,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        agent_command: Option<String>,
     },
     /// Bind an existing target to this device
     Bind {
@@ -91,6 +95,19 @@ enum TargetSubcommands {
         target_id: String,
         #[arg(long)]
         path: String,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        agent_command: Option<String>,
+    },
+    /// Configure the agent executor for a target
+    SetAgent {
+        #[arg(long)]
+        target_id: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        agent_command: String,
     },
     /// Remove this device's binding for a target
     Remove {
@@ -199,6 +216,8 @@ async fn main() -> ExitCode {
                 kind,
                 path,
                 workspace_repository,
+                agent_id,
+                agent_command,
             } => {
                 if let Err(e) = ceo_connector::targets::target_add(
                     &paths,
@@ -208,6 +227,8 @@ async fn main() -> ExitCode {
                     &kind,
                     &path,
                     workspace_repository,
+                    agent_id,
+                    agent_command,
                 )
                 .await
                 {
@@ -215,10 +236,39 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            TargetSubcommands::Bind { target_id, path } => {
-                if let Err(e) = ceo_connector::targets::target_bind(&paths, &target_id, &path).await
+            TargetSubcommands::Bind {
+                target_id,
+                path,
+                agent_id,
+                agent_command,
+            } => {
+                if let Err(e) = ceo_connector::targets::target_bind(
+                    &paths,
+                    &target_id,
+                    &path,
+                    agent_id,
+                    agent_command,
+                )
+                .await
                 {
                     eprintln!("Target bind failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            TargetSubcommands::SetAgent {
+                target_id,
+                agent_id,
+                agent_command,
+            } => {
+                if let Err(e) = ceo_connector::targets::target_set_agent(
+                    &paths,
+                    &target_id,
+                    &agent_id,
+                    &agent_command,
+                )
+                .await
+                {
+                    eprintln!("Target set-agent failed: {}", e);
                     return ExitCode::FAILURE;
                 }
             }

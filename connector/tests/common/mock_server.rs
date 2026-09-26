@@ -23,6 +23,7 @@ impl MockRequest {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MockResponse {
     pub status: u16,
@@ -31,6 +32,7 @@ pub struct MockResponse {
 }
 
 impl MockResponse {
+    #[allow(dead_code)]
     pub fn json(status: u16, value: &serde_json::Value) -> Self {
         let body = serde_json::to_vec(value).unwrap();
         Self {

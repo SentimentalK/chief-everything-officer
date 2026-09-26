@@ -1,10 +1,8 @@
-use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::client::{OrcaCliClient, OrcaError};
-use super::types::OrcaWorktreeItem;
 use crate::config::LocalTarget;
 use crate::scheduler::{
     ActiveAttempt, DispatchOutcome, DispatchReconciliation, ExecutionAdapter, WaitOutcome,
@@ -50,85 +48,70 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         &self,
         attempt: &ActiveAttempt,
         target: &LocalTarget,
-    ) -> Result<(String, String), String> {
-        // 1. Worktree reconciliation
-        let worktrees = self
+    ) -> Result<crate::scheduler::PreparedExecution, String> {
+        let executor = target.executor.as_ref().ok_or_else(|| {
+            "RECOVERY_REQUIRED: target has no agent executor configured".to_string()
+        })?;
+
+        // 1. Resolve fixed local Target in Orca (show worktree by path, repo add if missing)
+        let canonical_target_path = std::fs::canonicalize(&target.local_path).map_err(|e| {
+            format!(
+                "RECOVERY_REQUIRED: target path '{}' canonicalize failed: {e}",
+                target.local_path
+            )
+        })?;
+
+        let worktree = match self
             .client
-            .list_worktrees()
+            .show_worktree_by_path(&canonical_target_path)
             .await
-            .map_err(|e| format!("failed to list worktrees: {e}"))?;
-
-        let target_canonical = std::fs::canonicalize(&target.local_path).ok();
-        let matching_worktrees: Vec<&OrcaWorktreeItem> = worktrees
-            .iter()
-            .filter(|wt| {
-                if wt.path == target.local_path {
-                    return true;
-                }
-                if let Some(ref c) = target_canonical {
-                    if let Ok(wt_c) = std::fs::canonicalize(&wt.path) {
-                        return wt_c == *c;
-                    }
-                }
-                false
-            })
-            .collect();
-
-        let adopted_worktree = match matching_worktrees.len() {
-            0 => {
-                // 0 -> create worktree -> validate returned path matches configured Target
-                let attempt_name = format!("ceo-{}", attempt.attempt_id);
-                let created = self
+            .map_err(|e| format!("failed to show worktree for target: {e}"))?
+        {
+            Some(wt) => wt,
+            None => {
+                let _ = self
                     .client
-                    .create_worktree(&attempt_name, &format!("path:{}", target.local_path))
+                    .add_repo(&canonical_target_path)
                     .await
-                    .map_err(|e| format!("failed to create worktree for target: {e}"))?;
-
-                let created_canonical = std::fs::canonicalize(&created.path).ok();
-                let path_matches = created.path == target.local_path
-                    || (target_canonical.is_some() && created_canonical == target_canonical);
-                if !path_matches {
-                    return Err(format!(
-                        "RECOVERY_REQUIRED: created worktree path '{}' does not match target path '{}'",
-                        created.path, target.local_path
-                    ));
-                }
-                created.id
-            }
-            1 => matching_worktrees[0].id.clone(),
-            count => {
-                // >1 -> use explicitly durable/deterministic Attempt-owned identity if available, otherwise RECOVERY_REQUIRED
-                if let Some(owned_wt_id) = attempt
-                    .executor
-                    .as_ref()
-                    .and_then(|e| e.worktree_id.as_deref())
-                {
-                    if let Some(matched) = matching_worktrees.iter().find(|wt| wt.id == owned_wt_id)
-                    {
-                        matched.id.clone()
-                    } else {
-                        return Err(format!(
-                            "RECOVERY_REQUIRED: multiple worktrees ({count}) match target '{}', and attempt-owned worktree '{owned_wt_id}' is not among them",
-                            target.local_path
-                        ));
-                    }
-                } else {
-                    return Err(format!(
-                        "RECOVERY_REQUIRED: multiple worktrees ({count}) match target '{}'; ambiguous candidates cannot be adopted",
-                        target.local_path
-                    ));
-                }
+                    .map_err(|e| format!("failed to add repo for target: {e}"))?;
+                self.client
+                    .show_worktree_by_path(&canonical_target_path)
+                    .await
+                    .map_err(|e| format!("failed to show worktree after adding repo: {e}"))?
+                    .ok_or_else(|| {
+                        format!(
+                            "RECOVERY_REQUIRED: worktree not found after adding repo for path '{}'",
+                            canonical_target_path.display()
+                        )
+                    })?
             }
         };
 
-        // 2. Terminal reconciliation on title `ceo:<attempt_id>`, scoped to adopted_worktree
+        let wt_canonical = std::fs::canonicalize(&worktree.path).map_err(|e| {
+            format!(
+                "RECOVERY_REQUIRED: worktree path '{}' canonicalize failed: {e}",
+                worktree.path
+            )
+        })?;
+        if wt_canonical != canonical_target_path {
+            return Err(format!(
+                "RECOVERY_REQUIRED: resolved worktree path '{}' does not match target path '{}'",
+                wt_canonical.display(),
+                canonical_target_path.display()
+            ));
+        }
+
+        // 2. Terminal reconciliation on title `ceo:<attempt_id>`, scoped to resolved worktree
         let expected_title = format!("ceo:{}", attempt.attempt_id);
         let terminals = self
             .client
-            .list_terminals(Some(&adopted_worktree))
+            .list_terminals(Some(&worktree.id))
             .await
             .map_err(|e| {
-                format!("failed to list terminals for worktree '{adopted_worktree}': {e}")
+                format!(
+                    "failed to list terminals for worktree '{}': {e}",
+                    worktree.id
+                )
             })?;
 
         let matching_terminals: Vec<_> = terminals
@@ -137,34 +120,131 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 t.title.as_deref() == Some(&expected_title)
                     && t.worktree_id
                         .as_deref()
-                        .map(|w| w == adopted_worktree)
+                        .map(|w| w == worktree.id)
                         .unwrap_or(true)
             })
             .collect();
 
-        let terminal_handle = match matching_terminals.len() {
+        let (terminal_handle, ready_at) = match matching_terminals.len() {
             0 => {
                 let term = self
                     .client
                     .create_terminal(
-                        &adopted_worktree,
+                        &worktree.id,
                         &expected_title,
-                        None,
-                        Some(Path::new(&target.local_path)),
+                        Some(&executor.command),
+                        Some(&canonical_target_path),
                     )
                     .await
                     .map_err(|e| format!("failed to create terminal for attempt: {e}"))?;
-                term.handle
+
+                // TUI readiness gate: 60s, retry 120s
+                let wait_res = self
+                    .client
+                    .wait_terminal_tui_idle(&term.handle, Duration::from_secs(60))
+                    .await;
+                let satisfied = match wait_res {
+                    Ok(resp) => resp
+                        .result
+                        .and_then(|r| r.wait)
+                        .map(|w| w.satisfied)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+
+                let satisfied = if !satisfied {
+                    let retry_res = self
+                        .client
+                        .wait_terminal_tui_idle(&term.handle, Duration::from_secs(120))
+                        .await;
+                    match retry_res {
+                        Ok(resp) => resp
+                            .result
+                            .and_then(|r| r.wait)
+                            .map(|w| w.satisfied)
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    }
+                } else {
+                    true
+                };
+
+                if !satisfied {
+                    return Err(
+                        "RECOVERY_REQUIRED: AGENT_NOT_READY: terminal failed TUI readiness gate"
+                            .into(),
+                    );
+                }
+                let now = chrono::Utc::now().timestamp_millis();
+                (term.handle, now)
             }
-            1 => matching_terminals.into_iter().next().unwrap().handle,
+            1 => {
+                let handle = matching_terminals.into_iter().next().unwrap().handle;
+                let ready_at =
+                    if let Some(ts) = attempt.executor.as_ref().and_then(|e| e.agent_ready_at_ms) {
+                        ts
+                    } else {
+                        let wait_res = self
+                            .client
+                            .wait_terminal_tui_idle(&handle, Duration::from_secs(60))
+                            .await;
+                        let satisfied = match wait_res {
+                            Ok(resp) => resp
+                                .result
+                                .and_then(|r| r.wait)
+                                .map(|w| w.satisfied)
+                                .unwrap_or(false),
+                            Err(_) => false,
+                        };
+                        let satisfied = if !satisfied {
+                            let retry_res = self
+                                .client
+                                .wait_terminal_tui_idle(&handle, Duration::from_secs(120))
+                                .await;
+                            match retry_res {
+                                Ok(resp) => resp
+                                    .result
+                                    .and_then(|r| r.wait)
+                                    .map(|w| w.satisfied)
+                                    .unwrap_or(false),
+                                Err(_) => false,
+                            }
+                        } else {
+                            true
+                        };
+                        if !satisfied {
+                            return Err(
+                            "RECOVERY_REQUIRED: AGENT_NOT_READY: terminal failed TUI readiness gate"
+                                .into(),
+                        );
+                        }
+                        chrono::Utc::now().timestamp_millis()
+                    };
+                (handle, ready_at)
+            }
             count => {
                 return Err(format!(
-                    "RECOVERY_REQUIRED: multiple terminals ({count}) found with title '{expected_title}' in worktree '{adopted_worktree}'"
+                    "RECOVERY_REQUIRED: multiple terminals ({count}) found with title '{expected_title}' in worktree '{}'",
+                    worktree.id
                 ));
             }
         };
 
-        Ok((adopted_worktree, terminal_handle))
+        let orca_version = match self.client.status().await {
+            Ok(resp) => resp
+                .result
+                .and_then(|r| r.runtime.app_version)
+                .unwrap_or_else(|| "unknown".into()),
+            Err(_) => "unknown".into(),
+        };
+
+        Ok(crate::scheduler::PreparedExecution {
+            orca_version,
+            worktree_id: worktree.id,
+            terminal_id: terminal_handle,
+            agent_id: executor.agent_id.clone(),
+            agent_ready_at_ms: ready_at,
+        })
     }
 
     async fn reconcile_dispatch(
@@ -187,8 +267,14 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             .as_ref()
             .and_then(|e| e.dispatch_request_id.as_ref())
         {
+            let stage = attempt
+                .executor
+                .as_ref()
+                .and_then(|e| e.dispatch_stage)
+                .unwrap_or(crate::scheduler::DispatchStage::InputAccepted);
             return Ok(DispatchReconciliation::Accepted {
                 request_id: req_id.clone(),
+                stage,
             });
         }
 
@@ -228,9 +314,20 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     if send.accepted {
                         if let Some(p) = send.prompt {
                             if let Some(req_id) = p.request_id {
+                                let has_turn_started = p
+                                    .stages
+                                    .as_ref()
+                                    .map(|s| s.iter().any(|st| st == "turn_started"))
+                                    .unwrap_or(false);
+                                let stage = if has_turn_started {
+                                    crate::scheduler::DispatchStage::TurnStarted
+                                } else {
+                                    crate::scheduler::DispatchStage::InputAccepted
+                                };
                                 return Ok(DispatchOutcome::Accepted {
                                     request_id: req_id,
                                     accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    stage,
                                 });
                             }
                         }
@@ -296,7 +393,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         {
             Ok(resp) => {
                 if let Some(wait) = resp.result.as_ref().and_then(|r| r.wait.as_ref()) {
-                    if wait.condition == "tui-idle" {
+                    if wait.condition.as_deref() == Some("tui-idle") || wait.condition.is_none() {
                         if wait.satisfied {
                             return Ok(WaitOutcome::TuiIdle {
                                 elapsed_ms: wait.elapsed_ms.unwrap_or(0),
@@ -353,7 +450,39 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
     }
 
     async fn close(&self, terminal_id: &str) -> Result<(), String> {
-        let _ = self.client.close_terminal(terminal_id).await;
+        match self.client.close_terminal(terminal_id).await {
+            Ok(resp) => {
+                if let Some(close_part) = resp.result.and_then(|r| r.close) {
+                    if let Some(ref verdict) = close_part.pty_stop_verdict {
+                        if verdict == "live" || verdict == "unverifiable" {
+                            return Err(format!(
+                                "terminal close rejected: pty_stop_verdict was '{verdict}'"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(OrcaError::Orca(ref msg))
+                if msg.contains("not_found") || msg.contains("no such terminal") =>
+            {
+                // Terminal already closed/absent
+            }
+            Err(OrcaError::CommandFailed { ref stderr, .. })
+                if stderr.contains("not_found") || stderr.contains("no such terminal") =>
+            {
+                // Terminal already closed/absent
+            }
+            Err(e) => return Err(format!("terminal close failed: {e}")),
+        }
+
+        // Post-close verification: list terminals, verify handle is absent
+        if let Ok(terminals) = self.client.list_terminals(None).await {
+            if terminals.iter().any(|t| t.handle == terminal_id) {
+                return Err(format!(
+                    "terminal cleanup verification failed: terminal '{terminal_id}' still present after close"
+                ));
+            }
+        }
         Ok(())
     }
 }

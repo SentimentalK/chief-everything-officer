@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ceo_connector::client::ConnectorClient;
-use ceo_connector::config::{normalize_server_origin, LocalConfig, LocalTarget};
+use ceo_connector::config::{
+    normalize_server_origin, LocalConfig, LocalExecutorConfig, LocalTarget,
+};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::daemon::{drive_active_attempt, DaemonHooks};
 use ceo_connector::execution_contract::{BusinessOutcome, ExecutionStatus};
@@ -16,7 +18,7 @@ use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, DispatchOutcome, DispatchReconciliation,
-    ExecutionAdapter, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    DispatchStage, ExecutionAdapter, PreparedExecution, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
 use uuid::Uuid;
@@ -24,7 +26,7 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 struct MockAdapter {
     pub ready: bool,
-    pub prepare_result: Option<Result<(String, String), String>>,
+    pub prepare_result: Option<Result<PreparedExecution, String>>,
     pub reconcile_result: Option<Result<DispatchReconciliation, String>>,
     pub dispatch_result: Option<Result<DispatchOutcome, String>>,
     pub wait_result: Option<Result<WaitOutcome, String>>,
@@ -53,15 +55,18 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         attempt: &ActiveAttempt,
         _target: &LocalTarget,
-    ) -> Result<(String, String), String> {
+    ) -> Result<PreparedExecution, String> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(ref res) = self.prepare_result {
             res.clone()
         } else {
-            Ok((
-                format!("wt_{}", attempt.attempt_id),
-                format!("term_{}", attempt.attempt_id),
-            ))
+            Ok(PreparedExecution {
+                worktree_id: format!("wt_{}", attempt.attempt_id),
+                terminal_id: format!("term_{}", attempt.attempt_id),
+                orca_version: "1.4.209".into(),
+                agent_id: "agy".into(),
+                agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
         }
     }
 
@@ -87,6 +92,7 @@ impl ExecutionAdapter for MockAdapter {
             Ok(DispatchOutcome::Accepted {
                 request_id: "req_mock_123".into(),
                 accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                stage: DispatchStage::TurnStarted,
             })
         })
     }
@@ -147,6 +153,7 @@ fn setup_test_env(
             alias: "mock-target".to_string(),
             kind: "general_automation".to_string(),
             local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -160,12 +167,16 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         orca_version: Some(ver.to_string()),
         worktree_id: None,
         terminal_id: None,
+        agent_id: Some("agy".to_string()),
+        agent_ready_at_ms: Some(1727220000000),
         dispatch_send_count: 0,
         last_dispatch_outcome: None,
         dispatch_started_at_ms: None,
         execution_deadline_ms: None,
         dispatch_request_id: None,
         dispatch_accepted_at_ms: None,
+        dispatch_stage: None,
+        dispatch_observation_count: 0,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
         runtime_error: None,
@@ -420,6 +431,7 @@ async fn test_outcome_recorded_crash_recovery_skips_wait_and_dispatch() {
     executor_state.execution_deadline_ms = Some(1727000060000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
+    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
     executor_state.runtime_completion_kind = Some("tui_idle".into());
     executor_state.runtime_completed_at_ms = Some(1727000010000);
 
@@ -484,6 +496,7 @@ async fn test_durable_deadline_expired_marks_timed_out_without_waiting() {
     executor_state.execution_deadline_ms = Some(now - 1_000); // 1s in the past!
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
+    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
 
     let active = make_test_attempt(
         &cred,
@@ -710,6 +723,7 @@ async fn test_zero_lock_contention_during_adapter_wait() {
     executor_state.execution_deadline_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
+    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
 
     // Start in Waiting phase so adapter.wait() is directly invoked
     let active = make_test_attempt(
@@ -775,7 +789,13 @@ async fn test_prepare_terminal_adoption() {
     // Adapter returns existing adopted terminal ID
     let adapter = Arc::new(MockAdapter {
         ready: true,
-        prepare_result: Some(Ok(("wt_existing".into(), "term_adopted_123".into()))),
+        prepare_result: Some(Ok(PreparedExecution {
+            worktree_id: "wt_existing".into(),
+            terminal_id: "term_adopted_123".into(),
+            orca_version: "1.4.209".into(),
+            agent_id: "agy".into(),
+            agent_ready_at_ms: 1727220000000,
+        })),
         ..Default::default()
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
@@ -946,6 +966,7 @@ async fn test_interrupted_runtime_outcome_semantics() {
     executor_state.execution_deadline_ms = Some(now + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
+    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
 
     let active = make_test_attempt(
         &cred,

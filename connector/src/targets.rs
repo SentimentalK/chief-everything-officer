@@ -198,6 +198,25 @@ fn check_active_attempt_target_in_use(
     Ok(())
 }
 
+fn resolve_executor_args(
+    agent_id: Option<String>,
+    agent_command: Option<String>,
+) -> Result<Option<crate::config::LocalExecutorConfig>, TargetError> {
+    match (agent_id, agent_command) {
+        (Some(aid), Some(cmd)) => {
+            let cfg = crate::config::LocalExecutorConfig::new(aid, cmd)?;
+            Ok(Some(cfg))
+        }
+        (None, None) => Ok(None),
+        _ => Err(TargetError::Config(
+            crate::config::ConfigError::InvalidExecutor(
+                "Both --agent-id and --agent-command must be provided together".into(),
+            ),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn target_add(
     paths: &ConnectorPaths,
     workspace_id: &str,
@@ -206,7 +225,10 @@ pub async fn target_add(
     kind: &str,
     path_input: &str,
     use_workspace_repository: bool,
+    agent_id: Option<String>,
+    agent_command: Option<String>,
 ) -> Result<(), TargetError> {
+    let executor = resolve_executor_args(agent_id, agent_command)?;
     paths.ensure_dirs()?;
     let profile = crate::config::load_bound_profile(paths)?;
     let mut config = profile.config;
@@ -284,6 +306,7 @@ pub async fn target_add(
             alias: res.target.alias,
             kind: res.target.kind,
             local_path: canonical_str,
+            executor,
         },
     );
 
@@ -302,7 +325,10 @@ pub async fn target_bind(
     paths: &ConnectorPaths,
     target_id: &str,
     path_input: &str,
+    agent_id: Option<String>,
+    agent_command: Option<String>,
 ) -> Result<(), TargetError> {
+    let executor = resolve_executor_args(agent_id, agent_command)?;
     paths.ensure_dirs()?;
     let profile = crate::config::load_bound_profile(paths)?;
     let mut config = profile.config;
@@ -354,6 +380,7 @@ pub async fn target_bind(
             alias: target.alias,
             kind: target.kind,
             local_path: canonical_str,
+            executor,
         },
     );
 
@@ -362,6 +389,47 @@ pub async fn target_bind(
         "Target '{}' successfully bound and mapped to '{}'.",
         target_id,
         canonical_path.display()
+    );
+    Ok(())
+}
+
+pub async fn target_set_agent(
+    paths: &ConnectorPaths,
+    target_id: &str,
+    agent_id: &str,
+    agent_command: &str,
+) -> Result<(), TargetError> {
+    paths.ensure_dirs()?;
+    let executor_cfg =
+        crate::config::LocalExecutorConfig::new(agent_id.to_string(), agent_command.to_string())?;
+
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(TargetError::ProfileBusy)
+        }
+        Err(e) => return Err(TargetError::Io(e)),
+    };
+    check_active_attempt_target_in_use(paths, target_id)?;
+
+    let mut config = crate::config::LocalConfig::load(&paths.config_file())?
+        .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
+
+    let target = config
+        .targets
+        .get_mut(target_id)
+        .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
+
+    target.executor = Some(executor_cfg);
+    config.save(&paths.config_file())?;
+
+    println!(
+        "Target '{}' agent executor updated: agent_id='{}', command='{}'.",
+        target_id, agent_id, agent_command
     );
     Ok(())
 }

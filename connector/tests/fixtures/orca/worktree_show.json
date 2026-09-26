@@ -1,0 +1,19 @@
+{
+  "id": "c1f7a224-81d3-49d7-84d4-517865c68f12",
+  "ok": true,
+  "result": {
+    "worktree": {
+      "id": "52984381-30b0-4c5b-b23b-fd2fc2474049::/home/user/repo",
+      "instanceId": "ad1ec7e1-679e-44e9-9c2a-68df742bccee",
+      "repoId": "52984381-30b0-4c5b-b23b-fd2fc2474049",
+      "path": "/home/user/repo",
+      "branch": "refs/heads/main",
+      "isBare": false,
+      "isMainWorktree": true,
+      "displayName": "main"
+    }
+  },
+  "_meta": {
+    "runtimeId": "ecde337b-2214-4bdb-b09b-458b5f8d8cc7"
+  }
+}

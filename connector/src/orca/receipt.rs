@@ -10,15 +10,20 @@ pub struct ExecutionReceipt {
     pub orca_version: String,
     pub worktree_id: Option<String>,
     pub terminal_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_ready_at_ms: Option<i64>,
     pub dispatch_request_id: Option<String>,
+    pub dispatch_stage: Option<String>,
     pub task_dispatched: bool,
     pub runtime_completion_kind: Option<String>,
     pub dispatch_started_at_ms: Option<i64>,
     pub runtime_completed_at_ms: Option<i64>,
+    pub terminal_cleanup_verified: bool,
+    pub terminal_closed_at_ms: Option<i64>,
 }
 
 impl ExecutionReceipt {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     pub fn compute_sha256(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("canonical receipt serialization");
@@ -42,11 +47,16 @@ mod tests {
             orca_version: "1.4.209".into(),
             worktree_id: Some("wt-1".into()),
             terminal_id: Some("term-1".into()),
+            agent_id: Some("agy".into()),
+            agent_ready_at_ms: Some(1727220000000),
             dispatch_request_id: Some("req-1".into()),
+            dispatch_stage: Some("turn_started".into()),
             task_dispatched: true,
             runtime_completion_kind: Some("tui_idle".into()),
             dispatch_started_at_ms: Some(1727220000000),
             runtime_completed_at_ms: Some(1727220045000),
+            terminal_cleanup_verified: true,
+            terminal_closed_at_ms: Some(1727220046000),
         };
 
         let digest = receipt.compute_sha256();

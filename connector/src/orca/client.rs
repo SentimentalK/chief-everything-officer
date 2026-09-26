@@ -142,31 +142,83 @@ impl OrcaCliClient {
         Ok(resp.result.map(|r| r.worktrees).unwrap_or_default())
     }
 
-    pub async fn create_worktree(
+    pub async fn show_worktree_by_path(
         &self,
-        name: &str,
-        repo_selector: &str,
-    ) -> Result<OrcaWorktreeItem, OrcaError> {
-        let args = vec![
-            "worktree",
-            "create",
-            "--name",
-            name,
-            "--repo",
-            repo_selector,
-            "--no-parent",
-            "--setup",
-            "skip",
-            "--json",
-        ];
+        canonical_target_path: &Path,
+    ) -> Result<Option<OrcaWorktreeItem>, OrcaError> {
+        let selector = format!("path:{}", canonical_target_path.display());
+        let res = self
+            .execute_command(
+                &["worktree", "show", "--worktree", &selector, "--json"],
+                None,
+                self.default_timeout,
+            )
+            .await;
+
+        match res {
+            Ok(raw) => {
+                let resp: OrcaWorktreeShowResponse =
+                    serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
+                if resp.ok {
+                    Ok(resp.result.map(|r| r.worktree))
+                } else if let Some(ref err) = resp.error {
+                    if err.code.as_deref() == Some("selector_not_found")
+                        || err.code.as_deref() == Some("not_found")
+                        || err
+                            .message
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("selector_not_found")
+                        || err.message.as_deref().unwrap_or("").contains("not_found")
+                    {
+                        Ok(None)
+                    } else {
+                        Err(OrcaError::Orca(format!(
+                            "{}: {}",
+                            err.code.as_deref().unwrap_or("ERROR"),
+                            err.message.as_deref().unwrap_or("unknown error")
+                        )))
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(OrcaError::Orca(ref msg))
+                if msg.contains("selector_not_found") || msg.contains("not_found") =>
+            {
+                Ok(None)
+            }
+            Err(OrcaError::CommandFailed { ref stderr, .. })
+                if stderr.contains("selector_not_found") || stderr.contains("not_found") =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn add_repo(&self, path: &Path) -> Result<OrcaRepoItem, OrcaError> {
+        let path_str = path.display().to_string();
         let raw = self
-            .execute_command(&args, None, self.default_timeout)
+            .execute_command(
+                &["repo", "add", "--path", &path_str, "--json"],
+                None,
+                self.default_timeout,
+            )
             .await?;
-        let resp: OrcaWorktreeCreateResponse =
+        let resp: OrcaRepoAddResponse =
             serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-        resp.result.map(|r| r.worktree).ok_or_else(|| {
-            OrcaError::Orca("worktree create returned missing worktree object".into())
-        })
+        if resp.ok {
+            resp.result.map(|r| r.repo).ok_or_else(|| {
+                OrcaError::Orca("repo add returned ok=true but missing repo object".into())
+            })
+        } else {
+            let msg = resp
+                .error
+                .and_then(|e| e.message)
+                .unwrap_or_else(|| "unknown error".into());
+            Err(OrcaError::Orca(format!("repo add failed: {msg}")))
+        }
     }
 
     pub async fn list_terminals(
@@ -274,20 +326,14 @@ impl OrcaCliClient {
         serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
     }
 
-    pub async fn close_terminal(&self, terminal_handle: &str) -> Result<(), OrcaError> {
-        let args = vec![
-            "terminal",
-            "close",
-            "--terminal",
-            terminal_handle,
-            "--tab",
-            "--json",
-        ];
+    pub async fn close_terminal(
+        &self,
+        terminal_handle: &str,
+    ) -> Result<OrcaTerminalCloseResponse, OrcaError> {
+        let args = vec!["terminal", "close", "--terminal", terminal_handle, "--json"];
         let raw = self
             .execute_command(&args, None, self.default_timeout)
             .await?;
-        let _resp: OrcaTerminalCloseResponse =
-            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
-        Ok(())
+        serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))
     }
 }

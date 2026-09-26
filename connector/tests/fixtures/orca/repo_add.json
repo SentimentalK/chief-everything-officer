@@ -1,0 +1,13 @@
+{
+  "id": "e4f8b912-45a1-432d-90bc-123456789abc",
+  "ok": true,
+  "result": {
+    "repo": {
+      "id": "52984381-30b0-4c5b-b23b-fd2fc2474049",
+      "path": "/home/user/repo"
+    }
+  },
+  "_meta": {
+    "runtimeId": "ecde337b-2214-4bdb-b09b-458b5f8d8cc7"
+  }
+}

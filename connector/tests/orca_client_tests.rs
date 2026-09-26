@@ -1,9 +1,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ceo_connector::config::LocalTarget;
+use ceo_connector::config::{LocalExecutorConfig, LocalTarget};
 use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::receipt::ExecutionReceipt;
 use ceo_connector::orca::types::*;
@@ -37,16 +37,23 @@ fn test_parse_real_fixtures() {
         "52984381-30b0-4c5b-b23b-fd2fc2474049::/home/user/repo"
     );
 
-    // 2b. Worktree Create fixture
-    let wtc_str = fs::read_to_string(base.join("worktree_create.json")).unwrap();
-    let wtc: OrcaWorktreeCreateResponse = serde_json::from_str(&wtc_str).unwrap();
-    assert!(wtc.ok);
-    let wtc_res = wtc.result.unwrap();
+    // 2b. Worktree Show fixture
+    let wts_str = fs::read_to_string(base.join("worktree_show.json")).unwrap();
+    let wts: OrcaWorktreeShowResponse = serde_json::from_str(&wts_str).unwrap();
+    assert!(wts.ok);
+    let wts_res = wts.result.unwrap();
     assert_eq!(
-        wtc_res.worktree.id,
+        wts_res.worktree.id,
         "52984381-30b0-4c5b-b23b-fd2fc2474049::/home/user/repo"
     );
-    assert_eq!(wtc_res.worktree.path, "/home/user/repo");
+    assert_eq!(wts_res.worktree.path, "/home/user/repo");
+
+    // 2c. Repo Add fixture
+    let ra_str = fs::read_to_string(base.join("repo_add.json")).unwrap();
+    let ra: OrcaRepoAddResponse = serde_json::from_str(&ra_str).unwrap();
+    assert!(ra.ok);
+    let ra_res = ra.result.unwrap();
+    assert_eq!(ra_res.repo.path, "/home/user/repo");
 
     // 3. Terminal Create fixture
     let tc_str = fs::read_to_string(base.join("terminal_create.json")).unwrap();
@@ -86,7 +93,7 @@ fn test_parse_real_fixtures() {
     let tw_res = tw.result.unwrap();
     let wait_part = tw_res.wait.unwrap();
     assert!(wait_part.satisfied);
-    assert_eq!(wait_part.condition, "tui-idle");
+    assert_eq!(wait_part.condition.as_deref(), Some("tui-idle"));
 
     // 6. Terminal Close fixture
     let tcl_str = fs::read_to_string(base.join("terminal_close.json")).unwrap();
@@ -122,8 +129,10 @@ if [ "$1" = "status" ]; then
     echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.209"}}}}}}'
 elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_1","path":"/path/to/repo"}}]}}}}'
-elif [ "$1" = "worktree" ] && [ "$2" = "create" ]; then
-    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_created_1","path":"/path/to/repo","displayName":"task"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"/path/to/repo"}}}}}}'
+elif [ "$1" = "repo" ] && [ "$2" = "add" ]; then
+    echo '{{"ok":true,"result":{{"repo":{{"id":"repo_1","path":"/path/to/repo"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
@@ -131,7 +140,7 @@ elif [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
     echo '{{"ok":true,"result":{{"wait":{{"handle":"term_1","condition":"tui-idle","satisfied":true,"elapsedMs":100}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "close" ]; then
-    echo '{{"ok":true,"result":{{"close":{{"handle":"term_1","closeMode":"tab","ptyKilled":false}}}}}}'
+    echo '{{"ok":true,"result":{{"close":{{"handle":"term_1","closeMode":"exact","ptyKilled":true}}}}}}'
 else
     echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
 fi
@@ -155,13 +164,19 @@ fi
     assert_eq!(wts.len(), 1);
     assert_eq!(wts[0].id, "wt_1");
 
-    // Test create_worktree
-    let wt_created = client
-        .create_worktree("task", "/path/to/repo")
+    // Test show_worktree_by_path
+    let wt = client
+        .show_worktree_by_path(Path::new("/path/to/repo"))
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(wt_created.id, "wt_created_1");
-    assert_eq!(wt_created.path, "/path/to/repo");
+    assert_eq!(wt.id, "wt_1");
+    assert_eq!(wt.path, "/path/to/repo");
+
+    // Test add_repo
+    let repo = client.add_repo(Path::new("/path/to/repo")).await.unwrap();
+    assert_eq!(repo.id, "repo_1");
+    assert_eq!(repo.path, "/path/to/repo");
 
     // Test create_terminal
     let tc = client
@@ -192,9 +207,8 @@ fi
     let recorded_args = fs::read_to_string(&args_log).unwrap();
     assert!(recorded_args.contains("--retry-request req_retry_001"));
     assert!(recorded_args.contains("--wait-submit 10"));
-    assert!(recorded_args.contains(
-        "worktree create --name task --repo /path/to/repo --no-parent --setup skip --json"
-    ));
+    assert!(recorded_args.contains("worktree show --worktree path:/path/to/repo --json"));
+    assert!(recorded_args.contains("repo add --path /path/to/repo --json"));
 
     // Test wait_terminal_tui_idle
     let tw = client
@@ -258,11 +272,16 @@ fn test_execution_receipt_hashing_and_exclusion() {
         orca_version: "1.4.209".into(),
         worktree_id: Some("wt_789".into()),
         terminal_id: Some("term_abc".into()),
+        agent_id: Some("agy".into()),
+        agent_ready_at_ms: Some(1727220000000),
         dispatch_request_id: Some("req_xyz".into()),
+        dispatch_stage: Some("turn_started".into()),
         task_dispatched: true,
         runtime_completion_kind: Some("tui_idle".into()),
         dispatch_started_at_ms: Some(1727220000000),
         runtime_completed_at_ms: Some(1727220001000),
+        terminal_cleanup_verified: true,
+        terminal_closed_at_ms: Some(1727220002000),
     };
 
     let receipt2 = receipt1.clone();
@@ -356,25 +375,37 @@ async fn test_fake_orca_worktree_reconciliation_zero_creates_and_validates() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
     let args_log = temp.path().join("args.log");
+    let marker_file = temp.path().join("repo_added");
 
     let script = format!(
         r#"#!/bin/bash
 echo "$@" >> "{}"
-if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
-    echo '{{"ok":true,"result":{{"worktrees":[]}}}}'
-elif [ "$1" = "worktree" ] && [ "$2" = "create" ]; then
-    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_created_123","path":"{}","displayName":"att_123"}}}}}}'
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    if [ -f "{}" ]; then
+        echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+    else
+        echo '{{"ok":false,"error":{{"code":"not_found"}}}}'
+    fi
+elif [ "$1" = "repo" ] && [ "$2" = "add" ]; then
+    touch "{}"
+    echo '{{"ok":true,"result":{{"repo":{{"id":"repo_123","path":"{}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[]}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","title":"ceo:att_123"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"satisfied":true}}}}}}'
 else
     echo '{{"ok":false}}'
 fi
 "#,
         args_log.display(),
-        repo_dir.display()
+        marker_file.display(),
+        repo_canon,
+        marker_file.display(),
+        repo_canon,
     );
 
     let bin = create_mock_orca_script(&temp, &script);
@@ -385,7 +416,8 @@ fi
         workspace_id: "ws_1".into(),
         alias: "repo".into(),
         kind: "repo".into(),
-        local_path: repo_dir.display().to_string(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
 
     let attempt = ActiveAttempt {
@@ -409,27 +441,25 @@ fi
         executor: None,
     };
 
-    let (wt_id, term_id) = adapter.prepare(&attempt, &target).await.unwrap();
-    assert_eq!(wt_id, "wt_created_123");
-    assert_eq!(term_id, "term_new_123");
+    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    assert_eq!(prep.worktree_id, "wt_123");
+    assert_eq!(prep.terminal_id, "term_new_123");
+    assert_eq!(prep.agent_id, "agy");
 
     let recorded = fs::read_to_string(&args_log).unwrap();
-    assert!(recorded.contains(&format!(
-        "worktree create --name ceo-att_123 --repo path:{} --no-parent --setup skip --json",
-        repo_dir.display()
-    )));
+    assert!(recorded.contains("repo add"));
+    assert!(recorded.contains("--command agy"));
 }
 
 #[tokio::test]
-async fn test_fake_orca_worktree_reconciliation_ambiguous_fails_closed() {
+async fn test_fake_orca_missing_executor_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
 
     let script = r#"#!/bin/bash
-if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
-    echo '{"ok":true,"result":{"worktrees":[{"id":"wt_1","path":"/path/to/repo"},{"id":"wt_2","path":"/path/to/repo"}]}}'
-else
-    echo '{"ok":false}'
-fi
+echo '{"ok":true}'
 "#;
 
     let bin = create_mock_orca_script(&temp, script);
@@ -440,7 +470,8 @@ fi
         workspace_id: "ws_1".into(),
         alias: "repo".into(),
         kind: "repo".into(),
-        local_path: "/path/to/repo".into(),
+        local_path: repo_canon,
+        executor: None,
     };
 
     let attempt = ActiveAttempt {
@@ -467,7 +498,7 @@ fi
     let res = adapter.prepare(&attempt, &target).await;
     assert!(res.is_err());
     let err = res.unwrap_err();
-    assert!(err.contains("multiple worktrees") || err.contains("ambiguous candidates"));
+    assert!(err.contains("no agent executor configured"));
 }
 
 #[tokio::test]
@@ -475,21 +506,23 @@ async fn test_fake_orca_terminal_adoption_wrong_worktree_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
 
     let script = format!(
         r#"#!/bin/bash
-if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
-    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_target_1","path":"{}"}}]}}}}'
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_target_1","path":"{repo_canon}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     # Terminal matching title ceo:att_123 exists, but in wt_OTHER!
     echo '{{"ok":true,"result":{{"terminals":[{{"handle":"term_other_worktree","title":"ceo:att_123","worktreeId":"wt_OTHER"}}]}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","title":"ceo:att_123","worktreeId":"wt_target_1"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"satisfied":true}}}}}}'
 else
     echo '{{"ok":false}}'
 fi
-"#,
-        repo_dir.display()
+"#
     );
 
     let bin = create_mock_orca_script(&temp, &script);
@@ -500,7 +533,8 @@ fi
         workspace_id: "ws_1".into(),
         alias: "repo".into(),
         kind: "repo".into(),
-        local_path: repo_dir.display().to_string(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
 
     let attempt = ActiveAttempt {
@@ -524,10 +558,10 @@ fi
         executor: None,
     };
 
-    let (wt_id, term_id) = adapter.prepare(&attempt, &target).await.unwrap();
-    assert_eq!(wt_id, "wt_target_1");
+    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    assert_eq!(prep.worktree_id, "wt_target_1");
     // Must NOT adopt term_other_worktree
-    assert_eq!(term_id, "term_created_target");
+    assert_eq!(prep.terminal_id, "term_created_target");
 }
 
 #[tokio::test]

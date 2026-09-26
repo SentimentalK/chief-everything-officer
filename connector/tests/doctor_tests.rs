@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::process::Command;
 
-use ceo_connector::config::{LocalConfig, LocalTarget};
+use ceo_connector::config::{LocalConfig, LocalExecutorConfig, LocalTarget};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::doctor::{run_doctor, DiagnosticSeverity};
 use ceo_connector::paths::ConnectorPaths;
@@ -155,6 +155,7 @@ async fn doctor_detects_missing_path_and_disabled_target() {
             alias: "disabled-target".into(),
             kind: "general_automation".into(),
             local_path: "/nonexistent/path/for/target".into(), // Missing!
+            executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -252,6 +253,7 @@ async fn doctor_healthy_report_detects_git_and_targets() {
             alias: "healthy-target".into(),
             kind: "coding".into(),
             local_path: repo_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();

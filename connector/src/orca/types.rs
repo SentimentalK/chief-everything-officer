@@ -53,14 +53,34 @@ pub struct OrcaWorktreeListResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrcaWorktreeCreateResponse {
+pub struct OrcaWorktreeShowResponse {
     pub ok: bool,
-    pub result: Option<OrcaWorktreeCreateResult>,
+    pub result: Option<OrcaWorktreeShowResult>,
+    pub error: Option<OrcaErrorPart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrcaWorktreeCreateResult {
+pub struct OrcaWorktreeShowResult {
     pub worktree: OrcaWorktreeItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRepoAddResponse {
+    pub ok: bool,
+    pub result: Option<OrcaRepoAddResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRepoAddResult {
+    pub repo: OrcaRepoItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaRepoItem {
+    pub id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,8 +166,8 @@ pub struct OrcaTerminalWaitResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrcaWaitPart {
-    pub handle: String,
-    pub condition: String,
+    pub handle: Option<String>,
+    pub condition: Option<String>,
     pub satisfied: bool,
     pub elapsed_ms: Option<u64>,
 }
@@ -176,4 +196,5 @@ pub struct OrcaClosePart {
     pub handle: String,
     pub close_mode: Option<String>,
     pub pty_killed: Option<bool>,
+    pub pty_stop_verdict: Option<String>,
 }

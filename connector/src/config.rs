@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::local_state::atomic_write_json;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -21,6 +21,78 @@ pub enum ConfigError {
     NotAnOrigin(String),
     #[error("Unsupported schema version: {0}")]
     UnsupportedSchemaVersion(u32),
+    #[error("Invalid executor configuration: {0}")]
+    InvalidExecutor(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalExecutorConfig {
+    pub kind: String,
+    pub agent_id: String,
+    pub command: String,
+}
+
+impl LocalExecutorConfig {
+    pub fn new(agent_id: String, command: String) -> Result<Self, ConfigError> {
+        let cfg = Self {
+            kind: "orca_tui".to_string(),
+            agent_id,
+            command,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.kind != "orca_tui" {
+            return Err(ConfigError::InvalidExecutor(format!(
+                "unsupported executor kind '{}', must be 'orca_tui'",
+                self.kind
+            )));
+        }
+        let agent_id = self.agent_id.trim();
+        if agent_id.is_empty() {
+            return Err(ConfigError::InvalidExecutor(
+                "agent_id cannot be empty".into(),
+            ));
+        }
+        if agent_id.len() > 80 {
+            return Err(ConfigError::InvalidExecutor(
+                "agent_id exceeds maximum length of 80 bytes".into(),
+            ));
+        }
+        if agent_id.contains('\0') {
+            return Err(ConfigError::InvalidExecutor(
+                "agent_id cannot contain NUL byte".into(),
+            ));
+        }
+        if !agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(ConfigError::InvalidExecutor(
+                "agent_id contains invalid characters (allowed: alphanumeric, -, _, .)".into(),
+            ));
+        }
+        let command = self.command.trim();
+        if command.is_empty() {
+            return Err(ConfigError::InvalidExecutor(
+                "command cannot be empty".into(),
+            ));
+        }
+        if command.len() > 1024 {
+            return Err(ConfigError::InvalidExecutor(
+                "command exceeds maximum length of 1024 bytes".into(),
+            ));
+        }
+        if command.contains('\0') {
+            return Err(ConfigError::InvalidExecutor(
+                "command cannot contain NUL byte".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +102,8 @@ pub struct LocalTarget {
     pub alias: String,
     pub kind: String,
     pub local_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<LocalExecutorConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,10 +130,59 @@ impl LocalConfig {
             return Ok(None);
         }
         let content = fs::read_to_string(path)?;
-        let config: LocalConfig = serde_json::from_str(&content)?;
-        if config.schema_version != CONFIG_SCHEMA_VERSION {
-            return Err(ConfigError::UnsupportedSchemaVersion(config.schema_version));
-        }
+        let val: serde_json::Value = serde_json::from_str(&content)?;
+        let version = val
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .ok_or(ConfigError::UnsupportedSchemaVersion(0))? as u32;
+
+        let config = match version {
+            1 => {
+                #[derive(Deserialize)]
+                struct LocalConfigV1 {
+                    server_url: String,
+                    #[serde(default)]
+                    targets: BTreeMap<String, LocalTargetV1>,
+                }
+                #[derive(Deserialize)]
+                struct LocalTargetV1 {
+                    workspace_id: String,
+                    alias: String,
+                    kind: String,
+                    local_path: String,
+                }
+                let v1: LocalConfigV1 = serde_json::from_value(val)?;
+                let mut targets = BTreeMap::new();
+                for (tid, t) in v1.targets {
+                    targets.insert(
+                        tid,
+                        LocalTarget {
+                            workspace_id: t.workspace_id,
+                            alias: t.alias,
+                            kind: t.kind,
+                            local_path: t.local_path,
+                            executor: None,
+                        },
+                    );
+                }
+                LocalConfig {
+                    schema_version: CONFIG_SCHEMA_VERSION,
+                    server_url: v1.server_url,
+                    targets,
+                }
+            }
+            CONFIG_SCHEMA_VERSION => {
+                let cfg: LocalConfig = serde_json::from_value(val)?;
+                for lt in cfg.targets.values() {
+                    if let Some(ref exec) = lt.executor {
+                        exec.validate()?;
+                    }
+                }
+                cfg
+            }
+            other => return Err(ConfigError::UnsupportedSchemaVersion(other)),
+        };
+
         // Ensure server_url in file is a valid normalized origin
         normalize_server_origin(&config.server_url)?;
         Ok(Some(config))
@@ -67,6 +190,11 @@ impl LocalConfig {
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         normalize_server_origin(&self.server_url)?;
+        for lt in self.targets.values() {
+            if let Some(ref exec) = lt.executor {
+                exec.validate()?;
+            }
+        }
         atomic_write_json(path, self)?;
         Ok(())
     }
@@ -226,12 +354,67 @@ mod tests {
     #[test]
     fn config_deny_unknown_fields() {
         let bad_json = r#"{
-            "schema_version": 1,
+            "schema_version": 2,
             "server_url": "https://ceo.example.com",
             "targets": {},
             "unknown_extra": true
         }"#;
         let res: Result<LocalConfig, _> = serde_json::from_str(bad_json);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn executor_config_validation() {
+        let valid = LocalExecutorConfig::new("agy".into(), "agy".into());
+        assert!(valid.is_ok());
+
+        let invalid_kind = LocalExecutorConfig {
+            kind: "other".into(),
+            agent_id: "agy".into(),
+            command: "agy".into(),
+        };
+        assert!(invalid_kind.validate().is_err());
+
+        let empty_agent = LocalExecutorConfig::new("".into(), "agy".into());
+        assert!(empty_agent.is_err());
+
+        let long_agent = LocalExecutorConfig::new("a".repeat(81), "agy".into());
+        assert!(long_agent.is_err());
+
+        let bad_chars_agent =
+            LocalExecutorConfig::new("agy agent with spaces".into(), "agy".into());
+        assert!(bad_chars_agent.is_err());
+
+        let empty_cmd = LocalExecutorConfig::new("agy".into(), "   ".into());
+        assert!(empty_cmd.is_err());
+
+        let long_cmd = LocalExecutorConfig::new("agy".into(), "a".repeat(1025));
+        assert!(long_cmd.is_err());
+    }
+
+    #[test]
+    fn v1_to_v2_migration() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.json");
+        let v1_json = r#"{
+            "schema_version": 1,
+            "server_url": "https://ceo.example.com",
+            "targets": {
+                "t1": {
+                    "workspace_id": "ws-1",
+                    "alias": "repo1",
+                    "kind": "github_repo",
+                    "local_path": "/tmp/repo1"
+                }
+            }
+        }"#;
+        std::fs::write(&path, v1_json).unwrap();
+
+        let loaded = LocalConfig::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.targets.len(), 1);
+        let t1 = loaded.targets.get("t1").unwrap();
+        assert_eq!(t1.alias, "repo1");
+        assert!(t1.executor.is_none());
     }
 }

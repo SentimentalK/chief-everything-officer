@@ -242,10 +242,10 @@ pub async fn run_daemon_with_hooks(
         // Find eligible candidate
         let mut selected_candidate = None;
         for cand in &pending {
-            // 1. Is target mapped in local config?
+            // 1. Is target mapped in local config with configured executor?
             let local_t = match config.targets.get(&cand.target_id) {
-                Some(t) => t,
-                None => continue,
+                Some(t) if t.executor.is_some() => t,
+                _ => continue,
             };
 
             // 2. Does target exist in fresh Server Target snapshot?
@@ -554,14 +554,19 @@ pub async fn drive_active_attempt(
                     job_id: active.job_id.clone(),
                     attempt_id: active.attempt_id.clone(),
                     target_id: active.target_id.clone(),
-                    orca_version: env!("CARGO_PKG_VERSION").into(),
+                    orca_version: "unknown".into(),
                     worktree_id: None,
                     terminal_id: None,
+                    agent_id: None,
+                    agent_ready_at_ms: None,
                     dispatch_request_id: None,
+                    dispatch_stage: None,
                     task_dispatched: false,
                     runtime_completion_kind: None,
                     dispatch_started_at_ms: None,
                     runtime_completed_at_ms: None,
+                    terminal_cleanup_verified: true,
+                    terminal_closed_at_ms: None,
                 };
                 let receipt_sha256 = receipt.compute_sha256();
 
@@ -681,12 +686,16 @@ pub async fn drive_active_attempt(
                             orca_version: None,
                             worktree_id: None,
                             terminal_id: None,
+                            agent_id: None,
+                            agent_ready_at_ms: None,
                             dispatch_send_count: 0,
                             dispatch_started_at_ms: None,
                             execution_deadline_ms: None,
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
+                            dispatch_stage: None,
+                            dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
@@ -777,7 +786,7 @@ pub async fn drive_active_attempt(
             };
 
             match adapter.prepare(&active, &target).await {
-                Ok((worktree_id, terminal_id)) => {
+                Ok(prep) => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -793,23 +802,30 @@ pub async fn drive_active_attempt(
                             orca_version: None,
                             worktree_id: None,
                             terminal_id: None,
+                            agent_id: None,
+                            agent_ready_at_ms: None,
                             dispatch_send_count: 0,
                             dispatch_started_at_ms: None,
                             execution_deadline_ms: None,
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
+                            dispatch_stage: None,
+                            dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
                         }
                     });
-                    exec.worktree_id = Some(worktree_id);
-                    exec.terminal_id = Some(terminal_id);
+                    exec.orca_version = Some(prep.orca_version);
+                    exec.worktree_id = Some(prep.worktree_id);
+                    exec.terminal_id = Some(prep.terminal_id);
+                    exec.agent_id = Some(prep.agent_id);
+                    exec.agent_ready_at_ms = Some(prep.agent_ready_at_ms);
                     current.phase = AttemptPhase::Prepared;
                     current.save(&paths.active_attempt_file())?;
                     println!(
-                        "Attempt '{}' prepared with worktree and terminal.",
+                        "Attempt '{}' prepared with worktree and agent terminal.",
                         active.attempt_id
                     );
                     Ok(true)
@@ -893,7 +909,7 @@ pub async fn drive_active_attempt(
             };
 
             match reconciliation {
-                crate::scheduler::DispatchReconciliation::Accepted { request_id } => {
+                crate::scheduler::DispatchReconciliation::Accepted { request_id, stage } => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -904,13 +920,74 @@ pub async fn drive_active_attempt(
                         _ => return Ok(true),
                     };
                     if let Some(ref mut exec) = current.executor {
-                        exec.dispatch_request_id = Some(request_id);
+                        exec.dispatch_request_id = Some(request_id.clone());
+                        exec.dispatch_stage = Some(stage);
                         if exec.dispatch_accepted_at_ms.is_none() {
                             exec.dispatch_accepted_at_ms = Some(now_utc_ms());
                         }
                     }
-                    current.phase = AttemptPhase::Dispatched;
+
+                    if stage == crate::scheduler::DispatchStage::TurnStarted {
+                        current.phase = AttemptPhase::Dispatched;
+                        current.save(&paths.active_attempt_file())?;
+                        return Ok(true);
+                    }
+
+                    // stage == InputAccepted: check observation budget
+                    let obs_count = current
+                        .executor
+                        .as_ref()
+                        .map(|e| e.dispatch_observation_count)
+                        .unwrap_or(0);
+                    if obs_count >= 2 {
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(
+                            "DISPATCH_SUBMISSION_UNPROVEN: agent turn did not start within retry budget"
+                                .into(),
+                        ));
+                    }
+
+                    // Increment observation count (does NOT increment dispatch_send_count)
+                    if let Some(ref mut exec) = current.executor {
+                        exec.dispatch_observation_count += 1;
+                    }
                     current.save(&paths.active_attempt_file())?;
+                    drop(_lock);
+
+                    // Replay observation using retry_request_id
+                    let outcome = match adapter
+                        .dispatch(&active, &terminal_id, Some(&request_id))
+                        .await
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("Dispatch observation error: {e}");
+                            return Ok(true);
+                        }
+                    };
+
+                    if let crate::scheduler::DispatchOutcome::Accepted {
+                        stage: new_stage, ..
+                    } = outcome
+                    {
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        if let Some(ref mut exec) = current.executor {
+                            exec.dispatch_stage = Some(new_stage);
+                        }
+                        if new_stage == crate::scheduler::DispatchStage::TurnStarted {
+                            current.phase = AttemptPhase::Dispatched;
+                        }
+                        current.save(&paths.active_attempt_file())?;
+                    }
                     Ok(true)
                 }
                 crate::scheduler::DispatchReconciliation::DefinitelyNotDispatched => {
@@ -951,7 +1028,7 @@ pub async fn drive_active_attempt(
                                 .executor
                                 .as_ref()
                                 .and_then(|e| e.orca_version.clone())
-                                .unwrap_or_else(|| "1.4.209".into()),
+                                .unwrap_or_else(|| "unknown".into()),
                             worktree_id: active
                                 .executor
                                 .as_ref()
@@ -960,7 +1037,13 @@ pub async fn drive_active_attempt(
                                 .executor
                                 .as_ref()
                                 .and_then(|e| e.terminal_id.clone()),
+                            agent_id: active.executor.as_ref().and_then(|e| e.agent_id.clone()),
+                            agent_ready_at_ms: active
+                                .executor
+                                .as_ref()
+                                .and_then(|e| e.agent_ready_at_ms),
                             dispatch_request_id: None,
+                            dispatch_stage: None,
                             task_dispatched: false,
                             runtime_completion_kind: None,
                             dispatch_started_at_ms: active
@@ -968,6 +1051,8 @@ pub async fn drive_active_attempt(
                                 .as_ref()
                                 .and_then(|e| e.dispatch_started_at_ms),
                             runtime_completed_at_ms: Some(now_utc_ms()),
+                            terminal_cleanup_verified: true,
+                            terminal_closed_at_ms: None,
                         };
                         let receipt_sha256 = receipt.compute_sha256();
 
@@ -993,7 +1078,7 @@ pub async fn drive_active_attempt(
                                     .executor
                                     .as_ref()
                                     .and_then(|e| e.orca_version.clone())
-                                    .unwrap_or_else(|| "1.4.209".into()),
+                                    .unwrap_or_else(|| "unknown".into()),
                             },
                             receipt_sha256,
                         };
@@ -1067,6 +1152,7 @@ pub async fn drive_active_attempt(
                         crate::scheduler::DispatchOutcome::Accepted {
                             request_id,
                             accepted_at_ms,
+                            stage,
                         } => {
                             let _lock = ExecutionLock::acquire_with_retry(
                                 &paths.state_lock_file(),
@@ -1081,9 +1167,12 @@ pub async fn drive_active_attempt(
                             if let Some(ref mut exec) = current.executor {
                                 exec.dispatch_request_id = Some(request_id);
                                 exec.dispatch_accepted_at_ms = Some(accepted_at_ms);
+                                exec.dispatch_stage = Some(stage);
                                 exec.last_dispatch_outcome = None;
                             }
-                            current.phase = AttemptPhase::Dispatched;
+                            if stage == crate::scheduler::DispatchStage::TurnStarted {
+                                current.phase = AttemptPhase::Dispatched;
+                            }
                             current.save(&paths.active_attempt_file())?;
                             Ok(true)
                         }
@@ -1184,6 +1273,24 @@ pub async fn drive_active_attempt(
                 }
             };
 
+            let dispatch_stage = active.executor.as_ref().and_then(|e| e.dispatch_stage);
+            if dispatch_stage != Some(crate::scheduler::DispatchStage::TurnStarted) {
+                let _lock = ExecutionLock::acquire_with_retry(
+                    &paths.state_lock_file(),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                )?;
+                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                    Some(c) if c.attempt_id == active.attempt_id => c,
+                    _ => return Ok(true),
+                };
+                current.phase = AttemptPhase::RecoveryRequired;
+                current.save(&paths.active_attempt_file())?;
+                return Err(DaemonError::RecoveryRequired(
+                    "Waiting phase requires dispatch_stage=TurnStarted".into(),
+                ));
+            }
+
             let deadline_ms = match active
                 .executor
                 .as_ref()
@@ -1268,12 +1375,16 @@ pub async fn drive_active_attempt(
         }
         AttemptPhase::OutcomeRecorded => {
             // NEVER wait or dispatch again!
+            let mut terminal_cleanup_verified = true;
+            let mut terminal_closed_at_ms = None;
             if let Some(tid) = active
                 .executor
                 .as_ref()
                 .and_then(|e| e.terminal_id.as_ref())
             {
-                let _ = adapter.close(tid).await;
+                let close_res = adapter.close(tid).await;
+                terminal_closed_at_ms = Some(now_utc_ms());
+                terminal_cleanup_verified = close_res.is_ok();
             }
 
             let exec_state = active.executor.as_ref().ok_or_else(|| {
@@ -1327,22 +1438,34 @@ pub async fn drive_active_attempt(
                 .unwrap_or_else(now_utc_ms);
             let duration_ms = (completed_ms - started_ms).max(0);
 
+            let orca_version = exec_state
+                .orca_version
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
+
+            let is_turn_started =
+                exec_state.dispatch_stage == Some(crate::scheduler::DispatchStage::TurnStarted);
+
             let receipt = ExecutionReceipt {
                 schema_version: ExecutionReceipt::SCHEMA_VERSION,
                 job_id: active.job_id.clone(),
                 attempt_id: active.attempt_id.clone(),
                 target_id: active.target_id.clone(),
-                orca_version: exec_state
-                    .orca_version
-                    .clone()
-                    .unwrap_or_else(|| "1.4.209".into()),
+                orca_version: orca_version.clone(),
                 worktree_id: exec_state.worktree_id.clone(),
                 terminal_id: exec_state.terminal_id.clone(),
+                agent_id: exec_state.agent_id.clone(),
+                agent_ready_at_ms: exec_state.agent_ready_at_ms,
                 dispatch_request_id: exec_state.dispatch_request_id.clone(),
-                task_dispatched: exec_state.dispatch_request_id.is_some(),
+                dispatch_stage: exec_state
+                    .dispatch_stage
+                    .map(|s| format!("{s:?}").to_lowercase()),
+                task_dispatched: is_turn_started,
                 runtime_completion_kind: exec_state.runtime_completion_kind.clone(),
                 dispatch_started_at_ms: exec_state.dispatch_started_at_ms,
                 runtime_completed_at_ms: exec_state.runtime_completed_at_ms,
+                terminal_cleanup_verified,
+                terminal_closed_at_ms,
             };
             let receipt_sha256 = receipt.compute_sha256();
 
@@ -1350,16 +1473,13 @@ pub async fn drive_active_attempt(
                 schema_version: REPORT_SCHEMA_VERSION,
                 execution_status: status,
                 business_outcome: outcome,
-                task_dispatched: exec_state.dispatch_request_id.is_some(),
+                task_dispatched: is_turn_started,
                 finished_at_ms: completed_ms,
                 duration_ms,
                 error: err,
                 executor: ExecutionReportExecutor {
                     executor_type: "orca".into(),
-                    version: exec_state
-                        .orca_version
-                        .clone()
-                        .unwrap_or_else(|| "1.4.209".into()),
+                    version: orca_version,
                 },
                 receipt_sha256,
             };
