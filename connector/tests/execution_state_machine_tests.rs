@@ -86,6 +86,7 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _terminal_id: &str,
+        _prompt_text: &str,
     ) -> Result<DispatchOutcome, String> {
         self.dispatch_calls.fetch_add(1, Ordering::SeqCst);
         self.dispatch_result.clone().unwrap_or_else(|| {
@@ -191,6 +192,17 @@ fn make_test_attempt(
     result_target: &str,
     executor: Option<AttemptExecutorState>,
 ) -> ActiveAttempt {
+    make_test_attempt_with_resource(cred, attempt_id, phase, result_target, None, executor)
+}
+
+fn make_test_attempt_with_resource(
+    cred: &DeviceCredential,
+    attempt_id: String,
+    phase: AttemptPhase,
+    result_target: &str,
+    resource_id: Option<&str>,
+    executor: Option<AttemptExecutorState>,
+) -> ActiveAttempt {
     let job_id = "job_mock_1".to_string();
     let workspace_id = "ws_mock".to_string();
     let target_id = "tgt_mock".to_string();
@@ -201,7 +213,7 @@ fn make_test_attempt(
         &job_id,
         &workspace_id,
         &target_id,
-        None,
+        resource_id,
         &prompt,
         &acceptance,
         timeout,
@@ -218,7 +230,7 @@ fn make_test_attempt(
         phase,
         workspace_id,
         target_id,
-        resource_id: None,
+        resource_id: resource_id.map(|s| s.to_string()),
         prompt: Some(prompt),
         acceptance: Some(acceptance),
         execution_timeout_seconds: Some(timeout),
@@ -354,10 +366,10 @@ async fn test_happy_path_execution_to_outbox() {
     assert!(record.report.error.is_none());
 }
 
-/// 2. Unsupported result_target = "resource" guard:
-/// Blocks before /start, creates terminal BLOCKED report with executor.type = "ceo-connector", zero Orca calls.
+/// 2. V1.8 result_target = "resource" execution & collection:
+/// Successfully completes lifecycle, writes /start, collects managed-result.json, and persists into outbox.
 #[tokio::test]
-async fn test_unsupported_result_target_blocks_before_start() {
+async fn test_resource_result_target_executes_and_collects_managed_result() {
     let server = MockServer::start().await;
     let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
 
@@ -368,37 +380,80 @@ async fn test_unsupported_result_target_blocks_before_start() {
     server.add_handler(move |req| {
         if req.path.contains("/start") {
             start_called_clone.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({
+                "ok": true,
+                "replayed": false,
+                "server_time": "2026-09-24T12:00:00.000Z",
+                "attempt": {
+                    "attempt_id": "any",
+                    "phase": "started",
+                    "claimed_at": "2026-09-24T12:00:00.000Z",
+                    "started_at": "2026-09-24T12:00:01.000Z"
+                }
+            }));
         }
-        MockResponse::json(200, &serde_json::json!({ "ok": true }))
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
 
-    let active = make_test_attempt(&cred, attempt_id, AttemptPhase::Claimed, "resource", None);
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Claimed,
+        "resource",
+        Some("res_mock_1"),
+        None,
+    );
     active.save(&paths.active_attempt_file()).unwrap();
 
+    let paths_clone = paths.clone();
+    let attempt_id_clone = attempt_id.clone();
     let adapter = Arc::new(MockAdapter {
         ready: true,
+        on_wait: Some(Arc::new(move || {
+            let result_file = paths_clone.managed_result_file(&attempt_id_clone);
+            fs::create_dir_all(result_file.parent().unwrap()).unwrap();
+            let envelope = serde_json::json!({
+                "schema_version": 1,
+                "job_id": "job_mock_1",
+                "attempt_id": attempt_id_clone,
+                "resource_id": "res_mock_1",
+                "summary": "Updated resource content",
+                "operations": [
+                    {
+                        "op": "replace_body",
+                        "content": "new body"
+                    }
+                ]
+            });
+            fs::write(&result_file, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        })),
         ..Default::default()
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
-    // Drive active attempt: should block immediately
-    let advanced = drive_active_attempt(
-        &paths,
-        &client,
-        &cred,
-        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
-        &DaemonHooks::default(),
-    )
-    .await
-    .unwrap();
-    assert!(advanced);
+    loop {
+        let current = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+        if current.phase == AttemptPhase::FinalizedLocal {
+            break;
+        }
+        let advanced = drive_active_attempt(
+            &paths,
+            &client,
+            &cred,
+            &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+            &DaemonHooks::default(),
+        )
+        .await
+        .unwrap();
+        assert!(advanced);
+    }
 
-    // Verify /start was NEVER called and adapter was NOT invoked
-    assert_eq!(start_called.load(Ordering::SeqCst), 0);
-    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(start_called.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.wait_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 1);
 
-    // Verify outbox was written with BLOCKED / NOT_STARTED / RESULT_TARGET_UNSUPPORTED
     let outbox_entries = fs::read_dir(paths.outbox_dir())
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -407,14 +462,101 @@ async fn test_unsupported_result_target_blocks_before_start() {
     let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
     let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
 
-    assert_eq!(record.report.execution_status, ExecutionStatus::BLOCKED);
-    assert_eq!(record.report.business_outcome, BusinessOutcome::NOT_STARTED);
-    assert!(!record.report.task_dispatched);
-    assert_eq!(record.report.executor.executor_type, "ceo-connector");
+    assert_eq!(record.report.execution_status, ExecutionStatus::COMPLETED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::UNVERIFIED);
+    assert!(record.report.task_dispatched);
+    assert!(record.report.error.is_none());
+
+    let res = record.managed_result.expect("managed result must be attached");
+    assert_eq!(res.resource_id, "res_mock_1");
+    assert_eq!(res.summary, "Updated resource content");
+    assert!(record.managed_result_sha256.is_some());
+}
+
+/// 2b. V1.8 result_target = "resource" missing result fails closed:
+/// If runtime finishes with tui_idle but managed-result.json is missing, execution marks FAILED.
+#[tokio::test]
+async fn test_resource_result_target_missing_result_fails_closed() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let start_called = Arc::new(AtomicUsize::new(0));
+    let start_called_clone = start_called.clone();
+
+    server.add_handler(move |req| {
+        if req.path.contains("/start") {
+            start_called_clone.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({
+                "ok": true,
+                "replayed": false,
+                "server_time": "2026-09-24T12:00:00.000Z",
+                "attempt": {
+                    "attempt_id": "any",
+                    "phase": "started",
+                    "claimed_at": "2026-09-24T12:00:00.000Z",
+                    "started_at": "2026-09-24T12:00:01.000Z"
+                }
+            }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Claimed,
+        "resource",
+        Some("res_mock_1"),
+        None,
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    loop {
+        let current = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+        if current.phase == AttemptPhase::FinalizedLocal {
+            break;
+        }
+        let advanced = drive_active_attempt(
+            &paths,
+            &client,
+            &cred,
+            &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+            &DaemonHooks::default(),
+        )
+        .await
+        .unwrap();
+        assert!(advanced);
+    }
+
+    assert_eq!(start_called.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.wait_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 1);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+
+    assert_eq!(record.report.execution_status, ExecutionStatus::FAILED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::FAILED);
+    assert!(record.report.task_dispatched);
+    assert!(record.managed_result.is_none());
 
     let err = record.report.error.expect("expected error details");
-    assert_eq!(err.code, "RESULT_TARGET_UNSUPPORTED");
-    assert_eq!(err.stage, "orchestration");
+    assert_eq!(err.code, "RESULT_MISSING");
+    assert_eq!(err.stage, "result");
 }
 
 /// 3. OutcomeRecorded Crash Recovery:

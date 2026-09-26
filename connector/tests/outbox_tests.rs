@@ -1,5 +1,6 @@
 mod common;
 
+use std::fs;
 use std::sync::Arc;
 
 use ceo_connector::client::ConnectorClient;
@@ -59,6 +60,8 @@ async fn outbox_device_mismatch_prevents_delivery() {
         attempt_id: "att-1".into(),
         claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         report: sample_report(),
+        managed_result: None,
+        managed_result_sha256: None,
         created_at_ms: 1000,
     };
 
@@ -120,6 +123,8 @@ async fn report_delivery_terminal_cleanup() {
         attempt_id: "att-00000000-0000-0000-0000-000000000010".into(),
         claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
         report,
+        managed_result: None,
+        managed_result_sha256: None,
         created_at_ms: 1000,
     };
 
@@ -336,6 +341,8 @@ async fn crash_window_history_written_outbox_still_present_replays_safely() {
         attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
         claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         report: report.clone(),
+        managed_result: None,
+        managed_result_sha256: None,
         created_at_ms: 1000,
     };
     let outbox_file =
@@ -395,6 +402,8 @@ fn invalid_numeric_report_cannot_be_persisted_into_outbox() {
         attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
         claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         report,
+        managed_result: None,
+        managed_result_sha256: None,
         created_at_ms: 1000,
     };
 
@@ -414,10 +423,132 @@ fn invalid_numeric_report_cannot_be_persisted_into_outbox() {
         attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
         claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         report: report2,
+        managed_result: None,
+        managed_result_sha256: None,
         created_at_ms: 1000,
     };
     let outbox_file2 = paths.outbox_file("job_inv2", "att-00000000-0000-0000-0000-000000000001");
     let err2 = record2.save(&outbox_file2).unwrap_err();
     assert!(matches!(err2, OutboxError::InvalidReport(_)));
     assert!(!outbox_file2.exists());
+}
+
+#[tokio::test]
+async fn outbox_delivers_managed_result_before_report() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let client = ConnectorClient::new(&server.origin()).unwrap();
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+
+    let attempt_id = "att-00000000-0000-0000-0000-000000000099";
+    let job_id = "job_v18";
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order_clone = order.clone();
+
+    server.add_handler(move |req| {
+        if req.path.contains("/result") && req.method == "POST" {
+            order_clone.lock().unwrap().push("result");
+            return MockResponse::json(200, &serde_json::json!({
+                "ok": true,
+                "replayed": false,
+                "server_time": "2026-09-26T12:00:00.000Z",
+                "resource_id": "res_1",
+                "commit": "abc123commit"
+            }));
+        }
+        if req.path.contains("/report") && req.method == "POST" {
+            order_clone.lock().unwrap().push("report");
+            return MockResponse::json(200, &serde_json::json!({
+                "ok": true,
+                "replayed": false,
+                "server_time": "2026-09-26T12:00:01.000Z",
+                "attempt": {
+                    "attempt_id": attempt_id,
+                    "phase": "finished",
+                    "claimed_at": "2026-09-26T11:59:00.000Z",
+                    "started_at": "2026-09-26T11:59:01.000Z"
+                }
+            }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let report = sample_report();
+    let report_sha256 = compute_report_sha256(&report);
+
+    let managed_result = ceo_connector::managed_result::ManagedResultEnvelope {
+        schema_version: 1,
+        job_id: job_id.into(),
+        attempt_id: attempt_id.into(),
+        resource_id: "res_1".into(),
+        summary: "Completed V1.8 job".into(),
+        operations: vec![serde_json::json!({ "op": "replace_body", "content": "hello" })],
+    };
+    let payload_sha256 = managed_result.compute_canonical_sha256().unwrap();
+
+    let record = OutboxRecord {
+        schema_version: 1,
+        server_origin: server.origin(),
+        device_id: "dev_1".into(),
+        job_id: job_id.into(),
+        attempt_id: attempt_id.into(),
+        claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        report,
+        managed_result: Some(managed_result),
+        managed_result_sha256: Some(payload_sha256),
+        created_at_ms: 1000,
+    };
+
+    let outbox_file = paths.outbox_file(job_id, attempt_id);
+    record.save(&outbox_file).unwrap();
+
+    // Plant active attempt in finalized_local matching report digest
+    atomic_write_json(
+        &paths.active_attempt_file(),
+        &serde_json::json!({
+            "schema_version": ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            "server_origin": server.origin(),
+            "device_id": "dev_1",
+            "job_id": job_id,
+            "attempt_id": attempt_id,
+            "claim_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "phase": "finalized_local",
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "resource_id": "res_1",
+            "terminal_report_sha256": report_sha256
+        }),
+    )
+    .unwrap();
+
+    // Plant runtime directory
+    let runtime_dir = paths.attempt_runtime_dir(attempt_id);
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(runtime_dir.join("test.txt"), "temporary agent artifact").unwrap();
+
+    deliver_outbox_record(&paths, &client, &cred, &outbox_file, &record)
+        .await
+        .unwrap();
+
+    // Verify ordering: result strictly before report!
+    let recorded_order = order.lock().unwrap().clone();
+    assert_eq!(recorded_order, vec!["result", "report"]);
+
+    // Verify outbox unlinked
+    assert!(!outbox_file.exists());
+    // Verify active attempt unlinked
+    assert!(!paths.active_attempt_file().exists());
+    // Verify runtime directory cleaned up
+    assert!(!runtime_dir.exists());
 }

@@ -883,4 +883,73 @@ impl ConnectorClient {
             })
         }
     }
+
+    // 14. Submit job result (V1.8)
+    pub async fn submit_job_result(
+        &self,
+        credential: &DeviceCredential,
+        job_id: &str,
+        attempt_id: &str,
+        claim_token: &str,
+        result: &crate::managed_result::ManagedResultEnvelope,
+        payload_sha256: &str,
+    ) -> Result<SubmitJobResultResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!(
+            "{}/api/connector/jobs/{}/result",
+            self.server_origin, job_id
+        );
+        let body = serde_json::json!({
+            "attempt_id": attempt_id,
+            "claim_token": claim_token,
+            "result": result,
+            "payload_sha256": payload_sha256,
+        });
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: SubmitJobResultResponse = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::JobError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitJobResultResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub replayed: bool,
+    pub server_time: String,
+    pub resource_id: String,
+    pub commit: String,
 }

@@ -16,6 +16,7 @@
     "@modelcontextprotocol/express": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "canonicalize": "^5.1.0",
     "express": "5.2.1",
     "redis": "^5.12.1",
     "yaml": "^2.9.0",

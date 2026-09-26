@@ -452,20 +452,13 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
     async fn dispatch(
         &self,
-        attempt: &ActiveAttempt,
+        _attempt: &ActiveAttempt,
         terminal_id: &str,
+        prompt_text: &str,
     ) -> Result<DispatchOutcome, String> {
-        // Build one deterministic Agent input from prompt and acceptance criteria
-        let prompt_text = match (&attempt.prompt, &attempt.acceptance) {
-            (Some(p), Some(a)) => format!("TASK\n\n{p}\n\nACCEPTANCE CRITERIA\n\n{a}"),
-            (Some(p), None) => format!("TASK\n\n{p}"),
-            (None, Some(a)) => format!("ACCEPTANCE CRITERIA\n\n{a}"),
-            (None, None) => "".into(),
-        };
-
         match self
             .client
-            .send_terminal_prompt(terminal_id, &prompt_text, None, Some(10))
+            .send_terminal_prompt(terminal_id, prompt_text, None, Some(10))
             .await
         {
             Ok(resp) => {

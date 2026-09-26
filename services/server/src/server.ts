@@ -136,6 +136,10 @@ const v2Coordinator = v2Store
         const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
         return loc !== null;
       },
+      resourceService: async (workspaceId: string) => {
+        const runtime = await runtimeRegistry.get(workspaceId);
+        return runtime.resourceService;
+      },
     })
   : null;
 

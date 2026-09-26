@@ -432,7 +432,7 @@ describe("Redis V2 Coordination Schema", () => {
       ).toThrow(V2SchemaError);
     });
 
-    it("rejects running attempt with started_at_ms=null or with report/result", () => {
+    it("rejects running attempt with started_at_ms=null or with report", () => {
       expect(() =>
         parseAttemptRecordV1({ ...validAttempt, phase: "running", started_at_ms: null }),
       ).toThrow(V2SchemaError);
@@ -445,13 +445,23 @@ describe("Redis V2 Coordination Schema", () => {
           report: validReport,
         }),
       ).toThrow(V2SchemaError);
+    });
+
+    it("accepts running attempt with optional valid result and rejects malformed result", () => {
+      const parsed = parseAttemptRecordV1({
+        ...validAttempt,
+        phase: "running",
+        started_at_ms: 1500,
+        result: validResult,
+      });
+      expect(parsed.result).toEqual(validResult);
 
       expect(() =>
         parseAttemptRecordV1({
           ...validAttempt,
           phase: "running",
           started_at_ms: 1500,
-          result: validResult,
+          result: { ...validResult, attempt_id: "att_mismatch" },
         }),
       ).toThrow(V2SchemaError);
     });

@@ -20,17 +20,21 @@ import {
   utf8ByteLength,
   isWhitespaceOnly,
   validateStreamEntryV2,
+  type ManagedResultEnvelope,
 } from "./v2-schema.js";
 import {
   type ExecutionReport,
   type ExecutionStatus,
   type BusinessOutcome,
+  type PersistedJobResult,
   executionReportSchema,
 } from "./execution-contract.js";
 import {
   RedisJobStoreV2,
   V2JobNotFoundError,
   V2IdempotencyConflictError,
+  V2ReportConflictError,
+  V2AttemptLifecycleError,
   V2StoreError,
 } from "./v2-store.js";
 import type {
@@ -38,6 +42,8 @@ import type {
   ExecutionTargetRecord,
 } from "../connector/control-store.js";
 import type { IdentityStore } from "../identity/store.js";
+import type { ResourceService } from "../resource/service.js";
+import { computeCanonicalSha256 } from "./canonical.js";
 import { assertHostWorkspaceAccess } from "./tool-audit.js";
 
 export type HostJobState = "queued" | "expired" | "claimed" | "running" | "terminal";
@@ -286,6 +292,9 @@ export interface JobCoordinatorV2Deps {
   store: RedisJobStoreV2;
   controlStore: ConnectorControlStore;
   identityStore: IdentityStore;
+  resourceService?:
+    | ResourceService
+    | ((workspaceId: string) => Promise<ResourceService> | ResourceService);
   resourceExists?: (
     scope: { userId: string; workspaceId: string },
     resourceId: string,
@@ -297,6 +306,9 @@ export class JobCoordinatorV2 {
   private readonly store: RedisJobStoreV2;
   private readonly controlStore: ConnectorControlStore;
   private readonly identityStore: IdentityStore;
+  private readonly resourceService?:
+    | ResourceService
+    | ((workspaceId: string) => Promise<ResourceService> | ResourceService);
   private readonly resourceExists?: (
     scope: { userId: string; workspaceId: string },
     resourceId: string,
@@ -307,6 +319,7 @@ export class JobCoordinatorV2 {
     this.store = deps.store;
     this.controlStore = deps.controlStore;
     this.identityStore = deps.identityStore;
+    this.resourceService = deps.resourceService;
     this.resourceExists = deps.resourceExists;
     this.nowMs = deps.nowMs ?? (() => Date.now());
   }
@@ -615,6 +628,121 @@ export class JobCoordinatorV2 {
     };
   }
 
+  async submitJobResult(
+    deviceId: string,
+    jobId: string,
+    attemptId: string,
+    claimToken: string,
+    result: ManagedResultEnvelope,
+    payloadSha256: string,
+  ): Promise<{
+    ok: true;
+    replayed: boolean;
+    server_time: string;
+    resource_id: string;
+    commit: string;
+  }> {
+    if (!jobId || !JOB_ID_V2_RE.test(jobId)) {
+      throw new JobValidationError("Invalid job_id format.");
+    }
+    if (!attemptId || !ATTEMPT_ID_V2_RE.test(attemptId)) {
+      throw new JobValidationError("Invalid attempt_id format.");
+    }
+    if (!claimToken || typeof claimToken !== "string") {
+      throw new JobValidationError("claim_token is required.");
+    }
+    if (!this.resourceService) {
+      throw new JobValidationError("ResourceService is not configured on coordinator.");
+    }
+
+    // Verify JCS canonical digest matches payloadSha256
+    const expectedDigest = computeCanonicalSha256(result);
+    if (expectedDigest !== payloadSha256) {
+      throw new JobValidationError("payload_sha256 does not match canonical JCS digest of result.");
+    }
+
+    const job = await this.store.getJob(jobId);
+    if (!job) {
+      throw new V2JobNotFoundError();
+    }
+    if (job.result_target !== "resource") {
+      throw new JobValidationError("Job result_target is not 'resource'.");
+    }
+    if (job.resource_id !== result.resource_id) {
+      throw new JobValidationError(
+        `Result resource_id '${result.resource_id}' does not match job resource_id '${job.resource_id}'.`,
+      );
+    }
+
+    const attempt = await this.store.getAttempt(attemptId);
+    if (!attempt || attempt.job_id !== jobId) {
+      throw new V2AttemptLifecycleError("ATTEMPT_NOT_FOUND", "Attempt not found for job.");
+    }
+    if (attempt.device_id !== deviceId) {
+      throw new V2AttemptLifecycleError("IDENTITY_MISMATCH", "Device ID mismatch.");
+    }
+
+    const claimTokenSha256 = crypto.createHash("sha256").update(claimToken, "utf8").digest("hex");
+    if (attempt.claim_token_sha256 !== claimTokenSha256) {
+      throw new V2AttemptLifecycleError("IDENTITY_MISMATCH", "Claim token mismatch.");
+    }
+
+    // Fast replay check if attempt already has this exact result
+    if (attempt.result) {
+      if (attempt.result.payload_sha256 === payloadSha256) {
+        return {
+          ok: true,
+          replayed: true,
+          server_time: new Date().toISOString(),
+          resource_id: attempt.result.resource_id,
+          commit: attempt.result.commit,
+        };
+      } else {
+        throw new V2ReportConflictError("RESULT_CONFLICT");
+      }
+    }
+
+    const resourceService =
+      typeof this.resourceService === "function"
+        ? await this.resourceService(job.workspace_id)
+        : this.resourceService;
+
+    // Apply via deterministic Resource transaction
+    const txRes = await resourceService.applyManagedJobResult({
+      jobId,
+      attemptId,
+      resourceId: result.resource_id,
+      summary: result.summary,
+      operations: result.operations,
+      payloadSha256,
+    });
+
+    const persistedResult: PersistedJobResult = {
+      target: "resource",
+      attempt_id: attemptId,
+      payload_sha256: payloadSha256,
+      resource_id: result.resource_id,
+      commit: txRes.commit,
+      received_at_ms: Date.now(),
+    };
+
+    const storeRes = await this.store.recordJobResult({
+      job_id: jobId,
+      attempt_id: attemptId,
+      device_id: deviceId,
+      claim_token_sha256: claimTokenSha256,
+      result: persistedResult,
+    });
+
+    return {
+      ok: true,
+      replayed: txRes.replayed || storeRes.status === "replayed",
+      server_time: new Date(storeRes.server_time_ms).toISOString(),
+      resource_id: storeRes.resource_id,
+      commit: storeRes.commit,
+    };
+  }
+
   async reportJob(
     deviceId: string,
     jobId: string,
@@ -629,7 +757,20 @@ export class JobCoordinatorV2 {
       throw new JobValidationError("claim_token must be 64 lowercase hex characters.");
     }
 
+    const job = await this.store.getJob(jobId);
+    if (!job) {
+      throw new V2JobNotFoundError();
+    }
+
     const parsedReport = executionReportSchema.parse(rawReport) as ExecutionReport;
+
+    if (job.result_target === "resource" && parsedReport.execution_status === "COMPLETED") {
+      const attempt = await this.store.getAttempt(attemptId);
+      if (!attempt || !attempt.result) {
+        throw new V2ReportConflictError("RESULT_REQUIRED");
+      }
+    }
+
     const claimTokenSha256 = crypto.createHash("sha256").update(claimToken, "utf8").digest("hex");
 
     const res = await this.store.reportJob({

@@ -481,6 +481,7 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         attempt: &ActiveAttempt,
         terminal_id: &str,
+        prompt_text: &str,
     ) -> Result<DispatchOutcome, String>;
 
     async fn wait(
@@ -529,6 +530,7 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _terminal_id: &str,
+        _prompt_text: &str,
     ) -> Result<DispatchOutcome, String> {
         Err("UnavailableExecutionAdapter cannot dispatch".into())
     }
@@ -591,6 +593,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _terminal_id: &str,
+        _prompt_text: &str,
     ) -> Result<DispatchOutcome, String> {
         Ok(DispatchOutcome::Accepted {
             request_id: "req_fake".into(),

@@ -546,87 +546,6 @@ pub async fn drive_active_attempt(
             }
         }
         AttemptPhase::Claimed => {
-            // Guard: unsupported result_target = "resource"
-            if active.result_target.as_deref() == Some("resource") {
-                eprintln!("Job has unsupported result_target='resource'. Blocking execution before /start.");
-                let receipt = ExecutionReceipt {
-                    schema_version: ExecutionReceipt::SCHEMA_VERSION,
-                    job_id: active.job_id.clone(),
-                    attempt_id: active.attempt_id.clone(),
-                    target_id: active.target_id.clone(),
-                    orca_version: "unknown".into(),
-                    worktree_id: None,
-                    terminal_id: None,
-                    agent_id: None,
-                    agent_ready_at_ms: None,
-                    dispatch_request_id: None,
-                    task_dispatched: false,
-                    runtime_completion_kind: None,
-                    dispatch_started_at_ms: None,
-                    runtime_completed_at_ms: None,
-                    terminal_cleanup_verified: true,
-                    terminal_closed_at_ms: None,
-                };
-                let receipt_sha256 = receipt.compute_sha256();
-
-                let report = ExecutionReport {
-                    schema_version: REPORT_SCHEMA_VERSION,
-                    execution_status: ExecutionStatus::BLOCKED,
-                    business_outcome: BusinessOutcome::NOT_STARTED,
-                    task_dispatched: false,
-                    finished_at_ms: now_utc_ms(),
-                    duration_ms: 0,
-                    error: Some(ExecutionReportError {
-                        stage: "orchestration".into(),
-                        code: "RESULT_TARGET_UNSUPPORTED".into(),
-                        message: "result_target 'resource' is unsupported in V1.7 (requires V1.8)"
-                            .into(),
-                    }),
-                    executor: ExecutionReportExecutor {
-                        executor_type: "ceo-connector".into(),
-                        version: env!("CARGO_PKG_VERSION").into(),
-                    },
-                    receipt_sha256,
-                };
-                report
-                    .validate()
-                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
-                let digest = compute_report_sha256(&report);
-
-                let outbox_rec = OutboxRecord {
-                    schema_version: OUTBOX_SCHEMA_VERSION,
-                    server_origin: cred.server_origin.clone(),
-                    device_id: cred.device_id.clone(),
-                    job_id: active.job_id.clone(),
-                    attempt_id: active.attempt_id.clone(),
-                    claim_token: active.claim_token.clone(),
-                    report,
-                    created_at_ms: now_utc_ms(),
-                };
-                let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);
-                outbox_rec
-                    .save(&outbox_file)
-                    .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
-
-                let _lock = ExecutionLock::acquire_with_retry(
-                    &paths.state_lock_file(),
-                    Duration::from_secs(5),
-                    Duration::from_millis(50),
-                )?;
-                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                    Some(c) if c.attempt_id == active.attempt_id => c,
-                    _ => return Ok(true),
-                };
-                current.phase = AttemptPhase::FinalizedLocal;
-                current.terminal_report_sha256 = Some(digest);
-                current.save(&paths.active_attempt_file())?;
-                drop(_lock);
-
-                let _ = flush_outbox(paths, client, cred).await;
-                return Ok(true);
-            }
-
-            // Normal path: advance to PrepareIntent
             let _lock = ExecutionLock::acquire_with_retry(
                 &paths.state_lock_file(),
                 Duration::from_secs(5),
@@ -765,6 +684,7 @@ pub async fn drive_active_attempt(
 
             match adapter.prepare(&active, &target).await {
                 Ok(crate::scheduler::PrepareOutcome::Ready(prep)) => {
+                    paths.ensure_attempt_runtime_dir(&active.attempt_id)?;
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -1104,7 +1024,22 @@ pub async fn drive_active_attempt(
                     current.save(&paths.active_attempt_file())?;
                     drop(_lock);
 
-                    let outcome = match adapter.dispatch(&active, &terminal_id).await {
+                    let prompt_text = {
+                        let managed_contract = if active.result_target.as_deref() == Some("resource") {
+                            let result_path = paths.managed_result_file(&active.attempt_id);
+                            let resource_id = active.resource_id.as_deref().unwrap_or("");
+                            Some((result_path, resource_id))
+                        } else {
+                            None
+                        };
+                        crate::execution_contract::build_execution_prompt(
+                            active.prompt.as_deref(),
+                            active.acceptance.as_deref(),
+                            managed_contract.as_ref().map(|(p, r)| (p.as_path(), *r)),
+                        )
+                    };
+
+                    let outcome = match adapter.dispatch(&active, &terminal_id, &prompt_text).await {
                         Ok(o) => o,
                         Err(e) => {
                             eprintln!("Dispatch execution error: {e}");
@@ -1411,12 +1346,62 @@ pub async fn drive_active_attempt(
 
             let task_dispatched = exec_state.dispatch_request_id.is_some();
 
-            let (status, outcome, err) = match exec_state.runtime_completion_kind.as_deref() {
-                Some("tui_idle") => (
-                    ExecutionStatus::COMPLETED,
-                    BusinessOutcome::UNVERIFIED,
-                    None,
-                ),
+            let (status, outcome, err, managed_result, managed_result_sha256) = match exec_state.runtime_completion_kind.as_deref() {
+                Some("tui_idle") => {
+                    if active.result_target.as_deref() == Some("resource") {
+                        let result_file = paths.managed_result_file(&active.attempt_id);
+                        let expected_resource_id = active.resource_id.as_deref();
+                        match crate::managed_result::read_and_validate_from_file(
+                            &result_file,
+                            &active.job_id,
+                            &active.attempt_id,
+                            expected_resource_id,
+                        ) {
+                            Ok((envelope, sha256)) => (
+                                ExecutionStatus::COMPLETED,
+                                BusinessOutcome::UNVERIFIED,
+                                None,
+                                Some(envelope),
+                                Some(sha256),
+                            ),
+                            Err(e) => {
+                                let (code, msg) = match &e {
+                                    crate::managed_result::ManagedResultError::Io(err)
+                                        if err.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        (
+                                            "RESULT_MISSING".to_string(),
+                                            "managed-result.json was not found".to_string(),
+                                        )
+                                    }
+                                    other => (
+                                        "RESULT_INVALID".to_string(),
+                                        other.to_string(),
+                                    ),
+                                };
+                                (
+                                    ExecutionStatus::FAILED,
+                                    BusinessOutcome::FAILED,
+                                    Some(ExecutionReportError {
+                                        stage: "result".into(),
+                                        code,
+                                        message: msg,
+                                    }),
+                                    None,
+                                    None,
+                                )
+                            }
+                        }
+                    } else {
+                        (
+                            ExecutionStatus::COMPLETED,
+                            BusinessOutcome::UNVERIFIED,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                }
                 Some("timed_out") => (
                     ExecutionStatus::TIMED_OUT,
                     BusinessOutcome::UNVERIFIED,
@@ -1427,6 +1412,8 @@ pub async fn drive_active_attempt(
                             message: "Execution timed out".into(),
                         })
                     }),
+                    None,
+                    None,
                 ),
                 Some("interrupted") => (
                     ExecutionStatus::INTERRUPTED,
@@ -1438,6 +1425,8 @@ pub async fn drive_active_attempt(
                             message: "Execution interrupted".into(),
                         })
                     }),
+                    None,
+                    None,
                 ),
                 Some("not_started") => (
                     ExecutionStatus::BLOCKED,
@@ -1449,6 +1438,8 @@ pub async fn drive_active_attempt(
                             message: "Execution blocked before agent dispatch".into(),
                         })
                     }),
+                    None,
+                    None,
                 ),
                 other => {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -1530,6 +1521,8 @@ pub async fn drive_active_attempt(
                 attempt_id: active.attempt_id.clone(),
                 claim_token: active.claim_token.clone(),
                 report,
+                managed_result,
+                managed_result_sha256,
                 created_at_ms: now_utc_ms(),
             };
             let outbox_file = paths.outbox_file(&active.job_id, &active.attempt_id);

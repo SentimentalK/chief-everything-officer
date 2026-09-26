@@ -620,19 +620,8 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
       const token = crypto.randomBytes(32).toString("hex");
       await coordinator.claimJob(device.id, sub.job.job_id, attemptId, token);
       await coordinator.startJob(device.id, sub.job.job_id, attemptId, token);
-      await coordinator.reportJob(device.id, sub.job.job_id, attemptId, token, {
-        schema_version: 2,
-        execution_status: "COMPLETED",
-        business_outcome: "UNVERIFIED",
-        task_dispatched: true,
-        finished_at_ms: 1700000000000,
-        duration_ms: 450,
-        executor: { type: "orca", version: "3.2.1" },
-        receipt_sha256: "3".repeat(64),
-        error: null,
-      });
 
-      // Attach result to the attempt
+      // In V1.8, result must exist before reportJob for result_target='resource'
       const attemptKey = `ceo:attempt:v1:${attemptId}`;
       const rawAttempt = JSON.parse((await fakeRedis.get(attemptKey))!);
       rawAttempt.result = {
@@ -644,6 +633,18 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
         received_at_ms: 1700000005000,
       };
       await fakeRedis.set(attemptKey, JSON.stringify(rawAttempt));
+
+      await coordinator.reportJob(device.id, sub.job.job_id, attemptId, token, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: 1700000000000,
+        duration_ms: 450,
+        executor: { type: "orca", version: "3.2.1" },
+        receipt_sha256: "3".repeat(64),
+        error: null,
+      });
 
       // HostJobDetail
       const detail = await coordinator.getJobForHost(scopeA, sub.job.job_id);

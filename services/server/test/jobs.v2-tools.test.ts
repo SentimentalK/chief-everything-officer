@@ -710,19 +710,8 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       const claimToken = crypto.randomBytes(32).toString("hex");
       await coordinator.claimJob(dev.id, jobId, attemptId, claimToken);
       await coordinator.startJob(dev.id, jobId, attemptId, claimToken);
-      await coordinator.reportJob(dev.id, jobId, attemptId, claimToken, {
-        schema_version: 2,
-        execution_status: "COMPLETED",
-        business_outcome: "UNVERIFIED",
-        task_dispatched: true,
-        finished_at_ms: Date.now(),
-        duration_ms: 300,
-        executor: { type: "orca", version: "2.0.0" },
-        receipt_sha256: "1".repeat(64),
-        error: null,
-      });
 
-      // Inject valid Attempt.result into Redis store
+      // In V1.8, result must exist before reportJob for result_target='resource'
       const attemptKey = `ceo:attempt:v1:${attemptId}`;
       const rawAttempt = JSON.parse((await fakeRedis.get(attemptKey))!);
       rawAttempt.result = {
@@ -734,6 +723,18 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
         received_at_ms: 1700000000000,
       };
       await fakeRedis.set(attemptKey, JSON.stringify(rawAttempt));
+
+      await coordinator.reportJob(dev.id, jobId, attemptId, claimToken, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 300,
+        executor: { type: "orca", version: "2.0.0" },
+        receipt_sha256: "1".repeat(64),
+        error: null,
+      });
 
       // 1. job_get exposes full result detail
       const getRes = await client.callTool({

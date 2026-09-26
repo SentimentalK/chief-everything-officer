@@ -108,7 +108,29 @@ impl ConnectorPaths {
             .join(format!("{job_id}.{attempt_id}.json"))
     }
 
-    /// Ensures that config, state, history, and outbox directories exist with 0700 permissions
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.state_dir.join("runtime")
+    }
+
+    pub fn attempt_runtime_dir(&self, attempt_id: &str) -> PathBuf {
+        self.runtime_dir().join(attempt_id)
+    }
+
+    pub fn managed_result_file(&self, attempt_id: &str) -> PathBuf {
+        self.attempt_runtime_dir(attempt_id).join("managed-result.json")
+    }
+
+    /// Ensures the attempt-specific runtime directory exists with 0700 permissions
+    /// and that its hierarchy contains no symlinks.
+    pub fn ensure_attempt_runtime_dir(&self, attempt_id: &str) -> std::io::Result<PathBuf> {
+        let dir = self.attempt_runtime_dir(attempt_id);
+        reject_control_ancestor_symlinks(&dir)?;
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
+    }
+
+    /// Ensures that config, state, history, outbox, and runtime directories exist with 0700 permissions
     /// and ensures no component in the control hierarchy is a symlink.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         reject_control_ancestor_symlinks(&self.config_dir)?;
@@ -119,6 +141,7 @@ impl ConnectorPaths {
             &self.state_dir,
             &self.history_dir(),
             &self.outbox_dir(),
+            &self.runtime_dir(),
         ] {
             fs::create_dir_all(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;

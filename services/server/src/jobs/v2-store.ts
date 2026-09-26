@@ -16,12 +16,13 @@ import {
   type JobRecordV2,
   type AttemptRecordV1,
 } from "./v2-schema.js";
-import { type ExecutionReport } from "./execution-contract.js";
+import { type ExecutionReport, type PersistedJobResult } from "./execution-contract.js";
 import {
   V2_CREATE_JOB_SCRIPT,
   V2_CLAIM_JOB_SCRIPT,
   V2_START_JOB_SCRIPT,
   V2_REPORT_JOB_SCRIPT,
+  V2_RECORD_RESULT_SCRIPT,
 } from "./v2-assignment-script.js";
 
 export class V2StoreError extends StoreError {
@@ -94,6 +95,7 @@ export class RedisJobStoreV2 {
   private claimScriptSha: string | null = null;
   private startScriptSha: string | null = null;
   private reportScriptSha: string | null = null;
+  private recordResultScriptSha: string | null = null;
 
   constructor(private readonly redis: RedisRunner) {}
 
@@ -436,6 +438,71 @@ export class RedisJobStoreV2 {
     return {
       status: parsed.status as "reported" | "replayed",
       server_time_ms: Number(parsed.server_time_ms),
+    };
+  }
+
+  async recordJobResult(params: {
+    job_id: string;
+    attempt_id: string;
+    device_id: string;
+    claim_token_sha256: string;
+    result: PersistedJobResult;
+  }): Promise<{
+    status: "recorded" | "replayed";
+    server_time_ms: number;
+    commit: string;
+    resource_id: string;
+  }> {
+    const keys = [
+      jobKeyV2(params.job_id),
+      attemptKeyV1(params.attempt_id),
+    ];
+    const args = [
+      params.attempt_id,
+      params.device_id,
+      params.claim_token_sha256,
+      JSON.stringify(params.result),
+    ];
+
+    const raw = await this.evalScript(
+      V2_RECORD_RESULT_SCRIPT,
+      () => this.recordResultScriptSha,
+      (s) => (this.recordResultScriptSha = s),
+      keys,
+      args,
+    );
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", `Corrupt record result script response: ${raw}`, "SCRIPT_CORRUPTION");
+    }
+
+    if (parsed.error) {
+      const err = String(parsed.error);
+      if (err === "JOB_NOT_FOUND") throw new V2JobNotFoundError();
+      if (err === "RESULT_CONFLICT") throw new V2ReportConflictError("RESULT_CONFLICT");
+      if (
+        err === "ATTEMPT_NOT_FOUND" ||
+        err === "ATTEMPT_MISMATCH" ||
+        err === "IDENTITY_MISMATCH" ||
+        err === "INVALID_JOB_STATUS" ||
+        err === "INVALID_ATTEMPT_PHASE" ||
+        err === "CORRUPT_ATTEMPT_RECORD" ||
+        err === "CORRUPT_JOB_RECORD" ||
+        err === "MALFORMED_RESULT"
+      ) {
+        throw new V2AttemptLifecycleError(err, `Result recording failed: ${err}`);
+      }
+      throw new V2StoreError("QUEUE_UNAVAILABLE", `Record result failed: ${err}`, err);
+    }
+
+    return {
+      status: parsed.status as "recorded" | "replayed",
+      server_time_ms: Number(parsed.server_time_ms),
+      commit: String(parsed.commit),
+      resource_id: String(parsed.resource_id),
     };
   }
 

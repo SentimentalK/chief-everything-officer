@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as z from "zod/v4";
 import {
   type ResultTarget,
   type PersistedExecutionReport,
@@ -481,8 +482,17 @@ export function parseAttemptRecordV1(raw: unknown): AttemptRecordV1 {
     if (rec.report !== undefined) {
       throw new V2SchemaError("Attempt in 'running' phase cannot have a report.");
     }
-    if (rec.result !== undefined) {
-      throw new V2SchemaError("Attempt in 'running' phase cannot have a result.");
+    if (rec.result !== undefined && rec.result !== null) {
+      try {
+        validatedResult = validatePersistedJobResult(rec.result);
+      } catch (err) {
+        throw new V2SchemaError(`Invalid attempt result: ${(err as Error).message}`);
+      }
+      if (validatedResult.attempt_id !== rec.attempt_id) {
+        throw new V2SchemaError(
+          `Result attempt_id '${validatedResult.attempt_id}' does not match attempt record attempt_id '${rec.attempt_id}'.`,
+        );
+      }
     }
   } else {
     // terminal
@@ -638,3 +648,44 @@ export function serializeStreamEntryV2(entry: unknown): Record<string, string> {
 export function parseStreamEntryV2(fields: Record<string, string>): JobStreamEntryV2 {
   return validateStreamEntryV2(fields);
 }
+
+export const MAX_MANAGED_RESULT_BYTES = 64 * 1024;
+
+export const managedResultEnvelopeSchema = z
+  .object({
+    schema_version: z.literal(1),
+    job_id: z.string().regex(JOB_ID_V2_RE, "Invalid job_id format"),
+    attempt_id: z.string().regex(ATTEMPT_ID_V2_RE, "Invalid attempt_id format"),
+    resource_id: z.string().regex(RESOURCE_ID_V2_RE, "Invalid resource_id format"),
+    summary: z
+      .string()
+      .min(1, "summary cannot be empty")
+      .refine((s) => !isWhitespaceOnly(s), "summary cannot be whitespace"),
+    operations: z.array(z.record(z.string(), z.unknown())).min(1, "operations cannot be empty"),
+  })
+  .strict();
+
+export type ManagedResultEnvelope = z.infer<typeof managedResultEnvelopeSchema>;
+
+export const jobResultRequestSchema = z
+  .object({
+    attempt_id: z.string().regex(ATTEMPT_ID_V2_RE, "Invalid attempt_id format"),
+    claim_token: z.string().min(1, "claim_token is required"),
+    result: managedResultEnvelopeSchema,
+    payload_sha256: z.string().regex(HEX_64_RE, "payload_sha256 must be 64 lowercase hex chars"),
+  })
+  .strict();
+
+export type JobResultRequest = z.infer<typeof jobResultRequestSchema>;
+
+export const jobResultResponseSchema = z
+  .object({
+    ok: z.literal(true),
+    replayed: z.boolean(),
+    server_time: z.string(),
+    resource_id: z.string(),
+    commit: z.string(),
+  })
+  .strict();
+
+export type JobResultResponse = z.infer<typeof jobResultResponseSchema>;

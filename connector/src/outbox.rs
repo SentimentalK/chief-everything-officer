@@ -58,6 +58,10 @@ pub struct OutboxRecord {
     pub attempt_id: String,
     pub claim_token: String,
     pub report: ExecutionReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_result: Option<crate::managed_result::ManagedResultEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_result_sha256: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -129,6 +133,43 @@ pub async fn deliver_outbox_record(
             actual_server: record.server_origin.clone(),
             actual_device: record.device_id.clone(),
         });
+    }
+
+    // Sequential delivery: Result ACK strictly before Report ACK
+    if let (Some(ref result), Some(ref digest)) = (&record.managed_result, &record.managed_result_sha256) {
+        let result_res = client
+            .submit_job_result(
+                cred,
+                &record.job_id,
+                &record.attempt_id,
+                &record.claim_token,
+                result,
+                digest,
+            )
+            .await;
+
+        match result_res {
+            Ok(_res) => {}
+            Err(ClientError::Unauthorized) => {
+                return Err(OutboxError::AuthRequired);
+            }
+            Err(ClientError::JobError { code, message }) => {
+                return Err(OutboxError::RecoveryRequired(format!("{code}: {message}")));
+            }
+            Err(ClientError::ServerUnavailable { status, message }) => {
+                return Err(OutboxError::Retryable(format!(
+                    "Server returned {status}: {message}"
+                )));
+            }
+            Err(ClientError::Http(e)) => {
+                return Err(OutboxError::Retryable(format!("HTTP error: {e}")));
+            }
+            Err(other) => {
+                return Err(OutboxError::RecoveryRequired(format!(
+                    "Unexpected client error on result submit: {other}"
+                )));
+            }
+        }
     }
 
     let report_res = client
@@ -209,6 +250,12 @@ pub async fn deliver_outbox_record(
 
             // 3. Durably unlink active attempt
             remove_durable(&paths.active_attempt_file())?;
+
+            // 4. Clean up attempt runtime dir if present
+            let runtime_attempt_dir = paths.attempt_runtime_dir(&record.attempt_id);
+            if runtime_attempt_dir.exists() {
+                let _ = fs::remove_dir_all(&runtime_attempt_dir);
+            }
 
             Ok(())
         }

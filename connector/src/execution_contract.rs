@@ -184,6 +184,40 @@ impl ExecutionReport {
     }
 }
 
+/// Builds a deterministic, structured execution prompt for coding agents.
+pub fn build_execution_prompt(
+    task: Option<&str>,
+    acceptance: Option<&str>,
+    managed_contract: Option<(&std::path::Path, &str)>,
+) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(t) = task {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!("TASK\n\n{trimmed}"));
+        }
+    }
+
+    if let Some(a) = acceptance {
+        let trimmed = a.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!("ACCEPTANCE CRITERIA\n\n{trimmed}"));
+        }
+    }
+
+    if let Some((path, resource_id)) = managed_contract {
+        let contract = format!(
+            "MANAGED RESULT CONTRACT\n\nWhen your task is complete, you MUST write a single JSON file to this EXACT path:\n{}\n\nThe JSON must follow this schema:\n{{\n  \"schema_version\": 1,\n  \"resource_id\": \"{}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"replace_body\",\n      \"content\": \"<string>\"\n    }}\n  ]\n}}\n\nRules:\n1. Do not place this file in the git repository.\n2. Write only valid JSON encoded in UTF-8.\n3. Do not generate empty or partial files.",
+            path.display(),
+            resource_id
+        );
+        sections.push(contract);
+    }
+
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +277,27 @@ mod tests {
                 MAX_SAFE_INTEGER + 1
             ))
         );
+    }
+
+    #[test]
+    fn build_execution_prompt_none_target() {
+        let prompt = build_execution_prompt(Some("Fix bug in parser"), Some("All tests green"), None);
+        assert_eq!(
+            prompt,
+            "TASK\n\nFix bug in parser\n\nACCEPTANCE CRITERIA\n\nAll tests green"
+        );
+    }
+
+    #[test]
+    fn build_execution_prompt_with_managed_contract() {
+        let path = std::path::Path::new("/var/ceo/state/runtime/att-123/managed-result.json");
+        let prompt = build_execution_prompt(
+            Some("Update docs"),
+            Some("Doc matches schema"),
+            Some((path, "res_456")),
+        );
+        assert!(prompt.starts_with("TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"));
+        assert!(prompt.contains("/var/ceo/state/runtime/att-123/managed-result.json"));
+        assert!(prompt.contains("\"resource_id\": \"res_456\""));
     }
 }

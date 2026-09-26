@@ -445,3 +445,93 @@ redis.call('SET', KEYS[1], cjson.encode(job))
 
 return cjson.encode({ status = 'reported', server_time_ms = now_ms })
 `;
+
+export const V2_RECORD_RESULT_SCRIPT = `
+local function badtype(key, ok)
+  local t = redis.call('TYPE', key)
+  local tt = type(t) == 'table' and t.ok or tostring(t)
+  if (tt ~= 'none') and (tt ~= ok) then return true end
+  return false
+end
+
+if badtype(KEYS[1], 'string') then
+  return redis.error_reply('WRONGTYPE_JOB_KEY')
+end
+if badtype(KEYS[2], 'string') then
+  return redis.error_reply('WRONGTYPE_ATTEMPT_KEY')
+end
+
+local job_raw = redis.call('GET', KEYS[1])
+if not job_raw then
+  return cjson.encode({ error = 'JOB_NOT_FOUND' })
+end
+local okj, job = pcall(cjson.decode, job_raw)
+if not okj then
+  return cjson.encode({ error = 'CORRUPT_JOB_RECORD' })
+end
+
+local att_raw = redis.call('GET', KEYS[2])
+if not att_raw then
+  return cjson.encode({ error = 'ATTEMPT_NOT_FOUND' })
+end
+local oka, attempt = pcall(cjson.decode, att_raw)
+if not oka then
+  return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+end
+
+-- Key correlation & ownership checks
+if attempt.job_id ~= job.job_id or job.latest_attempt_id ~= attempt.attempt_id then
+  return cjson.encode({ error = 'ATTEMPT_MISMATCH' })
+end
+
+if attempt.device_id ~= ARGV[2] or attempt.claim_token_sha256 ~= ARGV[3] then
+  return cjson.encode({ error = 'IDENTITY_MISMATCH' })
+end
+
+local okr, incoming_result = pcall(cjson.decode, ARGV[4])
+if not okr then
+  return cjson.encode({ error = 'MALFORMED_RESULT' })
+end
+
+local time_parts = redis.call('TIME')
+local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
+
+-- Check if attempt already has a result
+if attempt.result and attempt.result ~= cjson.null then
+  local existing = attempt.result
+  if existing.payload_sha256 == incoming_result.payload_sha256 and
+     existing.resource_id == incoming_result.resource_id and
+     existing.target == incoming_result.target then
+    return cjson.encode({
+      status = 'replayed',
+      server_time_ms = now_ms,
+      commit = existing.commit,
+      resource_id = existing.resource_id,
+    })
+  else
+    return cjson.encode({ error = 'RESULT_CONFLICT' })
+  end
+end
+
+-- Must be in running phase to accept initial result
+if attempt.phase ~= 'running' then
+  return cjson.encode({ error = 'INVALID_ATTEMPT_PHASE', phase = attempt.phase })
+end
+if job.status ~= 'active' then
+  return cjson.encode({ error = 'INVALID_JOB_STATUS', status = job.status })
+end
+
+-- Set attempt.result
+incoming_result.received_at_ms = now_ms
+attempt.result = incoming_result
+
+redis.call('SET', KEYS[2], cjson.encode(attempt))
+
+return cjson.encode({
+  status = 'recorded',
+  server_time_ms = now_ms,
+  commit = incoming_result.commit,
+  resource_id = incoming_result.resource_id,
+})
+`;
+

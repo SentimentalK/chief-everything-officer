@@ -350,7 +350,7 @@ export function createFakeRedisRunner(): RedisRunner & {
         return JSON.stringify({ status: "started", attempt, server_time_ms: nowMs });
       }
 
-      if (script.includes("ATTEMPT_MISMATCH") || script.includes("INVALID_REPORT_SCHEMA_VERSION")) {
+      if (script.includes("INVALID_REPORT_SCHEMA_VERSION")) {
         // V2_REPORT_JOB_SCRIPT
         // Keys: [jobKey, attemptKey]
         // Args: [attemptId, deviceId, claimTokenSha256, serializedReportJson]
@@ -482,6 +482,89 @@ export function createFakeRedisRunner(): RedisRunner & {
         strings.set(jobKey, JSON.stringify(job));
 
         return JSON.stringify({ status: "reported", server_time_ms: nowMs });
+      }
+
+      if (script.includes("MALFORMED_RESULT")) {
+        // V2_RECORD_RESULT_SCRIPT
+        // Keys: [jobKey, attemptKey]
+        // Args: [attemptId, deviceId, claimTokenSha256, serializedResultJson]
+        const [jobKey, attemptKey] = keys;
+        const [attemptId, deviceId, claimTokenSha256, serializedResultJson] = args;
+
+        const jobRaw = strings.get(jobKey);
+        if (!jobRaw) {
+          return JSON.stringify({ error: "JOB_NOT_FOUND" });
+        }
+        let job: Record<string, any>;
+        try {
+          job = JSON.parse(jobRaw);
+        } catch {
+          return JSON.stringify({ error: "CORRUPT_JOB_RECORD" });
+        }
+
+        const attRaw = strings.get(attemptKey);
+        if (!attRaw) {
+          return JSON.stringify({ error: "ATTEMPT_NOT_FOUND" });
+        }
+        let attempt: Record<string, any>;
+        try {
+          attempt = JSON.parse(attRaw);
+        } catch {
+          return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+        }
+
+        if (attempt.job_id !== job.job_id || job.latest_attempt_id !== attempt.attempt_id) {
+          return JSON.stringify({ error: "ATTEMPT_MISMATCH" });
+        }
+        if (attempt.device_id !== deviceId || attempt.claim_token_sha256 !== claimTokenSha256) {
+          return JSON.stringify({ error: "IDENTITY_MISMATCH" });
+        }
+
+        let incomingResult: Record<string, any>;
+        try {
+          incomingResult = JSON.parse(serializedResultJson);
+        } catch {
+          return JSON.stringify({ error: "MALFORMED_RESULT" });
+        }
+
+        const nowMs = Date.now();
+
+        if (attempt.result) {
+          const existing = attempt.result;
+          if (
+            existing.payload_sha256 === incomingResult.payload_sha256 &&
+            existing.resource_id === incomingResult.resource_id &&
+            existing.target === incomingResult.target
+          ) {
+            return JSON.stringify({
+              status: "replayed",
+              server_time_ms: nowMs,
+              commit: existing.commit,
+              resource_id: existing.resource_id,
+            });
+          } else {
+            return JSON.stringify({ error: "RESULT_CONFLICT" });
+          }
+        }
+
+        if (attempt.phase !== "running") {
+          return JSON.stringify({ error: "INVALID_ATTEMPT_PHASE", phase: attempt.phase });
+        }
+        if (job.status !== "active") {
+          return JSON.stringify({ error: "INVALID_JOB_STATUS", status: job.status });
+        }
+
+        incomingResult.received_at_ms = nowMs;
+        attempt.result = incomingResult;
+
+        strings.set(attemptKey, JSON.stringify(attempt));
+
+        return JSON.stringify({
+          status: "recorded",
+          server_time_ms: nowMs,
+          commit: incomingResult.commit,
+          resource_id: incomingResult.resource_id,
+        });
       }
 
       throw new Error(`Unknown script in fake runner: ${script}`);

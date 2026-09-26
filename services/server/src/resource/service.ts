@@ -66,6 +66,7 @@ import {
 } from "./resolver-mapping.js";
 import { formatSummaryDocument } from "./summary.js";
 import type { ContentMetadataV1 } from "./resolver-contract.js";
+import { deriveDeterministicUuid } from "../jobs/canonical.js";
 
 export interface ResourceExecutionContext {
   location: ResourceLocation;
@@ -772,6 +773,169 @@ export class ResourceService {
         };
       },
     });
+  }
+
+  async applyManagedJobResult(input: {
+    jobId: string;
+    attemptId: string;
+    resourceId: string;
+    summary: string;
+    operations: Record<string, unknown>[];
+    payloadSha256: string;
+  }): Promise<{
+    commit: string;
+    resource_id: string;
+    replayed: boolean;
+  }> {
+    if (!input.jobId || typeof input.jobId !== "string") {
+      throw new CeoError("VALIDATION_FAILED", "jobId is required.");
+    }
+    if (!input.attemptId || typeof input.attemptId !== "string") {
+      throw new CeoError("VALIDATION_FAILED", "attemptId is required.");
+    }
+    if (!input.resourceId || !/^res-[0-9a-f-]{36}$/i.test(input.resourceId)) {
+      throw new CeoError("VALIDATION_FAILED", "Invalid resource_id format.", {
+        resource_id: input.resourceId,
+      });
+    }
+    if (!input.summary || !input.summary.trim()) {
+      throw new CeoError("VALIDATION_FAILED", "summary cannot be empty.");
+    }
+    if (!input.operations || input.operations.length === 0) {
+      throw new CeoError("VALIDATION_FAILED", "At least one operation is required.");
+    }
+    if (!input.payloadSha256 || !/^[0-9a-f]{64}$/.test(input.payloadSha256)) {
+      throw new CeoError("VALIDATION_FAILED", "payloadSha256 must be 64 hex chars.");
+    }
+
+    // Provenance validation & normalization
+    for (const op of input.operations) {
+      if (op.op === "attach_source_asset") {
+        throw new CeoError("VALIDATION_FAILED", "attach_source_asset is unsupported in managed results.");
+      }
+      if ("provenance" in op && op.provenance !== "worker") {
+        throw new CeoError(
+          "VALIDATION_FAILED",
+          `Forbidden provenance '${op.provenance}': only 'worker' is permitted in managed results.`,
+        );
+      }
+    }
+
+    const normalizedOps: ResourceApplyOperation[] = input.operations.map((op) => {
+      if (
+        op.op === "upsert_content" ||
+        op.op === "upsert_summary" ||
+        op.op === "upsert_evidence" ||
+        op.op === "append_interaction"
+      ) {
+        return { ...op, provenance: "worker" as const } as ResourceApplyOperation;
+      }
+      return op as ResourceApplyOperation;
+    });
+
+    validateResourceOperations(normalizedOps);
+
+    const resultTxRequestId = deriveDeterministicUuid(`ceo:job:result:${input.attemptId}`);
+
+    // Resolve current workspace HEAD as baseCommit cleanly without holding lock during transaction
+    const baseCommit = await this.workspace.withReadyWorkspace(async (base) => base);
+
+    const allowEmpty = normalizedOps.every((op) => op.op === "rename");
+
+    let appliedResourceReceipt: Record<string, unknown> | null = null;
+    let initialRelativePath = "";
+    let finalCtx: ResourceExecutionContext | null = null;
+
+    const txResult = await this.workspace.withAtomicWorkspaceTransaction({
+      requestId: resultTxRequestId,
+      baseCommit,
+      commitMessage: `CEO Job ${input.jobId}: ${input.summary.trim()}`,
+      allowResourceSourceFiles: true,
+      allowEmpty,
+      operationResultProducer: (_changedFiles) => ({
+        resource: appliedResourceReceipt,
+        renamed: finalCtx ? finalCtx.location.relative_path !== initialRelativePath : false,
+        old_path: initialRelativePath,
+        new_path: finalCtx ? finalCtx.location.relative_path : initialRelativePath,
+        managed_job_result: {
+          job_id: input.jobId,
+          attempt_id: input.attemptId,
+          resource_id: input.resourceId,
+          payload_sha256: input.payloadSha256,
+        },
+      }),
+      mutator: async (worktree, _worktreeMatcher) => {
+        const location = await resolveResourceLocation(worktree, input.resourceId);
+        if (!location) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resourceId}' does not exist.`, {
+            resource_id: input.resourceId,
+          });
+        }
+        initialRelativePath = location.relative_path;
+
+        const ctx: ResourceExecutionContext = {
+          location: { ...location },
+          getResDir: () => path.join(worktree, ctx.location.relative_path),
+          getMetaPath: () => path.join(ctx.getResDir(), "meta.md"),
+        };
+        finalCtx = ctx;
+
+        const metaContent = await readFile(ctx.getMetaPath(), "utf8").catch(() => null);
+        if (!metaContent) {
+          throw new CeoError("NOT_FOUND", `Resource '${input.resourceId}' meta.md not found.`, {
+            resource_id: input.resourceId,
+          });
+        }
+
+        const doc = parseMetaMarkdown(metaContent);
+        const meta = doc.meta;
+
+        await this.executeResourceOperations(worktree, ctx, meta, normalizedOps);
+
+        const metaMarkdown = formatMetaMarkdown(meta, doc.capture_note, doc.capture_history);
+        await writeFile(ctx.getMetaPath(), metaMarkdown, "utf8");
+
+        const dirFiles = await readdir(ctx.getResDir()).catch(() => []);
+        const artifactSet = new Set(dirFiles);
+        let interactionsText: string | null = null;
+        if (artifactSet.has("interactions.md")) {
+          interactionsText = await readFile(path.join(ctx.getResDir(), "interactions.md"), "utf8").catch(() => null);
+        }
+        let summaryText: string | null = null;
+        const summaryPath = path.join(ctx.getResDir(), "summary.md");
+        if (artifactSet.has("summary.md")) {
+          summaryText = await readFile(summaryPath, "utf8");
+        }
+        const stage = deriveResourceStage(artifactSet, interactionsText, summaryText, summaryPath);
+
+        appliedResourceReceipt = {
+          resource_id: meta.resource_id,
+          display_name: meta.display_name,
+          naming_source: meta.naming_source,
+          relative_path: ctx.location.relative_path,
+          source_identity: meta.source_identity,
+          title: meta.title,
+          platform: meta.platform,
+          resource_kind: meta.resource_kind,
+          stage,
+        };
+      },
+    });
+
+    // Inspect the recorded payload digest to prevent race condition replays of conflicting digests
+    const opResult = txResult.operation_result as any;
+    const recordedDigest = opResult?.managed_job_result?.payload_sha256;
+    if (recordedDigest && recordedDigest !== input.payloadSha256) {
+      throw new CeoError("VALIDATION_FAILED", "RESULT_CONFLICT: Existing transaction has different payload digest.");
+    }
+
+    const replayed = txResult.pushed === false;
+
+    return {
+      commit: String(txResult.commit),
+      resource_id: input.resourceId,
+      replayed,
+    };
   }
 
   private async executeResourceOperations(
