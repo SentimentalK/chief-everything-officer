@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import express, { type Request, type Response, type Router, type RequestHandler } from "express";
+import express, { type Request, type Response, type Router, type RequestHandler, type NextFunction } from "express";
 import {
   ConnectorControlStore,
   ConnectorPermissionError,
@@ -167,15 +167,21 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
   if (!publicOrigin || typeof publicOrigin !== "string" || publicOrigin.trim().length === 0) {
     throw new Error("ConnectorRouter requires an authoritative non-empty publicOrigin.");
   }
+  const baseUrl = publicOrigin.trim().replace(/\/+$/, "");
   const router = express.Router();
+
   if (hostGuard) {
     router.use(hostGuard);
   }
   if (originGuard) {
-    router.use(originGuard);
+    router.use((req: Request, res: Response, next: NextFunction) => {
+      const origin = req.headers.origin?.trim().replace(/\/+$/, "");
+      if (origin && origin === baseUrl) {
+        return next();
+      }
+      return originGuard(req, res, next);
+    });
   }
-
-  const baseUrl = publicOrigin.trim().replace(/\/+$/, "");
 
   // ---------------------------------------------------------------------------
   // 1. Native API: Begin Enrollment

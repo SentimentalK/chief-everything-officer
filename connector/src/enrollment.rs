@@ -373,13 +373,35 @@ pub async fn login_flow(
     }
 }
 
+fn detect_hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(user) = std::env::var("USER") {
+        let trimmed = user.trim();
+        if !trimmed.is_empty() {
+            return format!("{trimmed}-device");
+        }
+    }
+    "unknown-device".into()
+}
+
 async fn create_fresh_enrollment(
     paths: &ConnectorPaths,
     client: &ConnectorClient,
     server_origin: &str,
     display_name_override: Option<String>,
 ) -> Result<PendingEnrollmentSession, EnrollmentError> {
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-device".into());
+    let hostname = detect_hostname();
     let display_name = display_name_override.unwrap_or(hostname);
     let platform = default_platform();
 

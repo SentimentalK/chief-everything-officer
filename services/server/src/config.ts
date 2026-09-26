@@ -108,6 +108,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     }
     publicOrigin = parsed.origin;
   }
+  if (publicOrigin) {
+    const norm = publicOrigin.replace(/\/+$/, "");
+    if (!allowedOrigins.includes(norm)) {
+      allowedOrigins.push(norm);
+    }
+  }
 
   const githubAppEnabled = parseBool(env.CEO_GITHUB_APP_ENABLED, false);
   const githubAppClientId = env.CEO_GITHUB_APP_CLIENT_ID?.trim() || undefined;
