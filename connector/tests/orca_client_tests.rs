@@ -10,8 +10,8 @@ use ceo_connector::orca::receipt::ExecutionReceipt;
 use ceo_connector::orca::types::*;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptPhase, CleanupOutcome, DispatchOutcome, DispatchProof, ExecutionAdapter,
-    WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
+    DispatchProof, ExecutionAdapter, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -398,6 +398,8 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","title":"ceo:att_123"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","connected":true,"writable":true}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
     echo '{{"ok":true,"result":{{"wait":{{"handle":"term_new_123","condition":"tui-idle","satisfied":true}}}}}}'
 else
@@ -523,6 +525,8 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[{{"handle":"term_other_worktree","title":"ceo:att_123","worktreeId":"wt_OTHER"}}],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","title":"ceo:att_123","worktreeId":"wt_target_1"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","connected":true,"writable":true}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
     echo '{{"ok":true,"result":{{"wait":{{"handle":"term_created_target","condition":"tui-idle","satisfied":true}}}}}}'
 else
@@ -1109,4 +1113,394 @@ fn test_active_attempt_v2_to_v3_migration() {
     let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
     assert_eq!(loaded.schema_version, 3);
     assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+
+    // Case 4: V2 OutcomeRecorded with tui_idle and legacy turn_started fails closed to RecoveryRequired
+    let prompt = "do task";
+    let acceptance = "must work";
+    let hash = ActiveAttempt::compute_payload_sha256(
+        "job_4", "ws_1", "tgt_1", None, prompt, acceptance, 60, "none",
+    );
+    let v2_outcome_recorded_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_4",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "outcome_recorded",
+        "prompt": prompt,
+        "acceptance": acceptance,
+        "execution_timeout_seconds": 60,
+        "result_target": "none",
+        "payload_sha256": hash,
+        "executor": {
+            "type": "orca",
+            "worktree_id": "wt_1",
+            "terminal_id": "term_1",
+            "agent_id": "agy",
+            "agent_ready_at_ms": 1727000000000i64,
+            "dispatch_send_count": 1,
+            "dispatch_request_id": "req_1",
+            "dispatch_stage": "turn_started",
+            "dispatch_observation_count": 1,
+            "runtime_completion_kind": "tui_idle",
+            "runtime_completed_at_ms": 1727000010000i64
+        }
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&v2_outcome_recorded_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+    assert_eq!(loaded.executor.unwrap().dispatch_proof, None);
+}
+
+#[tokio::test]
+async fn test_cleanup_regression_matrix() {
+    let temp = tempfile::tempdir().unwrap();
+
+    async fn run_close(
+        temp: &tempfile::TempDir,
+        close_json: &str,
+        list_json: &str,
+        show_json: &str,
+        show_exit: i32,
+    ) -> CleanupOutcome {
+        let script = format!(
+            r#"#!/bin/bash
+if [[ "$*" == *"terminal close"* ]]; then
+  echo '{close_json}'
+  exit 0
+fi
+if [[ "$*" == *"terminal list"* ]]; then
+  echo '{list_json}'
+  exit 0
+fi
+if [[ "$*" == *"terminal show"* ]]; then
+  echo '{show_json}'
+  exit {show_exit}
+fi
+"#
+        );
+        let bin = create_mock_orca_script(temp, &script);
+        let client = OrcaCliClient::new(bin);
+        let adapter = OrcaExecutionAdapter::new(client);
+        adapter.close("term_target").await
+    }
+
+    // 1. Inventory truncated => RecoveryRequired
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":true}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target"}}}"#,
+        0,
+    )
+    .await;
+    match out {
+        CleanupOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "TERMINAL_LIST_TRUNCATED")
+        }
+        other => panic!("Expected RecoveryRequired(TERMINAL_LIST_TRUNCATED), got {other:?}"),
+    }
+
+    // 2. Close response handle mismatch => RecoveryRequired(TERMINAL_CLOSE_CORRELATION_MISMATCH)
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_wrong","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target"}}}"#,
+        0,
+    )
+    .await;
+    match out {
+        CleanupOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "TERMINAL_CLOSE_CORRELATION_MISMATCH")
+        }
+        other => {
+            panic!("Expected RecoveryRequired(TERMINAL_CLOSE_CORRELATION_MISMATCH), got {other:?}")
+        }
+    }
+
+    // 3. Inventory complete + handle absent + show orphaned=true + connected=false + writable=false + exitCause=operator_close => VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"operator_close"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 4. Same but exitCause=signaled => VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"signaled"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 5. Same but exitCause=exited => VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"exited"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 6. Same but exitCause=unknown => NOT VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"unknown"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 7. Same but exitCause absent => NOT VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":false}}}"#,
+        0,
+    )
+    .await;
+    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 8. Same but connected=true => NOT VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":true,"writable":false,"exitCause":{"kind":"operator_close"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+
+    // 9. Same but writable=true => NOT VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":true}}}"#,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+        r#"{"ok":true,"result":{"terminal":{"handle":"term_target","orphaned":true,"connected":false,"writable":true,"exitCause":{"kind":"operator_close"}}}}"#,
+        0,
+    )
+    .await;
+    assert!(!matches!(out, CleanupOutcome::VerifiedClosed { .. }));
+}
+
+#[tokio::test]
+async fn test_dispatch_correlation_regression_matrix() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let dummy_attempt = ActiveAttempt {
+        schema_version: 3,
+        server_origin: "http://127.0.0.1:4000".into(),
+        device_id: "dev_1".into(),
+        job_id: "job_1".into(),
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        attempt_id: "att_1".into(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        phase: AttemptPhase::DispatchIntent,
+        resource_id: None,
+        prompt: Some("prompt".into()),
+        acceptance: Some("acceptance".into()),
+        execution_timeout_seconds: Some(60),
+        result_target: Some("none".into()),
+        payload_sha256: Some("hash".into()),
+        claimed_at_ms: Some(1727000000000),
+        terminal_report_sha256: None,
+        executor: Some(AttemptExecutorState {
+            executor_type: "orca".into(),
+            orca_version: Some("1.4.209".into()),
+            worktree_id: Some("wt_1".into()),
+            terminal_id: Some("term_target".into()),
+            agent_id: Some("agy".into()),
+            agent_ready_at_ms: Some(1727000001000),
+            dispatch_send_count: 1,
+            dispatch_started_at_ms: Some(1727000002000),
+            execution_deadline_ms: Some(1727000062000),
+            dispatch_request_id: None,
+            dispatch_accepted_at_ms: None,
+            last_dispatch_outcome: None,
+            dispatch_proof: None,
+            dispatch_provider: None,
+            dispatch_observation: None,
+            dispatch_observation_count: 0,
+            runtime_completion_kind: None,
+            runtime_completed_at_ms: None,
+            runtime_error: None,
+        }),
+    };
+
+    async fn run_dispatch(
+        temp: &tempfile::TempDir,
+        attempt: &ActiveAttempt,
+        send_json: &str,
+    ) -> DispatchOutcome {
+        let script = format!(
+            r#"#!/bin/bash
+if [[ "$*" == *"terminal send"* ]]; then
+  echo '{send_json}'
+  exit 0
+fi
+"#
+        );
+        let bin = create_mock_orca_script(temp, &script);
+        let client = OrcaCliClient::new(bin);
+        let adapter = OrcaExecutionAdapter::new(client);
+        let retry_req = attempt
+            .executor
+            .as_ref()
+            .and_then(|e| e.dispatch_request_id.as_deref());
+        adapter
+            .dispatch(attempt, "term_target", retry_req)
+            .await
+            .unwrap()
+    }
+
+    // 1. send.handle != requested terminal => DISPATCH_TERMINAL_CORRELATION_MISMATCH
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_other","accepted":true,"prompt":{"requestId":"req_expected","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "DISPATCH_TERMINAL_CORRELATION_MISMATCH")
+        }
+        other => panic!("Expected DISPATCH_TERMINAL_CORRELATION_MISMATCH, got {other:?}"),
+    }
+
+    // 2. retry request id != response prompt.requestId => DISPATCH_REQUEST_CORRELATION_MISMATCH
+    let mut retry_attempt = dummy_attempt.clone();
+    retry_attempt.executor.as_mut().unwrap().dispatch_request_id = Some("req_first".into());
+    let out = run_dispatch(
+        &temp,
+        &retry_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_different","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "DISPATCH_REQUEST_CORRELATION_MISMATCH")
+        }
+        other => panic!("Expected DISPATCH_REQUEST_CORRELATION_MISMATCH, got {other:?}"),
+    }
+
+    // 3. provider=old-host => INCOMPATIBLE_RUNTIME
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"old-host","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "INCOMPATIBLE_RUNTIME")
+        }
+        other => panic!("Expected INCOMPATIBLE_RUNTIME, got {other:?}"),
+    }
+
+    // 4. observation=permission => DISPATCH_PERMISSION_BLOCKED
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","observation":"permission","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "DISPATCH_PERMISSION_BLOCKED")
+        }
+        other => panic!("Expected DISPATCH_PERMISSION_BLOCKED, got {other:?}"),
+    }
+
+    // 5. observation=incarnation_replaced => DISPATCH_INCARNATION_REPLACED
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","observation":"incarnation_replaced","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::RecoveryRequired { code, .. } => {
+            assert_eq!(code, "DISPATCH_INCARNATION_REPLACED")
+        }
+        other => panic!("Expected DISPATCH_INCARNATION_REPLACED, got {other:?}"),
+    }
+
+    // 6. provider=unsupported + observation=unsupported + input_accepted => AcceptedUnobservable
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"unsupported","observation":"unsupported","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::Accepted {
+            proof,
+            provider,
+            observation,
+            ..
+        } => {
+            assert_eq!(proof, DispatchProof::AcceptedUnobservable);
+            assert_eq!(provider.as_deref(), Some("unsupported"));
+            assert_eq!(observation.as_deref(), Some("unsupported"));
+        }
+        other => panic!("Expected Accepted with AcceptedUnobservable, got {other:?}"),
+    }
+
+    // 7. supported provider + input_accepted only => InputAccepted
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"claude-code","observation":"pty-screen","stages":["input_accepted"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::Accepted {
+            proof,
+            provider,
+            observation,
+            ..
+        } => {
+            assert_eq!(proof, DispatchProof::InputAccepted);
+            assert_eq!(provider.as_deref(), Some("claude-code"));
+            assert_eq!(observation.as_deref(), Some("pty-screen"));
+        }
+        other => panic!("Expected Accepted with InputAccepted, got {other:?}"),
+    }
+
+    // 8. stages contains turn_started => TurnStarted
+    let out = run_dispatch(
+        &temp,
+        &dummy_attempt,
+        r#"{"ok":true,"result":{"send":{"handle":"term_target","accepted":true,"prompt":{"requestId":"req_expected","provider":"claude-code","observation":"pty-screen","stages":["input_accepted","turn_started"]}}}}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::Accepted { proof, .. } => {
+            assert_eq!(proof, DispatchProof::TurnStarted);
+        }
+        other => panic!("Expected Accepted with TurnStarted, got {other:?}"),
+    }
 }

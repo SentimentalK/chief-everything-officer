@@ -10,7 +10,7 @@ use ceo_connector::daemon::run_daemon;
 use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::paths::ConnectorPaths;
-use ceo_connector::scheduler::{ActiveAttempt, AttemptPhase, DispatchProof};
+use ceo_connector::scheduler::{ActiveAttempt, AttemptPhase, DispatchProof, ExecutionAdapter};
 use common::mock_server::{MockRequest, MockResponse, MockServer};
 use uuid::Uuid;
 
@@ -77,6 +77,7 @@ fn setup_dogfood_env_with_cmd(
     server_origin: &str,
     target_path: &str,
     mode: &str,
+    agent_id: &str,
     custom_cmd: Option<&str>,
 ) -> (
     tempfile::TempDir,
@@ -125,7 +126,7 @@ fn setup_dogfood_env_with_cmd(
             alias: "dogfood-target".into(),
             kind: "coding".into(),
             local_path: target_path.to_string(),
-            executor: Some(LocalExecutorConfig::new("agent".into(), exec_cmd).unwrap()),
+            executor: Some(LocalExecutorConfig::new(agent_id.into(), exec_cmd).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();
@@ -143,7 +144,37 @@ fn setup_dogfood_env(
     DeviceCredential,
     LocalConfig,
 ) {
-    setup_dogfood_env_with_cmd(server_origin, target_path, mode, None)
+    setup_dogfood_env_with_cmd(server_origin, target_path, mode, "synthetic", None)
+}
+
+async fn drive_until_phase<A: ExecutionAdapter + 'static, F>(
+    paths: &ConnectorPaths,
+    adapter: Arc<A>,
+    predicate: F,
+    max_steps: usize,
+) -> Result<ActiveAttempt, String>
+where
+    F: Fn(AttemptPhase) -> bool,
+{
+    for step in 0..max_steps {
+        if let Ok(Some(active)) = ActiveAttempt::load(&paths.active_attempt_file()) {
+            if predicate(active.phase) {
+                return Ok(active);
+            }
+        }
+        if let Err(e) = run_daemon(paths, adapter.clone(), Some(1)).await {
+            return Err(format!("daemon step failed at step {step}: {e}"));
+        }
+        if let Ok(Some(active)) = ActiveAttempt::load(&paths.active_attempt_file()) {
+            if predicate(active.phase) {
+                return Ok(active);
+            }
+        }
+    }
+    Err(format!(
+        "Timed out waiting for predicate after {max_steps} steps. Current attempt: {:?}",
+        ActiveAttempt::load(&paths.active_attempt_file())
+    ))
 }
 
 async fn check_orca_available() -> bool {
@@ -583,12 +614,17 @@ async fn test_dogfood_real_agy() {
     println!("\n=== [DOGFOOD REAL AGY] Starting Run 1: Normal Execution ===");
     {
         let server = MockServer::start().await;
-        let (_temp, paths, _cred, _config) =
-            setup_dogfood_env_with_cmd(&server.origin(), &repo_canon, "normal", Some(&agent_cmd));
+        let (_temp, paths, _cred, _config) = setup_dogfood_env_with_cmd(
+            &server.origin(),
+            &repo_canon,
+            "normal",
+            "agy",
+            Some(&agent_cmd),
+        );
 
         let job_id = format!("job-{}", Uuid::new_v4());
         let claim_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let token = format!("token-{}", Uuid::new_v4());
+        let token = format!("V17_REAL_{}", Uuid::new_v4());
 
         let job_claimed = Arc::new(AtomicBool::new(false));
         let job_claimed_clone = job_claimed.clone();
@@ -672,7 +708,7 @@ async fn test_dogfood_real_agy() {
                             "workspace_id": "ws_dogfood",
                             "target_id": "tgt_dogfood",
                             "resource_id": null,
-                            "prompt": format!("Create a file named v17-real-acceptance.txt containing exactly the text '{tok}'"),
+                            "prompt": format!("Create a file named v17-real-acceptance.txt containing exactly:\n\n{tok}"),
                             "acceptance": "v17-real-acceptance.txt must exist with the specified content",
                             "timeout_seconds": 90,
                             "result_target": "none",
@@ -713,31 +749,56 @@ async fn test_dogfood_real_agy() {
 
         let adapter = Arc::new(OrcaExecutionAdapter::default());
 
-        // Step 1: Run 5 iterations to capture in-flight state at Dispatched/Waiting
+        // Step 1: Drive daemon until Dispatched or Waiting to capture in-flight state
         println!("[DOGFOOD REAL AGY] Driving daemon to capture in-flight state...");
-        let _ = run_daemon(&paths, adapter.clone(), Some(5)).await;
+        let in_flight = drive_until_phase(
+            &paths,
+            adapter.clone(),
+            |p| matches!(p, AttemptPhase::Dispatched | AttemptPhase::Waiting),
+            20,
+        )
+        .await
+        .expect("real AGY attempt must reach Dispatched or Waiting");
 
-        let in_flight = ActiveAttempt::load(&paths.active_attempt_file()).unwrap();
-        if let Some(att) = in_flight {
-            println!(
-                "[DOGFOOD REAL AGY] In-flight attempt phase: {:?}",
-                att.phase
-            );
-            assert!(matches!(
-                att.phase,
-                AttemptPhase::Dispatched | AttemptPhase::Waiting
-            ));
-            if let Some(exec) = att.executor {
-                println!(
-                    "[DOGFOOD REAL AGY] In-flight proof: {:?}, provider: {:?}, observation: {:?}",
-                    exec.dispatch_proof, exec.dispatch_provider, exec.dispatch_observation
+        println!(
+            "[DOGFOOD REAL AGY] In-flight attempt phase: {:?}",
+            in_flight.phase
+        );
+        let exec = in_flight
+            .executor
+            .as_ref()
+            .expect("real AGY attempt must have executor state at proof checkpoint");
+
+        println!(
+            "[DOGFOOD REAL AGY] In-flight proof: {:?}, provider: {:?}, observation: {:?}, agent_id: {:?}",
+            exec.dispatch_proof, exec.dispatch_provider, exec.dispatch_observation, exec.agent_id
+        );
+        assert_eq!(
+            exec.agent_id.as_deref(),
+            Some("agy"),
+            "agent_id must be 'agy'"
+        );
+
+        match (
+            exec.dispatch_provider.as_deref(),
+            exec.dispatch_observation.as_deref(),
+            exec.dispatch_proof,
+        ) {
+            (
+                Some("unsupported"),
+                Some("unsupported"),
+                Some(DispatchProof::AcceptedUnobservable),
+            ) => {
+                // Truthful unsupported observation
+            }
+            (_, _, Some(DispatchProof::TurnStarted)) => {
+                // Genuine TurnStarted observation
+            }
+            other => {
+                panic!(
+                    "Unexpected dispatch proof or observation metadata: {:?}",
+                    other
                 );
-                assert_eq!(
-                    exec.dispatch_proof,
-                    Some(DispatchProof::AcceptedUnobservable)
-                );
-                assert_eq!(exec.dispatch_provider.as_deref(), Some("unsupported"));
-                assert_eq!(exec.dispatch_observation.as_deref(), Some("unsupported"));
             }
         }
 
@@ -777,16 +838,17 @@ async fn test_dogfood_real_agy() {
             "task_dispatched must be true"
         );
 
-        // Verify file written by real AGY
+        // Verify file written by real AGY matches exact token
         let target_file = scratch_repo.join("v17-real-acceptance.txt");
         assert!(
             target_file.exists(),
             "AGY must have created v17-real-acceptance.txt in scratch repo"
         );
         let content = std::fs::read_to_string(&target_file).unwrap();
-        assert!(
-            content.contains(&token),
-            "v17-real-acceptance.txt must contain the expected token '{token}'"
+        assert_eq!(
+            content.trim(),
+            token,
+            "v17-real-acceptance.txt must contain exactly the expected token"
         );
 
         // Verify terminal was cleanly stopped and absent
@@ -806,13 +868,18 @@ async fn test_dogfood_real_agy() {
     }
 
     // =========================================================================
-    // Real AGY Run 2: Timeout Execution (5s timeout -> TIMED_OUT)
+    // Real AGY Run 2: Timeout Execution (30s timeout -> TIMED_OUT via adapter.wait)
     // =========================================================================
     println!("\n=== [DOGFOOD REAL AGY] Starting Run 2: Timeout Execution ===");
     {
         let server = MockServer::start().await;
-        let (_temp, paths, _cred, _config) =
-            setup_dogfood_env_with_cmd(&server.origin(), &repo_canon, "timeout", Some(&agent_cmd));
+        let (_temp, paths, _cred, _config) = setup_dogfood_env_with_cmd(
+            &server.origin(),
+            &repo_canon,
+            "timeout",
+            "agy",
+            Some(&agent_cmd),
+        );
 
         let job_id = format!("job-{}", Uuid::new_v4());
         let claim_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -898,9 +965,9 @@ async fn test_dogfood_real_agy() {
                             "workspace_id": "ws_dogfood",
                             "target_id": "tgt_dogfood",
                             "resource_id": null,
-                            "prompt": "Please do a complex refactor and analyze all files. Do not stop.",
+                            "prompt": "Run the shell command `sleep 60`. Wait for it to finish before completing the task.",
                             "acceptance": "Should time out before finishing",
-                            "timeout_seconds": 5, // 5s timeout
+                            "timeout_seconds": 30, // 30s timeout
                             "result_target": "none",
                         },
                         "claim_token": claim_token,
@@ -938,8 +1005,67 @@ async fn test_dogfood_real_agy() {
         });
 
         let adapter = Arc::new(OrcaExecutionAdapter::default());
-        println!("[DOGFOOD REAL AGY] Starting daemon for timeout run...");
-        let daemon_res = run_daemon(&paths, adapter, Some(15)).await;
+        println!("[DOGFOOD REAL AGY] Driving daemon to Waiting phase for timeout run...");
+        let waiting_attempt =
+            drive_until_phase(&paths, adapter.clone(), |p| p == AttemptPhase::Waiting, 20)
+                .await
+                .expect("real AGY timeout attempt must reach Waiting");
+
+        let exec = waiting_attempt
+            .executor
+            .as_ref()
+            .expect("executor must exist at Waiting");
+        assert_eq!(
+            exec.agent_id.as_deref(),
+            Some("agy"),
+            "agent_id must be 'agy'"
+        );
+        assert!(
+            matches!(
+                exec.dispatch_proof,
+                Some(DispatchProof::AcceptedUnobservable) | Some(DispatchProof::TurnStarted)
+            ),
+            "Waiting attempt must have valid dispatch proof"
+        );
+
+        let deadline = exec
+            .execution_deadline_ms
+            .expect("execution_deadline_ms must be set");
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            deadline > now,
+            "execution_deadline_ms must be in the future"
+        );
+        assert!(
+            deadline - now >= 15_000,
+            "Must have meaningful remaining budget, remaining: {}ms",
+            deadline - now
+        );
+
+        println!(
+            "[DOGFOOD REAL AGY] Driving Waiting phase to exercise adapter.wait until timeout..."
+        );
+        let outcome_attempt = drive_until_phase(
+            &paths,
+            adapter.clone(),
+            |p| p == AttemptPhase::OutcomeRecorded,
+            5,
+        )
+        .await
+        .expect("must reach OutcomeRecorded after timeout wait");
+
+        let exec_outcome = outcome_attempt
+            .executor
+            .as_ref()
+            .expect("executor must exist at OutcomeRecorded");
+        assert_eq!(
+            exec_outcome.runtime_completion_kind.as_deref(),
+            Some("timed_out"),
+            "runtime_completion_kind must be timed_out"
+        );
+
+        println!("[DOGFOOD REAL AGY] Finishing cleanup and report delivery...");
+        let daemon_res = run_daemon(&paths, adapter, Some(10)).await;
         println!("[DOGFOOD REAL AGY] Timeout run daemon result: {daemon_res:?}");
         assert!(daemon_res.is_ok());
 

@@ -121,6 +121,9 @@ pub struct OrcaTerminalItem {
     pub writable: Option<bool>,
     pub orphaned: Option<bool>,
     pub exit_cause: Option<OrcaExitCause>,
+    /// Set by Orca when a known agent is running in this terminal.
+    /// e.g. `"antigravity"` for AGY sessions.
+    pub agent_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -75,7 +75,64 @@ impl OrcaExecutionAdapter {
         Self { client }
     }
 
+    /// Poll `terminal show` until `connected == true && writable == true`, up to
+    /// `max_polls` attempts with 1-second inter-poll sleep.  Returns the
+    /// timestamp (ms) at which the terminal became ready.
+    async fn poll_connected_ready(
+        &self,
+        terminal_handle: &str,
+        max_polls: u32,
+    ) -> Result<i64, ReadinessError> {
+        for attempt in 0..max_polls {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let term = match self.client.show_terminal(terminal_handle).await {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return Err(ReadinessError::NotReady(format!(
+                        "AGENT_NOT_READY: terminal '{terminal_handle}' disappeared during readiness poll"
+                    )));
+                }
+                Err(e) => {
+                    return Err(ReadinessError::Retryable(format!(
+                        "readiness poll failed: {e}"
+                    )));
+                }
+            };
+            if term.connected == Some(true) && term.writable == Some(true) {
+                return Ok(chrono::Utc::now().timestamp_millis());
+            }
+        }
+        Err(ReadinessError::NotReady(format!(
+            "AGENT_NOT_READY: terminal '{terminal_handle}' did not become connected+writable after {max_polls} polls"
+        )))
+    }
+
     async fn run_readiness_gate(&self, terminal_handle: &str) -> Result<i64, ReadinessError> {
+        // Probe the terminal to learn its agent identity so we can choose the
+        // correct readiness strategy.
+        let agent_identity = match self.client.show_terminal(terminal_handle).await {
+            Ok(Some(t)) => t.agent_identity,
+            Ok(None) => {
+                return Err(ReadinessError::NotReady(format!(
+                    "AGENT_NOT_READY: terminal '{terminal_handle}' not found during initial probe"
+                )));
+            }
+            Err(e) => {
+                return Err(ReadinessError::Retryable(format!(
+                    "readiness initial probe failed: {e}"
+                )));
+            }
+        };
+
+        // AGY (and any other Orca-managed TUI agent) is never "tui-idle"
+        // because it is always running as an active process.  Use a
+        // connected+writable poll loop instead.
+        if agent_identity.as_deref() == Some("antigravity") {
+            return self.poll_connected_ready(terminal_handle, 30).await;
+        }
+
         let is_timeout = |err: &OrcaError| -> bool {
             match err {
                 OrcaError::Timeout(_) => true,

@@ -90,6 +90,8 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","connected":true,"writable":true}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
     COUNT_FILE="{}/wait_count"
     C=0
@@ -175,6 +177,8 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","connected":true,"writable":true}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
     echo '{{"ok":true,"result":{{"wait":{{"handle":"term_1","condition":"tui-idle","satisfied":false}}}}}}'
 else

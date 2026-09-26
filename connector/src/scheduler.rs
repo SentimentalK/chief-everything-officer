@@ -524,23 +524,32 @@ impl ActiveAttempt {
                 }
 
                 let v2: ActiveAttemptV2 = serde_json::from_value(val)?;
-                let (phase, dispatch_proof) = match v2.phase {
-                    AttemptPhase::LegacyRunning => (AttemptPhase::RecoveryRequired, None),
-                    AttemptPhase::Dispatched | AttemptPhase::Waiting => {
-                        // Fail closed: cannot verify if TurnStarted was genuine or pseudo-promoted
-                        (AttemptPhase::RecoveryRequired, None)
-                    }
-                    other => {
-                        let proof = v2
-                            .executor
-                            .as_ref()
-                            .and_then(|e| e.dispatch_stage.as_deref())
-                            .and_then(|s| match s {
+                let legacy_stage = v2
+                    .executor
+                    .as_ref()
+                    .and_then(|e| e.dispatch_stage.as_deref());
+
+                let (phase, dispatch_proof) = if legacy_stage == Some("turn_started")
+                    && !matches!(
+                        v2.phase,
+                        AttemptPhase::FinalizedLocal | AttemptPhase::RecoveryRequired
+                    ) {
+                    (AttemptPhase::RecoveryRequired, None)
+                } else {
+                    match v2.phase {
+                        AttemptPhase::LegacyRunning => (AttemptPhase::RecoveryRequired, None),
+                        AttemptPhase::Dispatched | AttemptPhase::Waiting => {
+                            // Fail closed: cannot verify if TurnStarted was genuine or pseudo-promoted
+                            (AttemptPhase::RecoveryRequired, None)
+                        }
+                        other => {
+                            let proof = legacy_stage.and_then(|s| match s {
                                 "input_accepted" => Some(DispatchProof::InputAccepted),
                                 "turn_started" => Some(DispatchProof::TurnStarted),
                                 _ => None,
                             });
-                        (other, proof)
+                            (other, proof)
+                        }
                     }
                 };
 
