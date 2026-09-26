@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import type { RedisRunner } from "../../src/jobs/redis-runner.js";
 
-export function createFakeRedisRunner(): RedisRunner {
+export function createFakeRedisRunner(): RedisRunner & {
+  zadd(key: string, score: number, member: string): Promise<number>;
+} {
   const strings = new Map<string, string>();
   const zsets = new Map<string, Map<string, number>>();
   const streams = new Map<string, Array<{ id: string; fields: Record<string, string | number> }>>();

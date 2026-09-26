@@ -20,6 +20,7 @@ import {
   targetQueueKeyV1,
   jobAttemptsKeyV1,
   requestKeyV2,
+  KEY_STREAM_V2,
   type JobRecordV2,
 } from "../src/jobs/v2-schema.js";
 import { type ExecutionReport } from "../src/jobs/execution-contract.js";
