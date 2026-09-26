@@ -560,7 +560,9 @@ pub async fn drive_active_attempt(
                     agent_id: None,
                     agent_ready_at_ms: None,
                     dispatch_request_id: None,
-                    dispatch_stage: None,
+                    dispatch_proof: None,
+                    dispatch_provider: None,
+                    dispatch_observation: None,
                     task_dispatched: false,
                     runtime_completion_kind: None,
                     dispatch_started_at_ms: None,
@@ -694,7 +696,9 @@ pub async fn drive_active_attempt(
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
-                            dispatch_stage: None,
+                            dispatch_proof: None,
+                            dispatch_provider: None,
+                            dispatch_observation: None,
                             dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
@@ -810,7 +814,9 @@ pub async fn drive_active_attempt(
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
-                            dispatch_stage: None,
+                            dispatch_proof: None,
+                            dispatch_provider: None,
+                            dispatch_observation: None,
                             dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
@@ -855,7 +861,9 @@ pub async fn drive_active_attempt(
                                 dispatch_request_id: None,
                                 dispatch_accepted_at_ms: None,
                                 last_dispatch_outcome: None,
-                                dispatch_stage: None,
+                                dispatch_proof: None,
+                                dispatch_provider: None,
+                                dispatch_observation: None,
                                 dispatch_observation_count: 0,
                                 runtime_completion_kind: None,
                                 runtime_completed_at_ms: None,
@@ -895,7 +903,9 @@ pub async fn drive_active_attempt(
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
                             last_dispatch_outcome: None,
-                            dispatch_stage: None,
+                            dispatch_proof: None,
+                            dispatch_provider: None,
+                            dispatch_observation: None,
                             dispatch_observation_count: 0,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
@@ -921,7 +931,7 @@ pub async fn drive_active_attempt(
                     );
                     Ok(true)
                 }
-                Ok(crate::scheduler::PrepareOutcome::RecoveryRequired(reason)) => {
+                Ok(crate::scheduler::PrepareOutcome::RecoveryRequired { execution, reason }) => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -931,6 +941,35 @@ pub async fn drive_active_attempt(
                         Some(c) if c.attempt_id == active.attempt_id => c,
                         _ => return Ok(true),
                     };
+                    if let Some(ident) = execution {
+                        let exec = current.executor.get_or_insert_with(|| {
+                            crate::scheduler::AttemptExecutorState {
+                                executor_type: "orca".into(),
+                                orca_version: None,
+                                worktree_id: None,
+                                terminal_id: None,
+                                agent_id: None,
+                                agent_ready_at_ms: None,
+                                dispatch_send_count: 0,
+                                dispatch_started_at_ms: None,
+                                execution_deadline_ms: None,
+                                dispatch_request_id: None,
+                                dispatch_accepted_at_ms: None,
+                                last_dispatch_outcome: None,
+                                dispatch_proof: None,
+                                dispatch_provider: None,
+                                dispatch_observation: None,
+                                dispatch_observation_count: 0,
+                                runtime_completion_kind: None,
+                                runtime_completed_at_ms: None,
+                                runtime_error: None,
+                            }
+                        });
+                        exec.orca_version = Some(ident.orca_version);
+                        exec.worktree_id = Some(ident.worktree_id);
+                        exec.terminal_id = Some(ident.terminal_id);
+                        exec.agent_id = Some(ident.agent_id);
+                    }
                     current.phase = AttemptPhase::RecoveryRequired;
                     current.save(&paths.active_attempt_file())?;
                     Err(DaemonError::RecoveryRequired(reason))
@@ -1014,7 +1053,12 @@ pub async fn drive_active_attempt(
             };
 
             match reconciliation {
-                crate::scheduler::DispatchReconciliation::Accepted { request_id, stage } => {
+                crate::scheduler::DispatchReconciliation::Accepted {
+                    request_id,
+                    proof,
+                    provider,
+                    observation,
+                } => {
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -1026,19 +1070,23 @@ pub async fn drive_active_attempt(
                     };
                     if let Some(ref mut exec) = current.executor {
                         exec.dispatch_request_id = Some(request_id.clone());
-                        exec.dispatch_stage = Some(stage);
+                        exec.dispatch_proof = Some(proof);
+                        exec.dispatch_provider = provider;
+                        exec.dispatch_observation = observation;
                         if exec.dispatch_accepted_at_ms.is_none() {
                             exec.dispatch_accepted_at_ms = Some(now_utc_ms());
                         }
                     }
 
-                    if stage == crate::scheduler::DispatchStage::TurnStarted {
+                    if proof == crate::scheduler::DispatchProof::TurnStarted
+                        || proof == crate::scheduler::DispatchProof::AcceptedUnobservable
+                    {
                         current.phase = AttemptPhase::Dispatched;
                         current.save(&paths.active_attempt_file())?;
                         return Ok(true);
                     }
 
-                    // stage == InputAccepted: check observation budget
+                    // proof == InputAccepted: check observation budget
                     let obs_count = current
                         .executor
                         .as_ref()
@@ -1072,26 +1120,54 @@ pub async fn drive_active_attempt(
                         }
                     };
 
-                    if let crate::scheduler::DispatchOutcome::Accepted {
-                        stage: new_stage, ..
-                    } = outcome
-                    {
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
-                        if let Some(ref mut exec) = current.executor {
-                            exec.dispatch_stage = Some(new_stage);
+                    match outcome {
+                        crate::scheduler::DispatchOutcome::Accepted {
+                            proof: new_proof,
+                            provider: new_prov,
+                            observation: new_obs,
+                            ..
+                        } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            if let Some(ref mut exec) = current.executor {
+                                exec.dispatch_proof = Some(new_proof);
+                                exec.dispatch_provider = new_prov;
+                                exec.dispatch_observation = new_obs;
+                            }
+                            if new_proof == crate::scheduler::DispatchProof::TurnStarted
+                                || new_proof
+                                    == crate::scheduler::DispatchProof::AcceptedUnobservable
+                            {
+                                current.phase = AttemptPhase::Dispatched;
+                            }
+                            current.save(&paths.active_attempt_file())?;
                         }
-                        if new_stage == crate::scheduler::DispatchStage::TurnStarted {
-                            current.phase = AttemptPhase::Dispatched;
+                        crate::scheduler::DispatchOutcome::RecoveryRequired { code, message } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            current.phase = AttemptPhase::RecoveryRequired;
+                            current.save(&paths.active_attempt_file())?;
+                            return Err(DaemonError::RecoveryRequired(format!(
+                                "{code}: {message}"
+                            )));
                         }
-                        current.save(&paths.active_attempt_file())?;
+                        _ => {}
                     }
                     Ok(true)
                 }
@@ -1180,7 +1256,9 @@ pub async fn drive_active_attempt(
                         crate::scheduler::DispatchOutcome::Accepted {
                             request_id,
                             accepted_at_ms,
-                            stage,
+                            proof,
+                            provider,
+                            observation,
                         } => {
                             let _lock = ExecutionLock::acquire_with_retry(
                                 &paths.state_lock_file(),
@@ -1195,10 +1273,14 @@ pub async fn drive_active_attempt(
                             if let Some(ref mut exec) = current.executor {
                                 exec.dispatch_request_id = Some(request_id);
                                 exec.dispatch_accepted_at_ms = Some(accepted_at_ms);
-                                exec.dispatch_stage = Some(stage);
+                                exec.dispatch_proof = Some(proof);
+                                exec.dispatch_provider = provider;
+                                exec.dispatch_observation = observation;
                                 exec.last_dispatch_outcome = None;
                             }
-                            if stage == crate::scheduler::DispatchStage::TurnStarted {
+                            if proof == crate::scheduler::DispatchProof::TurnStarted
+                                || proof == crate::scheduler::DispatchProof::AcceptedUnobservable
+                            {
                                 current.phase = AttemptPhase::Dispatched;
                             }
                             current.save(&paths.active_attempt_file())?;
@@ -1223,6 +1305,21 @@ pub async fn drive_active_attempt(
                             current.save(&paths.active_attempt_file())?;
                             eprintln!("Dispatch rejected before acceptance: {reason}. Intent remains for retry/budget check.");
                             Ok(true)
+                        }
+                        crate::scheduler::DispatchOutcome::RecoveryRequired { code, message } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            current.phase = AttemptPhase::RecoveryRequired;
+                            current.save(&paths.active_attempt_file())?;
+                            Err(DaemonError::RecoveryRequired(format!("{code}: {message}")))
                         }
                         crate::scheduler::DispatchOutcome::AmbiguousTransportFailure { error } => {
                             let _lock = ExecutionLock::acquire_with_retry(
@@ -1301,8 +1398,12 @@ pub async fn drive_active_attempt(
                 }
             };
 
-            let dispatch_stage = active.executor.as_ref().and_then(|e| e.dispatch_stage);
-            if dispatch_stage != Some(crate::scheduler::DispatchStage::TurnStarted) {
+            let dispatch_proof = active.executor.as_ref().and_then(|e| e.dispatch_proof);
+            if !matches!(
+                dispatch_proof,
+                Some(crate::scheduler::DispatchProof::TurnStarted)
+                    | Some(crate::scheduler::DispatchProof::AcceptedUnobservable)
+            ) {
                 let _lock = ExecutionLock::acquire_with_retry(
                     &paths.state_lock_file(),
                     Duration::from_secs(5),
@@ -1315,7 +1416,8 @@ pub async fn drive_active_attempt(
                 current.phase = AttemptPhase::RecoveryRequired;
                 current.save(&paths.active_attempt_file())?;
                 return Err(DaemonError::RecoveryRequired(
-                    "Waiting phase requires dispatch_stage=TurnStarted".into(),
+                    "Waiting phase requires dispatch_proof in [TurnStarted, AcceptedUnobservable]"
+                        .into(),
                 ));
             }
 
@@ -1459,67 +1561,68 @@ pub async fn drive_active_attempt(
                 DaemonError::RecoveryRequired("OutcomeRecorded phase missing executor state".into())
             })?;
 
-            let (status, outcome, task_dispatched, err) =
-                match exec_state.runtime_completion_kind.as_deref() {
-                    Some("tui_idle") => (
-                        ExecutionStatus::COMPLETED,
-                        BusinessOutcome::UNVERIFIED,
-                        true,
-                        None,
-                    ),
-                    Some("timed_out") => (
-                        ExecutionStatus::TIMED_OUT,
-                        BusinessOutcome::UNVERIFIED,
-                        true,
-                        exec_state.runtime_error.clone().or_else(|| {
-                            Some(ExecutionReportError {
-                                stage: "runtime".into(),
-                                code: "EXECUTION_TIMEOUT".into(),
-                                message: "Execution timed out".into(),
-                            })
-                        }),
-                    ),
-                    Some("interrupted") => (
-                        ExecutionStatus::INTERRUPTED,
-                        BusinessOutcome::UNVERIFIED,
-                        true,
-                        exec_state.runtime_error.clone().or_else(|| {
-                            Some(ExecutionReportError {
-                                stage: "runtime".into(),
-                                code: "TERMINAL_EXITED".into(),
-                                message: "Execution interrupted".into(),
-                            })
-                        }),
-                    ),
-                    Some("not_started") => (
-                        ExecutionStatus::BLOCKED,
-                        BusinessOutcome::NOT_STARTED,
-                        false,
-                        exec_state.runtime_error.clone().or_else(|| {
-                            Some(ExecutionReportError {
-                                stage: "orchestration".into(),
-                                code: "EXECUTION_NOT_STARTED".into(),
-                                message: "Execution blocked before agent dispatch".into(),
-                            })
-                        }),
-                    ),
-                    other => {
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
-                        current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
-                        return Err(DaemonError::RecoveryRequired(format!(
-                            "Unknown runtime_completion_kind: {other:?}"
-                        )));
-                    }
-                };
+            let task_dispatched = matches!(
+                exec_state.dispatch_proof,
+                Some(crate::scheduler::DispatchProof::TurnStarted)
+                    | Some(crate::scheduler::DispatchProof::AcceptedUnobservable)
+            );
+
+            let (status, outcome, err) = match exec_state.runtime_completion_kind.as_deref() {
+                Some("tui_idle") => (
+                    ExecutionStatus::COMPLETED,
+                    BusinessOutcome::UNVERIFIED,
+                    None,
+                ),
+                Some("timed_out") => (
+                    ExecutionStatus::TIMED_OUT,
+                    BusinessOutcome::UNVERIFIED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "runtime".into(),
+                            code: "EXECUTION_TIMEOUT".into(),
+                            message: "Execution timed out".into(),
+                        })
+                    }),
+                ),
+                Some("interrupted") => (
+                    ExecutionStatus::INTERRUPTED,
+                    BusinessOutcome::UNVERIFIED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "runtime".into(),
+                            code: "TERMINAL_EXITED".into(),
+                            message: "Execution interrupted".into(),
+                        })
+                    }),
+                ),
+                Some("not_started") => (
+                    ExecutionStatus::BLOCKED,
+                    BusinessOutcome::NOT_STARTED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "orchestration".into(),
+                            code: "EXECUTION_NOT_STARTED".into(),
+                            message: "Execution blocked before agent dispatch".into(),
+                        })
+                    }),
+                ),
+                other => {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(format!(
+                        "Unknown runtime_completion_kind: {other:?}"
+                    )));
+                }
+            };
 
             let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
             let completed_ms = exec_state
@@ -1547,9 +1650,9 @@ pub async fn drive_active_attempt(
                 agent_id: exec_state.agent_id.clone(),
                 agent_ready_at_ms: exec_state.agent_ready_at_ms,
                 dispatch_request_id: exec_state.dispatch_request_id.clone(),
-                dispatch_stage: exec_state
-                    .dispatch_stage
-                    .map(|s| format!("{s:?}").to_lowercase()),
+                dispatch_proof: exec_state.dispatch_proof,
+                dispatch_provider: exec_state.dispatch_provider.clone(),
+                dispatch_observation: exec_state.dispatch_observation.clone(),
                 task_dispatched,
                 runtime_completion_kind: exec_state.runtime_completion_kind.clone(),
                 dispatch_started_at_ms: exec_state.dispatch_started_at_ms,

@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ceo_connector::config::{LocalExecutorConfig, LocalTarget};
+use ceo_connector::orca::adapter::{validate_tui_idle_wait, ValidatedWait};
 use ceo_connector::orca::client::{parse_orca_json, OrcaCliClient, OrcaCommandOutput, OrcaError};
 use ceo_connector::orca::receipt::ExecutionReceipt;
 use ceo_connector::orca::types::*;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptPhase, CleanupOutcome, DispatchOutcome, ExecutionAdapter, WaitOutcome,
-    ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ActiveAttempt, AttemptPhase, CleanupOutcome, DispatchOutcome, DispatchProof, ExecutionAdapter,
+    WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -275,7 +276,9 @@ fn test_execution_receipt_hashing_and_exclusion() {
         agent_id: Some("agy".into()),
         agent_ready_at_ms: Some(1727220000000),
         dispatch_request_id: Some("req_xyz".into()),
-        dispatch_stage: Some("turn_started".into()),
+        dispatch_proof: Some(DispatchProof::TurnStarted),
+        dispatch_provider: Some("unsupported".into()),
+        dispatch_observation: Some("unsupported".into()),
         task_dispatched: true,
         runtime_completion_kind: Some("tui_idle".into()),
         dispatch_started_at_ms: Some(1727220000000),
@@ -396,7 +399,7 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","title":"ceo:att_123"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
-    echo '{{"ok":true,"result":{{"wait":{{"satisfied":true}}}}}}'
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_new_123","condition":"tui-idle","satisfied":true}}}}}}'
 else
     echo '{{"ok":false}}'
 fi
@@ -521,7 +524,7 @@ elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","title":"ceo:att_123","worktreeId":"wt_target_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
-    echo '{{"ok":true,"result":{{"wait":{{"satisfied":true}}}}}}'
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_created_target","condition":"tui-idle","satisfied":true}}}}}}'
 else
     echo '{{"ok":false}}'
 fi
@@ -893,4 +896,217 @@ fi
         outcome_success,
         CleanupOutcome::VerifiedClosed { .. }
     ));
+}
+
+#[test]
+fn test_validate_tui_idle_wait_protocol() {
+    // 1. ok = false
+    let resp_not_ok = OrcaTerminalWaitResponse {
+        ok: false,
+        result: None,
+        error: None,
+    };
+    assert!(validate_tui_idle_wait("term_1", &resp_not_ok).is_err());
+
+    // 2. missing result
+    let resp_no_res = OrcaTerminalWaitResponse {
+        ok: true,
+        result: None,
+        error: None,
+    };
+    assert!(validate_tui_idle_wait("term_1", &resp_no_res).is_err());
+
+    // 3. handle mismatch
+    let resp_mismatch = OrcaTerminalWaitResponse {
+        ok: true,
+        result: Some(OrcaTerminalWaitResult {
+            wait: Some(OrcaWaitPart {
+                handle: Some("term_different".into()),
+                condition: Some("tui-idle".into()),
+                satisfied: true,
+                elapsed_ms: Some(150),
+            }),
+        }),
+        error: None,
+    };
+    let err = validate_tui_idle_wait("term_1", &resp_mismatch).unwrap_err();
+    assert!(err.contains("handle mismatch"));
+
+    // 4. condition mismatch
+    let resp_cond_mismatch = OrcaTerminalWaitResponse {
+        ok: true,
+        result: Some(OrcaTerminalWaitResult {
+            wait: Some(OrcaWaitPart {
+                handle: Some("term_1".into()),
+                condition: Some("prompt-ready".into()),
+                satisfied: true,
+                elapsed_ms: Some(150),
+            }),
+        }),
+        error: None,
+    };
+    let err = validate_tui_idle_wait("term_1", &resp_cond_mismatch).unwrap_err();
+    assert!(err.contains("condition mismatch"));
+
+    // 5. satisfied true
+    let resp_satisfied = OrcaTerminalWaitResponse {
+        ok: true,
+        result: Some(OrcaTerminalWaitResult {
+            wait: Some(OrcaWaitPart {
+                handle: Some("term_1".into()),
+                condition: Some("tui-idle".into()),
+                satisfied: true,
+                elapsed_ms: Some(250),
+            }),
+        }),
+        error: None,
+    };
+    assert_eq!(
+        validate_tui_idle_wait("term_1", &resp_satisfied).unwrap(),
+        ValidatedWait::Satisfied { elapsed_ms: 250 }
+    );
+
+    // 6. satisfied false
+    let resp_unsatisfied = OrcaTerminalWaitResponse {
+        ok: true,
+        result: Some(OrcaTerminalWaitResult {
+            wait: Some(OrcaWaitPart {
+                handle: Some("term_1".into()),
+                condition: Some("tui-idle".into()),
+                satisfied: false,
+                elapsed_ms: Some(300),
+            }),
+        }),
+        error: None,
+    };
+    assert_eq!(
+        validate_tui_idle_wait("term_1", &resp_unsatisfied).unwrap(),
+        ValidatedWait::Unsatisfied { elapsed_ms: 300 }
+    );
+}
+
+#[test]
+fn test_active_attempt_v2_to_v3_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_file = temp.path().join("attempt.json");
+
+    // Case 1: V2 with Dispatched and legacy turn_started fails closed to RecoveryRequired
+    let v2_turn_started_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_1",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "dispatched",
+        "executor": {
+            "type": "orca",
+            "worktree_id": "wt_1",
+            "terminal_id": "term_1",
+            "agent_id": "agy",
+            "dispatch_send_count": 1,
+            "dispatch_request_id": "req_1",
+            "dispatch_stage": "turn_started",
+            "dispatch_observation_count": 0
+        }
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&v2_turn_started_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+
+    // Case 2: V2 with claim_intent migrates cleanly
+    let v2_claim_intent_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_2",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "claim_intent",
+        "executor": null
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&v2_claim_intent_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
+
+    // Case 2b: V2 with DispatchIntent and legacy input_accepted migrates to DispatchProof::InputAccepted
+    let prompt = "do task";
+    let acceptance = "must work";
+    let hash = ActiveAttempt::compute_payload_sha256(
+        "job_2b", "ws_1", "tgt_1", None, prompt, acceptance, 60, "none",
+    );
+    let v2_dispatch_intent_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_2b",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "dispatch_intent",
+        "prompt": prompt,
+        "acceptance": acceptance,
+        "execution_timeout_seconds": 60,
+        "result_target": "none",
+        "payload_sha256": hash,
+        "executor": {
+            "type": "orca",
+            "worktree_id": "wt_1",
+            "terminal_id": "term_1",
+            "agent_id": "agy",
+            "agent_ready_at_ms": 1727000000000i64,
+            "dispatch_send_count": 1,
+            "dispatch_request_id": "req_1",
+            "dispatch_stage": "input_accepted",
+            "dispatch_observation_count": 0
+        }
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&v2_dispatch_intent_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.phase, AttemptPhase::DispatchIntent);
+    assert_eq!(
+        loaded.executor.unwrap().dispatch_proof,
+        Some(DispatchProof::InputAccepted)
+    );
+
+    // Case 3: V2 with legacy "running" fails closed to RecoveryRequired
+    let v2_running_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_3",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "running"
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&v2_running_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded.schema_version, 3);
+    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
 }

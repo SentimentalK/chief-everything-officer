@@ -18,7 +18,7 @@ use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    DispatchReconciliation, DispatchStage, ExecutionAdapter, PrepareOutcome, PreparedExecution,
+    DispatchProof, DispatchReconciliation, ExecutionAdapter, PrepareOutcome, PreparedExecution,
     WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
@@ -93,7 +93,9 @@ impl ExecutionAdapter for MockAdapter {
             Ok(DispatchOutcome::Accepted {
                 request_id: "req_mock_123".into(),
                 accepted_at_ms: chrono::Utc::now().timestamp_millis(),
-                stage: DispatchStage::TurnStarted,
+                proof: DispatchProof::TurnStarted,
+                provider: Some("mock".into()),
+                observation: Some("mock".into()),
             })
         })
     }
@@ -180,7 +182,9 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         execution_deadline_ms: None,
         dispatch_request_id: None,
         dispatch_accepted_at_ms: None,
-        dispatch_stage: None,
+        dispatch_proof: None,
+        dispatch_provider: None,
+        dispatch_observation: None,
         dispatch_observation_count: 0,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
@@ -436,7 +440,9 @@ async fn test_outcome_recorded_crash_recovery_skips_wait_and_dispatch() {
     executor_state.execution_deadline_ms = Some(1727000060000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
+    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
+    executor_state.dispatch_provider = Some("mock".into());
+    executor_state.dispatch_observation = Some("mock".into());
     executor_state.runtime_completion_kind = Some("tui_idle".into());
     executor_state.runtime_completed_at_ms = Some(1727000010000);
 
@@ -501,7 +507,9 @@ async fn test_durable_deadline_expired_marks_timed_out_without_waiting() {
     executor_state.execution_deadline_ms = Some(now - 1_000); // 1s in the past!
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
+    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
+    executor_state.dispatch_provider = Some("mock".into());
+    executor_state.dispatch_observation = Some("mock".into());
 
     let active = make_test_attempt(
         &cred,
@@ -745,7 +753,9 @@ async fn test_zero_lock_contention_during_adapter_wait() {
     executor_state.execution_deadline_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
+    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
+    executor_state.dispatch_provider = Some("mock".into());
+    executor_state.dispatch_observation = Some("mock".into());
 
     // Start in Waiting phase so adapter.wait() is directly invoked
     let active = make_test_attempt(
@@ -988,7 +998,9 @@ async fn test_interrupted_runtime_outcome_semantics() {
     executor_state.execution_deadline_ms = Some(now + 60_000);
     executor_state.dispatch_request_id = Some("req_mock".into());
     executor_state.dispatch_send_count = 1;
-    executor_state.dispatch_stage = Some(DispatchStage::TurnStarted);
+    executor_state.dispatch_proof = Some(DispatchProof::TurnStarted);
+    executor_state.dispatch_provider = Some("mock".into());
+    executor_state.dispatch_observation = Some("mock".into());
 
     let active = make_test_attempt(
         &cred,

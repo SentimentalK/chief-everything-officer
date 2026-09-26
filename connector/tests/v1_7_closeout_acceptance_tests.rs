@@ -14,7 +14,7 @@ use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
-    ActiveAttempt, AttemptExecutorState, AttemptPhase, DispatchStage, ExecutionAdapter,
+    ActiveAttempt, AttemptExecutorState, AttemptPhase, DispatchProof, ExecutionAdapter,
     ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::MockServer;
@@ -283,7 +283,9 @@ fi
         execution_deadline_ms: None,
         dispatch_request_id: None,
         dispatch_accepted_at_ms: None,
-        dispatch_stage: None,
+        dispatch_proof: None,
+        dispatch_provider: None,
+        dispatch_observation: None,
         dispatch_observation_count: 0,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
@@ -338,7 +340,7 @@ fi
         .unwrap();
     assert_eq!(attempt_after_first.phase, AttemptPhase::DispatchIntent);
     let exec1 = attempt_after_first.executor.as_ref().unwrap();
-    assert_eq!(exec1.dispatch_stage, Some(DispatchStage::InputAccepted));
+    assert_eq!(exec1.dispatch_proof, Some(DispatchProof::InputAccepted));
     assert_eq!(exec1.dispatch_request_id.as_deref(), Some("req_replay_1"));
     assert_eq!(exec1.dispatch_observation_count, 0);
 
@@ -359,7 +361,7 @@ fi
         .unwrap();
     assert_eq!(attempt_after_second.phase, AttemptPhase::Dispatched);
     let exec2 = attempt_after_second.executor.as_ref().unwrap();
-    assert_eq!(exec2.dispatch_stage, Some(DispatchStage::TurnStarted));
+    assert_eq!(exec2.dispatch_proof, Some(DispatchProof::TurnStarted));
     assert_eq!(exec2.dispatch_observation_count, 1);
 }
 
@@ -416,7 +418,9 @@ fi
         execution_deadline_ms: Some(now + 60_000),
         dispatch_request_id: Some("req_clean_1".into()),
         dispatch_accepted_at_ms: Some(now - 7_000),
-        dispatch_stage: Some(DispatchStage::TurnStarted),
+        dispatch_proof: Some(DispatchProof::TurnStarted),
+        dispatch_provider: Some("unsupported".into()),
+        dispatch_observation: Some("unsupported".into()),
         dispatch_observation_count: 1,
         runtime_completion_kind: Some("tui_idle".into()),
         runtime_completed_at_ms: Some(now - 2_000),
@@ -542,7 +546,9 @@ fi
         execution_deadline_ms: Some(now + 60_000),
         dispatch_request_id: Some("req_replay_1".into()),
         dispatch_accepted_at_ms: Some(now - 500),
-        dispatch_stage: Some(DispatchStage::InputAccepted),
+        dispatch_proof: Some(DispatchProof::InputAccepted),
+        dispatch_provider: Some("unsupported".into()),
+        dispatch_observation: Some("unsupported".into()),
         dispatch_observation_count: 2, // Budget already reached 2
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,

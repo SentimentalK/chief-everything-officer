@@ -11,7 +11,7 @@ use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
-pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 2;
+pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -69,8 +69,9 @@ struct CanonicalPayload<'a> {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum DispatchStage {
+pub enum DispatchProof {
     InputAccepted,
+    AcceptedUnobservable,
     TurnStarted,
 }
 
@@ -111,7 +112,11 @@ pub struct AttemptExecutorState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dispatch_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_stage: Option<DispatchStage>,
+    pub dispatch_proof: Option<DispatchProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_observation: Option<String>,
     #[serde(default)]
     pub dispatch_observation_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +317,55 @@ impl ActiveAttempt {
                                 "prepared attempt missing agent_ready_at_ms".into(),
                             ));
                         }
+
+                        if matches!(self.phase, AttemptPhase::Dispatched | AttemptPhase::Waiting) {
+                            if exec.dispatch_request_id.is_none() {
+                                return Err(SchedulerError::CorruptState(
+                                    "dispatched/waiting attempt missing dispatch_request_id".into(),
+                                ));
+                            }
+                            match exec.dispatch_proof {
+                                Some(DispatchProof::TurnStarted)
+                                | Some(DispatchProof::AcceptedUnobservable) => {}
+                                other => {
+                                    return Err(SchedulerError::CorruptState(format!(
+                                        "dispatched/waiting attempt requires TurnStarted or AcceptedUnobservable proof, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+
+                        if self.phase == AttemptPhase::OutcomeRecorded {
+                            if exec.runtime_completion_kind.as_deref() == Some("not_started") {
+                                if matches!(
+                                    exec.dispatch_proof,
+                                    Some(DispatchProof::TurnStarted)
+                                        | Some(DispatchProof::AcceptedUnobservable)
+                                ) {
+                                    return Err(SchedulerError::CorruptState(
+                                        "not_started attempt cannot have TurnStarted or AcceptedUnobservable proof".into(),
+                                    ));
+                                }
+                            } else if matches!(
+                                exec.runtime_completion_kind.as_deref(),
+                                Some("tui_idle") | Some("timed_out") | Some("interrupted")
+                            ) {
+                                if exec.dispatch_request_id.is_none() {
+                                    return Err(SchedulerError::CorruptState(
+                                        "dispatched outcome missing dispatch_request_id".into(),
+                                    ));
+                                }
+                                match exec.dispatch_proof {
+                                    Some(DispatchProof::TurnStarted)
+                                    | Some(DispatchProof::AcceptedUnobservable) => {}
+                                    other => {
+                                        return Err(SchedulerError::CorruptState(format!(
+                                            "dispatched outcome requires TurnStarted or AcceptedUnobservable proof, got {other:?}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         return Err(SchedulerError::CorruptState(
                             "prepared attempt missing executor state".into(),
@@ -405,6 +459,135 @@ impl ActiveAttempt {
                 }
             }
             2 => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct AttemptExecutorStateV2 {
+                    #[serde(rename = "type")]
+                    pub executor_type: String,
+                    #[serde(default)]
+                    pub orca_version: Option<String>,
+                    #[serde(default)]
+                    pub worktree_id: Option<String>,
+                    #[serde(default)]
+                    pub terminal_id: Option<String>,
+                    #[serde(default)]
+                    pub agent_id: Option<String>,
+                    #[serde(default)]
+                    pub agent_ready_at_ms: Option<i64>,
+                    #[serde(default)]
+                    pub dispatch_send_count: u32,
+                    #[serde(default)]
+                    pub dispatch_started_at_ms: Option<i64>,
+                    #[serde(default)]
+                    pub execution_deadline_ms: Option<i64>,
+                    #[serde(default)]
+                    pub dispatch_request_id: Option<String>,
+                    #[serde(default)]
+                    pub dispatch_accepted_at_ms: Option<i64>,
+                    #[serde(default)]
+                    pub last_dispatch_outcome: Option<String>,
+                    #[serde(default)]
+                    pub dispatch_stage: Option<String>,
+                    #[serde(default)]
+                    pub dispatch_observation_count: u8,
+                    #[serde(default)]
+                    pub runtime_completion_kind: Option<String>,
+                    #[serde(default)]
+                    pub runtime_completed_at_ms: Option<i64>,
+                    #[serde(default)]
+                    pub runtime_error: Option<crate::execution_contract::ExecutionReportError>,
+                }
+
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                #[allow(dead_code)]
+                struct ActiveAttemptV2 {
+                    pub schema_version: u32,
+                    pub server_origin: String,
+                    pub device_id: String,
+                    pub job_id: String,
+                    pub workspace_id: String,
+                    pub target_id: String,
+                    pub attempt_id: String,
+                    pub claim_token: String,
+                    pub phase: AttemptPhase,
+                    pub resource_id: Option<String>,
+                    pub prompt: Option<String>,
+                    pub acceptance: Option<String>,
+                    pub execution_timeout_seconds: Option<u32>,
+                    pub result_target: Option<String>,
+                    pub payload_sha256: Option<String>,
+                    pub claimed_at_ms: Option<i64>,
+                    pub terminal_report_sha256: Option<String>,
+                    #[serde(default)]
+                    pub executor: Option<AttemptExecutorStateV2>,
+                }
+
+                let v2: ActiveAttemptV2 = serde_json::from_value(val)?;
+                let (phase, dispatch_proof) = match v2.phase {
+                    AttemptPhase::LegacyRunning => (AttemptPhase::RecoveryRequired, None),
+                    AttemptPhase::Dispatched | AttemptPhase::Waiting => {
+                        // Fail closed: cannot verify if TurnStarted was genuine or pseudo-promoted
+                        (AttemptPhase::RecoveryRequired, None)
+                    }
+                    other => {
+                        let proof = v2
+                            .executor
+                            .as_ref()
+                            .and_then(|e| e.dispatch_stage.as_deref())
+                            .and_then(|s| match s {
+                                "input_accepted" => Some(DispatchProof::InputAccepted),
+                                "turn_started" => Some(DispatchProof::TurnStarted),
+                                _ => None,
+                            });
+                        (other, proof)
+                    }
+                };
+
+                let executor = v2.executor.map(|e| AttemptExecutorState {
+                    executor_type: e.executor_type,
+                    orca_version: e.orca_version,
+                    worktree_id: e.worktree_id,
+                    terminal_id: e.terminal_id,
+                    agent_id: e.agent_id,
+                    agent_ready_at_ms: e.agent_ready_at_ms,
+                    dispatch_send_count: e.dispatch_send_count,
+                    dispatch_started_at_ms: e.dispatch_started_at_ms,
+                    execution_deadline_ms: e.execution_deadline_ms,
+                    dispatch_request_id: e.dispatch_request_id,
+                    dispatch_accepted_at_ms: e.dispatch_accepted_at_ms,
+                    last_dispatch_outcome: e.last_dispatch_outcome,
+                    dispatch_proof,
+                    dispatch_provider: None,
+                    dispatch_observation: None,
+                    dispatch_observation_count: e.dispatch_observation_count,
+                    runtime_completion_kind: e.runtime_completion_kind,
+                    runtime_completed_at_ms: e.runtime_completed_at_ms,
+                    runtime_error: e.runtime_error,
+                });
+
+                ActiveAttempt {
+                    schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+                    server_origin: v2.server_origin,
+                    device_id: v2.device_id,
+                    job_id: v2.job_id,
+                    workspace_id: v2.workspace_id,
+                    target_id: v2.target_id,
+                    attempt_id: v2.attempt_id,
+                    claim_token: v2.claim_token,
+                    phase,
+                    resource_id: v2.resource_id,
+                    prompt: v2.prompt,
+                    acceptance: v2.acceptance,
+                    execution_timeout_seconds: v2.execution_timeout_seconds,
+                    result_target: v2.result_target,
+                    payload_sha256: v2.payload_sha256,
+                    claimed_at_ms: v2.claimed_at_ms,
+                    terminal_report_sha256: v2.terminal_report_sha256,
+                    executor,
+                }
+            }
+            3 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
                 if att.phase == AttemptPhase::LegacyRunning {
                     att.phase = AttemptPhase::RecoveryRequired;
@@ -429,7 +612,9 @@ impl ActiveAttempt {
 pub enum DispatchReconciliation {
     Accepted {
         request_id: String,
-        stage: DispatchStage,
+        proof: DispatchProof,
+        provider: Option<String>,
+        observation: Option<String>,
     },
     DefinitelyNotDispatched,
     Ambiguous,
@@ -440,13 +625,19 @@ pub enum DispatchOutcome {
     Accepted {
         request_id: String,
         accepted_at_ms: i64,
-        stage: DispatchStage,
+        proof: DispatchProof,
+        provider: Option<String>,
+        observation: Option<String>,
     },
     KnownRejectedBeforeAcceptance {
         reason: String,
     },
     AmbiguousTransportFailure {
         error: String,
+    },
+    RecoveryRequired {
+        code: String,
+        message: String,
     },
 }
 
@@ -476,7 +667,10 @@ pub enum PrepareOutcome {
         execution: Option<PreparedExecutionIdentity>,
         reason: String,
     },
-    RecoveryRequired(String),
+    RecoveryRequired {
+        execution: Option<PreparedExecutionIdentity>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,9 +736,10 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
     ) -> Result<PrepareOutcome, String> {
-        Ok(PrepareOutcome::RecoveryRequired(
-            "UnavailableExecutionAdapter cannot prepare".into(),
-        ))
+        Ok(PrepareOutcome::RecoveryRequired {
+            execution: None,
+            reason: "UnavailableExecutionAdapter cannot prepare".into(),
+        })
     }
 
     async fn reconcile_dispatch(
@@ -627,7 +822,9 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         Ok(DispatchOutcome::Accepted {
             request_id: "req_fake".into(),
             accepted_at_ms: chrono::Utc::now().timestamp_millis(),
-            stage: DispatchStage::TurnStarted,
+            proof: DispatchProof::TurnStarted,
+            provider: Some("fake".into()),
+            observation: Some("fake".into()),
         })
     }
 
@@ -857,9 +1054,9 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string(&v1_json).unwrap()).unwrap();
 
-        // Load must migrate schema_version to 2 with executor: None
+        // Load must migrate schema_version to 3 with executor: None
         let loaded = ActiveAttempt::load(&path).unwrap().unwrap();
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, ACTIVE_ATTEMPT_SCHEMA_VERSION);
         assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
         assert!(loaded.executor.is_none());
     }

@@ -278,11 +278,7 @@ impl OrcaCliClient {
             .await?;
         match parse_orca_json::<OrcaTerminalShowResponse>(output) {
             Ok(resp) => Ok(resp.result.map(|r| r.terminal)),
-            Err(OrcaError::Orca { ref code, .. })
-                if code == "terminal_not_found" || code == "selector_not_found" =>
-            {
-                Ok(None)
-            }
+            Err(OrcaError::Orca { ref code, .. }) if code == "terminal_not_found" => Ok(None),
             Err(e) => Err(e),
         }
     }

@@ -104,6 +104,12 @@ pub struct OrcaRepoItem {
     pub path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaExitCause {
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrcaTerminalItem {
@@ -113,6 +119,8 @@ pub struct OrcaTerminalItem {
     pub title: Option<String>,
     pub connected: Option<bool>,
     pub writable: Option<bool>,
+    pub orphaned: Option<bool>,
+    pub exit_cause: Option<OrcaExitCause>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
