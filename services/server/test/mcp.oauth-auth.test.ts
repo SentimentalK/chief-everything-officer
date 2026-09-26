@@ -71,9 +71,9 @@ async function setupMcpAuthTestApp() {
     }
   );
 
-  // Protected worker route (strictly single-key IdentityService)
+  // Protected identity route (strictly single-key IdentityService)
   app.get(
-    "/api/worker/protected",
+    "/api/test/protected",
     createIdentityAuthMiddleware(identityService),
     (req: Request, res: Response) => {
       res.status(200).json({ ok: true, identity: res.locals.identity });
@@ -315,18 +315,18 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
     }
   });
 
-  it("ensures worker routes only accept MCP_API_KEY and reject OAuth tokens", async () => {
+  it("ensures identity-authenticated routes only accept MCP_API_KEY and reject OAuth tokens", async () => {
     const env = await setupMcpAuthTestApp();
     try {
-      // 1. Worker accepts MCP_API_KEY
-      const goodRes = await fetch(`${env.baseUrl}/api/worker/protected`, {
+      // 1. Accepts MCP_API_KEY
+      const goodRes = await fetch(`${env.baseUrl}/api/test/protected`, {
         headers: {
           Authorization: `Bearer ${env.rawApiKey}`,
         },
       });
       expect(goodRes.status).toBe(200);
 
-      // 2. Worker rejects OAuth token
+      // 2. Rejects OAuth token
       const verifier = "verifier_worker_boundary_test_1234567890123";
       const challenge = sha256Base64Url(verifier);
       const reqId = "oar_worker_bnd";
@@ -355,7 +355,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
         resource: "https://ceo.sentimentalk.com/mcp",
       });
 
-      const badRes = await fetch(`${env.baseUrl}/api/worker/protected`, {
+      const badRes = await fetch(`${env.baseUrl}/api/test/protected`, {
         headers: {
           Authorization: `Bearer ${tokens.access_token}`,
         },

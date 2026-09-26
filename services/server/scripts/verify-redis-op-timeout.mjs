@@ -16,7 +16,7 @@
 // image instead hung past 1500 ms on this scenario.
 import net from "node:net";
 import { createClient } from "redis";
-import { createRedisRunnerFromClient, StoreError } from "../dist/jobs/redis-store.js";
+import { createRedisRunnerFromClient, StoreError } from "../dist/jobs/redis-runner.js";
 
 const OP_TIMEOUT_MS = 250;
 const HARD_LIMIT_MS = 1500;

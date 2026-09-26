@@ -8,7 +8,6 @@ import {
   SocketClosedUnexpectedlyError,
   type RedisClientType,
 } from "redis";
-import { KEY_STREAM } from "./schema.js";
 
 export interface NeutralRedisTransport {
   runner: RedisRunner;
@@ -56,7 +55,7 @@ export interface RedisRunner {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<void>;
   /** Append a single-entry Redis Stream and return its entry id. */
-  xaddStream(payload: Record<string, string | number>): Promise<string>;
+  xaddStream(key: string, payload: Record<string, string | number>): Promise<string>;
   /** Number of entries in a key (stream length, for assertions). */
   xlen(key: string): Promise<number>;
   /** XRANGE over a stream from an EXCLUSIVE start with a bounded COUNT. */
@@ -265,17 +264,17 @@ export function createRedisRunnerFromClient(
         await client.sendCommand(["SET", key, value]);
       });
     },
-    async xaddStream(payload) {
+    async xaddStream(key, payload) {
       const parts: string[] = [];
       for (const [k, v] of Object.entries(payload)) parts.push(k, String(v));
       return execute("XADD", async (client) => {
-        const out = await client.sendCommand(["XADD", KEY_STREAM, "*", ...parts]);
+        const out = await client.sendCommand(["XADD", key, "*", ...parts]);
         return String(out);
       });
     },
-    async xlen() {
+    async xlen(key) {
       return execute("XLEN", async (client) => {
-        const out = await client.sendCommand(["XLEN", KEY_STREAM]);
+        const out = await client.sendCommand(["XLEN", key]);
         return typeof out === "number" ? out : Number(out);
       });
     },

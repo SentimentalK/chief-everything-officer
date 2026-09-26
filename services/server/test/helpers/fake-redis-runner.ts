@@ -20,11 +20,11 @@ export function createFakeRedisRunner(): RedisRunner {
     async set(key: string, value: string) {
       strings.set(key, value);
     },
-    async xaddStream(payload: Record<string, string | number>) {
+    async xaddStream(key: string, payload: Record<string, string | number>) {
       const id = `${Date.now()}-${++streamSeq}`;
-      const stream = streams.get("ceo:jobs:v2") ?? [];
+      const stream = streams.get(key) ?? [];
       stream.push({ id, fields: payload });
-      streams.set("ceo:jobs:v2", stream);
+      streams.set(key, stream);
       return id;
     },
     async xlen(key: string) {
@@ -118,41 +118,6 @@ export function createFakeRedisRunner(): RedisRunner {
         const err = new Error("NOSCRIPT No matching script");
         (err as unknown as { code: string }).code = "NOSCRIPT";
         throw err;
-      }
-
-      if (script.includes("local P = 'ceo:job:'")) {
-        // Legacy CREATE_SCRIPT
-        // KEYS[1] = requestKey, KEYS[2] = streamKey
-        const [reqKey, streamKey] = keys;
-        const [digest, prepJson, jobId, userId, workspaceId, schemaVersion] = args;
-        const reqVal = strings.get(reqKey);
-        if (reqVal) {
-          const ph = JSON.parse(reqVal);
-          const job = strings.get(`ceo:job:${ph.job_id}`);
-          if (!job) return "INCOMPLETE";
-          const jd = JSON.parse(job);
-          if (jd.user_id !== userId || jd.workspace_id !== workspaceId) return "INCOMPLETE";
-          if (jd.request_digest !== digest) return "CONFLICT";
-          return "REPLAY";
-        }
-        strings.set(reqKey, JSON.stringify({ job_id: jobId, request_digest: digest }));
-        const prepared = JSON.parse(prepJson);
-        const entryId = `${Date.now()}-${++streamSeq}`;
-        const stream = streams.get(streamKey) ?? [];
-        stream.push({
-          id: entryId,
-          fields: {
-            schema_version: Number(schemaVersion),
-            job_id: jobId,
-            user_id: prepared.user_id,
-            workspace_id: prepared.workspace_id,
-          },
-        });
-        streams.set(streamKey, stream);
-        prepared.status = "queued";
-        prepared.stream_entry_id = entryId;
-        strings.set(`ceo:job:${jobId}`, JSON.stringify(prepared));
-        return "NEW";
       }
 
       // Check script identity by matching distinctive patterns in the script

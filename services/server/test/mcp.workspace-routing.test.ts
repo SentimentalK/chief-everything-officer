@@ -26,9 +26,6 @@ import { CeoWorkspace } from "../src/workspace.js";
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { ResourceService } from "../resource/service.js";
-import { openJobBridge } from "../src/jobs/bridge.js";
-import { createJobResultHandler } from "../src/jobs/result-service.js";
-import type { JobAuthScope } from "../src/jobs/service.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -434,104 +431,5 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     expect(bobFiles.some((f) => f.path === "tasks/alice-task.md")).toBe(false);
 
     await clientBob.close();
-  });
-
-  it("worker result ingress resolves runtime for target workspace and commits there", async () => {
-    const { runtimeRegistry, identityService } = await setupMultiWorkspaceServer();
-
-    // Pre-initialize runtime for ws_two
-    const runtimeTwo = await runtimeRegistry.get("ws_two");
-    let applyWorkerResultCalledWith: any = null;
-    runtimeTwo.resourceService.applyWorkerResult = async (params: any) => {
-      applyWorkerResultCalledWith = params;
-      return {
-        commit: "0123456789abcdef0123456789abcdef01234567",
-        replayed: false,
-      };
-    };
-
-    const workerId = "wrk-00000000-0000-4000-8000-000000000001";
-    const attemptId = "00000000-0000-4000-8000-000000000002";
-    const claimToken = "a".repeat(64);
-    const tokenSha = sha256Hex(claimToken);
-
-    const mockJobStore = {
-      inspectAssignment: async (scope: JobAuthScope, jobId: string) => {
-        return {
-          ok: true,
-          record: {
-            job_id: jobId,
-            result_target: "resource",
-            resource_id: "res-test-1",
-            execution: {
-              worker_id: workerId,
-              attempt_id: attemptId,
-              claim_token_sha256: tokenSha,
-            },
-          },
-        };
-      },
-      resultAssignment: async (scope: JobAuthScope, jobId: string, input: any) => {
-        return {
-          ok: true,
-          replayed: false,
-          record: {
-            job_id: jobId,
-            result: {
-              attempt_id: input.attempt_id,
-              resource_id: input.result.resource_id,
-              commit: input.result.commit,
-              received_at_ms: Date.now(),
-            },
-          },
-        };
-      },
-    } as any;
-
-    const mockJobService = { store: mockJobStore } as any;
-
-    const app = express();
-    app.use(express.json());
-
-    const resolveResourceService = async (scope: JobAuthScope) => {
-      const rt = await runtimeRegistry.get(scope.workspace_id);
-      return rt.resourceService;
-    };
-
-    app.post(
-      "/api/worker/jobs/:job_id/result",
-      createIdentityAuthMiddleware(identityService),
-      createJobResultHandler(mockJobService, resolveResourceService),
-    );
-
-    const server = await new Promise<HttpServer>((resolve) => {
-      const s = app.listen(0, "127.0.0.1", () => resolve(s));
-    });
-    cleanupServers.push(server);
-    const port = (server.address() as AddressInfo).port;
-
-    // Send result from Bob (whose key resolves to ws_two)
-    const res = await fetch(`http://127.0.0.1:${port}/api/worker/jobs/job-11111111-1111-4111-8111-111111111111/result`, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer key_bob",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        worker_id: workerId,
-        attempt_id: attemptId,
-        claim_token: claimToken,
-        payload: {
-          content: "Extracted article content",
-        },
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.ok).toBe(true);
-    expect(body.commit).toBe("0123456789abcdef0123456789abcdef01234567");
-    expect(applyWorkerResultCalledWith).not.toBeNull();
-    expect(applyWorkerResultCalledWith.resourceId).toBe("res-test-1");
   });
 });

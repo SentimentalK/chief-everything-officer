@@ -114,8 +114,6 @@ export function recordSafeJobAuditTrace(
 }
 
 const RECOGNIZED_JOB_TOOLS = new Set([
-  "worker_submit",
-  "worker_get",
   "execution_targets",
   "job_submit",
   "job_get",

@@ -16,7 +16,6 @@ export interface Config {
   contentResolverUrl?: string;
   contentResolverToken?: string;
   contentResolverTimeoutMs: number;
-  bridgeEnabled: boolean;
   redisUrl?: string;
   githubClientId?: string;
   githubClientSecret?: string;
@@ -42,7 +41,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const bindHost = env.BIND_HOST ?? "127.0.0.1";
 
-  const bridgeEnabled = parseBool(env.CEO_BRIDGE_ENABLED, false);
   const redisUrlRaw = env.CEO_REDIS_URL?.trim();
   if (redisUrlRaw && !/^rediss?:\/\//i.test(redisUrlRaw)) {
     throw new Error("CEO_REDIS_URL must be a redis:// or rediss:// URL");
@@ -151,7 +149,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(contentResolverUrl ? { contentResolverUrl } : {}),
     ...(contentResolverToken ? { contentResolverToken } : {}),
     contentResolverTimeoutMs,
-    bridgeEnabled,
     ...(redisUrl ? { redisUrl } : {}),
     ...(githubClientId ? { githubClientId } : {}),
     ...(githubClientSecret ? { githubClientSecret } : {}),

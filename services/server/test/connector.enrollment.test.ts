@@ -129,9 +129,9 @@ function createTestServer(options?: {
     }),
   );
 
-  // Legacy Worker endpoint mock with identity auth to test surface isolation
+  // Host user identity endpoint mock with identity auth to test surface isolation
   app.get(
-    "/api/worker/jobs/poll",
+    "/api/identity-guarded/test",
     createIdentityAuthMiddleware(identityService),
     (_req: Request, res: Response) => {
       res.status(200).json({ ok: true });
@@ -514,8 +514,8 @@ describe("CEO Connector V1.2 - E2E Trusted Device Enrollment", () => {
 
       const deviceToken = `ceo_dev1.${cred.id}.${secret}`;
 
-      // 1. Device credential cannot access legacy Worker jobs endpoint (/api/worker/jobs/poll)
-      const legacyRes = await fetch(`${baseUrl}/api/worker/jobs/poll`, {
+      // 1. Device credential cannot access host user identity endpoint (/api/identity-guarded/test)
+      const legacyRes = await fetch(`${baseUrl}/api/identity-guarded/test`, {
         headers: { Authorization: `Bearer ${deviceToken}` },
       });
       expect(legacyRes.status).toBe(401);

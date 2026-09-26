@@ -56,8 +56,7 @@ Git repositories are created per workspace under `workspaces/<workspace_id>/` wh
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames accepted by the Host guard |
 | `ALLOWED_ORIGINS` | (empty) | Comma-separated Origins for CEO product/API Origin guard; absent Origin is always allowed |
 | `CEO_PROTOCOL_ALLOWED_ORIGINS` | (empty) | Comma-separated Origins allowed as browser MCP/OAuth protocol clients; independent of `ALLOWED_ORIGINS` |
-| `CEO_BRIDGE_ENABLED` | `false` | Enable Worker job bridge (Redis) |
-| `CEO_REDIS_URL` | unset | Redis URL when the bridge is enabled. Redis is not a `/readyz` blocker |
+| `CEO_REDIS_URL` | unset | Redis URL for Connector job coordination. Redis is not a `/readyz` blocker |
 | `CEO_OAUTH_ENABLED` | `false` | Enable OAuth 2.1; requires `CEO_PUBLIC_ORIGIN` (https origin) |
 
 `CEO_REMOTE`, `CEO_BRANCH`, `CEO_SSH_KEY_PATH`, and `MCP_API_KEY` are not server configuration. Authentication is DB-backed; workspace git uses GitHub App installation credentials.

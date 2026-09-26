@@ -78,7 +78,6 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
     auditDbPath: path.join(dataRoot, "audit", "ceo-trace.sqlite"),
     identityDbPath: path.join(dataRoot, "identity", "identity.sqlite"),
     contentResolverTimeoutMs: 5000,
-    bridgeEnabled: false,
     oauthEnabled: false,
     oauthDbPath: path.join(dataRoot, "identity", "oauth.sqlite"),
     oauthDcrEnabled: false,

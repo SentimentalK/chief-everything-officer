@@ -75,7 +75,7 @@ async function setupBrowserProtocolApp() {
     res.status(200).json({ ok: true });
   });
   app.get(
-    "/api/worker/jobs",
+    "/api/connector/jobs",
     createOriginGuard([]),
     (_req, res) => {
       res.status(200).json({ ok: true });
@@ -240,7 +240,7 @@ describe("Browser MCP protocol CORS", () => {
   it("keeps product APIs on ALLOWED_ORIGINS and does not add protocol CORS", async () => {
     const env = await setupBrowserProtocolApp();
     try {
-      const res = await fetch(`${env.baseUrl}/api/worker/jobs`, {
+      const res = await fetch(`${env.baseUrl}/api/connector/jobs`, {
         headers: { Origin: BROWSER_ORIGIN },
       });
       expect(res.status).toBe(403);

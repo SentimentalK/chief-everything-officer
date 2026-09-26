@@ -27,10 +27,8 @@ import type {
   ResourceGetInput,
   ResourceSearchInput,
 } from "./resource/types.js";
-import { registerJobTools } from "./jobs/tools.js";
 import { registerConnectorJobTools } from "./jobs/v2-tools.js";
 import { installJobToolValidationAuditInterceptor } from "./jobs/tool-audit.js";
-import type { JobService } from "./jobs/service.js";
 import type { JobCoordinatorV2 } from "./jobs/v2-service.js";
 import type { ConnectorControlStore } from "./connector/control-store.js";
 import type { IdentityStore } from "./identity/store.js";
@@ -253,7 +251,6 @@ export function createMcpServer(
     auditStore?: AuditStore;
     resolverClient?: UrlMetadataResolver;
     identity?: WorkspaceIdentity;
-    jobs?: { service: JobService | null };
     connectorJobs?: {
       coordinator: JobCoordinatorV2 | null;
       controlStore: ConnectorControlStore;
@@ -262,7 +259,7 @@ export function createMcpServer(
     resourceService?: ResourceService;
   } = {},
 ): McpServer {
-  const { auditStore, identity, jobs, connectorJobs } = options;
+  const { auditStore, identity, connectorJobs } = options;
   const workspaceId = identity?.workspace_id ?? "unknown";
   const trace = <T>(toolName: string, op: (input: T) => Promise<Record<string, unknown>>) =>
     tracedHandler(auditStore, workspaceId, toolName, op);
@@ -535,15 +532,6 @@ export function createMcpServer(
     },
   );
 
-  // Worker bridge tools (enabled only when the server layer provides a job service).
-  if (jobs && identity) {
-    registerJobTools(server, {
-      service: jobs.service,
-      scope: { user_id: identity.user_id, workspace_id: identity.workspace_id },
-      auditStore: auditStore ?? null,
-    });
-  }
-
   // Connector V2 Job tools (Target discovery & Host Job coordination).
   if (connectorJobs && identity) {
     registerConnectorJobTools(server, {
@@ -555,7 +543,7 @@ export function createMcpServer(
     });
   }
 
-  if (identity && (jobs || connectorJobs)) {
+  if (identity && connectorJobs) {
     installJobToolValidationAuditInterceptor(server, auditStore ?? null, {
       user_id: identity.user_id,
       workspace_id: identity.workspace_id,

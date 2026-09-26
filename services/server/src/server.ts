@@ -8,7 +8,6 @@ import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { createProtocolCorsMiddleware } from "./http/protocol-cors.js";
 import { attachMcpProtocolLog } from "./http/mcp-observability.js";
-import { createJobResultHandler } from "./jobs/result-service.js";
 import {
   createHostGuard,
   createOriginGuard,
@@ -34,10 +33,7 @@ import {
 } from "./github/router.js";
 import { AuditStore, createAuditRouter } from "./audit.js";
 import { BUILD_INFO } from "./build-info.js";
-import { openJobBridge } from "./jobs/bridge.js";
 import { openNeutralRedisRunner } from "./jobs/redis-runner.js";
-import { createJobAssignmentRouter } from "./jobs/router.js";
-import type { JobAuthScope } from "./jobs/service.js";
 import { RedisJobStoreV2 } from "./jobs/v2-store.js";
 import { JobCoordinatorV2 } from "./jobs/v2-service.js";
 import { createConnectorJobsRouter } from "./jobs/v2-router.js";
@@ -128,22 +124,7 @@ const deviceEnrollmentStore = new DeviceEnrollmentStore();
 const redisTransport = openNeutralRedisRunner(config.redisUrl);
 const redisRunner = redisTransport?.runner ?? null;
 
-// Optional legacy worker-bridge job layer (disabled unless configured). Resource
-// existence for new tasks is checked against repo contents of the requested workspace runtime.
-const jobBridge = openJobBridge(
-  {
-    bridgeEnabled: config.bridgeEnabled,
-    redisUrl: config.redisUrl,
-  },
-  async (scope, resourceId) => {
-    const runtime = await runtimeRegistry.get(scope.workspace_id);
-    const loc = await resolveResourceLocation(runtime.workspace.config.repoDir, resourceId);
-    return loc !== null;
-  },
-  redisRunner,
-);
-
-// V2 Connector Job Coordinator (independent of legacy bridgeEnabled, active whenever Redis is configured)
+// V2 Connector Job Coordinator (active whenever Redis is configured)
 const v2Store = redisRunner ? new RedisJobStoreV2(redisRunner) : null;
 const v2Coordinator = v2Store
   ? new JobCoordinatorV2({
@@ -167,22 +148,6 @@ app.use("/mcp", createHostGuard(config.allowedHosts), protocolCors);
 app.use("/.well-known", protocolCors);
 app.use("/register", protocolCors);
 app.use("/token", protocolCors);
-
-// Managed result route FIRST with dedicated 9 MiB body limit:
-// Host -> Origin -> Identity -> 9mb parser -> resultHandler
-const resolveResourceServiceForScope = async (scope: JobAuthScope) => {
-  const runtime = await runtimeRegistry.get(scope.workspace_id);
-  return runtime.resourceService;
-};
-
-app.post(
-  "/api/worker/jobs/:job_id/result",
-  createHostGuard(config.allowedHosts),
-  createOriginGuard(config.allowedOrigins),
-  createIdentityAuthMiddleware(identityService),
-  express.json({ limit: "9mb" }),
-  createJobResultHandler(jobBridge.service, resolveResourceServiceForScope),
-);
 
 // Ordinary JSON body parser for subsequent routes (default 100 KiB)
 app.use(express.json());
@@ -433,16 +398,6 @@ if (config.oauthEnabled) {
   );
 }
 
-// Worker assignment endpoints: Host -> Origin -> Identity -> router ->
-// JobService. Identity scope is taken from the authenticated locals only.
-app.use(
-  "/api/worker/jobs",
-  createHostGuard(config.allowedHosts),
-  createOriginGuard(config.allowedOrigins),
-  createIdentityAuthMiddleware(identityService),
-  createJobAssignmentRouter(jobBridge.service),
-);
-
 // MCP workspace runtime resolution middleware (strictly request-scoped, zero fallback)
 const workspaceRuntimeMiddleware = async (
   req: Request,
@@ -494,7 +449,6 @@ app.all(
           createMcpServer(runtime.workspace, productPolicy, {
             auditStore,
             identity: mcpIdentity,
-            jobs: { service: jobBridge.service },
             connectorJobs: {
               coordinator: v2Coordinator,
               controlStore: connectorControlStore,
@@ -520,7 +474,6 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     oauthStore?.close();
     dcrStore?.close();
     identityService.close();
-    void jobBridge.dispose();
     if (redisTransport) void redisTransport.dispose();
     listener.close(() => process.exit(0));
   });

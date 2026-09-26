@@ -11,7 +11,7 @@ import { ConnectorControlStore } from "../src/connector/control-store.js";
 import { RedisJobStoreV2, V2StoreError } from "../src/jobs/v2-store.js";
 import { JobCoordinatorV2, deriveHostJobState } from "../src/jobs/v2-service.js";
 import { createFakeRedisRunner } from "./helpers/fake-redis-runner.js";
-import { type JobRecordV2, type AttemptRecordV1, type ResultTarget } from "../src/jobs/v2-schema.js";
+import { type JobRecordV2, type AttemptRecordV1, type ResultTarget, KEY_STREAM_V2 } from "../src/jobs/v2-schema.js";
 
 describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
   const cleanupDirs: string[] = [];
@@ -218,7 +218,7 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
 
       // Inject a corrupt stream entry belonging to Workspace B (foreign)
       // It has missing schema_version, invalid job_id format, etc., but has valid workspace_id: workspaceBId
-      await fakeRedis.xaddStream({
+      await fakeRedis.xaddStream(KEY_STREAM_V2, {
         workspace_id: workspaceBId,
         corrupt_field: "invalid-data",
         schema_version: "invalid",
@@ -238,7 +238,7 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
 
     it("fails closed with CORRUPT_JOB_INDEX when stream entry workspace_id is missing or empty", async () => {
       // Inject entry without workspace_id
-      await fakeRedis.xaddStream({
+      await fakeRedis.xaddStream(KEY_STREAM_V2, {
         schema_version: "2",
         job_id: `job-${crypto.randomUUID()}`,
         // missing workspace_id
@@ -254,7 +254,7 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
 
     it("fails closed with CORRUPT_JOB_INDEX when authenticated workspace entry points to missing Job", async () => {
       // Inject entry pointing to non-existent job in Workspace A
-      await fakeRedis.xaddStream({
+      await fakeRedis.xaddStream(KEY_STREAM_V2, {
         schema_version: "2",
         job_id: `job-${crypto.randomUUID()}`,
         user_id: userAliceId,
