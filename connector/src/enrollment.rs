@@ -281,7 +281,16 @@ pub async fn login_flow(
 
         tokio::time::sleep(Duration::from_secs(interval)).await;
 
-        match client.poll_enrollment_token(&device_code).await? {
+        let poll_result = client.poll_enrollment_token(&device_code).await;
+        let outcome = match poll_result {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[WARN] Transient error polling enrollment (retrying): {e}");
+                continue;
+            }
+        };
+
+        match outcome {
             EnrollmentPollOutcome::Pending => {
                 // Keep waiting
             }
