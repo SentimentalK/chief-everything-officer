@@ -128,23 +128,19 @@ pub fn generate_secret_and_digest() -> (String, String) {
 }
 
 pub fn default_platform() -> &'static str {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(target_os = "linux")]
     {
-        "linux-x86_64"
+        "linux"
     }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     {
-        "linux-aarch64"
+        "macos"
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "windows")]
     {
-        "macos-aarch64"
+        "windows"
     }
-    #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    )))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         "unknown"
     }
