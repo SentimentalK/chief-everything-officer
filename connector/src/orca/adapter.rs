@@ -1,8 +1,10 @@
-use async_trait::async_trait;
 use std::path::Path;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use super::client::{OrcaCliClient, OrcaError};
+use super::types::OrcaWorktreeItem;
 use crate::config::LocalTarget;
 use crate::scheduler::{
     ActiveAttempt, DispatchOutcome, DispatchReconciliation, ExecutionAdapter, WaitOutcome,
@@ -49,7 +51,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         attempt: &ActiveAttempt,
         target: &LocalTarget,
     ) -> Result<(String, String), String> {
-        // 1. Resolve worktree selector
+        // 1. Worktree reconciliation
         let worktrees = self
             .client
             .list_worktrees()
@@ -57,58 +59,112 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             .map_err(|e| format!("failed to list worktrees: {e}"))?;
 
         let target_canonical = std::fs::canonicalize(&target.local_path).ok();
-        let matched_wt = worktrees.iter().find(|wt| {
-            if wt.path == target.local_path {
-                return true;
+        let matching_worktrees: Vec<&OrcaWorktreeItem> = worktrees
+            .iter()
+            .filter(|wt| {
+                if wt.path == target.local_path {
+                    return true;
+                }
+                if let Some(ref c) = target_canonical {
+                    if let Ok(wt_c) = std::fs::canonicalize(&wt.path) {
+                        return wt_c == *c;
+                    }
+                }
+                false
+            })
+            .collect();
+
+        let adopted_worktree = match matching_worktrees.len() {
+            0 => {
+                // 0 -> create worktree -> validate returned path matches configured Target
+                let attempt_name = format!("ceo-{}", attempt.attempt_id);
+                let created = self
+                    .client
+                    .create_worktree(&attempt_name, &format!("path:{}", target.local_path))
+                    .await
+                    .map_err(|e| format!("failed to create worktree for target: {e}"))?;
+
+                let created_canonical = std::fs::canonicalize(&created.path).ok();
+                let path_matches = created.path == target.local_path
+                    || (target_canonical.is_some() && created_canonical == target_canonical);
+                if !path_matches {
+                    return Err(format!(
+                        "RECOVERY_REQUIRED: created worktree path '{}' does not match target path '{}'",
+                        created.path, target.local_path
+                    ));
+                }
+                created.id
             }
-            if let Some(ref c) = target_canonical {
-                if let Ok(wt_c) = std::fs::canonicalize(&wt.path) {
-                    return wt_c == *c;
+            1 => matching_worktrees[0].id.clone(),
+            count => {
+                // >1 -> use explicitly durable/deterministic Attempt-owned identity if available, otherwise RECOVERY_REQUIRED
+                if let Some(owned_wt_id) = attempt
+                    .executor
+                    .as_ref()
+                    .and_then(|e| e.worktree_id.as_deref())
+                {
+                    if let Some(matched) = matching_worktrees.iter().find(|wt| wt.id == owned_wt_id)
+                    {
+                        matched.id.clone()
+                    } else {
+                        return Err(format!(
+                            "RECOVERY_REQUIRED: multiple worktrees ({count}) match target '{}', and attempt-owned worktree '{owned_wt_id}' is not among them",
+                            target.local_path
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "RECOVERY_REQUIRED: multiple worktrees ({count}) match target '{}'; ambiguous candidates cannot be adopted",
+                        target.local_path
+                    ));
                 }
             }
-            false
-        });
-
-        let wt_selector = match matched_wt {
-            Some(wt) => wt.id.clone(),
-            None => format!("path:{}", target.local_path),
         };
 
-        // 2. Terminal reconciliation on title `ceo:<attempt_id>`
+        // 2. Terminal reconciliation on title `ceo:<attempt_id>`, scoped to adopted_worktree
         let expected_title = format!("ceo:{}", attempt.attempt_id);
         let terminals = self
             .client
-            .list_terminals(None)
+            .list_terminals(Some(&adopted_worktree))
             .await
-            .map_err(|e| format!("failed to list terminals: {e}"))?;
+            .map_err(|e| {
+                format!("failed to list terminals for worktree '{adopted_worktree}': {e}")
+            })?;
 
         let matching_terminals: Vec<_> = terminals
             .into_iter()
-            .filter(|t| t.title.as_deref() == Some(&expected_title))
+            .filter(|t| {
+                t.title.as_deref() == Some(&expected_title)
+                    && t.worktree_id
+                        .as_deref()
+                        .map(|w| w == adopted_worktree)
+                        .unwrap_or(true)
+            })
             .collect();
 
-        match matching_terminals.len() {
+        let terminal_handle = match matching_terminals.len() {
             0 => {
                 let term = self
                     .client
                     .create_terminal(
-                        &wt_selector,
+                        &adopted_worktree,
                         &expected_title,
                         None,
                         Some(Path::new(&target.local_path)),
                     )
                     .await
                     .map_err(|e| format!("failed to create terminal for attempt: {e}"))?;
-                Ok((wt_selector, term.handle))
+                term.handle
             }
-            1 => {
-                let existing = &matching_terminals[0];
-                Ok((wt_selector, existing.handle.clone()))
+            1 => matching_terminals.into_iter().next().unwrap().handle,
+            count => {
+                return Err(format!(
+                    "RECOVERY_REQUIRED: multiple terminals ({count}) found with title '{expected_title}' in worktree '{adopted_worktree}'"
+                ));
             }
-            count => Err(format!(
-                "Multiple terminals ({count}) found with title '{expected_title}': RECOVERY_REQUIRED"
-            )),
-        }
+        };
+
+        Ok((adopted_worktree, terminal_handle))
     }
 
     async fn reconcile_dispatch(
@@ -136,6 +192,15 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             });
         }
 
+        let last_outcome = attempt
+            .executor
+            .as_ref()
+            .and_then(|e| e.last_dispatch_outcome.as_deref());
+
+        if last_outcome == Some("known_rejected") {
+            return Ok(DispatchReconciliation::DefinitelyNotDispatched);
+        }
+
         Ok(DispatchReconciliation::Ambiguous)
     }
 
@@ -145,10 +210,17 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         terminal_id: &str,
         retry_request_id: Option<&str>,
     ) -> Result<DispatchOutcome, String> {
-        let prompt = attempt.prompt.as_deref().unwrap_or("");
+        // Build one deterministic Agent input from prompt and acceptance criteria
+        let prompt_text = match (&attempt.prompt, &attempt.acceptance) {
+            (Some(p), Some(a)) => format!("TASK\n\n{p}\n\nACCEPTANCE CRITERIA\n\n{a}"),
+            (Some(p), None) => format!("TASK\n\n{p}"),
+            (None, Some(a)) => format!("ACCEPTANCE CRITERIA\n\n{a}"),
+            (None, None) => "".into(),
+        };
+
         match self
             .client
-            .send_terminal_prompt(terminal_id, prompt, retry_request_id, Some(10))
+            .send_terminal_prompt(terminal_id, &prompt_text, retry_request_id, Some(10))
             .await
         {
             Ok(resp) if resp.ok => {
@@ -162,21 +234,47 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                 });
                             }
                         }
+                        return Ok(DispatchOutcome::AmbiguousTransportFailure {
+                            error:
+                                "terminal send reported accepted=true but request_id was missing"
+                                    .into(),
+                        });
+                    } else {
+                        return Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
+                            reason: "terminal send rejected before acceptance (accepted=false)"
+                                .into(),
+                        });
                     }
                 }
-                Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
-                    reason: "send returned accepted=false or missing request_id".into(),
+                Ok(DispatchOutcome::AmbiguousTransportFailure {
+                    error: "terminal send returned ok=true but missing send payload".into(),
                 })
             }
-            Ok(_) => Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
-                reason: "send returned ok=false".into(),
+            Ok(resp) => Ok(DispatchOutcome::AmbiguousTransportFailure {
+                error: format!("terminal send returned ok=false: {resp:?}"),
             }),
             Err(OrcaError::Timeout(d)) => Ok(DispatchOutcome::AmbiguousTransportFailure {
                 error: format!("timeout after {d:?}"),
             }),
-            Err(OrcaError::CommandFailed { code, stderr }) => {
+            Err(OrcaError::CommandFailed { ref stderr, code }) => {
+                if stderr.contains("rejected_before_acceptance")
+                    || stderr.contains("terminal_not_accepting_input")
+                {
+                    Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
+                        reason: format!("structured pre-acceptance rejection: {stderr}"),
+                    })
+                } else {
+                    Ok(DispatchOutcome::AmbiguousTransportFailure {
+                        error: format!("CLI command failed with code {code:?}: {stderr}"),
+                    })
+                }
+            }
+            Err(OrcaError::Orca(ref msg))
+                if msg.contains("rejected_before_acceptance")
+                    || msg.contains("terminal_not_accepting_input") =>
+            {
                 Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
-                    reason: format!("command failed with code {code:?}: {stderr}"),
+                    reason: msg.clone(),
                 })
             }
             Err(e) => Ok(DispatchOutcome::AmbiguousTransportFailure {
@@ -197,33 +295,60 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             .await
         {
             Ok(resp) => {
-                if let Some(wait) = resp.result.and_then(|r| r.wait) {
-                    if wait.satisfied && wait.condition == "tui-idle" {
-                        return Ok(WaitOutcome::TuiIdle {
-                            elapsed_ms: wait.elapsed_ms.unwrap_or(0),
-                        });
+                if let Some(wait) = resp.result.as_ref().and_then(|r| r.wait.as_ref()) {
+                    if wait.condition == "tui-idle" {
+                        if wait.satisfied {
+                            return Ok(WaitOutcome::TuiIdle {
+                                elapsed_ms: wait.elapsed_ms.unwrap_or(0),
+                            });
+                        } else {
+                            return Ok(WaitOutcome::TimedOut {
+                                elapsed_ms: wait
+                                    .elapsed_ms
+                                    .unwrap_or(remaining_timeout.as_millis() as u64),
+                            });
+                        }
                     }
                 }
                 if !resp.ok {
-                    return Ok(WaitOutcome::TimedOut {
-                        elapsed_ms: remaining_timeout.as_millis() as u64,
-                    });
+                    return Err(format!("Terminal wait reported ok=false: {resp:?}"));
                 }
-                Ok(WaitOutcome::Interrupted {
-                    reason: "wait condition not satisfied".into(),
-                })
+                Err("Terminal wait returned unexpected result format".into())
             }
             Err(OrcaError::Timeout(_)) => Ok(WaitOutcome::TimedOut {
                 elapsed_ms: remaining_timeout.as_millis() as u64,
             }),
-            Err(OrcaError::Orca(ref msg)) if msg.to_lowercase().contains("timeout") => {
-                Ok(WaitOutcome::TimedOut {
-                    elapsed_ms: remaining_timeout.as_millis() as u64,
-                })
+            Err(OrcaError::Orca(ref msg)) => {
+                if msg.contains("terminal_not_found")
+                    || msg.contains("terminal_exited")
+                    || msg.contains("terminal_closed")
+                    || msg.contains("no such terminal")
+                {
+                    Ok(WaitOutcome::Interrupted {
+                        reason: msg.clone(),
+                    })
+                } else if msg.contains("timed_out") || msg.contains("timeout") {
+                    Ok(WaitOutcome::TimedOut {
+                        elapsed_ms: remaining_timeout.as_millis() as u64,
+                    })
+                } else {
+                    Err(format!("Terminal wait failed: {msg}"))
+                }
             }
-            Err(e) => Ok(WaitOutcome::Interrupted {
-                reason: e.to_string(),
-            }),
+            Err(OrcaError::CommandFailed { ref stderr, code }) => {
+                if stderr.contains("terminal_not_found")
+                    || stderr.contains("terminal_exited")
+                    || stderr.contains("terminal_closed")
+                    || stderr.contains("no such terminal")
+                {
+                    Ok(WaitOutcome::Interrupted {
+                        reason: format!("terminal exited/not found (exit {code:?}): {stderr}"),
+                    })
+                } else {
+                    Err(format!("Terminal wait failed with code {code:?}: {stderr}"))
+                }
+            }
+            Err(e) => Err(format!("Terminal wait transport failure: {e}")),
         }
     }
 

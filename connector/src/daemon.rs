@@ -647,7 +647,8 @@ pub async fn drive_active_attempt(
                 .await
             {
                 Ok(ack) => {
-                    if !ack.ok {
+                    let server_time_valid = parse_timestamp_strict(&ack.server_time).is_ok();
+                    if !ack.ok || !server_time_valid {
                         let _lock = ExecutionLock::acquire_with_retry(
                             &paths.state_lock_file(),
                             Duration::from_secs(5),
@@ -660,7 +661,7 @@ pub async fn drive_active_attempt(
                         current.phase = AttemptPhase::RecoveryRequired;
                         current.save(&paths.active_attempt_file())?;
                         return Err(DaemonError::RecoveryRequired(
-                            "Start job response reported ok=false".into(),
+                            "Start job response reported ok=false or invalid server_time".into(),
                         ));
                     }
 
@@ -685,6 +686,7 @@ pub async fn drive_active_attempt(
                             execution_deadline_ms: None,
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
+                            last_dispatch_outcome: None,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
@@ -697,7 +699,13 @@ pub async fn drive_active_attempt(
                 Err(ClientError::JobError {
                     ref code,
                     ref message,
-                }) if code == "IDEMPOTENCY_CONFLICT"
+                }) if code == "JOB_NOT_FOUND"
+                    || code == "ATTEMPT_NOT_FOUND"
+                    || code == "JOB_NOT_ACTIVE"
+                    || code == "IDENTITY_MISMATCH"
+                    || code == "CORRUPT_ATTEMPT_RECORD"
+                    || code == "INVALID_ATTEMPT_PHASE"
+                    || code == "IDEMPOTENCY_CONFLICT"
                     || code == "ATTEMPT_MISMATCH"
                     || code == "JOB_NOT_CLAIMED" =>
                 {
@@ -790,6 +798,7 @@ pub async fn drive_active_attempt(
                             execution_deadline_ms: None,
                             dispatch_request_id: None,
                             dispatch_accepted_at_ms: None,
+                            last_dispatch_outcome: None,
                             runtime_completion_kind: None,
                             runtime_completed_at_ms: None,
                             runtime_error: None,
@@ -910,7 +919,12 @@ pub async fn drive_active_attempt(
                         .as_ref()
                         .map(|e| e.dispatch_send_count)
                         .unwrap_or(0);
-                    if send_count >= 2 {
+                    let last_outcome = active
+                        .executor
+                        .as_ref()
+                        .and_then(|e| e.last_dispatch_outcome.as_deref());
+
+                    if last_outcome == Some("ambiguous") {
                         let _lock = ExecutionLock::acquire_with_retry(
                             &paths.state_lock_file(),
                             Duration::from_secs(5),
@@ -923,8 +937,106 @@ pub async fn drive_active_attempt(
                         current.phase = AttemptPhase::RecoveryRequired;
                         current.save(&paths.active_attempt_file())?;
                         return Err(DaemonError::RecoveryRequired(
-                            "Exceeded maximum dispatch send budget (max 2 sends)".into(),
+                            "Prior dispatch outcome was ambiguous; cannot safely issue fresh send without manual recovery".into(),
                         ));
+                    }
+
+                    if send_count >= 2 {
+                        let receipt = ExecutionReceipt {
+                            schema_version: ExecutionReceipt::SCHEMA_VERSION,
+                            job_id: active.job_id.clone(),
+                            attempt_id: active.attempt_id.clone(),
+                            target_id: active.target_id.clone(),
+                            orca_version: active
+                                .executor
+                                .as_ref()
+                                .and_then(|e| e.orca_version.clone())
+                                .unwrap_or_else(|| "1.4.209".into()),
+                            worktree_id: active
+                                .executor
+                                .as_ref()
+                                .and_then(|e| e.worktree_id.clone()),
+                            terminal_id: active
+                                .executor
+                                .as_ref()
+                                .and_then(|e| e.terminal_id.clone()),
+                            dispatch_request_id: None,
+                            task_dispatched: false,
+                            runtime_completion_kind: None,
+                            dispatch_started_at_ms: active
+                                .executor
+                                .as_ref()
+                                .and_then(|e| e.dispatch_started_at_ms),
+                            runtime_completed_at_ms: Some(now_utc_ms()),
+                        };
+                        let receipt_sha256 = receipt.compute_sha256();
+
+                        let report = ExecutionReport {
+                            schema_version: REPORT_SCHEMA_VERSION,
+                            execution_status: ExecutionStatus::BLOCKED,
+                            business_outcome: BusinessOutcome::NOT_STARTED,
+                            task_dispatched: false,
+                            finished_at_ms: now_utc_ms(),
+                            duration_ms: 0,
+                            error: Some(ExecutionReportError {
+                                stage: "dispatch".into(),
+                                code: "DISPATCH_REJECTED".into(),
+                                message: "Exhausted maximum dispatch retry budget (proven rejected before acceptance)".into(),
+                            }),
+                            executor: ExecutionReportExecutor {
+                                executor_type: active
+                                    .executor
+                                    .as_ref()
+                                    .map(|e| e.executor_type.clone())
+                                    .unwrap_or_else(|| "orca".into()),
+                                version: active
+                                    .executor
+                                    .as_ref()
+                                    .and_then(|e| e.orca_version.clone())
+                                    .unwrap_or_else(|| "1.4.209".into()),
+                            },
+                            receipt_sha256,
+                        };
+                        report
+                            .validate()
+                            .map_err(|e| DaemonError::RecoveryRequired(e.to_string()))?;
+                        let digest = compute_report_sha256(&report);
+
+                        let outbox_rec = OutboxRecord {
+                            schema_version: OUTBOX_SCHEMA_VERSION,
+                            server_origin: cred.server_origin.clone(),
+                            device_id: cred.device_id.clone(),
+                            job_id: active.job_id.clone(),
+                            attempt_id: active.attempt_id.clone(),
+                            claim_token: active.claim_token.clone(),
+                            report,
+                            created_at_ms: now_utc_ms(),
+                        };
+
+                        let _lock = ExecutionLock::acquire_with_retry(
+                            &paths.state_lock_file(),
+                            Duration::from_secs(5),
+                            Duration::from_millis(50),
+                        )?;
+
+                        let outbox_file = paths
+                            .outbox_dir()
+                            .join(format!("{}.json", active.attempt_id));
+                        outbox_rec.save(&outbox_file)?;
+
+                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
+                        current.phase = AttemptPhase::FinalizedLocal;
+                        current.terminal_report_sha256 = Some(digest);
+                        current.save(&paths.active_attempt_file())?;
+
+                        println!(
+                            "Dispatch retry budget exhausted for attempt '{}'; marked BLOCKED and queued in outbox",
+                            active.attempt_id
+                        );
+                        return Ok(true);
                     }
 
                     // Increment send count durable before dispatch!
@@ -969,6 +1081,7 @@ pub async fn drive_active_attempt(
                             if let Some(ref mut exec) = current.executor {
                                 exec.dispatch_request_id = Some(request_id);
                                 exec.dispatch_accepted_at_ms = Some(accepted_at_ms);
+                                exec.last_dispatch_outcome = None;
                             }
                             current.phase = AttemptPhase::Dispatched;
                             current.save(&paths.active_attempt_file())?;
@@ -977,10 +1090,38 @@ pub async fn drive_active_attempt(
                         crate::scheduler::DispatchOutcome::KnownRejectedBeforeAcceptance {
                             reason,
                         } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            if let Some(ref mut exec) = current.executor {
+                                exec.last_dispatch_outcome = Some("known_rejected".into());
+                            }
+                            current.save(&paths.active_attempt_file())?;
                             eprintln!("Dispatch rejected before acceptance: {reason}. Intent remains for retry/budget check.");
                             Ok(true)
                         }
                         crate::scheduler::DispatchOutcome::AmbiguousTransportFailure { error } => {
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            if let Some(ref mut exec) = current.executor {
+                                exec.last_dispatch_outcome = Some("ambiguous".into());
+                            }
+                            current.save(&paths.active_attempt_file())?;
                             eprintln!("Ambiguous transport failure during dispatch: {error}. Intent remains for reconciliation.");
                             Ok(true)
                         }
@@ -1147,8 +1288,25 @@ pub async fn drive_active_attempt(
                 ),
                 Some("timed_out") => (
                     ExecutionStatus::TIMED_OUT,
-                    BusinessOutcome::FAILED,
-                    exec_state.runtime_error.clone(),
+                    BusinessOutcome::UNVERIFIED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "runtime".into(),
+                            code: "EXECUTION_TIMEOUT".into(),
+                            message: "Execution timed out".into(),
+                        })
+                    }),
+                ),
+                Some("interrupted") => (
+                    ExecutionStatus::INTERRUPTED,
+                    BusinessOutcome::UNVERIFIED,
+                    exec_state.runtime_error.clone().or_else(|| {
+                        Some(ExecutionReportError {
+                            stage: "runtime".into(),
+                            code: "TERMINAL_EXITED".into(),
+                            message: "Execution interrupted".into(),
+                        })
+                    }),
                 ),
                 _ => (
                     ExecutionStatus::FAILED,
@@ -1319,9 +1477,11 @@ pub async fn drive_active_attempt(
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
-            current.phase = AttemptPhase::Started;
+            current.phase = AttemptPhase::RecoveryRequired;
             current.save(&paths.active_attempt_file())?;
-            Ok(true)
+            Err(DaemonError::RecoveryRequired(
+                "Legacy running attempt migrated to recovery_required".into(),
+            ))
         }
     }
 }

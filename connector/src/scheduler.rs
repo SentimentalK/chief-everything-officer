@@ -89,6 +89,8 @@ pub struct AttemptExecutorState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_accepted_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dispatch_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_completion_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_completed_at_ms: Option<i64>,
@@ -321,7 +323,7 @@ impl ActiveAttempt {
                 }
                 let v1: ActiveAttemptV1 = serde_json::from_value(val)?;
                 let phase = match v1.phase {
-                    AttemptPhase::LegacyRunning => AttemptPhase::Started,
+                    AttemptPhase::LegacyRunning => AttemptPhase::RecoveryRequired,
                     p => p,
                 };
                 ActiveAttempt {
@@ -348,7 +350,7 @@ impl ActiveAttempt {
             2 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
                 if att.phase == AttemptPhase::LegacyRunning {
-                    att.phase = AttemptPhase::Started;
+                    att.phase = AttemptPhase::RecoveryRequired;
                 }
                 att
             }

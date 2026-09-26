@@ -161,6 +161,7 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         worktree_id: None,
         terminal_id: None,
         dispatch_send_count: 0,
+        last_dispatch_outcome: None,
         dispatch_started_at_ms: None,
         execution_deadline_ms: None,
         dispatch_request_id: None,
@@ -553,11 +554,11 @@ async fn test_durable_deadline_expired_marks_timed_out_without_waiting() {
     let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
 
     assert_eq!(record.report.execution_status, ExecutionStatus::TIMED_OUT);
-    assert_eq!(record.report.business_outcome, BusinessOutcome::FAILED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::UNVERIFIED);
 }
 
-/// 5. Dispatch Retry Budget & Fail-Closed:
-/// Two rejected sends exhaust the max-2 send budget. Next retry transitions to RECOVERY_REQUIRED.
+/// 5. Dispatch Retry Budget & Terminal Rejection:
+/// Two rejected sends exhaust the max-2 send budget. Transitions to FinalizedLocal with BLOCKED outbox.
 #[tokio::test]
 async fn test_dispatch_retry_budget_exhaustion_fails_closed() {
     let server = MockServer::start().await;
@@ -570,6 +571,7 @@ async fn test_dispatch_retry_budget_exhaustion_fails_closed() {
     executor_state.dispatch_started_at_ms = Some(chrono::Utc::now().timestamp_millis());
     executor_state.execution_deadline_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
     executor_state.dispatch_send_count = 2; // Budget of 2 already exhausted!
+    executor_state.last_dispatch_outcome = Some("known_rejected".into());
 
     let active = make_test_attempt(
         &cred,
@@ -599,21 +601,37 @@ async fn test_dispatch_retry_budget_exhaustion_fails_closed() {
     .unwrap();
     assert!(advanced);
 
-    // Step 2: DispatchIntent checks send_count >= 2 -> transitions to RecoveryRequired and fails
-    let res = drive_active_attempt(
+    // Step 2: DispatchIntent checks send_count >= 2 -> transitions to FinalizedLocal and writes BLOCKED outbox
+    let advanced = drive_active_attempt(
         &paths,
         &client,
         &cred,
         &(adapter.clone() as Arc<dyn ExecutionAdapter>),
         &DaemonHooks::default(),
     )
-    .await;
+    .await
+    .unwrap();
+    assert!(advanced);
 
-    assert!(res.is_err());
     let a = ActiveAttempt::load(&paths.active_attempt_file())
         .unwrap()
         .unwrap();
-    assert_eq!(a.phase, AttemptPhase::RecoveryRequired);
+    assert_eq!(a.phase, AttemptPhase::FinalizedLocal);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_eq!(record.report.execution_status, ExecutionStatus::BLOCKED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::NOT_STARTED);
+    assert!(!record.report.task_dispatched);
+    assert_eq!(
+        record.report.error.as_ref().map(|e| e.code.as_str()),
+        Some("DISPATCH_REJECTED")
+    );
 }
 
 /// 6. Ambiguous Dispatch Fails Closed:
@@ -797,5 +815,426 @@ async fn test_prepare_terminal_adoption() {
     assert_eq!(
         a.executor.as_ref().unwrap().worktree_id.as_deref(),
         Some("wt_existing")
+    );
+}
+
+/// 9. Legacy "running" fails closed on both V1 and V2 schema:
+/// Never transitions to Started; maps directly to RecoveryRequired; zero prepare/dispatch/wait invocations.
+#[tokio::test]
+async fn test_legacy_running_migration_fails_closed_without_execution() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let prompt = "task prompt".to_string();
+    let acceptance = "task acceptance".to_string();
+    let payload_sha256 = ActiveAttempt::compute_payload_sha256(
+        "job_1",
+        "ws_1",
+        "tgt_1",
+        None,
+        &prompt,
+        &acceptance,
+        60,
+        "none",
+    );
+
+    // Case A: V1 JSON with phase "running"
+    let v1_json = serde_json::json!({
+        "schema_version": 1,
+        "server_origin": cred.server_origin,
+        "device_id": cred.device_id,
+        "job_id": "job_1",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": attempt_id,
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "running",
+        "prompt": prompt,
+        "acceptance": acceptance,
+        "execution_timeout_seconds": 60,
+        "result_target": "none",
+        "payload_sha256": payload_sha256,
+        "claimed_at_ms": 1727000000000i64
+    });
+    fs::write(
+        paths.active_attempt_file(),
+        serde_json::to_string(&v1_json).unwrap(),
+    )
+    .unwrap();
+
+    let loaded = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.phase, AttemptPhase::RecoveryRequired);
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let res = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    assert!(res.is_err());
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.wait_calls.load(Ordering::SeqCst), 0);
+
+    // Case B: V2 JSON with legacy phase "running"
+    let v2_json = serde_json::json!({
+        "schema_version": 2,
+        "server_origin": cred.server_origin,
+        "device_id": cred.device_id,
+        "job_id": "job_1",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": attempt_id,
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "running",
+        "prompt": prompt,
+        "acceptance": acceptance,
+        "execution_timeout_seconds": 60,
+        "result_target": "none",
+        "payload_sha256": payload_sha256,
+        "claimed_at_ms": 1727000000000i64,
+        "executor": null
+    });
+    fs::write(
+        paths.active_attempt_file(),
+        serde_json::to_string(&v2_json).unwrap(),
+    )
+    .unwrap();
+
+    let loaded_v2 = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_v2.phase, AttemptPhase::RecoveryRequired);
+
+    let res_v2 = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    assert!(res_v2.is_err());
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 10. Interrupted runtime outcome semantics:
+/// Maps to INTERRUPTED / UNVERIFIED / task_dispatched=true with TERMINAL_INTERRUPTED error details.
+#[tokio::test]
+async fn test_interrupted_runtime_outcome_semantics() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut executor_state = make_default_executor("orca", "1.4.209");
+    executor_state.worktree_id = Some("wt_mock".into());
+    executor_state.terminal_id = Some("term_mock".into());
+    executor_state.dispatch_started_at_ms = Some(now);
+    executor_state.execution_deadline_ms = Some(now + 60_000);
+    executor_state.dispatch_request_id = Some("req_mock".into());
+    executor_state.dispatch_send_count = 1;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id,
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor_state),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_result: Some(Ok(WaitOutcome::Interrupted {
+            reason: "terminal exited unexpectedly".into(),
+        })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Step 1: Waiting -> OutcomeRecorded
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.phase, AttemptPhase::OutcomeRecorded);
+    let exec = a.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("interrupted"));
+
+    // Step 2: OutcomeRecorded -> writes outbox -> FinalizedLocal
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+
+    assert_eq!(record.report.execution_status, ExecutionStatus::INTERRUPTED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::UNVERIFIED);
+    assert!(record.report.task_dispatched);
+    let err = record.report.error.expect("expected error details");
+    assert_eq!(err.stage, "runtime");
+    assert_eq!(err.code, "TERMINAL_EXITED");
+}
+
+/// 11. /start Permanent Error Fails Closed:
+/// When Server returns permanent errors (e.g. INVALID_ATTEMPT_PHASE), Connector transitions to RecoveryRequired.
+#[tokio::test]
+async fn test_start_permanent_error_fails_closed_to_recovery_required() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    server.add_handler(move |req| {
+        if req.path.contains("/start") {
+            MockResponse::json(
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "error": { "code": "INVALID_ATTEMPT_PHASE", "message": "Job phase is not claimed" }
+                }),
+            )
+        } else {
+            MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+        }
+    });
+
+    let active = make_test_attempt(&cred, attempt_id, AttemptPhase::StartIntent, "none", None);
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let res = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    assert!(res.is_err());
+
+    let a = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.phase, AttemptPhase::RecoveryRequired);
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 12. /start Malformed ACK Fails Closed:
+/// When Server returns invalid server_time, Connector transitions to RecoveryRequired.
+#[tokio::test]
+async fn test_start_malformed_timestamp_fails_closed() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    server.add_handler(move |req| {
+        if req.path.contains("/start") {
+            MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "invalid_date_format",
+                    "attempt": {
+                        "attempt_id": "att_1",
+                        "phase": "started",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": "2026-09-24T12:00:01.000Z"
+                    }
+                }),
+            )
+        } else {
+            MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+        }
+    });
+
+    let active = make_test_attempt(&cred, attempt_id, AttemptPhase::StartIntent, "none", None);
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let res = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    assert!(res.is_err());
+
+    let a = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.phase, AttemptPhase::RecoveryRequired);
+    assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 13. Proven Rejection Two-Send Flow and Terminal BLOCKED:
+/// First rejected send allows exactly one retry; second rejected send exhausts budget
+/// and transitions directly to FinalizedLocal with BLOCKED outbox (not recovery_required).
+#[tokio::test]
+async fn test_proven_rejection_allows_one_retry_then_exhausts_to_blocked() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let mut executor_state = make_default_executor("orca", "1.4.209");
+    executor_state.worktree_id = Some("wt_mock".into());
+    executor_state.terminal_id = Some("term_mock".into());
+    executor_state.dispatch_started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+    executor_state.execution_deadline_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
+    executor_state.dispatch_send_count = 0;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id,
+        AttemptPhase::Prepared,
+        "none",
+        Some(executor_state),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        reconcile_result: Some(Ok(DispatchReconciliation::DefinitelyNotDispatched)),
+        dispatch_result: Some(Ok(DispatchOutcome::KnownRejectedBeforeAcceptance {
+            reason: "pty busy".into(),
+        })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Drive 1: Prepared -> DispatchIntent
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    // Drive 2: DispatchIntent (Send #1) -> dispatch rejected -> remains in DispatchIntent with send_count = 1, outcome = known_rejected
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a1 = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a1.phase, AttemptPhase::DispatchIntent);
+    assert_eq!(a1.executor.as_ref().unwrap().dispatch_send_count, 1);
+    assert_eq!(
+        a1.executor
+            .as_ref()
+            .unwrap()
+            .last_dispatch_outcome
+            .as_deref(),
+        Some("known_rejected")
+    );
+
+    // Drive 3: DispatchIntent (Send #2 - Retry within budget) -> dispatch rejected -> remains in DispatchIntent with send_count = 2, outcome = known_rejected
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a2 = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a2.phase, AttemptPhase::DispatchIntent);
+    assert_eq!(a2.executor.as_ref().unwrap().dispatch_send_count, 2);
+
+    // Drive 4: DispatchIntent (Send #3 - Budget exhausted) -> sees send_count >= 2 -> terminal BLOCKED outbox -> FinalizedLocal
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let a3 = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a3.phase, AttemptPhase::FinalizedLocal);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_eq!(record.report.execution_status, ExecutionStatus::BLOCKED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::NOT_STARTED);
+    assert!(!record.report.task_dispatched);
+    assert_eq!(
+        record.report.error.as_ref().map(|e| e.code.as_str()),
+        Some("DISPATCH_REJECTED")
     );
 }

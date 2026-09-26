@@ -63,7 +63,19 @@ impl OrcaCliClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn()?;
+        let mut child = {
+            let mut attempts = 0;
+            loop {
+                match cmd.spawn() {
+                    Ok(c) => break c,
+                    Err(e) if e.raw_os_error() == Some(26) && attempts < 5 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(5 * attempts)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
 
         let stdout_handle = child.stdout.take().expect("stdout handle");
         let stderr_handle = child.stderr.take().expect("stderr handle");
@@ -128,6 +140,33 @@ impl OrcaCliClient {
         let resp: OrcaWorktreeListResponse =
             serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
         Ok(resp.result.map(|r| r.worktrees).unwrap_or_default())
+    }
+
+    pub async fn create_worktree(
+        &self,
+        name: &str,
+        repo_selector: &str,
+    ) -> Result<OrcaWorktreeItem, OrcaError> {
+        let args = vec![
+            "worktree",
+            "create",
+            "--name",
+            name,
+            "--repo",
+            repo_selector,
+            "--no-parent",
+            "--setup",
+            "skip",
+            "--json",
+        ];
+        let raw = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaWorktreeCreateResponse =
+            serde_json::from_str(&raw).map_err(|e| OrcaError::JsonParse(e, raw))?;
+        resp.result.map(|r| r.worktree).ok_or_else(|| {
+            OrcaError::Orca("worktree create returned missing worktree object".into())
+        })
     }
 
     pub async fn list_terminals(

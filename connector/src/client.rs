@@ -788,12 +788,34 @@ impl ConnectorClient {
         } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
             let code = err_json
                 .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN")
-                .to_string();
+                .and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(obj) = v.as_object() {
+                        obj.get("code")
+                            .and_then(|c| c.as_str())
+                            .map(|c| c.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    err_json
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .map(|c| c.to_string())
+                })
+                .unwrap_or_else(|| "UNKNOWN".into());
             let msg = err_json
                 .get("message")
                 .and_then(|v| v.as_str())
+                .or_else(|| {
+                    err_json
+                        .get("error")
+                        .and_then(|v| v.as_object())
+                        .and_then(|obj| obj.get("message"))
+                        .and_then(|m| m.as_str())
+                })
                 .unwrap_or("")
                 .to_string();
             Err(ClientError::JobError { code, message: msg })

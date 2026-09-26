@@ -3,9 +3,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ceo_connector::config::LocalTarget;
 use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::orca::receipt::ExecutionReceipt;
 use ceo_connector::orca::types::*;
+use ceo_connector::orca::OrcaExecutionAdapter;
+use ceo_connector::scheduler::{
+    ActiveAttempt, AttemptPhase, DispatchOutcome, ExecutionAdapter, WaitOutcome,
+    ACTIVE_ATTEMPT_SCHEMA_VERSION,
+};
 
 #[test]
 fn test_parse_real_fixtures() {
@@ -30,6 +36,17 @@ fn test_parse_real_fixtures() {
         w_res.worktrees[0].id,
         "52984381-30b0-4c5b-b23b-fd2fc2474049::/home/user/repo"
     );
+
+    // 2b. Worktree Create fixture
+    let wtc_str = fs::read_to_string(base.join("worktree_create.json")).unwrap();
+    let wtc: OrcaWorktreeCreateResponse = serde_json::from_str(&wtc_str).unwrap();
+    assert!(wtc.ok);
+    let wtc_res = wtc.result.unwrap();
+    assert_eq!(
+        wtc_res.worktree.id,
+        "52984381-30b0-4c5b-b23b-fd2fc2474049::/home/user/repo"
+    );
+    assert_eq!(wtc_res.worktree.path, "/home/user/repo");
 
     // 3. Terminal Create fixture
     let tc_str = fs::read_to_string(base.join("terminal_create.json")).unwrap();
@@ -83,7 +100,9 @@ fn test_parse_real_fixtures() {
 }
 
 fn create_mock_orca_script(temp: &tempfile::TempDir, script_body: &str) -> PathBuf {
-    let script_path = temp.path().join("mock-orca");
+    let script_path = temp
+        .path()
+        .join(format!("mock-orca-{}", uuid::Uuid::new_v4()));
     fs::write(&script_path, script_body).unwrap();
     let mut perms = fs::metadata(&script_path).unwrap().permissions();
     perms.set_mode(0o755);
@@ -103,6 +122,8 @@ if [ "$1" = "status" ]; then
     echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.209"}}}}}}'
 elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_1","path":"/path/to/repo"}}]}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_created_1","path":"/path/to/repo","displayName":"task"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_1","title":"ceo:att_1"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
@@ -134,6 +155,14 @@ fi
     assert_eq!(wts.len(), 1);
     assert_eq!(wts[0].id, "wt_1");
 
+    // Test create_worktree
+    let wt_created = client
+        .create_worktree("task", "/path/to/repo")
+        .await
+        .unwrap();
+    assert_eq!(wt_created.id, "wt_created_1");
+    assert_eq!(wt_created.path, "/path/to/repo");
+
     // Test create_terminal
     let tc = client
         .create_terminal("wt_1", "ceo:att_1", None, None)
@@ -163,6 +192,9 @@ fi
     let recorded_args = fs::read_to_string(&args_log).unwrap();
     assert!(recorded_args.contains("--retry-request req_retry_001"));
     assert!(recorded_args.contains("--wait-submit 10"));
+    assert!(recorded_args.contains(
+        "worktree create --name task --repo /path/to/repo --no-parent --setup skip --json"
+    ));
 
     // Test wait_terminal_tui_idle
     let tw = client
@@ -210,7 +242,10 @@ exit 1
     assert!(res.is_err());
     let err = res.unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("not_found: target terminal not found"));
+    assert!(
+        msg.contains("not_found: target terminal not found"),
+        "Unexpected error message: {msg}"
+    );
 }
 
 #[test]
@@ -243,4 +278,411 @@ fn test_execution_receipt_hashing_and_exclusion() {
     assert!(!serialized.contains("prompt"));
     assert!(!serialized.contains("token"));
     assert!(!serialized.contains("secret"));
+}
+
+#[tokio::test]
+async fn test_fake_orca_deterministic_prompt_and_acceptance_formatting_and_secret_exclusion() {
+    let temp = tempfile::tempdir().unwrap();
+    let invocations_log = temp.path().join("invocations.log");
+    let args_log = temp.path().join("args.log");
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "send" ]; then
+    echo "SEND_CALLED" >> "{}"
+    echo "$@" >> "{}"
+    echo '{{"ok":true,"result":{{"send":{{"handle":"term_1","accepted":true,"bytesWritten":42,"prompt":{{"requestId":"req_send_123","stages":["input_accepted"]}}}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unsupported"}}}}'
+fi
+"#,
+        invocations_log.display(),
+        args_log.display()
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let prompt_literal = "GENERATE_REPORT_FOR_Q3_TASK_LITERAL";
+    let acceptance_literal = "REPORT_MUST_BE_IN_CSV_FORMAT_LITERAL";
+    let secret_claim_token = "SECRET_CLAIM_TOKEN_999999";
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_xyz".into(),
+        attempt_id: "att_xyz".into(),
+        claim_token: secret_claim_token.into(),
+        device_id: "dev_xyz".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Prepared,
+        workspace_id: "ws_xyz".into(),
+        target_id: "tgt_xyz".into(),
+        resource_id: None,
+        prompt: Some(prompt_literal.into()),
+        acceptance: Some(acceptance_literal.into()),
+        execution_timeout_seconds: Some(60),
+        result_target: Some("none".into()),
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let outcome = adapter.dispatch(&attempt, "term_1", None).await.unwrap();
+    match outcome {
+        DispatchOutcome::Accepted { request_id, .. } => {
+            assert_eq!(request_id, "req_send_123");
+        }
+        other => panic!("Expected accepted dispatch outcome, got {other:?}"),
+    }
+
+    let invocations = fs::read_to_string(&invocations_log).unwrap();
+    // Proves exactly one terminal send
+    assert_eq!(invocations.lines().count(), 1);
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    let expected_prompt =
+        format!("TASK\n\n{prompt_literal}\n\nACCEPTANCE CRITERIA\n\n{acceptance_literal}");
+    assert!(recorded.contains(&expected_prompt));
+
+    assert!(!recorded.contains("SECRET_CLAIM_TOKEN"));
+    assert!(!recorded.contains("dev_xyz"));
+    assert!(!recorded.contains("127.0.0.1:4000"));
+}
+
+#[tokio::test]
+async fn test_fake_orca_worktree_reconciliation_zero_creates_and_validates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let args_log = temp.path().join("args.log");
+
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[]}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_created_123","path":"{}","displayName":"att_123"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_new_123","title":"ceo:att_123"}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#,
+        args_log.display(),
+        repo_dir.display()
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "repo".into(),
+        kind: "repo".into(),
+        local_path: repo_dir.display().to_string(),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let (wt_id, term_id) = adapter.prepare(&attempt, &target).await.unwrap();
+    assert_eq!(wt_id, "wt_created_123");
+    assert_eq!(term_id, "term_new_123");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(recorded.contains(&format!(
+        "worktree create --name ceo-att_123 --repo path:{} --no-parent --setup skip --json",
+        repo_dir.display()
+    )));
+}
+
+#[tokio::test]
+async fn test_fake_orca_worktree_reconciliation_ambiguous_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let script = r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{"ok":true,"result":{"worktrees":[{"id":"wt_1","path":"/path/to/repo"},{"id":"wt_2","path":"/path/to/repo"}]}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+
+    let bin = create_mock_orca_script(&temp, script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "repo".into(),
+        kind: "repo".into(),
+        local_path: "/path/to/repo".into(),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let res = adapter.prepare(&attempt, &target).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(err.contains("multiple worktrees") || err.contains("ambiguous candidates"));
+}
+
+#[tokio::test]
+async fn test_fake_orca_terminal_adoption_wrong_worktree_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_target_1","path":"{}"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    # Terminal matching title ceo:att_123 exists, but in wt_OTHER!
+    echo '{{"ok":true,"result":{{"terminals":[{{"handle":"term_other_worktree","title":"ceo:att_123","worktreeId":"wt_OTHER"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_created_target","title":"ceo:att_123","worktreeId":"wt_target_1"}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#,
+        repo_dir.display()
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "repo".into(),
+        kind: "repo".into(),
+        local_path: repo_dir.display().to_string(),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let (wt_id, term_id) = adapter.prepare(&attempt, &target).await.unwrap();
+    assert_eq!(wt_id, "wt_target_1");
+    // Must NOT adopt term_other_worktree
+    assert_eq!(term_id, "term_created_target");
+}
+
+#[tokio::test]
+async fn test_fake_orca_dispatch_classification_tightening() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_1".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::DispatchIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    // 1. accepted = false -> KnownRejectedBeforeAcceptance
+    let script1 = r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":false,"prompt":{"requestId":null}}}}'
+"#;
+    let bin1 = create_mock_orca_script(&temp, script1);
+    let client1 = OrcaCliClient::new(bin1);
+    let adapter1 = OrcaExecutionAdapter::new(client1);
+
+    let outcome1 = adapter1.dispatch(&attempt, "term_1", None).await.unwrap();
+    match outcome1 {
+        DispatchOutcome::KnownRejectedBeforeAcceptance { .. } => {}
+        other => panic!("Expected KnownRejectedBeforeAcceptance, got {other:?}"),
+    }
+
+    // 2. accepted = true with missing requestId -> AmbiguousTransportFailure
+    let script2 = r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"requestId":null}}}}'
+"#;
+    let bin2 = create_mock_orca_script(&temp, script2);
+    let client2 = OrcaCliClient::new(bin2);
+    let adapter2 = OrcaExecutionAdapter::new(client2);
+
+    let outcome2 = adapter2.dispatch(&attempt, "term_1", None).await.unwrap();
+    match outcome2 {
+        DispatchOutcome::AmbiguousTransportFailure { error } => {
+            assert!(error.contains("missing"));
+        }
+        other => panic!("Expected AmbiguousTransportFailure, got {other:?}"),
+    }
+
+    // 3. Command failed with error -> AmbiguousTransportFailure
+    let script3 = r#"#!/bin/bash
+echo '{"ok":false,"error":{"code":"internal_failure","message":"pipe broke"}}'
+exit 1
+"#;
+    let bin3 = create_mock_orca_script(&temp, script3);
+    let client3 = OrcaCliClient::new(bin3);
+    let adapter3 = OrcaExecutionAdapter::new(client3);
+
+    let outcome3 = adapter3.dispatch(&attempt, "term_1", None).await.unwrap();
+    match outcome3 {
+        DispatchOutcome::AmbiguousTransportFailure { error } => {
+            assert!(error.contains("internal_failure"));
+        }
+        other => panic!("Expected AmbiguousTransportFailure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_fake_orca_wait_classification() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "j".into(),
+        attempt_id: "a".into(),
+        claim_token: "t".into(),
+        device_id: "d".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "w".into(),
+        target_id: "tg".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    // 1. Terminal wait satisfied=false -> WaitOutcome::TimedOut
+    let script_to = r#"#!/bin/bash
+echo '{"ok":true,"result":{"wait":{"handle":"term_1","condition":"tui-idle","satisfied":false,"elapsedMs":50}}}'
+"#;
+    let bin_to = create_mock_orca_script(&temp, script_to);
+    let client_to = OrcaCliClient::new(bin_to);
+    let adapter_to = OrcaExecutionAdapter::new(client_to);
+
+    let outcome_to = adapter_to
+        .wait(&attempt, "term_1", Duration::from_millis(50))
+        .await
+        .unwrap();
+    match outcome_to {
+        WaitOutcome::TimedOut { elapsed_ms } => {
+            assert_eq!(elapsed_ms, 50);
+        }
+        other => panic!("Expected TimedOut, got {other:?}"),
+    }
+
+    // 2. Terminal exited/missing -> WaitOutcome::Interrupted
+    let script_exit = r#"#!/bin/bash
+echo '{"ok":false,"error":{"code":"terminal_exited","message":"terminal process exited"}}'
+exit 1
+"#;
+    let bin_exit = create_mock_orca_script(&temp, script_exit);
+    let client_exit = OrcaCliClient::new(bin_exit);
+    let adapter_exit = OrcaExecutionAdapter::new(client_exit);
+
+    let outcome_exit = adapter_exit
+        .wait(&attempt, "term_1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    match outcome_exit {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("terminal_exited"));
+        }
+        other => panic!("Expected Interrupted, got {other:?}"),
+    }
+
+    // 3. Unknown fatal error -> fail closed (Err, no timeout invented)
+    let script_err = r#"#!/bin/bash
+echo '{"ok":false,"error":{"code":"unknown_fatal","message":"catastrophic bus error"}}'
+exit 1
+"#;
+    let bin_err = create_mock_orca_script(&temp, script_err);
+    let client_err = OrcaCliClient::new(bin_err);
+    let adapter_err = OrcaExecutionAdapter::new(client_err);
+
+    let outcome_err = adapter_err
+        .wait(&attempt, "term_1", Duration::from_secs(5))
+        .await;
+    assert!(outcome_err.is_err());
+    let msg = outcome_err.unwrap_err();
+    assert!(
+        msg.contains("catastrophic bus error") || msg.contains("unknown_fatal"),
+        "Unexpected msg: {msg}"
+    );
 }
