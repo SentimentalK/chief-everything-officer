@@ -73,7 +73,7 @@ pub struct PreparedExecution {
     pub worktree_id: String,
     pub terminal_id: String,
     pub agent_id: String,
-    pub agent_ready_at_ms: i64,
+    pub agent_ready_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -292,13 +292,6 @@ impl ActiveAttempt {
                         if exec.agent_id.is_none() {
                             return Err(SchedulerError::CorruptState(
                                 "prepared attempt missing agent_id".into(),
-                            ));
-                        }
-                        if exec.runtime_completion_kind.as_deref() != Some("not_started")
-                            && exec.agent_ready_at_ms.is_none()
-                        {
-                            return Err(SchedulerError::CorruptState(
-                                "prepared attempt missing agent_ready_at_ms".into(),
                             ));
                         }
 
@@ -597,7 +590,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
             worktree_id: "wt_fake".into(),
             terminal_id: "term_fake".into(),
             agent_id: "fake_agent".into(),
-            agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
+            agent_ready_at_ms: Some(chrono::Utc::now().timestamp_millis()),
         }))
     }
 

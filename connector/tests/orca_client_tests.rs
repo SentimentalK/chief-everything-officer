@@ -11,7 +11,7 @@ use ceo_connector::orca::types::*;
 use ceo_connector::orca::OrcaExecutionAdapter;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    ExecutionAdapter, SchedulerError, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    ExecutionAdapter, PrepareOutcome, SchedulerError, WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 
 #[test]
@@ -1334,5 +1334,272 @@ fi
     match out {
         DispatchOutcome::KnownRejectedBeforeAcceptance { .. } => {}
         other => panic!("Expected KnownRejectedBeforeAcceptance, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_readiness_satisfied_prepares_normally() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_sat","title":"ceo:att_sat:agy"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_sat","connected":true,"writable":true}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_sat","condition":"tui-idle","satisfied":true}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "test-target".into(),
+        kind: "coding".into(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_sat".into(),
+        attempt_id: "att_sat".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_sat");
+    assert!(prep.agent_ready_at_ms.is_some());
+    assert!(prep.agent_ready_at_ms.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_readiness_unsatisfied_still_prepares_with_none_ready_at() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_unsat","title":"ceo:att_unsat:agy"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_unsat","connected":true,"writable":true}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_unsat","condition":"tui-idle","satisfied":false}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "test-target".into(),
+        kind: "coding".into(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_unsat".into(),
+        attempt_id: "att_unsat".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_unsat");
+    assert_eq!(prep.agent_ready_at_ms, None);
+}
+
+#[tokio::test]
+async fn test_readiness_timeout_still_prepares_with_none_ready_at() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_to","title":"ceo:att_to:agy"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_to","connected":true,"writable":true}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":false,"error":{{"code":"timeout","message":"terminal wait timed out"}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "test-target".into(),
+        kind: "coding".into(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_to".into(),
+        attempt_id: "att_to".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_to");
+    assert_eq!(prep.agent_ready_at_ms, None);
+}
+
+#[tokio::test]
+async fn test_readiness_protocol_mismatch_fails_with_recovery_required() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = repo_dir.canonicalize().unwrap().display().to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_1","path":"{repo_canon}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_mismatch","title":"ceo:att_mismatch:agy"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_mismatch","connected":true,"writable":true}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    # Return different handle in wait result => protocol mismatch!
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_different_alien","condition":"tui-idle","satisfied":true}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        workspace_id: "ws_1".into(),
+        alias: "test-target".into(),
+        kind: "coding".into(),
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_mis".into(),
+        attempt_id: "att_mis".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    match outcome {
+        PrepareOutcome::RecoveryRequired { reason, .. } => {
+            assert!(reason.contains("mismatch") || reason.contains("term_different_alien"));
+        }
+        other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
     }
 }

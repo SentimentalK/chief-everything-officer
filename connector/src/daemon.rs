@@ -717,7 +717,7 @@ pub async fn drive_active_attempt(
                     exec.worktree_id = Some(prep.worktree_id);
                     exec.terminal_id = Some(prep.terminal_id);
                     exec.agent_id = Some(prep.agent_id);
-                    exec.agent_ready_at_ms = Some(prep.agent_ready_at_ms);
+                    exec.agent_ready_at_ms = prep.agent_ready_at_ms;
                     current.phase = AttemptPhase::Prepared;
                     current.save(&paths.active_attempt_file())?;
                     println!(

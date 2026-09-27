@@ -67,7 +67,7 @@ impl ExecutionAdapter for MockAdapter {
                 terminal_id: format!("term_{}", attempt.attempt_id),
                 orca_version: "1.4.209".into(),
                 agent_id: "agy".into(),
-                agent_ready_at_ms: chrono::Utc::now().timestamp_millis(),
+                agent_ready_at_ms: Some(chrono::Utc::now().timestamp_millis()),
             }))
         }
     }
@@ -959,7 +959,7 @@ async fn test_prepare_terminal_adoption() {
             terminal_id: "term_adopted_123".into(),
             orca_version: "1.4.209".into(),
             agent_id: "agy".into(),
-            agent_ready_at_ms: 1727220000000,
+            agent_ready_at_ms: Some(1727220000000),
         }))),
         ..Default::default()
     });
@@ -1687,3 +1687,82 @@ async fn test_explicit_redelivery_flow() {
     let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, Some(&attempt_id)).await;
     assert!(res.is_ok(), "redelivery failed: {:?}", res);
 }
+
+#[tokio::test]
+async fn test_advisory_readiness_unsatisfied_persists_none_ready_at_and_advances_to_dispatch() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_uuid = Uuid::new_v4();
+    let attempt_id = format!("att-{}", attempt_uuid);
+    let attempt_id_clone = attempt_id.clone();
+
+    server.add_handler(move |req| {
+        if req.path.contains("/start") && req.method == "POST" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": attempt_id_clone,
+                        "phase": "started",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": "2026-09-24T12:00:01.000Z"
+                    }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Claimed,
+        "none",
+        None,
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    // MockAdapter returns PrepareOutcome::Ready with agent_ready_at_ms = None (advisory miss)
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        prepare_result: Some(Ok(PrepareOutcome::Ready(PreparedExecution {
+            worktree_id: "wt_adv".into(),
+            terminal_id: "term_adv".into(),
+            orca_version: "1.4.209".into(),
+            agent_id: "agy".into(),
+            agent_ready_at_ms: None,
+        }))),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Step 1: Claimed -> PrepareIntent
+    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    assert_eq!(cur.phase, AttemptPhase::PrepareIntent);
+
+    // Step 2: PrepareIntent -> Prepared with agent_ready_at_ms = None!
+    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    assert_eq!(cur.phase, AttemptPhase::Prepared);
+    assert_eq!(cur.executor.as_ref().unwrap().agent_ready_at_ms, None);
+    // CRITICAL: save & validate must succeed with agent_ready_at_ms = None!
+    assert!(cur.save(&paths.active_attempt_file()).is_ok());
+
+    // Step 3: Prepared -> DispatchIntent
+    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    assert_eq!(cur.phase, AttemptPhase::DispatchIntent);
+    assert_eq!(cur.executor.as_ref().unwrap().agent_ready_at_ms, None);
+
+    // Step 4: DispatchIntent -> Dispatched (relying on send accepted)
+    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    assert_eq!(cur.phase, AttemptPhase::Dispatched);
+    assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
+}
+

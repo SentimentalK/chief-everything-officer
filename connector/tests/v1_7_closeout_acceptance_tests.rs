@@ -138,13 +138,13 @@ fi
     assert_eq!(prep.worktree_id, "wt_1");
     assert_eq!(prep.terminal_id, "term_1");
     assert_eq!(prep.agent_id, "agy");
-    assert!(prep.agent_ready_at_ms > 0);
+    assert!(prep.agent_ready_at_ms.unwrap() > 0);
 }
 
-/// Slice V1.7e Acceptance:
-/// If retry 120s wait is also not satisfied, prepare fails closed with RECOVERY_REQUIRED.
+/// Advisory readiness:
+/// If wait is not satisfied, prepare proceeds with advisory warning and agent_ready_at_ms = None.
 #[tokio::test]
-async fn test_v1_7e_tui_readiness_exhaustion_fails_closed() {
+async fn test_advisory_tui_readiness_unsatisfied_proceeds_to_ready() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
@@ -203,10 +203,13 @@ fi
 
     let res = adapter.prepare(&attempt, &target).await.unwrap();
     match res {
-        ceo_connector::scheduler::PrepareOutcome::NotReady { reason, .. } => {
-            assert!(reason.contains("AGENT_NOT_READY"));
+        ceo_connector::scheduler::PrepareOutcome::Ready(prep) => {
+            assert_eq!(prep.worktree_id, "wt_1");
+            assert_eq!(prep.terminal_id, "term_1");
+            assert_eq!(prep.agent_id, "agy");
+            assert_eq!(prep.agent_ready_at_ms, None);
         }
-        other => panic!("expected PrepareOutcome::NotReady, got {other:?}"),
+        other => panic!("expected PrepareOutcome::Ready with None agent_ready_at_ms, got {other:?}"),
     }
 }
 

@@ -70,12 +70,17 @@ pub fn validate_tui_idle_wait(
     }
 }
 
+pub const ADVISORY_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl OrcaExecutionAdapter {
     pub fn new(client: OrcaCliClient) -> Self {
         Self { client }
     }
 
-    async fn run_readiness_gate(&self, terminal_handle: &str) -> Result<i64, ReadinessError> {
+    async fn run_readiness_gate(
+        &self,
+        terminal_handle: &str,
+    ) -> Result<Option<i64>, ReadinessError> {
         let is_timeout = |err: &OrcaError| -> bool {
             match err {
                 OrcaError::Timeout(_) => true,
@@ -91,19 +96,17 @@ impl OrcaExecutionAdapter {
 
         let wait_res = self
             .client
-            .wait_terminal_tui_idle(terminal_handle, Duration::from_secs(60))
+            .wait_terminal_tui_idle(terminal_handle, ADVISORY_READINESS_TIMEOUT)
             .await;
         match wait_res {
             Ok(resp) => match validate_tui_idle_wait(terminal_handle, &resp) {
-                Ok(ValidatedWait::Satisfied { .. }) => Ok(chrono::Utc::now().timestamp_millis()),
-                Ok(ValidatedWait::Unsatisfied { .. }) => Err(ReadinessError::NotReady(
-                    "AGENT_NOT_READY: terminal failed TUI readiness gate".into(),
-                )),
+                Ok(ValidatedWait::Satisfied { .. }) => {
+                    Ok(Some(chrono::Utc::now().timestamp_millis()))
+                }
+                Ok(ValidatedWait::Unsatisfied { .. }) => Ok(None),
                 Err(e) => Err(ReadinessError::ProtocolMismatch(e)),
             },
-            Err(ref e) if is_timeout(e) => Err(ReadinessError::NotReady(
-                "AGENT_NOT_READY: terminal readiness timed out".into(),
-            )),
+            Err(ref e) if is_timeout(e) => Ok(None),
             Err(e) => Err(ReadinessError::Retryable(format!(
                 "readiness check failed: {e}"
             ))),
@@ -112,7 +115,6 @@ impl OrcaExecutionAdapter {
 }
 
 enum ReadinessError {
-    NotReady(String),
     Retryable(String),
     ProtocolMismatch(String),
 }
@@ -245,19 +247,21 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     let ready_at = if let Some(ts) =
                         attempt.executor.as_ref().and_then(|e| e.agent_ready_at_ms)
                     {
-                        ts
+                        Some(ts)
                     } else {
                         match self.run_readiness_gate(existing_tid).await {
-                            Ok(ts) => ts,
+                            Ok(ts) => {
+                                if ts.is_none() {
+                                    eprintln!(
+                                        "Agent readiness not observed via tui-idle for attempt '{}' terminal '{}'; proceeding to dispatch and relying on terminal send acceptance.",
+                                        attempt.attempt_id, existing_tid
+                                    );
+                                }
+                                ts
+                            }
                             Err(ReadinessError::ProtocolMismatch(r)) => {
                                 return Ok(PrepareOutcome::RecoveryRequired {
                                     execution: Some(identity),
-                                    reason: r,
-                                });
-                            }
-                            Err(ReadinessError::NotReady(r)) => {
-                                return Ok(PrepareOutcome::NotReady {
-                                    execution: identity,
                                     reason: r,
                                 });
                             }
@@ -335,16 +339,18 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     };
 
                     let ready_at = match self.run_readiness_gate(&term.handle).await {
-                        Ok(ts) => ts,
+                        Ok(ts) => {
+                            if ts.is_none() {
+                                eprintln!(
+                                    "Agent readiness not observed via tui-idle for attempt '{}' terminal '{}'; proceeding to dispatch and relying on terminal send acceptance.",
+                                    attempt.attempt_id, term.handle
+                                );
+                            }
+                            ts
+                        }
                         Err(ReadinessError::ProtocolMismatch(r)) => {
                             return Ok(PrepareOutcome::RecoveryRequired {
                                 execution: Some(identity),
-                                reason: r,
-                            });
-                        }
-                        Err(ReadinessError::NotReady(r)) => {
-                            return Ok(PrepareOutcome::NotReady {
-                                execution: identity,
                                 reason: r,
                             });
                         }
@@ -368,19 +374,21 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     let ready_at = if let Some(ts) =
                         attempt.executor.as_ref().and_then(|e| e.agent_ready_at_ms)
                     {
-                        ts
+                        Some(ts)
                     } else {
                         match self.run_readiness_gate(&handle).await {
-                            Ok(ts) => ts,
+                            Ok(ts) => {
+                                if ts.is_none() {
+                                    eprintln!(
+                                        "Agent readiness not observed via tui-idle for attempt '{}' terminal '{}'; proceeding to dispatch and relying on terminal send acceptance.",
+                                        attempt.attempt_id, handle
+                                    );
+                                }
+                                ts
+                            }
                             Err(ReadinessError::ProtocolMismatch(r)) => {
                                 return Ok(PrepareOutcome::RecoveryRequired {
                                     execution: Some(identity),
-                                    reason: r,
-                                });
-                            }
-                            Err(ReadinessError::NotReady(r)) => {
-                                return Ok(PrepareOutcome::NotReady {
-                                    execution: identity,
                                     reason: r,
                                 });
                             }
