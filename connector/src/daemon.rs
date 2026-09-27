@@ -1025,6 +1025,11 @@ pub async fn drive_active_attempt(
                     drop(_lock);
 
                     let prompt_text = {
+                        let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
+                        let target_path = disk_config
+                            .as_ref()
+                            .and_then(|c| c.targets.get(&active.target_id))
+                            .map(|t| std::path::PathBuf::from(&t.local_path));
                         let managed_contract =
                             if active.result_target.as_deref() == Some("resource") {
                                 Some(crate::execution_contract::ManagedContract {
@@ -1039,6 +1044,7 @@ pub async fn drive_active_attempt(
                         crate::execution_contract::build_execution_prompt(
                             active.prompt.as_deref(),
                             active.acceptance.as_deref(),
+                            target_path.as_deref(),
                             managed_contract.as_ref(),
                         )
                     };

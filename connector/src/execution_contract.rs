@@ -198,21 +198,41 @@ pub struct ManagedContract {
 pub fn build_execution_prompt(
     task: Option<&str>,
     acceptance: Option<&str>,
+    working_directory: Option<&std::path::Path>,
     managed_contract: Option<&ManagedContract>,
 ) -> String {
     let mut sections = Vec::new();
 
     if let Some(t) = task {
-        let trimmed = t.trim();
-        if !trimmed.is_empty() {
-            sections.push(format!("TASK\n\n{trimmed}"));
+        let mut task_str = t.trim().to_string();
+        if let Some(wd) = working_directory {
+            if task_str.contains("{{WORKING_DIRECTORY}}") {
+                task_str = task_str.replace("{{WORKING_DIRECTORY}}", &wd.display().to_string());
+            }
+        }
+        if !task_str.is_empty() {
+            if task_str.starts_with("TASK\n")
+                || task_str.starts_with("TASK\r\n")
+                || task_str == "TASK"
+            {
+                sections.push(task_str);
+            } else {
+                sections.push(format!("TASK\n\n{task_str}"));
+            }
         }
     }
 
     if let Some(a) = acceptance {
         let trimmed = a.trim();
         if !trimmed.is_empty() {
-            sections.push(format!("ACCEPTANCE CRITERIA\n\n{trimmed}"));
+            if trimmed.starts_with("ACCEPTANCE CRITERIA\n")
+                || trimmed.starts_with("ACCEPTANCE CRITERIA\r\n")
+                || trimmed == "ACCEPTANCE CRITERIA"
+            {
+                sections.push(trimmed.to_string());
+            } else {
+                sections.push(format!("ACCEPTANCE CRITERIA\n\n{trimmed}"));
+            }
         }
     }
 
@@ -293,8 +313,12 @@ mod tests {
 
     #[test]
     fn build_execution_prompt_none_target() {
-        let prompt =
-            build_execution_prompt(Some("Fix bug in parser"), Some("All tests green"), None);
+        let prompt = build_execution_prompt(
+            Some("Fix bug in parser"),
+            Some("All tests green"),
+            None,
+            None,
+        );
         assert_eq!(
             prompt,
             "TASK\n\nFix bug in parser\n\nACCEPTANCE CRITERIA\n\nAll tests green"
@@ -309,8 +333,12 @@ mod tests {
             attempt_id: "att-123".into(),
             resource_id: "res_456".into(),
         };
-        let prompt =
-            build_execution_prompt(Some("Update docs"), Some("Doc matches schema"), Some(&mc));
+        let prompt = build_execution_prompt(
+            Some("Update docs"),
+            Some("Doc matches schema"),
+            None,
+            Some(&mc),
+        );
         assert!(prompt.starts_with(
             "TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"
         ));
@@ -321,5 +349,16 @@ mod tests {
         // Correct op; no forbidden op
         assert!(prompt.contains("\"op\": \"upsert_content\""));
         assert!(!prompt.contains("replace_body"));
+    }
+
+    #[test]
+    fn build_execution_prompt_working_directory_substitution() {
+        let prompt = build_execution_prompt(
+            Some("Run in {{WORKING_DIRECTORY}} now"),
+            None,
+            Some(std::path::Path::new("/workspace/project")),
+            None,
+        );
+        assert_eq!(prompt, "TASK\n\nRun in /workspace/project now");
     }
 }

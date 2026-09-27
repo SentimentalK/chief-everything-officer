@@ -15,6 +15,7 @@ fn test_contract_example_round_trips_through_validator() {
     let prompt = build_execution_prompt(
         Some("Acquire full textual content for Resource"),
         Some("A valid managed result must contain a non-empty upsert_content operation"),
+        None,
         Some(&contract),
     );
 
@@ -69,4 +70,45 @@ fn test_contract_example_round_trips_through_validator() {
         envelope.operations[0].get("op").and_then(|v| v.as_str()),
         Some("upsert_content")
     );
+}
+
+#[test]
+fn test_acquisition_prompt_working_directory_substitution_and_hardening() {
+    let raw_task = r#"TASK
+
+Extract the spoken/textual content from this URL and return it to the attached CEO Resource through the managed-result contract.
+
+SOURCE
+URL: https://www.youtube.com/watch?v=4Yb3JFbw4k0
+Resource ID: res-58045c04-d1a9-422a-a1a4-ecbee04187f7
+
+EXECUTION ENVIRONMENT
+
+Your working repository is:
+{{WORKING_DIRECTORY}}
+
+1. Stay inside this repository for task execution.
+2. Read the repository's AGENT.md / agent instructions first.
+3. Use the repository-provided URL extraction capability: content.extract_url.
+"#;
+
+    let target_dir = PathBuf::from("/home/sentimentalk/codes/ceo-agent-runtime");
+    let prompt = build_execution_prompt(
+        Some(raw_task),
+        Some("A valid managed result must contain a non-empty upsert_content operation"),
+        Some(&target_dir),
+        None,
+    );
+
+    // Verify {{WORKING_DIRECTORY}} is cleanly replaced with the actual path
+    assert!(!prompt.contains("{{WORKING_DIRECTORY}}"));
+    assert!(prompt.contains("/home/sentimentalk/codes/ceo-agent-runtime"));
+
+    // Verify TASK header is not duplicated
+    assert!(prompt.starts_with("TASK\n\nExtract the spoken/textual content"));
+    assert!(!prompt.starts_with("TASK\n\nTASK\n\n"));
+
+    // Verify SOURCE section has URL and Resource ID
+    assert!(prompt.contains("URL: https://www.youtube.com/watch?v=4Yb3JFbw4k0"));
+    assert!(prompt.contains("Resource ID: res-58045c04-d1a9-422a-a1a4-ecbee04187f7"));
 }

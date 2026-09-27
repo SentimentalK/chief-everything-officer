@@ -348,6 +348,7 @@ fi
         attempt.prompt.as_deref(),
         attempt.acceptance.as_deref(),
         None,
+        None,
     );
     let outcome = adapter
         .dispatch(&attempt, "term_1", &prompt_text)

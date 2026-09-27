@@ -176,9 +176,15 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const hostJob = await coordinator.getJobForHost(scope, res.job_id!, { include_task: true });
     expect(hostJob.resource_id).toBe(urlResourceId);
     expect(hostJob.result_target).toBe("resource");
-    expect(hostJob.task?.prompt).toContain("CAPABILITY: content.extract_url");
-    expect(hostJob.task?.prompt).toContain("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(hostJob.task?.prompt).toContain("content.extract_url");
+    expect(hostJob.task?.prompt).toContain("URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(hostJob.task?.prompt).toContain(`Resource ID: ${urlResourceId}`);
+    expect(hostJob.task?.prompt).toContain("{{WORKING_DIRECTORY}}");
+    expect(hostJob.task?.prompt).toContain('./capabilities/content.extract_url/run --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --output-dir <temporary-output-dir>');
+    expect(hostJob.task?.prompt).not.toContain("e.g.");
     expect(hostJob.task?.acceptance).toContain("upsert_content");
+    expect(hostJob.task?.acceptance).toContain("upsert_summary");
+    expect(hostJob.task?.acceptance).toContain("upsert_evidence");
   });
 
   it("returns already_satisfied when content exists and mode is if_missing", async () => {
