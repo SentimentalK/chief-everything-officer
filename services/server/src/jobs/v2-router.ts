@@ -202,6 +202,7 @@ export function createConnectorJobsRouter(
         parsedBody.claim_token,
         parsedBody.result,
         parsedBody.payload_sha256,
+        parsedBody.delivery_mode,
       );
       res.status(200).json(outcome);
     } catch (err) {
@@ -214,7 +215,8 @@ export function createConnectorJobsRouter(
         return;
       }
       if (err instanceof V2ReportConflictError) {
-        res.status(409).json({ error: "RESULT_CONFLICT", message: err.message });
+        const errCode = err.message === "STALE_RESULT_SUBMISSION" ? "STALE_RESULT_SUBMISSION" : "RESULT_CONFLICT";
+        res.status(409).json({ error: errCode, message: err.message });
         return;
       }
       if (err instanceof V2AttemptLifecycleError) {

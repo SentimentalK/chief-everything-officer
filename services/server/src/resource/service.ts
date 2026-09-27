@@ -836,7 +836,9 @@ export class ResourceService {
       }
     }
 
-    const resultTxRequestId = deriveDeterministicUuid(`ceo:job:result:${input.attemptId}`);
+    const resultTxRequestId = deriveDeterministicUuid(
+      `ceo:job:result:${input.attemptId}:${input.payloadSha256}`,
+    );
 
     // Resolve current workspace HEAD as baseCommit cleanly without holding lock during transaction
     const baseCommit = await this.workspace.withReadyWorkspace(async (base) => base);

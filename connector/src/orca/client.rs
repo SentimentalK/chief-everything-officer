@@ -372,6 +372,24 @@ impl OrcaCliClient {
         parse_orca_json(output)
     }
 
+    pub async fn send_interrupt(
+        &self,
+        terminal_handle: &str,
+    ) -> Result<OrcaTerminalSendResponse, OrcaError> {
+        let args = vec![
+            "terminal",
+            "send",
+            "--terminal",
+            terminal_handle,
+            "--interrupt",
+            "--json",
+        ];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        parse_orca_json(output)
+    }
+
     pub async fn close_terminal(
         &self,
         terminal_handle: &str,

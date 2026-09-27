@@ -529,6 +529,8 @@ export function createFakeRedisRunner(): RedisRunner & {
 
         const nowMs = Date.now();
 
+        const deliveryMode = args[4] || "automatic";
+
         if (attempt.result) {
           const existing = attempt.result;
           if (
@@ -542,16 +544,9 @@ export function createFakeRedisRunner(): RedisRunner & {
               commit: existing.commit,
               resource_id: existing.resource_id,
             });
-          } else {
-            return JSON.stringify({ error: "RESULT_CONFLICT" });
+          } else if (deliveryMode !== "explicit_redelivery") {
+            return JSON.stringify({ error: "STALE_RESULT_SUBMISSION" });
           }
-        }
-
-        if (attempt.phase !== "running") {
-          return JSON.stringify({ error: "INVALID_ATTEMPT_PHASE", phase: attempt.phase });
-        }
-        if (job.status !== "active") {
-          return JSON.stringify({ error: "INVALID_JOB_STATUS", status: job.status });
         }
 
         incomingResult.received_at_ms = nowMs;

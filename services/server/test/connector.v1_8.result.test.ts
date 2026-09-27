@@ -256,6 +256,12 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     const conflictResult = {
       ...managedResult,
       summary: "Conflicting summary",
+      operations: [
+        {
+          op: "upsert_content",
+          content: "# V1.8 Redelivered Content\nDistinct content for redelivery.",
+        },
+      ],
     };
     const conflictDigest = computeCanonicalSha256(conflictResult);
     const conflictRes = await fetch(`${baseUrl}/${jobId}/result`, {
@@ -273,7 +279,28 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     });
     expect(conflictRes.status).toBe(409);
     const conflictJson = await conflictRes.json();
-    expect(conflictJson.error).toBe("RESULT_CONFLICT");
+    expect(conflictJson.error).toBe("STALE_RESULT_SUBMISSION");
+
+    // 7b. Verify explicit_redelivery allows replacement with new commit
+    const redeliverRes = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: conflictResult,
+        payload_sha256: conflictDigest,
+        delivery_mode: "explicit_redelivery",
+      }),
+    });
+    const redeliverJson = await redeliverRes.json();
+    expect(redeliverRes.status).toBe(200);
+    expect(redeliverJson.ok).toBe(true);
+    expect(redeliverJson.replayed).toBe(false);
+    expect(redeliverJson.commit).not.toBe(resultJson.commit);
 
     // 8. Deliver final completion report now that result is ACKed
     const reportRes = await fetch(`${baseUrl}/${jobId}/report`, {
@@ -307,9 +334,9 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     expect(hostJob.result).toEqual({
       target: "resource",
       attempt_id: attemptId,
-      payload_sha256: payloadSha256,
+      payload_sha256: conflictDigest,
       resource_id: resourceId,
-      commit: resultJson.commit,
+      commit: redeliverJson.commit,
       received_at: expect.any(String),
     });
   });

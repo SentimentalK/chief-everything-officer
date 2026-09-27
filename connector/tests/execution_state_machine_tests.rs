@@ -18,7 +18,7 @@ use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    DispatchReconciliation, ExecutionAdapter, PrepareOutcome, PreparedExecution, WaitOutcome,
+    DispatchReconciliation, ExecutionAdapter, InterruptOutcome, PrepareOutcome, PreparedExecution, WaitOutcome,
     ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
@@ -38,6 +38,7 @@ struct MockAdapter {
     pub dispatch_calls: Arc<AtomicUsize>,
     pub wait_calls: Arc<AtomicUsize>,
     pub close_calls: Arc<AtomicUsize>,
+    pub interrupt_calls: Arc<AtomicUsize>,
 
     pub on_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -110,6 +111,15 @@ impl ExecutionAdapter for MockAdapter {
         self.wait_result
             .clone()
             .unwrap_or(Ok(WaitOutcome::TuiIdle { elapsed_ms: 100 }))
+    }
+
+    async fn interrupt(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+    ) -> Result<InterruptOutcome, String> {
+        self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(InterruptOutcome::Sent)
     }
 
     async fn close(&self, _terminal_id: &str) -> CleanupOutcome {
@@ -551,7 +561,7 @@ async fn test_resource_result_target_missing_result_fails_closed() {
     assert_eq!(adapter.prepare_calls.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.wait_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 0);
 
     let outbox_entries = fs::read_dir(paths.outbox_dir())
         .unwrap()
@@ -1181,12 +1191,13 @@ async fn test_interrupted_runtime_outcome_semantics() {
     let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
     let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
 
-    assert_eq!(record.report.execution_status, ExecutionStatus::INTERRUPTED);
-    assert_eq!(record.report.business_outcome, BusinessOutcome::UNVERIFIED);
+    assert_eq!(record.report.execution_status, ExecutionStatus::FAILED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::FAILED);
     assert!(record.report.task_dispatched);
     let err = record.report.error.expect("expected error details");
     assert_eq!(err.stage, "runtime");
     assert_eq!(err.code, "TERMINAL_EXITED");
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 0);
 }
 
 /// 11. /start Permanent Error Fails Closed:
@@ -1431,4 +1442,248 @@ async fn test_proven_rejection_allows_one_retry_then_exhausts_to_blocked() {
         record.report.error.as_ref().map(|e| e.code.as_str()),
         Some("DISPATCH_REJECTED")
     );
+}
+
+#[tokio::test]
+async fn test_timeout_fallback_with_valid_managed_result() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-123";
+
+    let mut executor_state = make_default_executor("orca", "1.4.209");
+    executor_state.worktree_id = Some("wt_mock".into());
+    executor_state.terminal_id = Some("term_mock".into());
+    executor_state.dispatch_started_at_ms = Some(1727000000000);
+    executor_state.execution_deadline_ms = Some(1727000060000);
+    executor_state.dispatch_request_id = Some("req_mock".into());
+    executor_state.dispatch_send_count = 1;
+    executor_state.runtime_completion_kind = Some("timed_out".into());
+    executor_state.runtime_completed_at_ms = Some(1727000070000);
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::OutcomeRecorded,
+        "resource",
+        Some(resource_id),
+        Some(executor_state),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    // Write valid managed result before outcome recorded runs
+    let result_file = paths.managed_result_file(&attempt_id);
+    let valid_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Extracted youtube transcript",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Full video transcript content here"
+            }
+        ]
+    });
+    fs::create_dir_all(result_file.parent().unwrap()).unwrap();
+    fs::write(&result_file, serde_json::to_string(&valid_envelope).unwrap()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    // Terminal was closed because timeout fallback succeeded as COMPLETED
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.interrupt_calls.load(Ordering::SeqCst), 0);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+
+    assert_eq!(record.report.execution_status, ExecutionStatus::COMPLETED);
+    assert!(record.managed_result.is_some());
+
+    // Preserved result and meta file must exist
+    let pres_res = paths.preserved_managed_result_file(&job_id, &attempt_id);
+    let pres_meta = paths.preserved_managed_result_meta_file(&job_id, &attempt_id);
+    assert!(pres_res.exists());
+    assert!(pres_meta.exists());
+}
+
+#[tokio::test]
+async fn test_timeout_without_managed_result() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-456";
+
+    let mut executor_state = make_default_executor("orca", "1.4.209");
+    executor_state.worktree_id = Some("wt_mock".into());
+    executor_state.terminal_id = Some("term_mock".into());
+    executor_state.dispatch_started_at_ms = Some(1727000000000);
+    executor_state.execution_deadline_ms = Some(1727000060000);
+    executor_state.dispatch_request_id = Some("req_mock".into());
+    executor_state.dispatch_send_count = 1;
+    executor_state.runtime_completion_kind = Some("timed_out".into());
+    executor_state.runtime_completed_at_ms = Some(1727000070000);
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::OutcomeRecorded,
+        "resource",
+        Some(resource_id),
+        Some(executor_state),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    // Ensure runtime attempt dir exists
+    let runtime_dir = paths.attempt_runtime_dir(&attempt_id);
+    fs::create_dir_all(&runtime_dir).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    // Terminal was NOT closed; interrupt was called!
+    assert_eq!(adapter.close_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.interrupt_calls.load(Ordering::SeqCst), 1);
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+
+    assert_eq!(record.report.execution_status, ExecutionStatus::TIMED_OUT);
+    assert!(record.managed_result.is_none());
+
+    // Mock report server endpoint
+    let report_path = format!("/api/connector/jobs/{job_id}/report");
+    server.add_handler(move |req| {
+        if req.path == report_path && req.method == "POST" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-27T16:00:00.000Z"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Deliver outbox
+    ceo_connector::outbox::flush_outbox(&paths, &client, &cred).await.unwrap();
+
+    // History record must record "timed_out"
+    let hist_file = paths.history_file(&job_id, &attempt_id);
+    assert!(hist_file.exists());
+    let hist_str = fs::read_to_string(hist_file).unwrap();
+    let hist: ceo_connector::outbox::SanitizedHistoryRecord = serde_json::from_str(&hist_str).unwrap();
+    assert_eq!(hist.status, "timed_out");
+
+    // Runtime dir must NOT be deleted on TIMED_OUT!
+    assert!(runtime_dir.exists());
+}
+
+#[tokio::test]
+async fn test_explicit_redelivery_flow() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let job_id = "job_redeliver_test";
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-789";
+
+    // Set up preserved result and meta
+    let pres_res = paths.preserved_managed_result_file(job_id, &attempt_id);
+    let pres_meta = paths.preserved_managed_result_meta_file(job_id, &attempt_id);
+
+    let valid_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Manual correction of transcript",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Corrected transcript content"
+            }
+        ]
+    });
+    let meta = ceo_connector::redelivery::PreservedResultMeta {
+        server_origin: cred.server_origin.clone(),
+        device_id: cred.device_id.clone(),
+        job_id: job_id.into(),
+        attempt_id: attempt_id.clone(),
+        claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        resource_id: Some(resource_id.into()),
+    };
+
+    ceo_connector::local_state::atomic_write_json(&pres_res, &valid_envelope).unwrap();
+    ceo_connector::local_state::atomic_write_json(&pres_meta, &meta).unwrap();
+
+    // Mock result endpoint on server expecting delivery_mode: explicit_redelivery
+    let result_path = format!("/api/connector/jobs/{job_id}/result");
+    let resource_id_clone = resource_id.to_string();
+    server.add_handler(move |req| {
+        if req.path == result_path && req.method == "POST" {
+            let body: serde_json::Value = req.json().unwrap();
+            assert_eq!(body.get("delivery_mode").and_then(|v| v.as_str()), Some("explicit_redelivery"));
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-27T16:00:00.000Z",
+                    "resource_id": resource_id_clone,
+                    "commit": "git-commit-hash-abc"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, Some(&attempt_id)).await;
+    assert!(res.is_ok(), "redelivery failed: {:?}", res);
 }

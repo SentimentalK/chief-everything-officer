@@ -447,6 +447,7 @@ export class RedisJobStoreV2 {
     device_id: string;
     claim_token_sha256: string;
     result: PersistedJobResult;
+    delivery_mode?: "automatic" | "explicit_redelivery";
   }): Promise<{
     status: "recorded" | "replayed";
     server_time_ms: number;
@@ -462,6 +463,7 @@ export class RedisJobStoreV2 {
       params.device_id,
       params.claim_token_sha256,
       JSON.stringify(params.result),
+      params.delivery_mode ?? "automatic",
     ];
 
     const raw = await this.evalScript(
@@ -482,6 +484,7 @@ export class RedisJobStoreV2 {
     if (parsed.error) {
       const err = String(parsed.error);
       if (err === "JOB_NOT_FOUND") throw new V2JobNotFoundError();
+      if (err === "STALE_RESULT_SUBMISSION") throw new V2ReportConflictError("STALE_RESULT_SUBMISSION");
       if (err === "RESULT_CONFLICT") throw new V2ReportConflictError("RESULT_CONFLICT");
       if (
         err === "ATTEMPT_NOT_FOUND" ||

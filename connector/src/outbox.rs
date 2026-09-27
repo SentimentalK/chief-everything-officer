@@ -147,6 +147,7 @@ pub async fn deliver_outbox_record(
                 &record.claim_token,
                 result,
                 digest,
+                Some("automatic"),
             )
             .await;
 
@@ -228,6 +229,7 @@ pub async fn deliver_outbox_record(
 
             let status_str = match record.report.execution_status {
                 crate::execution_contract::ExecutionStatus::COMPLETED => "completed",
+                crate::execution_contract::ExecutionStatus::TIMED_OUT => "timed_out",
                 _ => "failed",
             };
 
@@ -253,10 +255,12 @@ pub async fn deliver_outbox_record(
             // 3. Durably unlink active attempt
             remove_durable(&paths.active_attempt_file())?;
 
-            // 4. Clean up attempt runtime dir if present
-            let runtime_attempt_dir = paths.attempt_runtime_dir(&record.attempt_id);
-            if runtime_attempt_dir.exists() {
-                let _ = fs::remove_dir_all(&runtime_attempt_dir);
+            // 4. Clean up attempt runtime dir only if COMPLETED (retain for inspection & manual redelivery on failure/timeout)
+            if record.report.execution_status == crate::execution_contract::ExecutionStatus::COMPLETED {
+                let runtime_attempt_dir = paths.attempt_runtime_dir(&record.attempt_id);
+                if runtime_attempt_dir.exists() {
+                    let _ = fs::remove_dir_all(&runtime_attempt_dir);
+                }
             }
 
             Ok(())

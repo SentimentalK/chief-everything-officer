@@ -14,7 +14,7 @@ use crate::execution_contract::{
     BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionReportExecutor,
     ExecutionStatus, REPORT_SCHEMA_VERSION,
 };
-use crate::local_state::{remove_durable, ExecutionLock};
+use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
 use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
     compute_report_sha256, deliver_outbox_record, flush_outbox, OutboxError, OutboxRecord,
@@ -1292,59 +1292,6 @@ pub async fn drive_active_attempt(
             Ok(true)
         }
         AttemptPhase::OutcomeRecorded => {
-            // NEVER wait or dispatch again!
-            let (terminal_cleanup_verified, terminal_closed_at_ms) = if let Some(tid) = active
-                .executor
-                .as_ref()
-                .and_then(|e| e.terminal_id.as_ref())
-            {
-                match adapter.close(tid).await {
-                    crate::scheduler::CleanupOutcome::VerifiedClosed { closed_at_ms } => {
-                        (true, Some(closed_at_ms))
-                    }
-                    crate::scheduler::CleanupOutcome::AlreadyAbsent { verified_at_ms } => {
-                        (true, Some(verified_at_ms))
-                    }
-                    crate::scheduler::CleanupOutcome::Retryable { reason } => {
-                        eprintln!("Terminal cleanup retryable: {reason}. Will retry next loop.");
-                        return Ok(true);
-                    }
-                    crate::scheduler::CleanupOutcome::RecoveryRequired { code, message } => {
-                        let _lock = ExecutionLock::acquire_with_retry(
-                            &paths.state_lock_file(),
-                            Duration::from_secs(5),
-                            Duration::from_millis(50),
-                        )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
-                        current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
-                        return Err(DaemonError::RecoveryRequired(format!("{code}: {message}")));
-                    }
-                }
-            } else {
-                (true, None)
-            };
-
-            if !terminal_cleanup_verified {
-                let _lock = ExecutionLock::acquire_with_retry(
-                    &paths.state_lock_file(),
-                    Duration::from_secs(5),
-                    Duration::from_millis(50),
-                )?;
-                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                    Some(c) if c.attempt_id == active.attempt_id => c,
-                    _ => return Ok(true),
-                };
-                current.phase = AttemptPhase::RecoveryRequired;
-                current.save(&paths.active_attempt_file())?;
-                return Err(DaemonError::RecoveryRequired(
-                    "HARD INVARIANT VIOLATION: terminal_cleanup_verified is false in OutcomeRecorded".into(),
-                ));
-            }
-
             let exec_state = active.executor.as_ref().ok_or_else(|| {
                 DaemonError::RecoveryRequired("OutcomeRecorded phase missing executor state".into())
             })?;
@@ -1363,13 +1310,29 @@ pub async fn drive_active_attempt(
                                 &active.attempt_id,
                                 expected_resource_id,
                             ) {
-                                Ok((envelope, sha256)) => (
-                                    ExecutionStatus::COMPLETED,
-                                    BusinessOutcome::UNVERIFIED,
-                                    None,
-                                    Some(envelope),
-                                    Some(sha256),
-                                ),
+                                Ok((envelope, sha256)) => {
+                                    // Save preserved result and private metadata (0600)
+                                    let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
+                                    let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+                                    let meta = crate::redelivery::PreservedResultMeta {
+                                        server_origin: cred.server_origin.clone(),
+                                        device_id: cred.device_id.clone(),
+                                        job_id: active.job_id.clone(),
+                                        attempt_id: active.attempt_id.clone(),
+                                        claim_token: active.claim_token.clone(),
+                                        resource_id: active.resource_id.clone(),
+                                    };
+                                    let _ = atomic_write_json(&pres_res, &envelope);
+                                    let _ = atomic_write_json(&pres_meta, &meta);
+
+                                    (
+                                        ExecutionStatus::COMPLETED,
+                                        BusinessOutcome::UNVERIFIED,
+                                        None,
+                                        Some(envelope),
+                                        Some(sha256),
+                                    )
+                                }
                                 Err(e) => {
                                     let (code, msg) = match &e {
                                         crate::managed_result::ManagedResultError::Io(err)
@@ -1405,22 +1368,72 @@ pub async fn drive_active_attempt(
                             )
                         }
                     }
-                    Some("timed_out") => (
-                        ExecutionStatus::TIMED_OUT,
-                        BusinessOutcome::UNVERIFIED,
-                        exec_state.runtime_error.clone().or_else(|| {
-                            Some(ExecutionReportError {
-                                stage: "runtime".into(),
-                                code: "EXECUTION_TIMEOUT".into(),
-                                message: "Execution timed out".into(),
-                            })
-                        }),
-                        None,
-                        None,
-                    ),
+                    Some("timed_out") => {
+                        if active.result_target.as_deref() == Some("resource") {
+                            let result_file = paths.managed_result_file(&active.attempt_id);
+                            let expected_resource_id = active.resource_id.as_deref();
+                            match crate::managed_result::read_and_validate_from_file(
+                                &result_file,
+                                &active.job_id,
+                                &active.attempt_id,
+                                expected_resource_id,
+                            ) {
+                                Ok((envelope, sha256)) => {
+                                    // Timeout fallback: valid correlated managed result exists!
+                                    let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
+                                    let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+                                    let meta = crate::redelivery::PreservedResultMeta {
+                                        server_origin: cred.server_origin.clone(),
+                                        device_id: cred.device_id.clone(),
+                                        job_id: active.job_id.clone(),
+                                        attempt_id: active.attempt_id.clone(),
+                                        claim_token: active.claim_token.clone(),
+                                        resource_id: active.resource_id.clone(),
+                                    };
+                                    let _ = atomic_write_json(&pres_res, &envelope);
+                                    let _ = atomic_write_json(&pres_meta, &meta);
+
+                                    (
+                                        ExecutionStatus::COMPLETED,
+                                        BusinessOutcome::UNVERIFIED,
+                                        None,
+                                        Some(envelope),
+                                        Some(sha256),
+                                    )
+                                }
+                                Err(_) => (
+                                    ExecutionStatus::TIMED_OUT,
+                                    BusinessOutcome::UNVERIFIED,
+                                    exec_state.runtime_error.clone().or_else(|| {
+                                        Some(ExecutionReportError {
+                                            stage: "runtime".into(),
+                                            code: "EXECUTION_TIMEOUT".into(),
+                                            message: "Execution timed out".into(),
+                                        })
+                                    }),
+                                    None,
+                                    None,
+                                ),
+                            }
+                        } else {
+                            (
+                                ExecutionStatus::TIMED_OUT,
+                                BusinessOutcome::UNVERIFIED,
+                                exec_state.runtime_error.clone().or_else(|| {
+                                    Some(ExecutionReportError {
+                                        stage: "runtime".into(),
+                                        code: "EXECUTION_TIMEOUT".into(),
+                                        message: "Execution timed out".into(),
+                                    })
+                                }),
+                                None,
+                                None,
+                            )
+                        }
+                    }
                     Some("interrupted") => (
-                        ExecutionStatus::INTERRUPTED,
-                        BusinessOutcome::UNVERIFIED,
+                        ExecutionStatus::FAILED,
+                        BusinessOutcome::FAILED,
                         exec_state.runtime_error.clone().or_else(|| {
                             Some(ExecutionReportError {
                                 stage: "runtime".into(),
@@ -1461,6 +1474,54 @@ pub async fn drive_active_attempt(
                         )));
                     }
                 };
+
+            // Terminal handling: only close on COMPLETED; interrupt on TIMED_OUT; retain session on FAILED/TIMED_OUT
+            let (terminal_cleanup_verified, terminal_closed_at_ms) = match status {
+                ExecutionStatus::COMPLETED => {
+                    if let Some(tid) = exec_state.terminal_id.as_deref() {
+                        match adapter.close(tid).await {
+                            crate::scheduler::CleanupOutcome::VerifiedClosed { closed_at_ms } => {
+                                (true, Some(closed_at_ms))
+                            }
+                            crate::scheduler::CleanupOutcome::AlreadyAbsent { verified_at_ms } => {
+                                (true, Some(verified_at_ms))
+                            }
+                            crate::scheduler::CleanupOutcome::Retryable { reason } => {
+                                eprintln!("Terminal cleanup retryable: {reason}. Will retry next loop.");
+                                return Ok(true);
+                            }
+                            crate::scheduler::CleanupOutcome::RecoveryRequired { code, message } => {
+                                let _lock = ExecutionLock::acquire_with_retry(
+                                    &paths.state_lock_file(),
+                                    Duration::from_secs(5),
+                                    Duration::from_millis(50),
+                                )?;
+                                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                                current.phase = AttemptPhase::RecoveryRequired;
+                                current.save(&paths.active_attempt_file())?;
+                                return Err(DaemonError::RecoveryRequired(format!("{code}: {message}")));
+                            }
+                        }
+                    } else {
+                        (true, None)
+                    }
+                }
+                ExecutionStatus::TIMED_OUT => {
+                    if let Some(tid) = exec_state.terminal_id.as_deref() {
+                        if let Err(e) = adapter.interrupt(&active, tid).await {
+                            eprintln!("Warning: failed to send interrupt to terminal {tid}: {e}");
+                        }
+                    }
+                    (false, None)
+                }
+                _ => {
+                    // Retain terminal session for user inspection in Orca
+                    (false, None)
+                }
+            };
 
             let started_ms = exec_state.dispatch_started_at_ms.unwrap_or_else(now_utc_ms);
             let completed_ms = exec_state

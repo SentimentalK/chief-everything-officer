@@ -457,6 +457,12 @@ pub enum CleanupOutcome {
     RecoveryRequired { code: String, message: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    Sent,
+    Failed { error: String },
+}
+
 /// Boundary trait for job execution adapters.
 /// V1.6 used monolithic execute().
 /// V1.7 implements fine-grained prepare, dispatch, wait, close stages.
@@ -490,6 +496,12 @@ pub trait ExecutionAdapter: Send + Sync {
         terminal_id: &str,
         remaining_timeout: std::time::Duration,
     ) -> Result<WaitOutcome, String>;
+
+    async fn interrupt(
+        &self,
+        attempt: &ActiveAttempt,
+        terminal_id: &str,
+    ) -> Result<InterruptOutcome, String>;
 
     async fn close(&self, terminal_id: &str) -> CleanupOutcome;
 }
@@ -542,6 +554,14 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         _remaining_timeout: std::time::Duration,
     ) -> Result<WaitOutcome, String> {
         Err("UnavailableExecutionAdapter cannot wait".into())
+    }
+
+    async fn interrupt(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+    ) -> Result<InterruptOutcome, String> {
+        Ok(InterruptOutcome::Sent)
     }
 
     async fn close(&self, _terminal_id: &str) -> CleanupOutcome {
@@ -608,6 +628,14 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         _remaining_timeout: std::time::Duration,
     ) -> Result<WaitOutcome, String> {
         Ok(WaitOutcome::TuiIdle { elapsed_ms: 100 })
+    }
+
+    async fn interrupt(
+        &self,
+        _attempt: &ActiveAttempt,
+        _terminal_id: &str,
+    ) -> Result<InterruptOutcome, String> {
+        Ok(InterruptOutcome::Sent)
     }
 
     async fn close(&self, _terminal_id: &str) -> CleanupOutcome {

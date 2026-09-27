@@ -61,6 +61,16 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// Redeliver a managed result to the server
+    Redeliver {
+        /// Job ID to redeliver
+        job_id: String,
+
+        /// Specific attempt ID to redeliver (optional if only one attempt exists)
+        #[arg(long)]
+        attempt: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -282,6 +292,12 @@ async fn main() -> ExitCode {
         Commands::Doctor { json } => {
             let report = ceo_connector::doctor::run_doctor(&paths, json).await;
             if !report.overall_passed {
+                return ExitCode::FAILURE;
+            }
+        }
+        Commands::Redeliver { job_id, attempt } => {
+            if let Err(e) = ceo_connector::redelivery::run_redeliver(&paths, &job_id, attempt.as_deref()).await {
+                eprintln!("Redelivery failed: {}", e);
                 return ExitCode::FAILURE;
             }
         }

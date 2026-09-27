@@ -659,6 +659,7 @@ export class JobCoordinatorV2 {
     claimToken: string,
     result: ManagedResultEnvelope,
     payloadSha256: string,
+    deliveryMode: "automatic" | "explicit_redelivery" = "automatic",
   ): Promise<{
     ok: true;
     replayed: boolean;
@@ -721,8 +722,8 @@ export class JobCoordinatorV2 {
           resource_id: attempt.result.resource_id,
           commit: attempt.result.commit,
         };
-      } else {
-        throw new V2ReportConflictError("RESULT_CONFLICT");
+      } else if (deliveryMode !== "explicit_redelivery") {
+        throw new V2ReportConflictError("STALE_RESULT_SUBMISSION");
       }
     }
 
@@ -756,6 +757,7 @@ export class JobCoordinatorV2 {
       device_id: deviceId,
       claim_token_sha256: claimTokenSha256,
       result: persistedResult,
+      delivery_mode: deliveryMode,
     });
 
     return {

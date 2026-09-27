@@ -6,7 +6,7 @@ use super::client::{OrcaCliClient, OrcaError};
 use crate::config::LocalTarget;
 use crate::scheduler::{
     ActiveAttempt, CleanupOutcome, DispatchOutcome, DispatchReconciliation, ExecutionAdapter,
-    PrepareOutcome, PreparedExecution, PreparedExecutionIdentity, WaitOutcome,
+    InterruptOutcome, PrepareOutcome, PreparedExecution, PreparedExecutionIdentity, WaitOutcome,
 };
 
 #[derive(Clone, Debug)]
@@ -606,6 +606,22 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 }
             }
             Err(e) => Err(format!("Terminal wait transport failure: {e}")),
+        }
+    }
+
+    async fn interrupt(
+        &self,
+        _active: &ActiveAttempt,
+        terminal_id: &str,
+    ) -> Result<InterruptOutcome, String> {
+        match self.client.send_interrupt(terminal_id).await {
+            Ok(_) => Ok(InterruptOutcome::Sent),
+            Err(e) => {
+                eprintln!("Warning: failed to send interrupt to terminal {terminal_id}: {e}");
+                Ok(InterruptOutcome::Failed {
+                    error: e.to_string(),
+                })
+            }
         }
     }
 

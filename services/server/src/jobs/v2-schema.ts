@@ -673,6 +673,7 @@ export const jobResultRequestSchema = z
     claim_token: z.string().min(1, "claim_token is required"),
     result: managedResultEnvelopeSchema,
     payload_sha256: z.string().regex(HEX_64_RE, "payload_sha256 must be 64 lowercase hex chars"),
+    delivery_mode: z.enum(["automatic", "explicit_redelivery"]).optional().default("automatic"),
   })
   .strict();
 

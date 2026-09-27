@@ -496,6 +496,11 @@ end
 local time_parts = redis.call('TIME')
 local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
 
+local delivery_mode = ARGV[5]
+if not delivery_mode or delivery_mode == "" then
+  delivery_mode = "automatic"
+end
+
 -- Check if attempt already has a result
 if attempt.result and attempt.result ~= cjson.null then
   local existing = attempt.result
@@ -508,20 +513,12 @@ if attempt.result and attempt.result ~= cjson.null then
       commit = existing.commit,
       resource_id = existing.resource_id,
     })
-  else
-    return cjson.encode({ error = 'RESULT_CONFLICT' })
+  elseif delivery_mode ~= "explicit_redelivery" then
+    return cjson.encode({ error = 'STALE_RESULT_SUBMISSION' })
   end
 end
 
--- Must be in running phase to accept initial result
-if attempt.phase ~= 'running' then
-  return cjson.encode({ error = 'INVALID_ATTEMPT_PHASE', phase = attempt.phase })
-end
-if job.status ~= 'active' then
-  return cjson.encode({ error = 'INVALID_JOB_STATUS', status = job.status })
-end
-
--- Set attempt.result
+-- Set attempt.result (terminal jobs and attempts can record/replace results)
 incoming_result.received_at_ms = now_ms
 attempt.result = incoming_result
 

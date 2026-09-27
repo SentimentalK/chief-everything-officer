@@ -108,6 +108,18 @@ impl ConnectorPaths {
             .join(format!("{job_id}.{attempt_id}.json"))
     }
 
+    pub fn results_dir(&self) -> PathBuf {
+        self.state_dir.join("results")
+    }
+
+    pub fn preserved_managed_result_file(&self, job_id: &str, attempt_id: &str) -> PathBuf {
+        self.results_dir().join(format!("{job_id}.{attempt_id}.json"))
+    }
+
+    pub fn preserved_managed_result_meta_file(&self, job_id: &str, attempt_id: &str) -> PathBuf {
+        self.results_dir().join(format!("{job_id}.{attempt_id}.meta.json"))
+    }
+
     pub fn runtime_dir(&self) -> PathBuf {
         self.state_dir.join("runtime")
     }
@@ -131,7 +143,7 @@ impl ConnectorPaths {
         Ok(dir)
     }
 
-    /// Ensures that config, state, history, outbox, and runtime directories exist with 0700 permissions
+    /// Ensures that config, state, history, outbox, results, and runtime directories exist with 0700 permissions
     /// and ensures no component in the control hierarchy is a symlink.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         reject_control_ancestor_symlinks(&self.config_dir)?;
@@ -142,6 +154,7 @@ impl ConnectorPaths {
             &self.state_dir,
             &self.history_dir(),
             &self.outbox_dir(),
+            &self.results_dir(),
             &self.runtime_dir(),
         ] {
             fs::create_dir_all(dir)?;

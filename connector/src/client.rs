@@ -893,6 +893,7 @@ impl ConnectorClient {
         claim_token: &str,
         result: &crate::managed_result::ManagedResultEnvelope,
         payload_sha256: &str,
+        delivery_mode: Option<&str>,
     ) -> Result<SubmitJobResultResponse, ClientError> {
         let headers = self.auth_headers(credential)?;
         let url = format!(
@@ -904,6 +905,7 @@ impl ConnectorClient {
             "claim_token": claim_token,
             "result": result,
             "payload_sha256": payload_sha256,
+            "delivery_mode": delivery_mode.unwrap_or("automatic"),
         });
 
         let resp = self

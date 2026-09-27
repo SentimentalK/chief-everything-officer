@@ -10,6 +10,7 @@ pub mod managed_result;
 pub mod orca;
 pub mod outbox;
 pub mod paths;
+pub mod redelivery;
 pub mod scheduler;
 pub mod status;
 pub mod targets;
