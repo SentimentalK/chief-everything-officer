@@ -813,10 +813,10 @@ fn test_parse_orca_json_discriminator_first() {
 async fn test_cleanup_outcome_variants() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. pty_killed == false -> CleanupOutcome::RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
+    // 1. pty_stop_verdict == unverifiable -> CleanupOutcome::RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
     let script_unv = r#"#!/bin/bash
 if [[ "$*" == *"terminal close"* ]]; then
-  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":false}}}'
+  echo '{"ok":true,"result":{"close":{"handle":"term_1","ptyKilled":false,"ptyStopVerdict":"unverifiable"}}}'
   exit 0
 fi
 "#;
@@ -828,8 +828,8 @@ fi
         CleanupOutcome::RecoveryRequired { code, message } => {
             assert_eq!(code, "TERMINAL_STOP_UNVERIFIABLE");
             assert!(
-                message.contains("pty_killed=Some(false)"),
-                "Expected 'pty_killed=Some(false)' in message: {message}"
+                message.contains("unverifiable"),
+                "Expected 'unverifiable' in message: {message}"
             );
         }
         other => panic!("Expected RecoveryRequired, got {other:?}"),
@@ -1174,10 +1174,10 @@ fi
         }
     }
 
-    // 7. ptyKilled missing in close payload => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
+    // 7. ptyStopVerdict is unverifiable => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
     let out = run_close(
         &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target"}}}"#,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":false,"ptyStopVerdict":"unverifiable"}}}"#,
         0,
         r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
     )
@@ -1191,11 +1191,11 @@ fi
         }
     }
 
-    // 8. ptyKilled is explicitly false => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
+    // 8. terminal_stop_unverifiable error => RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE)
     let out = run_close(
         &temp,
-        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":false}}}"#,
-        0,
+        r#"{"ok":false,"error":{"code":"terminal_stop_unverifiable","message":"PTY not confirmed stopped"}}"#,
+        1,
         r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
     )
     .await;
@@ -1207,6 +1207,16 @@ fi
             panic!("Expected RecoveryRequired(TERMINAL_STOP_UNVERIFIABLE), got {other:?}")
         }
     }
+
+    // 9. Clean exit without active kill (ptyKilled=false, no bad verdict) + terminal absent from list => VerifiedClosed
+    let out = run_close(
+        &temp,
+        r#"{"ok":true,"result":{"close":{"handle":"term_target","ptyKilled":false}}}"#,
+        0,
+        r#"{"ok":true,"result":{"terminals":[],"truncated":false}}"#,
+    )
+    .await;
+    assert!(matches!(out, CleanupOutcome::VerifiedClosed { .. }));
 }
 
 #[tokio::test]

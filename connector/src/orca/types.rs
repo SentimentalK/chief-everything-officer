@@ -220,4 +220,6 @@ pub struct OrcaClosePart {
     pub handle: String,
     pub close_mode: Option<String>,
     pub pty_killed: Option<bool>,
+    pub pty_stop_verdict: Option<String>,
+    pub pty_stop_reason: Option<String>,
 }

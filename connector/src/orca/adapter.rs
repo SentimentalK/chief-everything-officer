@@ -632,14 +632,15 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                         ),
                     };
                 }
-                if close_part.pty_killed != Some(true) {
-                    return CleanupOutcome::RecoveryRequired {
-                        code: "TERMINAL_STOP_UNVERIFIABLE".into(),
-                        message: format!(
-                            "terminal close returned pty_killed={:?}, expected Some(true)",
-                            close_part.pty_killed
-                        ),
-                    };
+                if let Some(ref verdict) = close_part.pty_stop_verdict {
+                    if verdict == "live" || verdict == "unverifiable" {
+                        return CleanupOutcome::RecoveryRequired {
+                            code: "TERMINAL_STOP_UNVERIFIABLE".into(),
+                            message: format!(
+                                "terminal close returned pty_stop_verdict='{verdict}'"
+                            ),
+                        };
+                    }
                 }
             }
             Err(OrcaError::Orca {
@@ -647,6 +648,12 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 ref message,
                 ..
             }) => {
+                if code == "terminal_stop_unverifiable" || code == "terminal_stop_live" {
+                    return CleanupOutcome::RecoveryRequired {
+                        code: "TERMINAL_STOP_UNVERIFIABLE".into(),
+                        message: format!("terminal close returned unverifiable stop: {message}"),
+                    };
+                }
                 if code == "terminal_not_found" {
                     match self.client.list_terminals_result(None).await {
                         Ok(res) => {
