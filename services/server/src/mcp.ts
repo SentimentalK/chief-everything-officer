@@ -545,13 +545,13 @@ export function createMcpServer(
       server.registerTool(
         "resource_acquire",
         {
-          title: "Acquire deep content for a CEO resource",
+          title: "Acquire deep content and metadata for a CEO resource",
           description:
-            "Submit an asynchronous job to extract full textual content (transcript, article body) " +
-            "for a URL-based Resource, writing the result into content.md via the managed-result contract. " +
-            "Use this after resource_capture when the user wants deep content. " +
-            "Default mode=if_missing skips if content.md already exists. " +
-            "mode=refresh re-extracts. " +
+            "Dedicated entrypoint for Resource deep content acquisition. Canonical URL save workflow: resource_capture -> rename (optional) -> resource_acquire. " +
+            "Unless the user explicitly requested link-only, use this tool after capturing a URL to submit an asynchronous deep acquisition job, " +
+            "writing extracted content and permitted trusted source metadata back through the managed Resource result contract. " +
+            "Never use generic job_submit as a substitute for resource_acquire. " +
+            "Default mode=if_missing skips if content.md already exists; mode=refresh re-extracts. " +
             "If the Connector is offline, the Job queues and waits up to 7 days for execution.",
           inputSchema: {
             request_id: z.string().min(1).describe("Stable UUID for retry-safe idempotency"),

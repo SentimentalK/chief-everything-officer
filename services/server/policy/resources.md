@@ -125,11 +125,29 @@ Resource 讨论不会仅因为“聊过”就自动修改 State。只有确实�
 不是每次讨论都需要提炼到其他目录，普通来源摘要也不自动成为 Knowledge。规则只保留数据语义和 AI 行为；实现、部署、测试、迁移和待修问题维护在项目任务与代码仓库。
 
 
-## Capture 后的强制命名后续
+## URL 资源保存与深度提取标准流程（Ordered URL Save Workflow）
 
-`resource_capture` 返回后必须检查回执中的 `naming_source` 与可靠来源 metadata。若 `naming_source = "id"`，且回执或 Resource metadata 已取得非空的可靠 `title` 或 `original_name`，则本次 workflow **必须继续调用 `resource_apply` 的 `op: "rename"`**，不能在 capture 成功后直接结束。rename 只更新语义化 `display_name` 与目录名，不改写来源 `title`；名称应遵守上文的命名规范。
+当用户提供 URL 并表达保存或记忆意图（如“记一下”、“保存”、“收藏”、“帮我记”、“以后想看”等），Host AI 必须严格按以下顺序推进，不得跳步或颠倒：
 
-若没有可靠 `title` / `original_name`，但用户上下文已经足以给出安全、明确的语义名称，也应继续 rename。只有在 metadata 与用户上下文都不足以安全命名时，才允许保留 `naming_source = "id"`。已为 `naming_source = "explicit"` 的资源不适用本条，不因普通 refresh / revisit 自动再次改名。
+1. **第 1 步：resource_capture(url)**  
+   始终先调用 `resource_capture` 建立或复用 Resource 并提交初始元数据。`resource_capture` 成功即代表链接在 CEO 中已被安全记录，不依赖后续步骤。
+
+2. **第 2 步：检查回执与按需语义重命名**  
+   检查 capture 回执中的 `naming_source` 与来源 metadata：
+   - 若 `naming_source = "id"`，且已取得可靠 `title` 或上下文已足以给出安全、明确的语义名称，**必须继续调用 `resource_apply` 的 `op: "rename"`** 设置 `display_name`。
+   - 若当前上下文尚不足以安全重命名，保留 ID 名称，**直接进入下一步，不得阻塞后续提取**。已为 `naming_source = "explicit"` 的资源不因重访自动再次改名。
+
+3. **第 3 步：自动触发深度提取（除非用户明确说明只记链接）**  
+   若用户明确表达“只记链接”或“不用抓正文”，流程在完成重命名后立即停止。否则：
+   - 调用 `execution_targets()` 检查工作空间是否有可用 target（`active_binding_count > 0`）。
+   - 若存在可用 target：由 Host 根据目标选择 `target_id`，并**唯一调用 `resource_acquire(resource_id, target_id, mode="if_missing")`** 提交异步提取任务。告知用户：“已保存 Resource；深度内容提取任务已提交，本地 Connector 执行完毕后会自动写入 content.md 与来源元数据（若设备离线，任务将在队列中安全等待，最多等待 7 天）。”
+   - 若无可用 target 或 Connector 队列不可用：告知用户：“链接与元数据已保存；当前暂无可用执行目标，正文尚未提取。”
+
+### 核心边界原则
+- **`resource_acquire` 是唯一入口**：`resource_acquire` 是 Resource 深度提取任务的唯一 Host-facing 入口。**严禁使用底层通用的 `job_submit` 手工构造 Resource 提取任务**。
+- **不预先过滤 resource_kind**：不要根据解析出的 resource_kind 决定是否调用 acquire。URL 是否可提取字幕或正文由 `content.extract_url` 能力自行判定，不要手工设卡。
+- **Target 语义**：Host 根据 `execution_targets()` 选择 `target_id`，Job 创建时 Target 已完全确定。Connector 只负责在绑定该 Target 的本地路径上执行，不选择 Target。
+- **离线容忍与幂等**：Connector 离线不是错误，Job 会在队列中安全暂存（TTL 最长 7 天）；重复重试复用同一 request_id。
 
 ## 删除与销毁
 
@@ -139,17 +157,5 @@ Resource 的生命周期销毁必须通过官方的 `resource_delete` 工具执�
 - **原子彻底删除**：`resource_delete` 一次性永久删除目标 Resource 的整个目录及其所有 owned artifacts（包括 metadata、content、summary、evidence、interactions 及 source assets 等）。
 - **无应用层墓碑（Tombstone）**：当前工作空间 HEAD 中直接删除，不保留墓碑标记文件；历史变更由底层 Git commit 自然追踪。删除后若用户再次 capture 相同来源，将作为全新 Resource 分配新 ID。
 - **禁止绕过 Resource Plane**：严禁尝试使用 `apply_change_set`、GitHub 直接操作或文件系统删除手段操作 `resources/**`。
-
-## URL 资源抓取与深度提取（Acquisition）
-
-当用户提供 URL 并表达保存或记忆意图（如“记一下”、“保存”、“收藏”、“帮我记”、“以后想看”等）：
-
-1. **先做 capture**：始终先调用 `resource_capture` 建立/复用 Resource 并提交 metadata。`resource_capture` 的成功绝不受后续 acquisition 可用性的阻碍，两项操作职责分离。
-2. **自动触发深度提取**：capture 成功后，除非用户明确表达“只记链接”或“不用抓内容”：
-   - 调用 `execution_targets()` 检查工作空间是否有可用 target（`active_binding_count > 0`）。
-   - 若存在可用 target：调用 `resource_acquire(resource_id, target_id, mode="if_missing")` 提交异步提取 Job，并告知用户：“已保存 Resource；深度内容提取任务已提交，本地 Connector 执行完毕后会自动写入 content.md（若设备离线，任务将在队列中安全等待，最多等待 7 天）。”
-   - 若无可用 target 或 Connector 队列不可用：告知用户：“链接与元数据已保存；当前暂无可用执行目标，正文尚未提取。”
-3. **不预先过滤 resource_kind**：不要根据解析出的 resource_kind 决定是否调用 acquire。URL 是否可提取字幕或正文由 `content.extract_url` 能力自行判定，不要手工设卡。
-4. **离线容忍与幂等**：Connector 离线不是错误，Job 会在队列中安全暂存（TTL 最长 7 天）；重复重试复用同一 request_id。
 
 

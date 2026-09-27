@@ -86,18 +86,25 @@ export function buildCanonicalAcquisitionTask(url: string, resourceId: string): 
   acceptance: string;
 } {
   return {
-    prompt: `提取下面 URL 的完整文本内容并存入关联的 CEO Resource。
+    prompt: `提取下面 URL 的完整来源内容。
 
 来源：
 URL: ${url}
 Resource ID: ${resourceId}
 
 执行要求：
-1. 使用当前目标工作区中提供的 content.extract_url 能力。
-2. 按照该 capability 自身的说明运行，不要自行编写抓取代码或重新实现字幕下载/ASR。
-3. 提取成功后，根据本任务后附的托管结果契约（Managed Result Contract）返回提取结果。
-4. 不要直接修改 CEO Git 仓库中的 resources/**，不要直接调用 CEO Server API。`,
-    acceptance: `提取成功后，必须通过 upsert_content 返回从该 URL 提取的真实文本或字幕内容；若提取失败，如实报告具体原因，禁止伪造内容。`,
+1. 使用当前目标工作区提供的 content.extract_url capability。
+2. 按 capability 自身说明执行，不要自行重新实现抓取、字幕下载或 ASR。
+3. 成功后读取 capability 生成的 result.json。
+4. 将真实 transcript/content 写入 upsert_content。
+5. result.json 中存在可靠来源 metadata 时，通过 merge_source_metadata 返回（可包含 title、author、published_at、language）。
+6. 不要根据自己的推断补全缺失 metadata。
+7. 不要修改 display_name、topics、note、interactions 或其他用户语义信息。
+8. 不要直接修改 CEO Git 仓库中的 resources/**，不要直接调用 CEO Server API。`,
+    acceptance: `1. transcript/content 成功时必须有非空 upsert_content。
+2. metadata 只能来自 capability 的实际 result.json。
+3. 不伪造缺失内容或 metadata。
+4. extraction 失败时允许无 managed result，以明确 FAILED/BLOCKED report 结束。`,
   };
 }
 

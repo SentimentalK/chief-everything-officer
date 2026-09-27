@@ -808,39 +808,38 @@ export class ResourceService {
       throw new CeoError("VALIDATION_FAILED", "payloadSha256 must be 64 hex chars.");
     }
 
-    // Provenance validation & normalization
+    // Strict operation validation for managed results: only upsert_content and merge_source_metadata
     for (const op of input.operations) {
-      if (op.op === "attach_source_asset") {
+      if (!op || typeof op !== "object" || typeof (op as any).op !== "string") {
+        throw new CeoError("VALIDATION_FAILED", "Every operation must be an object with an 'op' discriminator.");
+      }
+      const opKind = (op as any).op;
+      if (opKind === "attach_source_asset") {
         throw new CeoError("VALIDATION_FAILED", "attach_source_asset is unsupported in managed results.");
       }
-      if ("provenance" in op && op.provenance !== "worker") {
+      if (opKind !== "upsert_content" && opKind !== "merge_source_metadata") {
         throw new CeoError(
           "VALIDATION_FAILED",
-          `Forbidden provenance '${op.provenance}': only 'worker' is permitted in managed results.`,
+          `Operation '${opKind}' is not permitted in managed results. Allowed ops: 'upsert_content', 'merge_source_metadata'.`,
         );
       }
-    }
-
-    const normalizedOps: ResourceApplyOperation[] = input.operations.map((op) => {
-      if (
-        op.op === "upsert_content" ||
-        op.op === "upsert_summary" ||
-        op.op === "upsert_evidence" ||
-        op.op === "append_interaction"
-      ) {
-        return { ...op, provenance: "worker" as const } as ResourceApplyOperation;
+      if (opKind === "upsert_content") {
+        if (typeof (op as any).content !== "string") {
+          throw new CeoError("VALIDATION_FAILED", "upsert_content requires a string 'content' field.");
+        }
+        if ("provenance" in op && (op as any).provenance !== "worker") {
+          throw new CeoError(
+            "VALIDATION_FAILED",
+            `Forbidden provenance '${(op as any).provenance}': only 'worker' is permitted in managed results.`,
+          );
+        }
       }
-      return op as ResourceApplyOperation;
-    });
-
-    validateResourceOperations(normalizedOps);
+    }
 
     const resultTxRequestId = deriveDeterministicUuid(`ceo:job:result:${input.attemptId}`);
 
     // Resolve current workspace HEAD as baseCommit cleanly without holding lock during transaction
     const baseCommit = await this.workspace.withReadyWorkspace(async (base) => base);
-
-    const allowEmpty = normalizedOps.every((op) => op.op === "rename");
 
     let appliedResourceReceipt: Record<string, unknown> | null = null;
     let initialRelativePath = "";
@@ -851,7 +850,7 @@ export class ResourceService {
       baseCommit,
       commitMessage: `CEO Job ${input.jobId}: ${input.summary.trim()}`,
       allowResourceSourceFiles: true,
-      allowEmpty,
+      allowEmpty: false,
       operationResultProducer: (_changedFiles) => ({
         resource: appliedResourceReceipt,
         renamed: finalCtx ? finalCtx.location.relative_path !== initialRelativePath : false,
@@ -890,7 +889,14 @@ export class ResourceService {
         const doc = parseMetaMarkdown(metaContent);
         const meta = doc.meta;
 
-        await this.executeResourceOperations(worktree, ctx, meta, normalizedOps);
+        for (const op of input.operations) {
+          if (op.op === "upsert_content") {
+            const resDir = ctx.getResDir();
+            await writeFile(path.join(resDir, "content.md"), String(op.content), "utf8");
+          } else if (op.op === "merge_source_metadata") {
+            this.applyManagedSourceMetadata(meta, op as Record<string, unknown>);
+          }
+        }
 
         const metaMarkdown = formatMetaMarkdown(meta, doc.capture_note, doc.capture_history);
         await writeFile(ctx.getMetaPath(), metaMarkdown, "utf8");
@@ -946,6 +952,48 @@ export class ResourceService {
       resource_id: input.resourceId,
       replayed,
     };
+  }
+
+  private applyManagedSourceMetadata(
+    meta: ResourceMeta,
+    op: Record<string, unknown>,
+  ): void {
+    const allowedFields = ["title", "author", "published_at", "language"] as const;
+    let updatedAny = false;
+
+    for (const field of allowedFields) {
+      if (field in op) {
+        const val = op[field];
+        if (val === null || val === undefined) {
+          continue;
+        }
+        if (typeof val === "string") {
+          const trimmed = val.trim();
+          if (trimmed.length > 0) {
+            meta[field] = trimmed;
+            updatedAny = true;
+          }
+        } else {
+          throw new CeoError(
+            "VALIDATION_FAILED",
+            `Field '${field}' in merge_source_metadata must be a string or null.`,
+          );
+        }
+      }
+    }
+
+    if (!updatedAny) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        "merge_source_metadata requires at least one non-empty string field among: title, author, published_at, language.",
+      );
+    }
+
+    meta.metadata_method =
+      meta.metadata_method === null || meta.metadata_method === "worker"
+        ? "worker"
+        : "mixed";
+    meta.metadata_fetched_at = new Date().toISOString();
   }
 
   private async executeResourceOperations(

@@ -138,7 +138,6 @@ const jobSubmitSchema = z
     target_id: z.string().min(1).describe("Execution Target ID (tgt_<uuid>)"),
     prompt: z.string().min(1).describe("Task goal and necessary inputs"),
     acceptance: z.string().min(1).describe("Concrete criteria for task completion"),
-    resource_id: z.string().nullable().optional().default(null).describe("Optional resource ID (res-<uuid>)"),
     timeout_seconds: z
       .number()
       .int()
@@ -147,11 +146,6 @@ const jobSubmitSchema = z
       .optional()
       .default(3600)
       .describe("Execution timeout in seconds (60-7200, default 3600)"),
-    result_target: z
-      .enum(["none", "resource"])
-      .optional()
-      .default("none")
-      .describe("Result destination ('none' or 'resource')"),
   })
   .strict();
 
@@ -282,7 +276,7 @@ export function registerConnectorJobTools(
     {
       title: "Submit a connector job",
       description:
-        "Submit a new job targeted to a specific execution target in the workspace. Retrying the same request_id returns the existing job.",
+        "Submit a general freestyle/coding task to an execution target in the workspace. Retrying the same request_id returns the existing job. For resource content extraction/acquisition, DO NOT use job_submit; use the dedicated resource_acquire workflow instead.",
       inputSchema: jobSubmitSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -297,20 +291,16 @@ export function registerConnectorJobTools(
         typeof body.timeout_seconds === "number"
           ? body.timeout_seconds
           : 3600;
-      const resultTarget =
-        body.result_target === "none" || body.result_target === "resource"
-          ? body.result_target
-          : null;
+      const resultTarget = "none";
       const digest =
         typeof body.target_id === "string" &&
         typeof body.prompt === "string" &&
-        typeof body.acceptance === "string" &&
-        resultTarget
+        typeof body.acceptance === "string"
           ? businessDigestV2({
               target_id: body.target_id,
               prompt: body.prompt,
               acceptance: body.acceptance,
-              resource_id: typeof body.resource_id === "string" ? body.resource_id : null,
+              resource_id: null,
               execution_timeout_seconds: timeoutSeconds,
               result_target: resultTarget,
             })
@@ -344,9 +334,9 @@ export function registerConnectorJobTools(
           target_id: String(body.target_id),
           prompt: String(body.prompt),
           acceptance: String(body.acceptance),
-          resource_id: (body.resource_id as string | null) ?? null,
+          resource_id: null,
           execution_timeout_seconds: timeoutSeconds,
-          result_target: (resultTarget ?? "none") as "none" | "resource",
+          result_target: "none",
         });
 
         const detail = await ctx.coordinator.getJobForHost(scope, res.job.job_id);

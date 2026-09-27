@@ -82,10 +82,26 @@ export interface ResourceMeta {
   first_captured_at: string;
   language: string | null;
   topics: string[];
-  metadata_method: "deterministic_adapter" | "user_provided" | "mixed" | null;
+  metadata_method: "deterministic_adapter" | "user_provided" | "worker" | "mixed" | null;
   metadata_fetched_at: string | null;
   capture_surface: string;
 }
+
+export interface ManagedMergeSourceMetadataOp {
+  op: "merge_source_metadata";
+  title?: string | null;
+  author?: string | null;
+  published_at?: string | null;
+  language?: string | null;
+}
+
+export type ManagedResultOperation =
+  | {
+      op: "upsert_content";
+      provenance?: Exclude<Provenance, "host_semantic">;
+      content: string;
+    }
+  | ManagedMergeSourceMetadataOp;
 
 export type ResourceSourceInput =
   | {

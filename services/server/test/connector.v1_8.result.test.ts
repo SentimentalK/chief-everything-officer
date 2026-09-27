@@ -16,6 +16,7 @@ import { createConnectorJobsRouter } from "../src/jobs/v2-router.js";
 import { createFakeRedisRunner } from "./helpers/fake-redis-runner.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { ResourceService } from "../src/resource/service.js";
+import { ResourceRetrievalService } from "../src/resource/retrieval.js";
 import { fixture } from "./helpers.js";
 import { computeCanonicalSha256 } from "../src/jobs/canonical.js";
 
@@ -28,6 +29,7 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
   let coordinator: JobCoordinatorV2;
   let workspace: CeoWorkspace;
   let resourceService: ResourceService;
+  let retrievalService: ResourceRetrievalService;
 
   let userId: string;
   let workspaceId: string;
@@ -67,6 +69,7 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     workspace = new CeoWorkspace(fix.config);
     await workspace.initialize();
     resourceService = new ResourceService(workspace);
+    retrievalService = new ResourceRetrievalService(workspace);
 
     // Capture an initial resource to apply results to
     const captureRes = await resourceService.capture({
@@ -111,7 +114,7 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
       controlStore,
       identityStore,
       resourceService,
-      resourceExists: (_scope, resId) => resId === resourceId,
+      resourceExists: (_scope, resId) => Boolean(resId && resId.startsWith("res-")),
     });
 
     // 5. Express Router with identical parser configuration as server.ts
@@ -609,5 +612,250 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
       body: oversizedClaim,
     });
     expect(res.status).toBe(413);
+  });
+
+  it("applies upsert_content and merge_source_metadata, preserving display_name, topics, and canonical identity", async () => {
+    // 1. Capture a fresh resource with deterministic_adapter metadata_method and explicit rename
+    const captureRes = await resourceService.capture({
+      source: {
+        type: "url",
+        url: "https://www.youtube.com/watch?v=aircAruvnKk",
+      },
+    });
+    const resId = String((captureRes.resource as any).resource_id);
+
+    // Apply explicit rename to simulate user/host semantic naming
+    const baseSnap = await workspace.captureReadSnapshot();
+    await resourceService.apply({
+      resource_id: resId,
+      base_commit: baseSnap.commit,
+      summary: "Set semantic display name",
+      operations: [
+        { op: "rename", display_name: "3Blue1Brown Neural Networks" },
+        { op: "patch_topics", set: ["machine_learning", "math"] },
+      ],
+    });
+
+    // Verify initial metadata state
+    const beforeGet = await retrievalService.get({ resource_id: resId, view: "metadata" });
+    const beforeMeta = (beforeGet as any).metadata;
+    expect(beforeMeta.display_name).toBe("3Blue1Brown Neural Networks");
+    expect(beforeMeta.topics).toEqual(["machine_learning", "math"]);
+
+    // 2. Submit a job with result_target = resource
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Extract transcript",
+        acceptance: "upsert_content",
+        resource_id: resId,
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    // 3. Post managed result containing upsert_content AND merge_source_metadata
+    const managedResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resId,
+      summary: "Extracted transcript and source metadata",
+      operations: [
+        {
+          op: "upsert_content",
+          content: "# Neural Networks Transcript\nNeurons are functions.",
+        },
+        {
+          op: "merge_source_metadata",
+          title: "But what is a neural network? | Chapter 1, Deep learning",
+          author: "3Blue1Brown",
+          published_at: "2017-10-05T00:00:00Z",
+          language: "zh",
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(managedResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: managedResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.ok).toBe(true);
+
+    // 4. Assert metadata and content in Resource
+    const afterGet = await retrievalService.get({ resource_id: resId, view: "metadata" });
+    const afterMeta = (afterGet as any).metadata;
+    // Source descriptive facts updated
+    expect(afterMeta.title).toBe("But what is a neural network? | Chapter 1, Deep learning");
+    expect(afterMeta.author).toBe("3Blue1Brown");
+    expect(afterMeta.published_at).toBe("2017-10-05T00:00:00Z");
+    expect(afterMeta.language).toBe("zh");
+    expect(afterMeta.metadata_fetched_at).toBeTruthy();
+    // Provenance transitioned properly (worker or mixed)
+    expect(["worker", "mixed"]).toContain(afterMeta.metadata_method);
+
+    // USER SEMANTIC FACTS PRESERVED
+    expect(afterMeta.display_name).toBe("3Blue1Brown Neural Networks");
+    expect(afterMeta.topics).toEqual(["machine_learning", "math"]);
+
+    // Content verified
+    const contentGet = await retrievalService.get({ resource_id: resId, view: "content" });
+    expect((contentGet as any).content).toBe("# Neural Networks Transcript\nNeurons are functions.");
+  });
+
+  it("merge_source_metadata preserves existing fields when incoming fields are null or empty", async () => {
+    const captureRes = await resourceService.capture({
+      source: {
+        type: "raw_text",
+        text: "Document text",
+        original_name: "doc.txt",
+      },
+    });
+    const resId = String((captureRes.resource as any).resource_id);
+
+    // Set initial title and author via meta
+    const snap = await workspace.captureReadSnapshot();
+    const docPath = `resources/${resId}/meta.md`;
+
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Prompt",
+        acceptance: "Acceptance",
+        resource_id: resId,
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    // Post result with null title and valid author
+    const managedResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resId,
+      summary: "Partial metadata merge",
+      operations: [
+        {
+          op: "upsert_content",
+          content: "Content",
+        },
+        {
+          op: "merge_source_metadata",
+          title: null,
+          author: "Preserved Author",
+          language: "   ", // whitespace only should be ignored
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(managedResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: managedResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const afterGet = await retrievalService.get({ resource_id: resId, view: "metadata" });
+    const meta = (afterGet as any).metadata;
+    expect(meta.author).toBe("Preserved Author");
+    expect(meta.language).toBeNull(); // not set because it was whitespace
+  });
+
+  it("strictly rejects managed results containing disallowed operations like rename or patch_topics with VALIDATION_FAILED", async () => {
+    const captureRes = await resourceService.capture({
+      source: {
+        type: "raw_text",
+        text: "Document text",
+        original_name: "doc.txt",
+      },
+    });
+    const resId = String((captureRes.resource as any).resource_id);
+
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Prompt",
+        acceptance: "Acceptance",
+        resource_id: resId,
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    const invalidResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resId,
+      summary: "Attempting disallowed rename operation",
+      operations: [
+        {
+          op: "rename",
+          display_name: "Malicious Name Override",
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(invalidResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: invalidResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toBe("VALIDATION_FAILED");
+    expect(json.message).toContain("rename");
   });
 });

@@ -355,7 +355,6 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
           prompt: "Run audit task",
           acceptance: "Exit code 0",
           timeout_seconds: 120,
-          result_target: "none",
         },
       });
 
@@ -369,6 +368,13 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(content.state).toBe("queued");
       expect(content.replayed).toBe(false);
 
+      // Verify internal coordinator job has result_target: none
+      const internalJob = await coordinator.getJobForHost(
+        { user_id: userAliceId, workspace_id: workspaceAId },
+        content.job_id,
+      );
+      expect(internalJob.target_id).toBe(targetA1.id);
+
       // Verify audit redaction: prompt and acceptance text withheld
       const traces = getAuditTraces(workspaceAId);
       expect(traces.length).toBeGreaterThan(0);
@@ -377,6 +383,37 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(trace.status).toBe("success");
       expect(trace.input_json).not.toContain("Run audit task");
       expect(trace.output_json).not.toContain("Run audit task");
+    });
+
+    it("strictly rejects resource_id and result_target in public schema", async () => {
+      const { client } = await createConnectedClient({
+        userId: userAliceId,
+        workspaceId: workspaceAId,
+      });
+
+      const resWithResId = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task",
+          acceptance: "Accept",
+          resource_id: "res-00000000-0000-0000-0000-000000000000",
+        },
+      });
+      expect(resWithResId.isError).toBe(true);
+
+      const resWithResultTarget = await client.callTool({
+        name: "job_submit",
+        arguments: {
+          request_id: `req-${crypto.randomUUID()}`,
+          target_id: targetA1.id,
+          prompt: "Task",
+          acceptance: "Accept",
+          result_target: "resource",
+        },
+      });
+      expect(resWithResultTarget.isError).toBe(true);
     });
 
     it("replays idempotently on identical request_id", async () => {
@@ -684,18 +721,20 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
         workspaceId: workspaceAId,
       });
 
-      const subRes = await client.callTool({
-        name: "job_submit",
-        arguments: {
+      // Submit job with result directly via coordinator
+      const submitRes = await coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceAId },
+        {
           request_id: `req-${crypto.randomUUID()}`,
           target_id: targetA1.id,
           prompt: "Task with result",
           acceptance: "Criteria",
           resource_id: "res-11111111-1111-1111-1111-111111111111",
           result_target: "resource",
+          execution_timeout_seconds: 3600,
         },
-      });
-      const jobId = JSON.parse((subRes.content as any)[0].text).job_id;
+      );
+      const jobId = submitRes.job.job_id;
 
       // Device enroll & claim & report
       const dev = controlStore.createDevice({ userId: userAliceId, displayName: "D-Res", platform: "linux" });
