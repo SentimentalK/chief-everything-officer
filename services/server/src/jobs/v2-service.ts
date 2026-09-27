@@ -324,10 +324,12 @@ export class JobCoordinatorV2 {
     this.nowMs = deps.nowMs ?? (() => Date.now());
   }
 
-  async submit(
+  async checkExistingSubmission(
     scope: JobSubmitScopeV2,
     input: SubmitJobInputV2,
-  ): Promise<{ status: "created" | "replayed"; job: JobRecordV2 }> {
+  ): Promise<JobRecordV2 | null> {
+    assertHostWorkspaceAccess(this.identityStore, scope);
+
     // Validate request_id
     if (!input.request_id || !REQUEST_ID_V2_RE.test(input.request_id)) {
       throw new JobValidationError("Invalid request_id format.");
@@ -384,28 +386,50 @@ export class JobCoordinatorV2 {
       result_target: input.result_target,
     });
 
-    // Step 1: Idempotency check first
+    // Idempotency lookup
     const existingJobId = await this.store.getRequestJobId(scope.user_id, scope.workspace_id, input.request_id);
-    if (existingJobId) {
-      const existingJob = await this.store.getJob(existingJobId);
-      if (!existingJob) {
-        throw new V2StoreError("QUEUE_UNAVAILABLE", "Request placeholder references a missing Job.", "CORRUPT_SUBMISSION_REFERENCE");
-      }
-      if (
-        existingJob.user_id !== scope.user_id ||
-        existingJob.workspace_id !== scope.workspace_id ||
-        existingJob.request_id !== input.request_id
-      ) {
-        throw new V2IdempotencyConflictError("Existing job identity mismatch.");
-      }
-      if (existingJob.status === "preparing") {
-        throw new V2StoreError("QUEUE_UNAVAILABLE", "Previous submission with this request ID was incomplete.", "INCOMPLETE_SUBMISSION");
-      }
-      if (existingJob.request_digest === digest) {
-        return { status: "replayed", job: existingJob };
-      }
-      throw new V2IdempotencyConflictError("Request digest mismatch with existing job.");
+    if (!existingJobId) {
+      return null;
     }
+
+    const existingJob = await this.store.getJob(existingJobId);
+    if (!existingJob) {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", "Request placeholder references a missing Job.", "CORRUPT_SUBMISSION_REFERENCE");
+    }
+    if (
+      existingJob.user_id !== scope.user_id ||
+      existingJob.workspace_id !== scope.workspace_id ||
+      existingJob.request_id !== input.request_id
+    ) {
+      throw new V2IdempotencyConflictError("Existing job identity mismatch.");
+    }
+    if (existingJob.status === "preparing") {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", "Previous submission with this request ID was incomplete.", "INCOMPLETE_SUBMISSION");
+    }
+    if (existingJob.request_digest === digest) {
+      return existingJob;
+    }
+    throw new V2IdempotencyConflictError("Request digest mismatch with existing job.");
+  }
+
+  async submit(
+    scope: JobSubmitScopeV2,
+    input: SubmitJobInputV2,
+  ): Promise<{ status: "created" | "replayed"; job: JobRecordV2 }> {
+    // Step 1: Idempotency check with business digest validation
+    const existing = await this.checkExistingSubmission(scope, input);
+    if (existing) {
+      return { status: "replayed", job: existing };
+    }
+
+    const digest = businessDigestV2({
+      target_id: input.target_id,
+      prompt: input.prompt,
+      acceptance: input.acceptance,
+      resource_id: input.resource_id ?? null,
+      execution_timeout_seconds: input.execution_timeout_seconds,
+      result_target: input.result_target,
+    });
 
     // Step 2: Genuinely new job authorization
     const target = this.controlStore.getExecutionTarget(input.target_id);

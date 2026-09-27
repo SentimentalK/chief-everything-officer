@@ -284,6 +284,39 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     expect(replayRes.job_id).toBe(originalJobId);
   });
 
+  it("rejects request_id reuse with conflicting business parameters with IDEMPOTENCY_CONFLICT", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+    const reqId = crypto.randomUUID();
+
+    // 1. Initial acquire for urlResourceId
+    const firstRes = await acquisitionService.acquire(scope, {
+      request_id: reqId,
+      resource_id: urlResourceId,
+      target_id: targetId,
+      mode: "if_missing",
+    });
+    expect(firstRes.status).toBe("queued");
+
+    // 2. Capture a second URL resource
+    const secondCapture = await resourceService.capture({
+      source: {
+        type: "url",
+        url: "https://www.youtube.com/watch?v=differentVideoId",
+      },
+    });
+    const secondResourceId = String((secondCapture.resource as any).resource_id);
+
+    // 3. Reusing the SAME reqId with a different Resource must throw IDEMPOTENCY_CONFLICT
+    await expect(
+      acquisitionService.acquire(scope, {
+        request_id: reqId,
+        resource_id: secondResourceId,
+        target_id: targetId,
+        mode: "if_missing",
+      }),
+    ).rejects.toThrow(/IDEMPOTENCY_CONFLICT|Request digest mismatch/);
+  });
+
   it("invokes resource_acquire through MCP server", async () => {
     const productPolicy = await loadProductPolicy();
     const server = createMcpServer(workspace, productPolicy, {

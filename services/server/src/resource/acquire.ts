@@ -1,7 +1,7 @@
 import path from "node:path";
 import { CeoError } from "../errors.js";
 import type { CeoWorkspace } from "../workspace.js";
-import type { JobCoordinatorV2, JobSubmitScopeV2 } from "../jobs/v2-service.js";
+import type { JobCoordinatorV2, JobSubmitScopeV2, SubmitJobInputV2 } from "../jobs/v2-service.js";
 import { resolveResourceLocationAtSnapshot } from "./locator.js";
 import { parseMetaMarkdown } from "./meta.js";
 import { getTreeEntry, readBlobUtf8 } from "../git.js";
@@ -116,19 +116,7 @@ export class ResourceAcquisitionService {
   ): Promise<ResourceAcquireResult> {
     const mode = input.mode ?? "if_missing";
 
-    // 1. Idempotency check FIRST:
-    // If request_id already corresponds to an existing Job, return that Job ID immediately.
-    // This ensures consistent replay even if the Job has completed and content.md now exists.
-    const existingJobId = await this.coordinator.getJobIdByRequestId(scope, input.request_id);
-    if (existingJobId) {
-      return {
-        status: "queued",
-        resource_id: input.resource_id,
-        job_id: existingJobId,
-      };
-    }
-
-    // 2. Read Resource acquisition descriptor via snapshot read
+    // 1. Read Resource acquisition descriptor via snapshot read
     const desc = await getAcquisitionDescriptor(this.workspace, input.resource_id);
     if (!desc) {
       throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
@@ -154,7 +142,32 @@ export class ResourceAcquisitionService {
       );
     }
 
-    // 3. Satisfied check: mode=if_missing and content already exists
+    // 2. Build canonical acquisition task + SubmitJobInput
+    const task = buildCanonicalAcquisitionTask(targetUrl);
+    const submitInput: SubmitJobInputV2 = {
+      request_id: input.request_id,
+      target_id: input.target_id,
+      prompt: task.prompt,
+      acceptance: task.acceptance,
+      resource_id: input.resource_id,
+      execution_timeout_seconds: 3600,
+      result_target: "resource",
+    };
+
+    // 3. Coordinator existing submission check FIRST (with business digest verification):
+    // If request_id matches an existing submission:
+    // - identical business request => returns existing Job (even if completed & content exists)
+    // - different business request (different Resource, Target, etc.) => throws IDEMPOTENCY_CONFLICT
+    const existingJob = await this.coordinator.checkExistingSubmission(scope, submitInput);
+    if (existingJob) {
+      return {
+        status: "queued",
+        resource_id: input.resource_id,
+        job_id: existingJob.job_id,
+      };
+    }
+
+    // 4. Satisfied check: mode=if_missing and content already exists
     if (mode === "if_missing" && desc.content_available) {
       return {
         status: "already_satisfied",
@@ -163,19 +176,8 @@ export class ResourceAcquisitionService {
       };
     }
 
-    // 4. Build canonical acquisition task
-    const task = buildCanonicalAcquisitionTask(targetUrl);
-
     // 5. Submit canonical acquisition Job
-    const submitRes = await this.coordinator.submit(scope, {
-      request_id: input.request_id,
-      target_id: input.target_id,
-      prompt: task.prompt,
-      acceptance: task.acceptance,
-      resource_id: input.resource_id,
-      execution_timeout_seconds: 3600,
-      result_target: "resource",
-    });
+    const submitRes = await this.coordinator.submit(scope, submitInput);
 
     return {
       status: "queued",
