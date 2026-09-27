@@ -201,7 +201,7 @@ pub async fn deliver_outbox_record(
                 OutboxError::RecoveryRequired(format!("failed to load active attempt: {e}"))
             })?;
 
-            let target_id = if let Some(active) = active_opt {
+            let active = if let Some(active) = active_opt {
                 if active.job_id != record.job_id || active.attempt_id != record.attempt_id {
                     return Err(OutboxError::RecoveryRequired(format!(
                         "Active attempt '{}/{}' does not match outbox '{}/{}'",
@@ -220,12 +220,13 @@ pub async fn deliver_outbox_record(
                         active.terminal_report_sha256, report_sha256
                     )));
                 }
-                active.target_id
+                active
             } else {
                 return Err(OutboxError::RecoveryRequired(
                     "Active attempt missing during outbox delivery cleanup".into(),
                 ));
             };
+            let target_id = active.target_id.clone();
 
             let status_str = match record.report.execution_status {
                 crate::execution_contract::ExecutionStatus::COMPLETED => "completed",
@@ -245,17 +246,28 @@ pub async fn deliver_outbox_record(
                 recorded_at_ms: chrono::Utc::now().timestamp_millis(),
             };
 
-            // 1. Write sanitized history record
+            // 1. Defensively ensure redelivery authority exists before unlinking active-attempt
+            if active.result_target.as_deref() == Some("resource") && active.resource_id.is_some() {
+                let meta_file =
+                    paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+                if !meta_file.exists() {
+                    let _ = crate::managed_result::durable_persist_redelivery_meta(
+                        paths, cred, &active,
+                    );
+                }
+            }
+
+            // 2. Write sanitized history record
             let hist_file = paths.history_file(&record.job_id, &record.attempt_id);
             atomic_write_json(&hist_file, &history)?;
 
-            // 2. Durably unlink outbox record
+            // 3. Durably unlink outbox record
             remove_durable(outbox_file)?;
 
-            // 3. Durably unlink active attempt
+            // 4. Durably unlink active attempt
             remove_durable(&paths.active_attempt_file())?;
 
-            // 4. Clean up attempt runtime dir only if COMPLETED (retain for inspection & manual redelivery on failure/timeout)
+            // 5. Clean up attempt runtime dir only if COMPLETED (retain for inspection & manual redelivery on failure/timeout)
             if record.report.execution_status
                 == crate::execution_contract::ExecutionStatus::COMPLETED
             {

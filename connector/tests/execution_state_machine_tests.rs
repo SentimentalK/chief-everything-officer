@@ -12,9 +12,11 @@ use ceo_connector::config::{
 };
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::daemon::{drive_active_attempt, DaemonHooks};
-use ceo_connector::execution_contract::{BusinessOutcome, ExecutionStatus};
+use ceo_connector::execution_contract::{
+    BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionStatus,
+};
 use ceo_connector::local_state::ExecutionLock;
-use ceo_connector::outbox::OutboxRecord;
+use ceo_connector::outbox::{OutboxRecord, OUTBOX_SCHEMA_VERSION};
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
@@ -2139,5 +2141,510 @@ async fn test_agent_done_resource_job_with_missing_result_fails_and_retains_term
         adapter.close_calls.load(Ordering::SeqCst),
         0,
         "Terminal must be retained for user inspection on FAILED"
+    );
+}
+
+#[tokio::test]
+async fn test_redelivery_authority_decoupled_from_active_attempt_and_late_runtime_result_succeeds()
+{
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+    let client = ConnectorClient::new(&server.origin()).unwrap();
+    let adapter = Arc::new(MockAdapter::default());
+
+    let job_a_id = "job_redeliver_decoupled_a";
+    let att_a_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-late-456";
+    let claim_token_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // 1. Claim Job A as resource job
+    let mut attempt_a = make_test_attempt_with_resource(
+        &cred,
+        att_a_id.clone(),
+        AttemptPhase::ClaimIntent,
+        "resource",
+        Some(resource_id),
+        None,
+    );
+    attempt_a.job_id = job_a_id.to_string();
+    attempt_a.workspace_id = "ws_test".to_string();
+    attempt_a.target_id = "tgt_test".to_string();
+    attempt_a.claim_token = claim_token_a.to_string();
+    attempt_a.prompt = Some("prompt".into());
+    attempt_a.acceptance = Some("acceptance".into());
+    attempt_a.execution_timeout_seconds = Some(3600);
+    attempt_a.payload_sha256 = Some(ActiveAttempt::compute_payload_sha256(
+        job_a_id,
+        "ws_test",
+        "tgt_test",
+        Some(resource_id),
+        "prompt",
+        "acceptance",
+        3600,
+        "resource",
+    ));
+    attempt_a.save(&paths.active_attempt_file()).unwrap();
+
+    let att_a_id_clone = att_a_id.clone();
+    let resource_id_clone = resource_id.to_string();
+    server.add_handler(move |req| {
+        if req.path.contains("/claim") && req.method == "POST" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": att_a_id_clone,
+                        "phase": "claimed",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "claim_expires_at": "2026-09-24T13:00:00.000Z"
+                    },
+                    "job": {
+                        "job_id": job_a_id,
+                        "workspace_id": "ws_test",
+                        "target_id": "tgt_test",
+                        "resource_id": resource_id_clone,
+                        "prompt": "prompt",
+                        "acceptance": "acceptance",
+                        "timeout_seconds": 3600,
+                        "result_target": "resource"
+                    }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Drive ClaimIntent -> reconciles to Claimed.
+    // Assert PreservedResultMeta was durably written BEFORE/ON Claimed transition!
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let meta_file_a = paths.preserved_managed_result_meta_file(job_a_id, &att_a_id);
+    assert!(
+        meta_file_a.exists(),
+        "Redelivery authority meta must be durably persisted on Claimed phase"
+    );
+
+    // Simulate Job A failed with RESULT_MISSING, outbox delivered, active-attempt deleted
+    paths.ensure_attempt_runtime_dir(&att_a_id).unwrap();
+    let report = ExecutionReport {
+        schema_version: 2,
+        execution_status: ExecutionStatus::FAILED,
+        business_outcome: BusinessOutcome::FAILED,
+        task_dispatched: true,
+        finished_at_ms: chrono::Utc::now().timestamp_millis(),
+        duration_ms: 5000,
+        executor: ceo_connector::execution_contract::ExecutionReportExecutor {
+            executor_type: "orca".into(),
+            version: "1.0.0".into(),
+        },
+        receipt_sha256: "receipt_a".into(),
+        error: Some(ExecutionReportError {
+            stage: "result".into(),
+            code: "RESULT_MISSING".into(),
+            message: "managed-result.json was not found".into(),
+        }),
+    };
+    let outbox_record = OutboxRecord {
+        schema_version: OUTBOX_SCHEMA_VERSION,
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        server_origin: cred.server_origin.clone(),
+        device_id: cred.device_id.clone(),
+        job_id: job_a_id.to_string(),
+        attempt_id: att_a_id.clone(),
+        claim_token: claim_token_a.to_string(),
+        report,
+        managed_result: None,
+        managed_result_sha256: None,
+    };
+    let outbox_file = paths.outbox_file(job_a_id, &att_a_id);
+    ceo_connector::local_state::atomic_write_json(&outbox_file, &outbox_record).unwrap();
+
+    // Transition active-attempt to FinalizedLocal so outbox delivery can finalize it
+    let mut cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    cur.phase = AttemptPhase::FinalizedLocal;
+    cur.terminal_report_sha256 = Some(ceo_connector::outbox::compute_report_sha256(
+        &outbox_record.report,
+    ));
+    cur.save(&paths.active_attempt_file()).unwrap();
+
+    let server_report_received = Arc::new(AtomicBool::new(false));
+    let srr = server_report_received.clone();
+    server.add_handler(move |req| {
+        if req.path.contains("/report") && req.method == "POST" {
+            srr.store(true, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    ceo_connector::outbox::deliver_outbox_record(
+        &paths,
+        &client,
+        &cred,
+        &outbox_file,
+        &outbox_record,
+    )
+    .await
+    .unwrap();
+
+    // Verify active-attempt is unlinked for Job A, but runtime dir and meta are retained
+    assert!(!paths.active_attempt_file().exists());
+    assert!(meta_file_a.exists());
+    assert!(paths.attempt_runtime_dir(&att_a_id).exists());
+
+    // 2. Now simulate Job B is claimed and becomes current active-attempt!
+    let job_b_id = "job_redeliver_decoupled_b";
+    let att_b_id = format!("att-{}", Uuid::new_v4());
+    let mut attempt_b = make_test_attempt_with_resource(
+        &cred,
+        att_b_id.clone(),
+        AttemptPhase::Claimed,
+        "none",
+        None,
+        None,
+    );
+    attempt_b.job_id = job_b_id.to_string();
+    attempt_b.claim_token =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+    attempt_b.payload_sha256 = Some(ActiveAttempt::compute_payload_sha256(
+        job_b_id,
+        &attempt_b.workspace_id,
+        &attempt_b.target_id,
+        None,
+        attempt_b.prompt.as_deref().unwrap(),
+        attempt_b.acceptance.as_deref().unwrap(),
+        attempt_b.execution_timeout_seconds.unwrap(),
+        "none",
+    ));
+    attempt_b.save(&paths.active_attempt_file()).unwrap();
+
+    // 3. User resumes agent in Job A's retained terminal -> late managed-result.json appears!
+    let runtime_res_file_a = paths.managed_result_file(&att_a_id);
+    let valid_envelope_a = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_a_id,
+        "attempt_id": att_a_id,
+        "resource_id": resource_id,
+        "summary": "Late extraction of transcript after continue",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Full video transcript recovered successfully"
+            }
+        ]
+    });
+    ceo_connector::local_state::atomic_write_json(&runtime_res_file_a, &valid_envelope_a).unwrap();
+
+    // 4. Mock redelivery endpoint expecting explicit_redelivery with Job A's claim token
+    let explicit_redelivery_called = Arc::new(AtomicBool::new(false));
+    let erc = explicit_redelivery_called.clone();
+    let job_a_result_path = format!("/api/connector/jobs/{job_a_id}/result");
+    let resource_id_clone2 = resource_id.to_string();
+    let expected_claim_token = claim_token_a.to_string();
+    server.add_handler(move |req| {
+        if req.path == job_a_result_path && req.method == "POST" {
+            let body: serde_json::Value = req.json().unwrap();
+            assert_eq!(
+                body.get("claim_token").and_then(|v| v.as_str()),
+                Some(expected_claim_token.as_str())
+            );
+            assert_eq!(
+                body.get("delivery_mode").and_then(|v| v.as_str()),
+                Some("explicit_redelivery")
+            );
+            erc.store(true, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-27T18:00:00.000Z",
+                    "resource_id": resource_id_clone2,
+                    "commit": "git-commit-hash-late-a"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Run redelivery on Job A while Job B is active!
+    let redeliver_res = ceo_connector::redelivery::run_redeliver(&paths, job_a_id, None).await;
+    assert!(
+        redeliver_res.is_ok(),
+        "Redelivery failed: {:?}",
+        redeliver_res
+    );
+    assert!(explicit_redelivery_called.load(Ordering::SeqCst));
+
+    // Verify late runtime result was promoted/snapshotted to results/
+    let pres_res_a = paths.preserved_managed_result_file(job_a_id, &att_a_id);
+    assert!(pres_res_a.exists());
+
+    // Verify Job B is completely untouched as active-attempt
+    let active_cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_cur.job_id, job_b_id);
+    assert_eq!(active_cur.attempt_id, att_b_id);
+}
+
+#[tokio::test]
+async fn test_redelivery_runtime_candidate_precedence_and_snapshot_replacement() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let job_id = "job_redeliver_precedence";
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-precedence-999";
+    let claim_token = "tok123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Setup PreservedResultMeta
+    let meta = ceo_connector::redelivery::PreservedResultMeta {
+        server_origin: cred.server_origin.clone(),
+        device_id: cred.device_id.clone(),
+        job_id: job_id.into(),
+        attempt_id: attempt_id.clone(),
+        claim_token: claim_token.into(),
+        resource_id: Some(resource_id.into()),
+    };
+    let meta_file = paths.preserved_managed_result_meta_file(job_id, &attempt_id);
+    ceo_connector::local_state::atomic_write_json(&meta_file, &meta).unwrap();
+
+    // 1. Place old snapshot in results/
+    let pres_res = paths.preserved_managed_result_file(job_id, &attempt_id);
+    let old_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Old snapshot content",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Old stale content"
+            }
+        ]
+    });
+    ceo_connector::local_state::atomic_write_json(&pres_res, &old_envelope).unwrap();
+
+    // 2. Place corrected candidate in runtime/
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let runtime_res = paths.managed_result_file(&attempt_id);
+    let corrected_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Human corrected content",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "New corrected content with high accuracy"
+            }
+        ]
+    });
+    ceo_connector::local_state::atomic_write_json(&runtime_res, &corrected_envelope).unwrap();
+
+    // 3. Mock server checks that the CORRECTED content is submitted
+    let server_saw_corrected = Arc::new(AtomicBool::new(false));
+    let ssc = server_saw_corrected.clone();
+    let result_path = format!("/api/connector/jobs/{job_id}/result");
+    let resource_id_clone = resource_id.to_string();
+    server.add_handler(move |req| {
+        if req.path == result_path && req.method == "POST" {
+            let body: serde_json::Value = req.json().unwrap();
+            let summary = body.pointer("/result/summary").and_then(|v| v.as_str());
+            assert_eq!(summary, Some("Human corrected content"));
+            ssc.store(true, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-27T18:00:00.000Z",
+                    "resource_id": resource_id_clone,
+                    "commit": "git-commit-hash-corrected"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, None).await;
+    assert!(res.is_ok(), "Redelivery failed: {:?}", res);
+    assert!(server_saw_corrected.load(Ordering::SeqCst));
+
+    // 4. Assert preserved snapshot was replaced with the corrected content
+    let updated_snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pres_res).unwrap()).unwrap();
+    assert_eq!(
+        updated_snapshot.get("summary").and_then(|v| v.as_str()),
+        Some("Human corrected content")
+    );
+}
+
+#[tokio::test]
+async fn test_redelivery_invalid_runtime_result_strict_failure_no_silent_fallback() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let job_id = "job_redeliver_invalid_fail_closed";
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res-invalid-fail";
+    let claim_token = "tok123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // Setup PreservedResultMeta
+    let meta = ceo_connector::redelivery::PreservedResultMeta {
+        server_origin: cred.server_origin.clone(),
+        device_id: cred.device_id.clone(),
+        job_id: job_id.into(),
+        attempt_id: attempt_id.clone(),
+        claim_token: claim_token.into(),
+        resource_id: Some(resource_id.into()),
+    };
+    let meta_file = paths.preserved_managed_result_meta_file(job_id, &attempt_id);
+    ceo_connector::local_state::atomic_write_json(&meta_file, &meta).unwrap();
+
+    // 1. Place old valid snapshot in results/
+    let pres_res = paths.preserved_managed_result_file(job_id, &attempt_id);
+    let old_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Old valid snapshot",
+        "operations": [{ "op": "upsert_content", "content": "Old valid content" }]
+    });
+    ceo_connector::local_state::atomic_write_json(&pres_res, &old_envelope).unwrap();
+
+    // 2. Place corrupted/invalid candidate in runtime/
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let runtime_res = paths.managed_result_file(&attempt_id);
+    std::fs::write(&runtime_res, b"{ corrupt json: [").unwrap();
+
+    // 3. Mock server must receive ZERO calls!
+    let network_called = Arc::new(AtomicBool::new(false));
+    let nc = network_called.clone();
+    server.add_handler(move |_req| {
+        nc.store(true, Ordering::SeqCst);
+        MockResponse::json(500, &serde_json::json!({ "error": "should not be called" }))
+    });
+
+    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, None).await;
+    assert!(res.is_err(), "Must fail when runtime result is invalid");
+    let err_msg = res.unwrap_err();
+    assert!(
+        err_msg.contains("Invalid runtime managed result"),
+        "Error message should indicate invalid runtime candidate, got: {err_msg}"
+    );
+    assert!(
+        !network_called.load(Ordering::SeqCst),
+        "Must NOT make network calls or fall back silently to old preserved result"
+    );
+}
+
+#[tokio::test]
+async fn test_non_resource_job_does_not_persist_redelivery_meta() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+    let client = ConnectorClient::new(&server.origin()).unwrap();
+    let adapter = Arc::new(MockAdapter::default());
+
+    let job_id = "job_freestyle_no_meta";
+    let att_id = format!("att-{}", Uuid::new_v4());
+
+    // Claim non-resource (freestyle) job: result_target: "none", resource_id: None
+    let mut attempt = make_test_attempt_with_resource(
+        &cred,
+        att_id.clone(),
+        AttemptPhase::ClaimIntent,
+        "none",
+        None,
+        None,
+    );
+    attempt.job_id = job_id.to_string();
+    attempt.workspace_id = "ws_test".to_string();
+    attempt.target_id = "tgt_test".to_string();
+    attempt.claim_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into();
+    attempt.prompt = Some("prompt".into());
+    attempt.acceptance = Some("acceptance".into());
+    attempt.execution_timeout_seconds = Some(3600);
+    attempt.payload_sha256 = Some(ActiveAttempt::compute_payload_sha256(
+        job_id,
+        "ws_test",
+        "tgt_test",
+        None,
+        "prompt",
+        "acceptance",
+        3600,
+        "none",
+    ));
+    attempt.save(&paths.active_attempt_file()).unwrap();
+
+    let att_id_clone = att_id.clone();
+    server.add_handler(move |req| {
+        if req.path.contains("/claim") && req.method == "POST" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": att_id_clone,
+                        "phase": "claimed",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "claim_expires_at": "2026-09-24T13:00:00.000Z"
+                    },
+                    "job": {
+                        "job_id": job_id,
+                        "workspace_id": "ws_test",
+                        "target_id": "tgt_test",
+                        "resource_id": null,
+                        "prompt": "prompt",
+                        "acceptance": "acceptance",
+                        "timeout_seconds": 3600,
+                        "result_target": "none"
+                    }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let meta_file = paths.preserved_managed_result_meta_file(job_id, &att_id);
+    assert!(
+        !meta_file.exists(),
+        "Non-resource jobs must NOT persist redelivery metadata"
     );
 }

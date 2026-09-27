@@ -491,7 +491,6 @@ pub async fn drive_active_attempt(
                         Some(c) if c.attempt_id == active.attempt_id => c,
                         _ => return Ok(true),
                     };
-                    current.phase = AttemptPhase::Claimed;
                     current.resource_id = resp.job.resource_id;
                     current.prompt = Some(resp.job.prompt);
                     current.acceptance = Some(resp.job.acceptance);
@@ -499,6 +498,11 @@ pub async fn drive_active_attempt(
                     current.result_target = Some(resp.job.result_target);
                     current.payload_sha256 = Some(payload_hash);
                     current.claimed_at_ms = Some(claimed_at_ms);
+
+                    // For resource jobs: persist redelivery authority BEFORE committing phase = Claimed
+                    crate::managed_result::durable_persist_redelivery_meta(paths, cred, &current)?;
+
+                    current.phase = AttemptPhase::Claimed;
                     current.save(&paths.active_attempt_file())?;
                     println!("Claim intent successfully reconciled to claimed.");
                     Ok(true)
@@ -1404,6 +1408,9 @@ pub async fn drive_active_attempt(
             })?;
 
             let task_dispatched = exec_state.dispatch_request_id.is_some();
+
+            // Defensively ensure redelivery authority is preserved for resource jobs
+            let _ = crate::managed_result::durable_persist_redelivery_meta(paths, cred, &active);
 
             let (status, outcome, err, managed_result, managed_result_sha256) = match exec_state
                 .runtime_completion_kind

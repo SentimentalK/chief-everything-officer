@@ -179,6 +179,25 @@ pub fn durable_capture_managed_result(
 
     // 2. Durably snapshot into preserved storage
     let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
+    crate::local_state::atomic_write_json(&pres_res, &envelope)?;
+    durable_persist_redelivery_meta(paths, cred, active)?;
+
+    Ok(CapturedManagedResult {
+        envelope,
+        payload_sha256,
+    })
+}
+
+/// Durably persists redelivery metadata (including claim_token) for resource jobs
+/// until explicit artifact cleanup.
+pub fn durable_persist_redelivery_meta(
+    paths: &crate::paths::ConnectorPaths,
+    cred: &crate::credential::DeviceCredential,
+    active: &crate::scheduler::ActiveAttempt,
+) -> std::io::Result<()> {
+    if active.result_target.as_deref() != Some("resource") || active.resource_id.is_none() {
+        return Ok(());
+    }
     let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
     let meta = crate::redelivery::PreservedResultMeta {
         server_origin: cred.server_origin.clone(),
@@ -188,14 +207,7 @@ pub fn durable_capture_managed_result(
         claim_token: active.claim_token.clone(),
         resource_id: active.resource_id.clone(),
     };
-
-    crate::local_state::atomic_write_json(&pres_res, &envelope)?;
-    crate::local_state::atomic_write_json(&pres_meta, &meta)?;
-
-    Ok(CapturedManagedResult {
-        envelope,
-        payload_sha256,
-    })
+    crate::local_state::atomic_write_json(&pres_meta, &meta)
 }
 
 #[cfg(test)]

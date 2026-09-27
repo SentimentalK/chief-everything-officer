@@ -78,21 +78,51 @@ pub async fn run_redeliver(
     let meta: PreservedResultMeta =
         serde_json::from_str(&meta_content).map_err(|e| format!("Corrupt meta file: {e}"))?;
 
-    let result_path = paths.preserved_managed_result_file(job_id, &attempt_id);
-    if !result_path.exists() {
-        return Err(format!(
-            "Preserved result file not found: {}",
-            result_path.display()
-        ));
-    }
+    let runtime_result_path = paths.managed_result_file(&attempt_id);
+    let preserved_result_path = paths.preserved_managed_result_file(job_id, &attempt_id);
 
-    let (envelope, sha256) = read_and_validate_from_file(
-        &result_path,
-        &meta.job_id,
-        &meta.attempt_id,
-        meta.resource_id.as_deref(),
-    )
-    .map_err(|e| format!("Invalid managed result: {e}"))?;
+    let (envelope, sha256) = if runtime_result_path.exists() {
+        // 1. Runtime candidate exists: validate strictly.
+        // If invalid, FAIL CLOSED. NEVER fall back silently to old preserved snapshot.
+        let (env, digest) = read_and_validate_from_file(
+            &runtime_result_path,
+            &meta.job_id,
+            &meta.attempt_id,
+            meta.resource_id.as_deref(),
+        )
+        .map_err(|e| {
+            format!(
+                "Invalid runtime managed result in {}: {e}",
+                runtime_result_path.display()
+            )
+        })?;
+
+        // Promote / snapshot to preserved storage
+        crate::local_state::atomic_write_json(&preserved_result_path, &env)
+            .map_err(|e| format!("Failed to snapshot runtime result to results storage: {e}"))?;
+
+        (env, digest)
+    } else if preserved_result_path.exists() {
+        // 2. Preserved snapshot fallback
+        read_and_validate_from_file(
+            &preserved_result_path,
+            &meta.job_id,
+            &meta.attempt_id,
+            meta.resource_id.as_deref(),
+        )
+        .map_err(|e| {
+            format!(
+                "Invalid preserved managed result in {}: {e}",
+                preserved_result_path.display()
+            )
+        })?
+    } else {
+        return Err(format!(
+            "No managed result available for redelivery for job '{job_id}', attempt '{attempt_id}' (checked {} and {})",
+            runtime_result_path.display(),
+            preserved_result_path.display()
+        ));
+    };
 
     let cred = DeviceCredential::load(&paths.credential_file())
         .map_err(|e| format!("Failed to load device credential: {e}"))?
