@@ -365,8 +365,7 @@ fi
     assert_eq!(invocations.lines().count(), 1);
 
     let recorded = fs::read_to_string(&args_log).unwrap();
-    let expected_prompt =
-        format!("任务\n\n{prompt_literal}\n\n验收标准\n\n{acceptance_literal}");
+    let expected_prompt = format!("任务\n\n{prompt_literal}\n\n验收标准\n\n{acceptance_literal}");
     assert!(recorded.contains(&expected_prompt));
     assert!(recorded.contains("执行上下文"));
 
