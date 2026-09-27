@@ -18,8 +18,8 @@ use ceo_connector::outbox::OutboxRecord;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::scheduler::{
     ActiveAttempt, AttemptExecutorState, AttemptPhase, CleanupOutcome, DispatchOutcome,
-    DispatchReconciliation, ExecutionAdapter, InterruptOutcome, PrepareOutcome, PreparedExecution, WaitOutcome,
-    ACTIVE_ATTEMPT_SCHEMA_VERSION,
+    DispatchReconciliation, ExecutionAdapter, InterruptOutcome, PrepareOutcome, PreparedExecution,
+    WaitOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
 };
 use common::mock_server::{MockResponse, MockServer};
 use uuid::Uuid;
@@ -1489,7 +1489,11 @@ async fn test_timeout_fallback_with_valid_managed_result() {
         ]
     });
     fs::create_dir_all(result_file.parent().unwrap()).unwrap();
-    fs::write(&result_file, serde_json::to_string(&valid_envelope).unwrap()).unwrap();
+    fs::write(
+        &result_file,
+        serde_json::to_string(&valid_envelope).unwrap(),
+    )
+    .unwrap();
 
     let adapter = Arc::new(MockAdapter {
         ready: true,
@@ -1612,13 +1616,16 @@ async fn test_timeout_without_managed_result() {
     });
 
     // Deliver outbox
-    ceo_connector::outbox::flush_outbox(&paths, &client, &cred).await.unwrap();
+    ceo_connector::outbox::flush_outbox(&paths, &client, &cred)
+        .await
+        .unwrap();
 
     // History record must record "timed_out"
     let hist_file = paths.history_file(&job_id, &attempt_id);
     assert!(hist_file.exists());
     let hist_str = fs::read_to_string(hist_file).unwrap();
-    let hist: ceo_connector::outbox::SanitizedHistoryRecord = serde_json::from_str(&hist_str).unwrap();
+    let hist: ceo_connector::outbox::SanitizedHistoryRecord =
+        serde_json::from_str(&hist_str).unwrap();
     assert_eq!(hist.status, "timed_out");
 
     // Runtime dir must NOT be deleted on TIMED_OUT!
@@ -1669,7 +1676,10 @@ async fn test_explicit_redelivery_flow() {
     server.add_handler(move |req| {
         if req.path == result_path && req.method == "POST" {
             let body: serde_json::Value = req.json().unwrap();
-            assert_eq!(body.get("delivery_mode").and_then(|v| v.as_str()), Some("explicit_redelivery"));
+            assert_eq!(
+                body.get("delivery_mode").and_then(|v| v.as_str()),
+                Some("explicit_redelivery")
+            );
             return MockResponse::json(
                 200,
                 &serde_json::json!({
@@ -1741,28 +1751,67 @@ async fn test_advisory_readiness_unsatisfied_persists_none_ready_at_and_advances
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
 
     // Step 1: Claimed -> PrepareIntent
-    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
-    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
     assert_eq!(cur.phase, AttemptPhase::PrepareIntent);
 
     // Step 2: PrepareIntent -> Prepared with agent_ready_at_ms = None!
-    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
-    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
     assert_eq!(cur.phase, AttemptPhase::Prepared);
     assert_eq!(cur.executor.as_ref().unwrap().agent_ready_at_ms, None);
     // CRITICAL: save & validate must succeed with agent_ready_at_ms = None!
     assert!(cur.save(&paths.active_attempt_file()).is_ok());
 
     // Step 3: Prepared -> DispatchIntent
-    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
-    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
     assert_eq!(cur.phase, AttemptPhase::DispatchIntent);
     assert_eq!(cur.executor.as_ref().unwrap().agent_ready_at_ms, None);
 
     // Step 4: DispatchIntent -> Dispatched (relying on send accepted)
-    drive_active_attempt(&paths, &client, &cred, &(adapter.clone() as Arc<dyn ExecutionAdapter>), &DaemonHooks::default()).await.unwrap();
-    let cur = ActiveAttempt::load(&paths.active_attempt_file()).unwrap().unwrap();
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
     assert_eq!(cur.phase, AttemptPhase::Dispatched);
     assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
 }
-

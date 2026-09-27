@@ -1,5 +1,5 @@
-use std::fs;
 use serde::{Deserialize, Serialize};
+use std::fs;
 
 use crate::client::ConnectorClient;
 use crate::credential::DeviceCredential;
@@ -23,7 +23,10 @@ pub async fn run_redeliver(
 ) -> Result<(), String> {
     let results_dir = paths.results_dir();
     if !results_dir.exists() {
-        return Err(format!("Results directory does not exist: {}", results_dir.display()));
+        return Err(format!(
+            "Results directory does not exist: {}",
+            results_dir.display()
+        ));
     }
 
     let attempt_id = if let Some(att) = specified_attempt_id {
@@ -34,7 +37,8 @@ pub async fn run_redeliver(
         let suffix = ".meta.json";
         let mut matching_attempts = Vec::new();
 
-        let entries = fs::read_dir(&results_dir).map_err(|e| format!("Failed to read results dir: {e}"))?;
+        let entries =
+            fs::read_dir(&results_dir).map_err(|e| format!("Failed to read results dir: {e}"))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("Directory entry error: {e}"))?;
             let name = entry.file_name().to_string_lossy().to_string();
@@ -47,7 +51,10 @@ pub async fn run_redeliver(
         }
 
         if matching_attempts.is_empty() {
-            return Err(format!("No preserved result metadata found for job '{job_id}' in {}", results_dir.display()));
+            return Err(format!(
+                "No preserved result metadata found for job '{job_id}' in {}",
+                results_dir.display()
+            ));
         }
         if matching_attempts.len() > 1 {
             return Err(format!(
@@ -60,15 +67,23 @@ pub async fn run_redeliver(
 
     let meta_path = paths.preserved_managed_result_meta_file(job_id, &attempt_id);
     if !meta_path.exists() {
-        return Err(format!("Preserved metadata file not found: {}", meta_path.display()));
+        return Err(format!(
+            "Preserved metadata file not found: {}",
+            meta_path.display()
+        ));
     }
 
-    let meta_content = fs::read_to_string(&meta_path).map_err(|e| format!("Failed to read meta file: {e}"))?;
-    let meta: PreservedResultMeta = serde_json::from_str(&meta_content).map_err(|e| format!("Corrupt meta file: {e}"))?;
+    let meta_content =
+        fs::read_to_string(&meta_path).map_err(|e| format!("Failed to read meta file: {e}"))?;
+    let meta: PreservedResultMeta =
+        serde_json::from_str(&meta_content).map_err(|e| format!("Corrupt meta file: {e}"))?;
 
     let result_path = paths.preserved_managed_result_file(job_id, &attempt_id);
     if !result_path.exists() {
-        return Err(format!("Preserved result file not found: {}", result_path.display()));
+        return Err(format!(
+            "Preserved result file not found: {}",
+            result_path.display()
+        ));
     }
 
     let (envelope, sha256) = read_and_validate_from_file(
@@ -76,7 +91,8 @@ pub async fn run_redeliver(
         &meta.job_id,
         &meta.attempt_id,
         meta.resource_id.as_deref(),
-    ).map_err(|e| format!("Invalid managed result: {e}"))?;
+    )
+    .map_err(|e| format!("Invalid managed result: {e}"))?;
 
     let cred = DeviceCredential::load(&paths.credential_file())
         .map_err(|e| format!("Failed to load device credential: {e}"))?
@@ -91,17 +107,23 @@ pub async fn run_redeliver(
 
     let client = ConnectorClient::new(&meta.server_origin)
         .map_err(|e| format!("Failed to create client: {e}"))?;
-    println!("Submitting redelivery for job '{}', attempt '{}' (delivery_mode: explicit_redelivery)...", meta.job_id, meta.attempt_id);
+    println!(
+        "Submitting redelivery for job '{}', attempt '{}' (delivery_mode: explicit_redelivery)...",
+        meta.job_id, meta.attempt_id
+    );
 
-    let resp = client.submit_job_result(
-        &cred,
-        &meta.job_id,
-        &meta.attempt_id,
-        &meta.claim_token,
-        &envelope,
-        &sha256,
-        Some("explicit_redelivery"),
-    ).await.map_err(|e| format!("Server rejected redelivery: {e}"))?;
+    let resp = client
+        .submit_job_result(
+            &cred,
+            &meta.job_id,
+            &meta.attempt_id,
+            &meta.claim_token,
+            &envelope,
+            &sha256,
+            Some("explicit_redelivery"),
+        )
+        .await
+        .map_err(|e| format!("Server rejected redelivery: {e}"))?;
 
     println!("Managed result redelivered successfully.");
     println!("  Resource ID: {}", resp.resource_id);

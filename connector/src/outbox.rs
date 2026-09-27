@@ -256,7 +256,9 @@ pub async fn deliver_outbox_record(
             remove_durable(&paths.active_attempt_file())?;
 
             // 4. Clean up attempt runtime dir only if COMPLETED (retain for inspection & manual redelivery on failure/timeout)
-            if record.report.execution_status == crate::execution_contract::ExecutionStatus::COMPLETED {
+            if record.report.execution_status
+                == crate::execution_contract::ExecutionStatus::COMPLETED
+            {
                 let runtime_attempt_dir = paths.attempt_runtime_dir(&record.attempt_id);
                 if runtime_attempt_dir.exists() {
                     let _ = fs::remove_dir_all(&runtime_attempt_dir);

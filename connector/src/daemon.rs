@@ -1312,8 +1312,14 @@ pub async fn drive_active_attempt(
                             ) {
                                 Ok((envelope, sha256)) => {
                                     // Save preserved result and private metadata (0600)
-                                    let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
-                                    let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+                                    let pres_res = paths.preserved_managed_result_file(
+                                        &active.job_id,
+                                        &active.attempt_id,
+                                    );
+                                    let pres_meta = paths.preserved_managed_result_meta_file(
+                                        &active.job_id,
+                                        &active.attempt_id,
+                                    );
                                     let meta = crate::redelivery::PreservedResultMeta {
                                         server_origin: cred.server_origin.clone(),
                                         device_id: cred.device_id.clone(),
@@ -1380,8 +1386,14 @@ pub async fn drive_active_attempt(
                             ) {
                                 Ok((envelope, sha256)) => {
                                     // Timeout fallback: valid correlated managed result exists!
-                                    let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
-                                    let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+                                    let pres_res = paths.preserved_managed_result_file(
+                                        &active.job_id,
+                                        &active.attempt_id,
+                                    );
+                                    let pres_meta = paths.preserved_managed_result_meta_file(
+                                        &active.job_id,
+                                        &active.attempt_id,
+                                    );
                                     let meta = crate::redelivery::PreservedResultMeta {
                                         server_origin: cred.server_origin.clone(),
                                         device_id: cred.device_id.clone(),
@@ -1487,22 +1499,30 @@ pub async fn drive_active_attempt(
                                 (true, Some(verified_at_ms))
                             }
                             crate::scheduler::CleanupOutcome::Retryable { reason } => {
-                                eprintln!("Terminal cleanup retryable: {reason}. Will retry next loop.");
+                                eprintln!(
+                                    "Terminal cleanup retryable: {reason}. Will retry next loop."
+                                );
                                 return Ok(true);
                             }
-                            crate::scheduler::CleanupOutcome::RecoveryRequired { code, message } => {
+                            crate::scheduler::CleanupOutcome::RecoveryRequired {
+                                code,
+                                message,
+                            } => {
                                 let _lock = ExecutionLock::acquire_with_retry(
                                     &paths.state_lock_file(),
                                     Duration::from_secs(5),
                                     Duration::from_millis(50),
                                 )?;
-                                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                                    Some(c) if c.attempt_id == active.attempt_id => c,
-                                    _ => return Ok(true),
-                                };
+                                let mut current =
+                                    match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                        Some(c) if c.attempt_id == active.attempt_id => c,
+                                        _ => return Ok(true),
+                                    };
                                 current.phase = AttemptPhase::RecoveryRequired;
                                 current.save(&paths.active_attempt_file())?;
-                                return Err(DaemonError::RecoveryRequired(format!("{code}: {message}")));
+                                return Err(DaemonError::RecoveryRequired(format!(
+                                    "{code}: {message}"
+                                )));
                             }
                         }
                     } else {

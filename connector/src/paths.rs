@@ -113,11 +113,13 @@ impl ConnectorPaths {
     }
 
     pub fn preserved_managed_result_file(&self, job_id: &str, attempt_id: &str) -> PathBuf {
-        self.results_dir().join(format!("{job_id}.{attempt_id}.json"))
+        self.results_dir()
+            .join(format!("{job_id}.{attempt_id}.json"))
     }
 
     pub fn preserved_managed_result_meta_file(&self, job_id: &str, attempt_id: &str) -> PathBuf {
-        self.results_dir().join(format!("{job_id}.{attempt_id}.meta.json"))
+        self.results_dir()
+            .join(format!("{job_id}.{attempt_id}.meta.json"))
     }
 
     pub fn runtime_dir(&self) -> PathBuf {

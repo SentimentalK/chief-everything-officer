@@ -209,7 +209,9 @@ fi
             assert_eq!(prep.agent_id, "agy");
             assert_eq!(prep.agent_ready_at_ms, None);
         }
-        other => panic!("expected PrepareOutcome::Ready with None agent_ready_at_ms, got {other:?}"),
+        other => {
+            panic!("expected PrepareOutcome::Ready with None agent_ready_at_ms, got {other:?}")
+        }
     }
 }
 

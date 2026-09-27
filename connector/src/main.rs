@@ -296,7 +296,9 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Redeliver { job_id, attempt } => {
-            if let Err(e) = ceo_connector::redelivery::run_redeliver(&paths, &job_id, attempt.as_deref()).await {
+            if let Err(e) =
+                ceo_connector::redelivery::run_redeliver(&paths, &job_id, attempt.as_deref()).await
+            {
                 eprintln!("Redelivery failed: {}", e);
                 return ExitCode::FAILURE;
             }

@@ -885,6 +885,7 @@ impl ConnectorClient {
     }
 
     // 14. Submit job result (V1.8)
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_job_result(
         &self,
         credential: &DeviceCredential,
