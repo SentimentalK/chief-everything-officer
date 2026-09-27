@@ -299,12 +299,14 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 }
             }
         } else {
-            let expected_title = format!("ceo:{}", attempt.attempt_id);
+            let expected_title = format!("ceo:{}:{}", attempt.attempt_id, executor.agent_id);
+            let legacy_title = format!("ceo:{}", attempt.attempt_id);
             let matching_terminals: Vec<_> = term_list_res
                 .terminals
                 .into_iter()
                 .filter(|t| {
-                    t.title.as_deref() == Some(&expected_title)
+                    (t.title.as_deref() == Some(&expected_title)
+                        || t.title.as_deref() == Some(&legacy_title))
                         && t.worktree_id
                             .as_deref()
                             .map(|w| w == worktree.id)
