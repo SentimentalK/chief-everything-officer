@@ -86,51 +86,18 @@ export function buildCanonicalAcquisitionTask(url: string, resourceId: string): 
   acceptance: string;
 } {
   return {
-    prompt: `TASK
+    prompt: `提取下面 URL 的完整文本内容并存入关联的 CEO Resource。
 
-Extract the spoken/textual content from this URL and return it to the attached CEO Resource through the managed-result contract.
-
-SOURCE
+来源：
 URL: ${url}
 Resource ID: ${resourceId}
 
-EXECUTION ENVIRONMENT
-
-Your working repository is:
-{{WORKING_DIRECTORY}}
-
-This repository contains capabilities specifically provided for autonomous Agent jobs.
-
-1. Stay inside this repository for task execution.
-2. Read the repository's AGENT.md / agent instructions first.
-3. Use the repository-provided URL extraction capability: content.extract_url.
-4. Prefer the repository capability over writing your own scraper, browsing unrelated repositories, or inspecting CEO/Connector implementation code.
-5. Do NOT search outside this repository, the CEO repository, Connector state, or Resource Git to discover the source URL. The required URL is provided above.
-6. If the declared capability is missing, broken, or its documented contract contradicts this task, STOP and report the concrete failure. Do not invent an alternative architecture.
-
-Expected execution is equivalent to:
-./capabilities/content.extract_url/run --url "${url}" --output-dir <temporary-output-dir>
-
-Follow the capability's actual AGENT_GUIDE/contract if its exact CLI syntax differs.
-
-OUTPUT REQUIREMENTS
-
-On successful extraction:
-- upsert_content: faithful transcript/extracted source content.
-- upsert_summary: concise summary based on the extracted source content, with basis: "source_content".
-- upsert_evidence: briefly record the extraction method, caption/transcription source, and material limitations.
-
-Do not fabricate missing speech, captions, or metadata.
-Do NOT modify CEO resources/** directly.
-Do NOT call CEO Server APIs.
-Do NOT commit anything to the CEO workspace.
-
-Write the final structured result only to the managed-result path below.`,
-    acceptance: `1. The attached Resource must be updated with transcript/subtitle-derived content via upsert_content when extraction succeeds.
-2. A concise summary must be provided via upsert_summary based on the actual source content, not metadata alone.
-3. Evidence must be provided via upsert_evidence stating the extraction method and limitations.
-4. No fabricated transcript or captions.
-5. If extraction fails, do not write a fake result; report the concrete failure.`,
+执行要求：
+1. 使用当前目标工作区中提供的 content.extract_url 能力。
+2. 按照该 capability 自身的说明运行，不要自行编写抓取代码或重新实现字幕下载/ASR。
+3. 提取成功后，根据本任务后附的托管结果契约（Managed Result Contract）返回提取结果。
+4. 不要直接修改 CEO Git 仓库中的 resources/**，不要直接调用 CEO Server API。`,
+    acceptance: `提取成功后，必须通过 upsert_content 返回从该 URL 提取的真实文本或字幕内容；若提取失败，如实报告具体原因，禁止伪造内容。`,
   };
 }
 

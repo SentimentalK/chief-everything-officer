@@ -179,12 +179,10 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     expect(hostJob.task?.prompt).toContain("content.extract_url");
     expect(hostJob.task?.prompt).toContain("URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ");
     expect(hostJob.task?.prompt).toContain(`Resource ID: ${urlResourceId}`);
-    expect(hostJob.task?.prompt).toContain("{{WORKING_DIRECTORY}}");
-    expect(hostJob.task?.prompt).toContain('./capabilities/content.extract_url/run --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --output-dir <temporary-output-dir>');
-    expect(hostJob.task?.prompt).not.toContain("e.g.");
+    expect(hostJob.task?.prompt).toContain("提取下面 URL 的完整文本内容");
+    expect(hostJob.task?.prompt).not.toContain("{{WORKING_DIRECTORY}}");
+    expect(hostJob.task?.prompt).not.toContain("任务\n");
     expect(hostJob.task?.acceptance).toContain("upsert_content");
-    expect(hostJob.task?.acceptance).toContain("upsert_summary");
-    expect(hostJob.task?.acceptance).toContain("upsert_evidence");
   });
 
   it("returns already_satisfied when content exists and mode is if_missing", async () => {

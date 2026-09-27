@@ -15,7 +15,6 @@ fn test_contract_example_round_trips_through_validator() {
     let prompt = build_execution_prompt(
         Some("Acquire full textual content for Resource"),
         Some("A valid managed result must contain a non-empty upsert_content operation"),
-        None,
         Some(&contract),
     );
 
@@ -73,42 +72,41 @@ fn test_contract_example_round_trips_through_validator() {
 }
 
 #[test]
-fn test_acquisition_prompt_working_directory_substitution_and_hardening() {
-    let raw_task = r#"TASK
+fn test_freestyle_and_resource_prompt_framing_isolation() {
+    let freestyle_task = "Fix bug in parser and run tests";
+    let freestyle_acceptance = "All tests green";
 
-Extract the spoken/textual content from this URL and return it to the attached CEO Resource through the managed-result contract.
+    // 1. Freestyle job (managed_contract = None)
+    let freestyle_prompt =
+        build_execution_prompt(Some(freestyle_task), Some(freestyle_acceptance), None);
 
-SOURCE
-URL: https://www.youtube.com/watch?v=4Yb3JFbw4k0
-Resource ID: res-58045c04-d1a9-422a-a1a4-ecbee04187f7
+    // Must preserve caller-owned body under Chinese headings
+    assert!(freestyle_prompt.contains("任务\n\nFix bug in parser and run tests"));
+    assert!(freestyle_prompt.contains("验收标准\n\nAll tests green"));
+    assert!(freestyle_prompt.contains("执行上下文"));
+    // Must NOT contain managed result contract!
+    assert!(!freestyle_prompt.contains("托管结果契约"));
+    assert!(!freestyle_prompt.contains("managed-result.json"));
 
-EXECUTION ENVIRONMENT
-
-Your working repository is:
-{{WORKING_DIRECTORY}}
-
-1. Stay inside this repository for task execution.
-2. Read the repository's AGENT.md / agent instructions first.
-3. Use the repository-provided URL extraction capability: content.extract_url.
-"#;
-
-    let target_dir = PathBuf::from("/home/sentimentalk/codes/ceo-agent-runtime");
-    let prompt = build_execution_prompt(
-        Some(raw_task),
-        Some("A valid managed result must contain a non-empty upsert_content operation"),
-        Some(&target_dir),
-        None,
+    // 2. Resource job (managed_contract = Some)
+    let contract = ManagedContract {
+        path: PathBuf::from("/var/ceo/managed-result.json"),
+        job_id: "job-123".into(),
+        attempt_id: "att-456".into(),
+        resource_id: "res-789".into(),
+    };
+    let resource_task = "提取下面 URL 的完整文本内容并存入关联的 CEO Resource。\n\n来源：\nURL: https://www.youtube.com/watch?v=aircAruvnKk";
+    let resource_prompt = build_execution_prompt(
+        Some(resource_task),
+        Some("必须通过 upsert_content 返回提取结果"),
+        Some(&contract),
     );
 
-    // Verify {{WORKING_DIRECTORY}} is cleanly replaced with the actual path
-    assert!(!prompt.contains("{{WORKING_DIRECTORY}}"));
-    assert!(prompt.contains("/home/sentimentalk/codes/ceo-agent-runtime"));
-
-    // Verify TASK header is not duplicated
-    assert!(prompt.starts_with("TASK\n\nExtract the spoken/textual content"));
-    assert!(!prompt.starts_with("TASK\n\nTASK\n\n"));
-
-    // Verify SOURCE section has URL and Resource ID
-    assert!(prompt.contains("URL: https://www.youtube.com/watch?v=4Yb3JFbw4k0"));
-    assert!(prompt.contains("Resource ID: res-58045c04-d1a9-422a-a1a4-ecbee04187f7"));
+    assert!(
+        resource_prompt.contains("任务\n\n提取下面 URL 的完整文本内容并存入关联的 CEO Resource。")
+    );
+    assert!(resource_prompt.contains("验收标准\n\n必须通过 upsert_content 返回提取结果"));
+    assert!(resource_prompt.contains("执行上下文"));
+    assert!(resource_prompt.contains("托管结果契约"));
+    assert!(resource_prompt.contains("/var/ceo/managed-result.json"));
 }

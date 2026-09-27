@@ -348,7 +348,6 @@ fi
         attempt.prompt.as_deref(),
         attempt.acceptance.as_deref(),
         None,
-        None,
     );
     let outcome = adapter
         .dispatch(&attempt, "term_1", &prompt_text)
@@ -367,8 +366,9 @@ fi
 
     let recorded = fs::read_to_string(&args_log).unwrap();
     let expected_prompt =
-        format!("TASK\n\n{prompt_literal}\n\nACCEPTANCE CRITERIA\n\n{acceptance_literal}");
+        format!("任务\n\n{prompt_literal}\n\n验收标准\n\n{acceptance_literal}");
     assert!(recorded.contains(&expected_prompt));
+    assert!(recorded.contains("执行上下文"));
 
     assert!(!recorded.contains("SECRET_CLAIM_TOKEN"));
     assert!(!recorded.contains("dev_xyz"));

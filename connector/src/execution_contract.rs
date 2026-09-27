@@ -194,51 +194,37 @@ pub struct ManagedContract {
     pub resource_id: String,
 }
 
-/// Builds a deterministic, structured execution prompt for CEO managed-result Jobs.
+/// Builds a deterministic, structured execution prompt for CEO Jobs.
 pub fn build_execution_prompt(
     task: Option<&str>,
     acceptance: Option<&str>,
-    working_directory: Option<&std::path::Path>,
     managed_contract: Option<&ManagedContract>,
 ) -> String {
     let mut sections = Vec::new();
 
     if let Some(t) = task {
-        let mut task_str = t.trim().to_string();
-        if let Some(wd) = working_directory {
-            if task_str.contains("{{WORKING_DIRECTORY}}") {
-                task_str = task_str.replace("{{WORKING_DIRECTORY}}", &wd.display().to_string());
-            }
-        }
-        if !task_str.is_empty() {
-            if task_str.starts_with("TASK\n")
-                || task_str.starts_with("TASK\r\n")
-                || task_str == "TASK"
-            {
-                sections.push(task_str);
-            } else {
-                sections.push(format!("TASK\n\n{task_str}"));
-            }
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!("任务\n\n{trimmed}"));
         }
     }
 
     if let Some(a) = acceptance {
         let trimmed = a.trim();
         if !trimmed.is_empty() {
-            if trimmed.starts_with("ACCEPTANCE CRITERIA\n")
-                || trimmed.starts_with("ACCEPTANCE CRITERIA\r\n")
-                || trimmed == "ACCEPTANCE CRITERIA"
-            {
-                sections.push(trimmed.to_string());
-            } else {
-                sections.push(format!("ACCEPTANCE CRITERIA\n\n{trimmed}"));
-            }
+            sections.push(format!("验收标准\n\n{trimmed}"));
         }
     }
 
+    // Generic Runtime Context (WHERE)
+    sections.push(
+        "执行上下文\n\n- 当前 Agent 已在该 Job 对应的 Target 工作区中启动。\n- 默认只在当前工作区内执行任务。\n- 除非任务明确要求，否则不要搜索父目录、兄弟仓库或其他项目。\n- 当前工作区中的 AGENTS.md / Agent instructions 是该工作区的执行说明。".to_string(),
+    );
+
+    // Optional Managed Result Contract (DELIVERY)
     if let Some(mc) = managed_contract {
         let contract = format!(
-            "MANAGED RESULT CONTRACT\n\nCEO JOB\nJob ID: {job_id}\nAttempt ID: {attempt_id}\nResource ID: {resource_id}\n\nWhen your task is complete, you MUST write a single JSON file to this EXACT path:\n{path}\n\nThe JSON must follow this schema:\n{{\n  \"schema_version\": 1,\n  \"job_id\": \"{job_id}\",\n  \"attempt_id\": \"{attempt_id}\",\n  \"resource_id\": \"{resource_id}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"upsert_content\",\n      \"content\": \"<full extracted content as string>\"\n    }}\n  ]\n}}\n\nAllowed ops: upsert_content, upsert_evidence, upsert_summary, append_interaction, patch_topics, rename\nForbidden ops: attach_source_asset\n\nRules:\n1. Do NOT place this file in the git repository.\n2. Write only valid JSON encoded in UTF-8.\n3. Do not generate empty or partial files.\n4. Do NOT call CEO Server APIs directly.\n5. Do NOT modify resources/** in the git workspace.\n6. job_id, attempt_id, resource_id are given above — do NOT guess or invent them.",
+            "托管结果契约\n\nCEO JOB\nJob ID: {job_id}\nAttempt ID: {attempt_id}\nResource ID: {resource_id}\n\n任务完成后，必须将单独的 JSON 结果文件写入此确切绝对路径：\n{path}\n\n该 JSON 必须符合以下结构（schema_version: 1）：\n{{\n  \"schema_version\": 1,\n  \"job_id\": \"{job_id}\",\n  \"attempt_id\": \"{attempt_id}\",\n  \"resource_id\": \"{resource_id}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"upsert_content\",\n      \"content\": \"<full extracted content as string>\"\n    }}\n  ]\n}}\n\n允许的操作类型：upsert_content, upsert_evidence, upsert_summary, append_interaction, patch_topics, rename\n禁止的操作类型：attach_source_asset\n\n规则：\n1. 不要将此结果文件放入 git 仓库中。\n2. 仅写入有效的 UTF-8 编码 JSON。\n3. 不要生成空文件或不完整文件。\n4. 不要直接调用 CEO Server API。\n5. 不要直接修改 git 工作区中的 resources/**。\n6. job_id, attempt_id, resource_id 已由上方明确给出，不要猜测或伪造。",
             job_id = mc.job_id,
             attempt_id = mc.attempt_id,
             resource_id = mc.resource_id,
@@ -313,15 +299,11 @@ mod tests {
 
     #[test]
     fn build_execution_prompt_none_target() {
-        let prompt = build_execution_prompt(
-            Some("Fix bug in parser"),
-            Some("All tests green"),
-            None,
-            None,
-        );
+        let prompt =
+            build_execution_prompt(Some("Fix bug in parser"), Some("All tests green"), None);
         assert_eq!(
             prompt,
-            "TASK\n\nFix bug in parser\n\nACCEPTANCE CRITERIA\n\nAll tests green"
+            "任务\n\nFix bug in parser\n\n验收标准\n\nAll tests green\n\n执行上下文\n\n- 当前 Agent 已在该 Job 对应的 Target 工作区中启动。\n- 默认只在当前工作区内执行任务。\n- 除非任务明确要求，否则不要搜索父目录、兄弟仓库或其他项目。\n- 当前工作区中的 AGENTS.md / Agent instructions 是该工作区的执行说明。"
         );
     }
 
@@ -333,15 +315,12 @@ mod tests {
             attempt_id: "att-123".into(),
             resource_id: "res_456".into(),
         };
-        let prompt = build_execution_prompt(
-            Some("Update docs"),
-            Some("Doc matches schema"),
-            None,
-            Some(&mc),
-        );
+        let prompt =
+            build_execution_prompt(Some("Update docs"), Some("Doc matches schema"), Some(&mc));
         assert!(prompt.starts_with(
-            "TASK\n\nUpdate docs\n\nACCEPTANCE CRITERIA\n\nDoc matches schema\n\nMANAGED RESULT CONTRACT\n\n"
+            "任务\n\nUpdate docs\n\n验收标准\n\nDoc matches schema\n\n执行上下文\n\n"
         ));
+        assert!(prompt.contains("托管结果契约\n\n"));
         assert!(prompt.contains("/var/ceo/state/runtime/att-123/managed-result.json"));
         assert!(prompt.contains("\"resource_id\": \"res_456\""));
         assert!(prompt.contains("\"job_id\": \"job-aaaaaaaa-0000-0000-0000-000000000001\""));
@@ -349,16 +328,5 @@ mod tests {
         // Correct op; no forbidden op
         assert!(prompt.contains("\"op\": \"upsert_content\""));
         assert!(!prompt.contains("replace_body"));
-    }
-
-    #[test]
-    fn build_execution_prompt_working_directory_substitution() {
-        let prompt = build_execution_prompt(
-            Some("Run in {{WORKING_DIRECTORY}} now"),
-            None,
-            Some(std::path::Path::new("/workspace/project")),
-            None,
-        );
-        assert_eq!(prompt, "TASK\n\nRun in /workspace/project now");
     }
 }
