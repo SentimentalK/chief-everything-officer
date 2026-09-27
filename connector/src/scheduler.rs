@@ -11,7 +11,7 @@ use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
-pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 4;
+pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -101,6 +101,12 @@ pub struct AttemptExecutorState {
     pub dispatch_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_accepted_at_ms: Option<i64>,
+    #[serde(default)]
+    pub dispatch_turn_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_baseline_state_started_at: Option<i64>,
+    #[serde(default)]
+    pub turn_started_observed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dispatch_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +115,31 @@ pub struct AttemptExecutorState {
     pub runtime_completed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_error: Option<crate::execution_contract::ExecutionReportError>,
+}
+
+impl AttemptExecutorState {
+    pub fn new_orca() -> Self {
+        Self {
+            executor_type: "orca".into(),
+            orca_version: None,
+            worktree_id: None,
+            terminal_id: None,
+            agent_id: None,
+            agent_ready_at_ms: None,
+            dispatch_send_count: 0,
+            dispatch_started_at_ms: None,
+            execution_deadline_ms: None,
+            dispatch_request_id: None,
+            dispatch_accepted_at_ms: None,
+            dispatch_turn_started: false,
+            dispatch_baseline_state_started_at: None,
+            turn_started_observed: false,
+            last_dispatch_outcome: None,
+            runtime_completion_kind: None,
+            runtime_completed_at_ms: None,
+            runtime_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -363,8 +394,16 @@ impl ActiveAttempt {
             as u32;
 
         let attempt = match version {
+            5 => {
+                let mut att: ActiveAttempt = serde_json::from_value(val)?;
+                if att.phase == AttemptPhase::LegacyRunning {
+                    att.phase = AttemptPhase::RecoveryRequired;
+                }
+                att
+            }
             4 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
+                att.schema_version = ACTIVE_ATTEMPT_SCHEMA_VERSION;
                 if att.phase == AttemptPhase::LegacyRunning {
                     att.phase = AttemptPhase::RecoveryRequired;
                 }
@@ -397,6 +436,7 @@ pub enum DispatchOutcome {
     Accepted {
         request_id: String,
         accepted_at_ms: i64,
+        turn_started: bool,
     },
     KnownRejectedBeforeAcceptance {
         reason: String,
@@ -412,7 +452,9 @@ pub enum DispatchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
+    AgentDone { elapsed_ms: u64 },
     TuiIdle { elapsed_ms: u64 },
+    WorkingObserved { elapsed_ms: u64 },
     TimedOut { elapsed_ms: u64 },
     Interrupted { reason: String },
 }
@@ -469,6 +511,10 @@ pub trait ExecutionAdapter: Send + Sync {
         attempt: &ActiveAttempt,
         target: &LocalTarget,
     ) -> Result<PrepareOutcome, String>;
+
+    async fn get_agent_status_baseline(&self, _terminal_id: &str) -> Result<Option<i64>, String> {
+        Ok(None)
+    }
 
     async fn reconcile_dispatch(
         &self,
@@ -611,6 +657,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         Ok(DispatchOutcome::Accepted {
             request_id: "req_fake".into(),
             accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+            turn_started: true,
         })
     }
 

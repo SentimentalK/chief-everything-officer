@@ -112,6 +112,15 @@ impl OrcaExecutionAdapter {
             ))),
         }
     }
+    pub async fn derive_pane_key(&self, terminal_id: &str) -> Option<String> {
+        match self.client.show_terminal(terminal_id).await {
+            Ok(Some(term)) => match (term.tab_id, term.leaf_id) {
+                (Some(t), Some(l)) => Some(format!("{t}:{l}")),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 enum ReadinessError {
@@ -135,6 +144,32 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 }
             }
             _ => false,
+        }
+    }
+
+    async fn get_agent_status_baseline(&self, terminal_id: &str) -> Result<Option<i64>, String> {
+        let pane_key = match self.derive_pane_key(terminal_id).await {
+            Some(pk) => pk,
+            None => return Ok(None),
+        };
+        match self
+            .client
+            .worktree_ps_bounded(Duration::from_millis(800))
+            .await
+        {
+            Ok(resp) => {
+                if let Some(res) = resp.result {
+                    for wt in res.worktrees {
+                        for ag in wt.agents {
+                            if ag.pane_key == pane_key {
+                                return Ok(ag.state_started_at);
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(_) => Ok(None),
         }
     }
 
@@ -485,9 +520,17 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     if send.accepted {
                         if let Some(p) = send.prompt {
                             if let Some(req_id) = p.request_id {
+                                let has_turn_started = p
+                                    .stages
+                                    .as_ref()
+                                    .map(|s| s.iter().any(|st| st == "turn_started"))
+                                    .unwrap_or(false)
+                                    || p.observation.as_deref() == Some("unsupported")
+                                    || p.provider.as_deref() == Some("unsupported");
                                 return Ok(DispatchOutcome::Accepted {
                                     request_id: req_id,
                                     accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    turn_started: has_turn_started,
                                 });
                             }
                         }
@@ -550,13 +593,49 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
     async fn wait(
         &self,
-        _attempt: &ActiveAttempt,
+        attempt: &ActiveAttempt,
         terminal_id: &str,
         remaining_timeout: Duration,
     ) -> Result<WaitOutcome, String> {
+        let pane_key = self.derive_pane_key(terminal_id).await;
+        if let Some(ref pk) = pane_key {
+            if let Ok(resp) = self
+                .client
+                .worktree_ps_bounded(Duration::from_millis(800))
+                .await
+            {
+                if let Some(res) = resp.result {
+                    for wt in res.worktrees {
+                        for ag in wt.agents {
+                            if ag.pane_key == *pk {
+                                if ag.state == "working" {
+                                    return Ok(WaitOutcome::WorkingObserved { elapsed_ms: 100 });
+                                }
+                                if ag.state == "done" && !ag.interrupted {
+                                    let baseline = attempt
+                                        .executor
+                                        .as_ref()
+                                        .and_then(|e| e.dispatch_baseline_state_started_at);
+                                    let is_new_generation = match baseline {
+                                        Some(b) => ag.state_started_at != Some(b),
+                                        None => true,
+                                    };
+                                    if is_new_generation {
+                                        return Ok(WaitOutcome::AgentDone { elapsed_ms: 100 });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bounded short wait on tui-idle (min of remaining_timeout and 1500ms)
+        let bounded_wait = remaining_timeout.min(Duration::from_millis(1500));
         match self
             .client
-            .wait_terminal_tui_idle(terminal_id, remaining_timeout)
+            .wait_terminal_tui_idle(terminal_id, bounded_wait)
             .await
         {
             Ok(resp) => match validate_tui_idle_wait(terminal_id, &resp) {
@@ -569,7 +648,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 Err(e) => Err(e),
             },
             Err(OrcaError::Timeout(_)) => Ok(WaitOutcome::TimedOut {
-                elapsed_ms: remaining_timeout.as_millis() as u64,
+                elapsed_ms: bounded_wait.as_millis() as u64,
             }),
             Err(OrcaError::Orca {
                 ref code,

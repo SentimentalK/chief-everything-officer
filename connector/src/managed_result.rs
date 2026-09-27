@@ -152,6 +152,52 @@ pub fn read_and_validate_from_file(
     Ok((envelope, digest))
 }
 
+#[derive(Debug, Clone)]
+pub struct CapturedManagedResult {
+    pub envelope: ManagedResultEnvelope,
+    pub payload_sha256: String,
+}
+
+/// Durably captures a finalized managed result from the attempt runtime directory
+/// into preserved result and private metadata files.
+/// Writes each file atomically. Idempotent on restart.
+pub fn durable_capture_managed_result(
+    paths: &crate::paths::ConnectorPaths,
+    cred: &crate::credential::DeviceCredential,
+    active: &crate::scheduler::ActiveAttempt,
+) -> Result<CapturedManagedResult, ManagedResultError> {
+    let result_file = paths.managed_result_file(&active.attempt_id);
+    let expected_resource_id = active.resource_id.as_deref();
+
+    // 1. Validate from runtime scratch path
+    let (envelope, payload_sha256) = read_and_validate_from_file(
+        &result_file,
+        &active.job_id,
+        &active.attempt_id,
+        expected_resource_id,
+    )?;
+
+    // 2. Durably snapshot into preserved storage
+    let pres_res = paths.preserved_managed_result_file(&active.job_id, &active.attempt_id);
+    let pres_meta = paths.preserved_managed_result_meta_file(&active.job_id, &active.attempt_id);
+    let meta = crate::redelivery::PreservedResultMeta {
+        server_origin: cred.server_origin.clone(),
+        device_id: cred.device_id.clone(),
+        job_id: active.job_id.clone(),
+        attempt_id: active.attempt_id.clone(),
+        claim_token: active.claim_token.clone(),
+        resource_id: active.resource_id.clone(),
+    };
+
+    crate::local_state::atomic_write_json(&pres_res, &envelope)?;
+    crate::local_state::atomic_write_json(&pres_meta, &meta)?;
+
+    Ok(CapturedManagedResult {
+        envelope,
+        payload_sha256,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

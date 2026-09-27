@@ -268,6 +268,15 @@ impl OrcaCliClient {
         Ok(res.terminals)
     }
 
+    pub async fn worktree_ps_bounded(
+        &self,
+        timeout: Duration,
+    ) -> Result<OrcaWorktreePsResponse, OrcaError> {
+        let args = vec!["worktree", "ps", "--json"];
+        let output = self.execute_command(&args, None, timeout).await?;
+        parse_orca_json(output)
+    }
+
     pub async fn show_terminal(
         &self,
         terminal_handle: &str,

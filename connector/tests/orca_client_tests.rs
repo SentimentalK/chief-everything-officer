@@ -1059,8 +1059,9 @@ fn test_active_attempt_v4_schema_and_rejection_of_legacy() {
     });
     fs::write(&state_file, serde_json::to_string_pretty(&v4_json).unwrap()).unwrap();
     let loaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
-    assert_eq!(loaded.schema_version, 4);
+    assert_eq!(loaded.schema_version, ACTIVE_ATTEMPT_SCHEMA_VERSION);
     assert_eq!(loaded.phase, AttemptPhase::OutcomeRecorded);
+
     assert_eq!(
         loaded.executor.unwrap().dispatch_request_id.as_deref(),
         Some("req_1")
@@ -1253,6 +1254,9 @@ async fn test_dispatch_correlation_regression_matrix() {
             execution_deadline_ms: Some(1727000062000),
             dispatch_request_id: None,
             dispatch_accepted_at_ms: None,
+            dispatch_turn_started: false,
+            dispatch_baseline_state_started_at: None,
+            turn_started_observed: false,
             last_dispatch_outcome: None,
             runtime_completion_kind: None,
             runtime_completed_at_ms: None,
@@ -1601,5 +1605,179 @@ fi
             assert!(reason.contains("mismatch") || reason.contains("term_different_alien"));
         }
         other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_worktree_ps_deserialization_and_agent_parsing() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"#!/bin/bash
+if [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    echo '{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"working","interrupted":false,"stateStartedAt":1727000100},{"paneKey":"tab1:leaf2","state":"done","interrupted":false,"stateStartedAt":1727000200}]}]}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+    let bin = create_mock_orca_script(&temp, script);
+    let client = OrcaCliClient::new(bin);
+
+    let resp = client
+        .worktree_ps_bounded(Duration::from_millis(800))
+        .await
+        .unwrap();
+    assert!(resp.ok);
+    let result = resp.result.unwrap();
+    assert_eq!(result.worktrees.len(), 1);
+    assert_eq!(result.worktrees[0].agents.len(), 2);
+    assert_eq!(result.worktrees[0].agents[0].pane_key, "tab1:leaf1");
+    assert_eq!(result.worktrees[0].agents[0].state, "working");
+    assert_eq!(
+        result.worktrees[0].agents[0].state_started_at,
+        Some(1727000100)
+    );
+    assert_eq!(result.worktrees[0].agents[1].pane_key, "tab1:leaf2");
+    assert_eq!(result.worktrees[0].agents[1].state, "done");
+}
+
+#[tokio::test]
+async fn test_exact_pane_isolation_ignores_other_agents_in_same_worktree() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    # Our target terminal is tab1:leaf1
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1"}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    # Another agent tab1:leaf2 is done, but our pane tab1:leaf1 is NOT done (or idle/absent)
+    echo '{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf2","state":"done","interrupted":false,"stateStartedAt":1727000500}]}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":true,"result":{"wait":{"handle":"term_my_pane","condition":"tui-idle","satisfied":false,"elapsedMs":100}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+    let bin = create_mock_orca_script(&temp, script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_iso".into(),
+        attempt_id: "att_iso".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: Some(AttemptExecutorState {
+            executor_type: "orca".into(),
+            orca_version: Some("1.4.209".into()),
+            worktree_id: Some("wt_1".into()),
+            terminal_id: Some("term_my_pane".into()),
+            agent_id: Some("agy".into()),
+            agent_ready_at_ms: Some(1727000000),
+            dispatch_send_count: 1,
+            dispatch_started_at_ms: Some(1727000010),
+            execution_deadline_ms: Some(1727000000 + 60_000),
+            dispatch_request_id: Some("req_1".into()),
+            dispatch_accepted_at_ms: Some(1727000010),
+            dispatch_turn_started: true,
+            dispatch_baseline_state_started_at: None,
+            turn_started_observed: true,
+            last_dispatch_outcome: None,
+            runtime_completion_kind: None,
+            runtime_completed_at_ms: None,
+            runtime_error: None,
+        }),
+    };
+
+    let wait_outcome = adapter
+        .wait(&attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    // Because tab1:leaf2 done does NOT match tab1:leaf1, adapter does not return AgentDone; it falls through to tui-idle wait (which timed out)
+    match wait_outcome {
+        WaitOutcome::TimedOut { .. } => {}
+        other => panic!("expected TimedOut because foreign pane must be ignored, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_worktree_ps_bounded_timeout_and_transient_failure_does_not_abort_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1"}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    # Simulate worktree ps failure or timeout
+    echo '{"ok":false,"error":{"code":"internal_error","message":"daemon busy"}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    # Fallback to wait terminal succeeds
+    echo '{"ok":true,"result":{"wait":{"handle":"term_my_pane","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+    let bin = create_mock_orca_script(&temp, script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_fallback".into(),
+        attempt_id: "att_fallback".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: Some(AttemptExecutorState {
+            executor_type: "orca".into(),
+            orca_version: Some("1.4.209".into()),
+            worktree_id: Some("wt_1".into()),
+            terminal_id: Some("term_my_pane".into()),
+            agent_id: Some("agy".into()),
+            agent_ready_at_ms: Some(1727000000),
+            dispatch_send_count: 1,
+            dispatch_started_at_ms: Some(1727000010),
+            execution_deadline_ms: Some(1727000000 + 60_000),
+            dispatch_request_id: Some("req_1".into()),
+            dispatch_accepted_at_ms: Some(1727000010),
+            dispatch_turn_started: true,
+            dispatch_baseline_state_started_at: None,
+            turn_started_observed: true,
+            last_dispatch_outcome: None,
+            runtime_completion_kind: None,
+            runtime_completed_at_ms: None,
+            runtime_error: None,
+        }),
+    };
+
+    let wait_outcome = adapter
+        .wait(&attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    match wait_outcome {
+        WaitOutcome::TuiIdle { .. } => {}
+        other => {
+            panic!("expected TuiIdle fallback when worktree ps transiently fails, got {other:?}")
+        }
     }
 }

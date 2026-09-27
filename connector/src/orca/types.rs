@@ -111,6 +111,39 @@ pub struct OrcaTerminalItem {
     pub pty_id: Option<String>,
     pub worktree_id: Option<String>,
     pub title: Option<String>,
+    pub tab_id: Option<String>,
+    pub leaf_id: Option<String>,
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorktreePsResponse {
+    pub ok: bool,
+    pub result: Option<OrcaWorktreePsResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorktreePsResult {
+    #[serde(default)]
+    pub worktrees: Vec<OrcaWorktreePsItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaWorktreePsItem {
+    pub worktree_id: String,
+    #[serde(default)]
+    pub agents: Vec<OrcaAgentPsItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaAgentPsItem {
+    pub pane_key: String,
+    pub state: String,
+    #[serde(default)]
+    pub interrupted: bool,
+    pub state_started_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +205,10 @@ pub struct OrcaSendPart {
 #[serde(rename_all = "camelCase")]
 pub struct OrcaSendPromptPart {
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub stages: Option<Vec<String>>,
+    pub provider: Option<String>,
+    pub observation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

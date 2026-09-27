@@ -41,6 +41,7 @@ struct MockAdapter {
     pub interrupt_calls: Arc<AtomicUsize>,
 
     pub on_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub wait_seq: Arc<std::sync::Mutex<Vec<Result<WaitOutcome, String>>>>,
 }
 
 #[async_trait]
@@ -94,6 +95,7 @@ impl ExecutionAdapter for MockAdapter {
             Ok(DispatchOutcome::Accepted {
                 request_id: "req_mock_123".into(),
                 accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                turn_started: true,
             })
         })
     }
@@ -107,6 +109,11 @@ impl ExecutionAdapter for MockAdapter {
         self.wait_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(ref cb) = self.on_wait {
             cb();
+        }
+        if let Ok(mut seq) = self.wait_seq.lock() {
+            if !seq.is_empty() {
+                return seq.remove(0);
+            }
         }
         self.wait_result
             .clone()
@@ -189,6 +196,9 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         execution_deadline_ms: None,
         dispatch_request_id: None,
         dispatch_accepted_at_ms: None,
+        dispatch_turn_started: false,
+        dispatch_baseline_state_started_at: None,
+        turn_started_observed: false,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
         runtime_error: None,
@@ -1814,4 +1824,320 @@ async fn test_advisory_readiness_unsatisfied_persists_none_ready_at_and_advances
         .unwrap();
     assert_eq!(cur.phase, AttemptPhase::Dispatched);
     assert_eq!(adapter.dispatch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_pre_turn_tui_idle_is_ignored_until_turn_started() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored!
+            Ok(WaitOutcome::WorkingObserved { elapsed_ms: 50 }), // Turn start observed!
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Now accepted as completion!
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("tui_idle"));
+    assert!(exec.turn_started_observed);
+    assert!(exec.runtime_error.is_none());
+}
+
+#[tokio::test]
+async fn test_partial_managed_result_ignored_until_finalized_then_immediately_completes() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_barrier".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let result_file = paths.managed_result_file(&attempt_id);
+
+    // Initially, write invalid/partial content
+    fs::write(
+        &result_file,
+        "{ \"schema_version\": 1, \"job_id\": \"incomplete",
+    )
+    .unwrap();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_barrier".into());
+
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = true;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let rf_clone = result_file.clone();
+    let j_clone = job_id.clone();
+    let a_clone = attempt_id.clone();
+    let r_clone = resource_id.clone();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        on_wait: Some(Arc::new(move || {
+            // During wait tick, finalize the result file with valid content
+            let valid = serde_json::json!({
+                "schema_version": 1,
+                "job_id": j_clone,
+                "attempt_id": a_clone,
+                "resource_id": r_clone,
+                "summary": "Completed successfully",
+                "operations": [
+                    {
+                        "op": "upsert_content",
+                        "content": "Acquired content"
+                    }
+                ]
+            });
+            fs::write(&rf_clone, serde_json::to_string(&valid).unwrap()).unwrap();
+        })),
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TimedOut { elapsed_ms: 100 }), // First tick: invalid JSON, ignored; tick triggers finalize
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(
+        exec.runtime_completion_kind.as_deref(),
+        Some("managed_result")
+    );
+    assert!(exec.runtime_error.is_none());
+
+    // Verify preserved result exists
+    let pres_res = paths.preserved_managed_result_file(&cur.job_id, &attempt_id);
+    assert!(pres_res.exists());
+}
+
+#[tokio::test]
+async fn test_capture_immutability_runtime_mutation_after_barrier_does_not_affect_outcome() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_immut".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let result_file = paths.managed_result_file(&attempt_id);
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_immut".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = true;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let valid = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Original pristine result",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Pristine content"
+            }
+        ]
+    });
+    fs::write(&result_file, serde_json::to_string(&valid).unwrap()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Drive Waiting -> detects managed_result barrier and advances to OutcomeRecorded
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+
+    // Mutate or remove the original runtime scratch file!
+    fs::remove_file(&result_file).unwrap();
+
+    // Drive OutcomeRecorded -> uses preserved result without failing
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+}
+
+#[tokio::test]
+async fn test_agent_done_resource_job_with_missing_result_fails_and_retains_terminal() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_missing".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_missing".into());
+    executor.dispatch_request_id = Some("req_missing".into());
+
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = true;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![Ok(WaitOutcome::AgentDone {
+            elapsed_ms: 100,
+        })])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Drive Waiting -> AgentDone without result file -> OutcomeRecorded with RESULT_MISSING
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("RESULT_MISSING")
+    );
+
+    // Drive OutcomeRecorded -> FAILED -> Terminal NOT closed
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Terminal must be retained for user inspection on FAILED"
+    );
 }

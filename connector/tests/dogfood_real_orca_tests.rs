@@ -468,19 +468,29 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
             "task_dispatched must be true"
         );
 
-        // Verify terminal was cleanly stopped and absent
+        // Verify terminal was retained for inspection per V1.8/V1.9 contract
         let client = OrcaCliClient::default();
         let active_terminals = client.list_terminals(None).await.unwrap();
-        let leaked = active_terminals.iter().find(|t| {
+        let retained = active_terminals.iter().find(|t| {
             t.title
                 .as_deref()
                 .map(|s| s.starts_with("ceo:att-"))
                 .unwrap_or(false)
+                || t.preview
+                    .as_deref()
+                    .map(|p| p.contains("working"))
+                    .unwrap_or(false)
         });
         assert!(
-            leaked.is_none(),
-            "Agent terminal must be cleanly removed from active inventory"
+            retained.is_some(),
+            "Agent terminal must be retained in active inventory for user inspection on TIMED_OUT"
         );
-        println!("[DOGFOOD] Timeout execution verified: TIMED_OUT / UNVERIFIED / Cleaned up.");
+        println!(
+            "[DOGFOOD] Timeout execution verified: TIMED_OUT / UNVERIFIED / Terminal retained."
+        );
+
+        if let Some(term) = retained {
+            let _ = client.close_terminal(&term.handle).await;
+        }
     }
 }
