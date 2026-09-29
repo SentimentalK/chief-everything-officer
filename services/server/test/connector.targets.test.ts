@@ -607,3 +607,165 @@ describe("Browser User API: Target Management", () => {
     expect(enRes.status).toBe(403);
   });
 });
+
+describe("POST /api/connector/targets/:target_id/default-runtime (workspace default Agent Runtime target)", () => {
+  let targetAId: string;
+  let targetBId: string;
+
+  beforeEach(async () => {
+    for (const alias of ["runtime-a", "runtime-b"]) {
+      const regRes = await fetch(`${baseUrl}/api/connector/targets/register`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ownerDevToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          workspace_id: workspaceId,
+          alias,
+          display_name: `Runtime ${alias}`,
+          kind: "general_automation",
+          repository: null,
+        }),
+      });
+      expect(regRes.status).toBe(201);
+      const data = await regRes.json();
+      if (alias === "runtime-a") targetAId = data.target.id;
+      else targetBId = data.target.id;
+    }
+  });
+
+  it("rejects unauthenticated requests", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects unexpected fields in the request body", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("INVALID_REQUEST");
+  });
+
+  it("owner sets an enabled same-workspace target as default runtime", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.workspace_id).toBe(workspaceId);
+    expect(data.target_id).toBe(targetAId);
+    expect(data.is_default_agent_runtime).toBe(true);
+    expect(data.replayed).toBe(false);
+    expect(typeof data.updated_at_ms).toBe("number");
+
+    // Target catalogue marks the default target.
+    const listRes = await fetch(`${baseUrl}/api/connector/targets`, {
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    const listData = await listRes.json();
+    for (const item of listData.targets) {
+      expect(item.target.is_default_agent_runtime).toBe(item.target.id === targetAId);
+    }
+
+    // Setting the same target again is an idempotent replay.
+    const replayRes = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    expect(replayRes.status).toBe(200);
+    const replayData = await replayRes.json();
+    expect(replayData.replayed).toBe(true);
+    expect(replayData.target_id).toBe(targetAId);
+
+    // Switching to another target moves the single workspace default.
+    const switchRes = await fetch(`${baseUrl}/api/connector/targets/${targetBId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    expect(switchRes.status).toBe(200);
+    const switched = await switchRes.json();
+    expect(switched.target_id).toBe(targetBId);
+    expect(switched.replayed).toBe(false);
+
+    const listRes2 = await fetch(`${baseUrl}/api/connector/targets`, {
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    const listData2 = await listRes2.json();
+    for (const item of listData2.targets) {
+      expect(item.target.is_default_agent_runtime).toBe(item.target.id === targetBId);
+    }
+  });
+
+  it("forbids non-owner members from setting the default runtime", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${memberDevToken}` },
+    });
+    expect(res.status).toBe(403);
+    const data = await res.json();
+    expect(data.error).toBe("DEVICE_NOT_ELIGIBLE");
+
+    // No default was created.
+    const listRes = await fetch(`${baseUrl}/api/connector/targets`, {
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    const listData = await listRes.json();
+    expect(listData.targets.every((i: any) => i.target.is_default_agent_runtime === false)).toBe(true);
+  });
+
+  it("masks foreign targets as 404", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${foreignDevToken}` },
+    });
+    expect(res.status).toBe(404);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_NOT_FOUND");
+  });
+
+  it("returns 404 for a missing target", async () => {
+    const res = await fetch(
+      `${baseUrl}/api/connector/targets/tgt_00000000-0000-0000-0000-00000000dead/default-runtime`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerDevToken}` },
+      },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("refuses to set a disabled target as default runtime", async () => {
+    const disRes = await fetch(`${baseUrl}/api/user/targets/${targetAId}/disable`, {
+      method: "POST",
+      headers: { Cookie: `ceo_user_session=${sessionManager.createSession({ userId: userOwnerId, provider: "github", providerSubject: "sub_owner2" }).sessionId}` },
+    });
+    expect(disRes.status).toBe(200);
+
+    const res = await fetch(`${baseUrl}/api/connector/targets/${targetAId}/default-runtime`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_DISABLED");
+
+    // No default exists for the workspace.
+    const listRes = await fetch(`${baseUrl}/api/connector/targets`, {
+      headers: { Authorization: `Bearer ${ownerDevToken}` },
+    });
+    const listData = await listRes.json();
+    expect(listData.targets.every((i: any) => i.target.is_default_agent_runtime === false)).toBe(true);
+  });
+});

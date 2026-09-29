@@ -19,20 +19,20 @@ afterEach(async () => {
 });
 
 async function tempDbPath(): Promise<{ dir: string; dbPath: string }> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v13-migration-test-"));
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-v14-migration-test-"));
   cleanupDirs.push(dir);
   return { dir, dbPath: path.join(dir, "identity.sqlite") };
 }
 
 /**
- * Historical v12 fixture: constructs the last schema generation that still
- * contained the legacy DB-backed `api_keys` credential table, with
- * representative modern identity / control-plane / device / target data.
- * Mentions of `api_keys` here exist only to prove its removal by migration.
+ * Historical v13 fixture: the last schema generation before the
+ * `workspace_execution_defaults` workspace default Agent Runtime mapping
+ * existed, with representative identity / device / target data.
  */
-function createValidV12Database(dbPath: string): void {
+function createValidV13Database(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(`
+    PRAGMA foreign_keys = ON;
     CREATE TABLE users (
       id TEXT PRIMARY KEY NOT NULL,
       created_at INTEGER NOT NULL,
@@ -46,14 +46,6 @@ function createValidV12Database(dbPath: string): void {
       branch TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       FOREIGN KEY (owner_user_id) REFERENCES users(id)
-    );
-    CREATE TABLE api_keys (
-      id TEXT PRIMARY KEY NOT NULL,
-      user_id TEXT NOT NULL,
-      key_digest TEXT NOT NULL UNIQUE,
-      created_at INTEGER NOT NULL,
-      revoked_at INTEGER,
-      FOREIGN KEY (user_id) REFERENCES users(id)
     );
     CREATE TABLE external_identities (
       id TEXT PRIMARY KEY NOT NULL,
@@ -230,13 +222,12 @@ function createValidV12Database(dbPath: string): void {
     CREATE INDEX idx_device_target_bindings_device ON device_target_bindings(device_id);
     CREATE INDEX idx_device_target_bindings_target ON device_target_bindings(target_id);
     CREATE INDEX idx_device_target_bindings_device_state ON device_target_bindings(device_id, disabled_at_ms);
-    PRAGMA user_version = 12;
+    PRAGMA user_version = 13;
 
     INSERT INTO users VALUES ('usr_alice', 1000, NULL, 0);
+    INSERT INTO users VALUES ('usr_bob', 1000, NULL, 0);
     INSERT INTO workspaces VALUES ('ws_alice', 'usr_alice', 'https://github.com/alice/repo.git', 'main', 1000);
     INSERT INTO workspace_memberships VALUES ('wsm_alice', 'ws_alice', 'usr_alice', 'owner', 1000);
-    INSERT INTO api_keys VALUES ('ak_alice', 'usr_alice', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 1000, NULL);
-    INSERT INTO api_keys VALUES ('ak_alice_revoked', 'usr_alice', 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210', 1000, 2000);
     INSERT INTO external_identities (id, provider, provider_subject, user_id, provider_login, provider_email, created_at_ms, updated_at_ms)
       VALUES ('ext_alice', 'github', '12345', 'usr_alice', 'alice_gh', 'alice@example.com', 1000, 1000);
     INSERT INTO github_installations VALUES ('ghi_1', '98765', '9999', '54321', 'alice-org', 'Organization', 'selected', NULL, 1000, 1000);
@@ -265,12 +256,12 @@ function createValidV12Database(dbPath: string): void {
   db.close();
 }
 
-describe("Identity DB Migration v12 -> v13 (legacy api_keys retirement)", () => {
-  it("IDENTITY_DB_USER_VERSION is 13", () => {
+describe("Identity DB Migration v13 -> v14 (workspace_execution_defaults)", () => {
+  it("IDENTITY_DB_USER_VERSION is 14", () => {
     expect(IDENTITY_DB_USER_VERSION).toBe(14);
   });
 
-  it("fresh v13 database has no api_keys table or index", async () => {
+  it("fresh v14 database contains empty workspace_execution_defaults", async () => {
     const { dbPath } = await tempDbPath();
     provisionEmptyControlPlaneDatabase(dbPath);
 
@@ -281,59 +272,48 @@ describe("Identity DB Migration v12 -> v13 (legacy api_keys retirement)", () => 
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
     expect(Number(versionRow.user_version)).toBe(14);
 
-    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as Array<{ name: string }>;
-    expect(tables.map((t) => t.name)).not.toContain("api_keys");
-    const indexes = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_api_keys_user';")
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_execution_defaults';")
       .all();
-    expect(indexes.length).toBe(0);
+    expect(tables.length).toBe(1);
+
+    const defaultsCount = db
+      .prepare("SELECT COUNT(*) AS c FROM workspace_execution_defaults;")
+      .get() as { c: number };
+    expect(Number(defaultsCount.c)).toBe(0);
     db.close();
   });
 
-  it("migrates a representative valid v12 database to v13, dropping api_keys and preserving modern data", async () => {
+  it("migrates a representative valid v13 database to v14, preserving users/workspaces/devices/targets and creating no default", async () => {
     const { dbPath } = await tempDbPath();
-    createValidV12Database(dbPath);
+    createValidV13Database(dbPath);
 
     const store = IdentityStore.open(dbPath);
     cleanupStores.push(store);
 
     const db = new DatabaseSync(dbPath);
 
-    // v13 reached
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
     expect(Number(versionRow.user_version)).toBe(14);
 
-    // api_keys is gone, including its index
-    const apiKeysTable = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='api_keys';")
-      .get() as { name: string } | undefined;
-    expect(apiKeysTable).toBeUndefined();
-    const apiKeysIndex = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_api_keys_user';")
-      .get();
-    expect(apiKeysIndex).toBeUndefined();
+    // Migration creates the mapping table but guesses no default
+    const defaultsCount = db
+      .prepare("SELECT COUNT(*) AS c FROM workspace_execution_defaults;")
+      .get() as { c: number };
+    expect(Number(defaultsCount.c)).toBe(0);
 
-    // Identity data preserved
-    const user = db.prepare("SELECT id, is_admin FROM users WHERE id = 'usr_alice';").get() as
-      | { id: string; is_admin: number }
-      | undefined;
-    expect(user).toEqual({ id: "usr_alice", is_admin: 0 });
-
-    const workspace = db.prepare("SELECT id, owner_user_id FROM workspaces WHERE id = 'ws_alice';").get() as
-      | { id: string; owner_user_id: string }
-      | undefined;
+    // Existing identity / device / target data survives intact
+    expect(
+      Number((db.prepare("SELECT COUNT(*) AS c FROM users;").get() as { c: number }).c),
+    ).toBe(2);
+    const workspace = db
+      .prepare("SELECT id, owner_user_id FROM workspaces WHERE id = 'ws_alice';")
+      .get() as { id: string; owner_user_id: string };
     expect(workspace).toEqual({ id: "ws_alice", owner_user_id: "usr_alice" });
-
-    const membership = db.prepare(
-      "SELECT workspace_id, user_id, role FROM workspace_memberships;",
-    ).get() as { workspace_id: string; user_id: string; role: string };
+    const membership = db
+      .prepare("SELECT workspace_id, user_id, role FROM workspace_memberships;")
+      .get() as { workspace_id: string; user_id: string; role: string };
     expect(membership).toEqual({ workspace_id: "ws_alice", user_id: "usr_alice", role: "owner" });
-
-    const ext = store.findExternalIdentity("github", "12345");
-    expect(ext).not.toBeNull();
-    expect(ext!.provider_email).toBe("alice@example.com");
-
-    // Modern device / target control-plane data preserved
     expect(
       Number((db.prepare("SELECT COUNT(*) AS c FROM devices;").get() as { c: number }).c),
     ).toBe(1);
@@ -347,24 +327,14 @@ describe("Identity DB Migration v12 -> v13 (legacy api_keys retirement)", () => 
       Number((db.prepare("SELECT COUNT(*) AS c FROM device_target_bindings;").get() as { c: number }).c),
     ).toBe(1);
 
-    const target = db.prepare(
-      "SELECT id, workspace_id, alias, kind FROM execution_targets;",
-    ).get() as { id: string; workspace_id: string; alias: string; kind: string };
+    const target = db
+      .prepare("SELECT id, workspace_id, alias, kind FROM execution_targets;")
+      .get() as { id: string; workspace_id: string; alias: string; kind: string };
     expect(target).toEqual({ id: "tgt_1", workspace_id: "ws_alice", alias: "default", kind: "workspace" });
 
-    // GitHub onboarding surface preserved
-    expect(
-      Number((db.prepare("SELECT COUNT(*) AS c FROM github_installations;").get() as { c: number }).c),
-    ).toBe(1);
-    expect(
-      Number((db.prepare("SELECT COUNT(*) AS c FROM github_repository_bindings;").get() as { c: number }).c),
-    ).toBe(1);
-    expect(
-      Number((db.prepare("SELECT COUNT(*) AS c FROM workspace_bootstraps;").get() as { c: number }).c),
-    ).toBe(1);
-    expect(
-      Number((db.prepare("SELECT COUNT(*) AS c FROM onboarding_flows;").get() as { c: number }).c),
-    ).toBe(1);
+    const ext = store.findExternalIdentity("github", "12345");
+    expect(ext).not.toBeNull();
+    expect(ext!.provider_email).toBe("alice@example.com");
 
     db.close();
 
@@ -374,67 +344,76 @@ describe("Identity DB Migration v12 -> v13 (legacy api_keys retirement)", () => 
     reopened.close();
   });
 
-  it("direct migrateV12ToV13 rejects when user_version is not 12", async () => {
+  it("direct migrateV13ToV14 rejects when user_version is not 13", async () => {
     const { dbPath } = await tempDbPath();
     const db = new DatabaseSync(dbPath);
-    db.exec("PRAGMA user_version = 11;");
-    expect(() => IdentityStore.migrateV12ToV13(db)).toThrow(IdentityStructureError);
+    db.exec("PRAGMA user_version = 12;");
+    expect(() => IdentityStore.migrateV13ToV14(db)).toThrow(IdentityStructureError);
     db.close();
   });
 
-  it("rolls back transaction and keeps api_keys when a required v12 table is missing", async () => {
+  it("rolls back transaction and stays at v13 when a required v13 table is missing", async () => {
     const { dbPath } = await tempDbPath();
-    createValidV12Database(dbPath);
+    createValidV13Database(dbPath);
 
-    // Simulate an invalid v12 database: its modern device/target tables are gone
     const raw = new DatabaseSync(dbPath);
     raw.exec(`
       PRAGMA foreign_keys = OFF;
       DROP TABLE device_target_bindings;
-      DROP TABLE execution_targets;
-      DROP TABLE device_credentials;
-      DROP TABLE devices;
     `);
     raw.close();
 
     const db = new DatabaseSync(dbPath);
-    expect(() => IdentityStore.migrateV12ToV13(db)).toThrow(IdentityStructureError);
+    expect(() => IdentityStore.migrateV13ToV14(db)).toThrow(IdentityStructureError);
 
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(12);
+    expect(Number(versionRow.user_version)).toBe(13);
 
-    const apiKeysTable = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='api_keys';")
+    const defaultsTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_execution_defaults';")
       .get() as { name: string } | undefined;
-    expect(apiKeysTable).toBeDefined();
+    expect(defaultsTable).toBeUndefined();
     db.close();
   });
 
-  it("fail-closes on a v12 database that lost api_keys already (invalid v12)", async () => {
+  it("structure validator rejects a cross-workspace corrupted default mapping", async () => {
     const { dbPath } = await tempDbPath();
-    createValidV12Database(dbPath);
+    createValidV13Database(dbPath);
+    const store = IdentityStore.open(dbPath);
+    store.close();
+
+    // Second workspace with its own target; corrupt mapping points workspace A at workspace B's target.
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      PRAGMA foreign_keys = OFF;
+      INSERT INTO users VALUES ('usr_b_owner', 1000, NULL, 0);
+      INSERT INTO workspaces VALUES ('ws_b', 'usr_b_owner', 'https://github.com/b/repo.git', 'main', 1000);
+      INSERT INTO workspace_memberships VALUES ('wsm_b', 'ws_b', 'usr_b_owner', 'owner', 1000);
+      INSERT INTO execution_targets VALUES ('tgt_b', 'ws_b', 'runtime-b', 'Runtime B', 'general_automation', NULL, NULL, NULL, 1000, 1000, NULL);
+      PRAGMA foreign_keys = ON;
+      INSERT INTO workspace_execution_defaults (workspace_id, default_agent_runtime_target_id, created_at_ms, updated_at_ms)
+      VALUES ('ws_alice', 'tgt_b', 1000, 1000);
+    `);
+    db.close();
+
+    expect(() => IdentityStore.open(dbPath)).toThrow(/another workspace/);
+  });
+
+  it("structure validator rejects a default mapping pointing at a missing execution target", async () => {
+    const { dbPath } = await tempDbPath();
+    createValidV13Database(dbPath);
+    const store = IdentityStore.open(dbPath);
+    store.close();
 
     const raw = new DatabaseSync(dbPath);
-    raw.exec("DROP TABLE api_keys;");
+    raw.exec(`
+      PRAGMA foreign_keys = OFF;
+      DELETE FROM execution_targets WHERE id = 'tgt_1';
+      INSERT INTO workspace_execution_defaults (workspace_id, default_agent_runtime_target_id, created_at_ms, updated_at_ms)
+      VALUES ('ws_alice', 'tgt_1', 1000, 1000);
+    `);
     raw.close();
 
-    expect(() => IdentityStore.open(dbPath)).toThrow(IdentityStructureError);
-
-    const db = new DatabaseSync(dbPath);
-    const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(12);
-    db.close();
-  });
-
-  it("idempotently reopens an already-migrated v13 database", async () => {
-    const { dbPath } = await tempDbPath();
-    createValidV12Database(dbPath);
-
-    const store1 = IdentityStore.open(dbPath);
-    store1.close();
-
-    const store2 = IdentityStore.open(dbPath);
-    cleanupStores.push(store2);
-    expect(store2.ping()).toBe(true);
+    expect(() => IdentityStore.open(dbPath)).toThrow(/missing execution_target/);
   });
 });

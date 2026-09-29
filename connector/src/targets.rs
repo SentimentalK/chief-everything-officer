@@ -71,6 +71,7 @@ pub struct TargetDisplayItem {
     pub local_path: Option<String>,
     pub status: String,
     pub disabled: bool,
+    pub is_default_agent_runtime: bool,
     pub active_binding_count: u32,
     pub repository: Option<String>,
 }
@@ -467,6 +468,40 @@ pub async fn target_remove(paths: &ConnectorPaths, target_id: &str) -> Result<()
 }
 
 pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<(), TargetError> {
+    let display_items = build_target_display_items(paths).await?;
+
+    if json_format {
+        println!("{}", serde_json::to_string_pretty(&display_items).unwrap());
+    } else {
+        println!(
+            "{:<38} {:<15} {:<18} {:<16} {:<22} LOCAL_PATH",
+            "TARGET_ID", "ALIAS", "KIND", "DEFAULT_RUNTIME", "STATUS"
+        );
+        println!("{}", "-".repeat(120));
+        for item in display_items {
+            let path_str = item.local_path.unwrap_or_else(|| "<none>".into());
+            let default_marker = if item.is_default_agent_runtime {
+                "DEFAULT".to_string()
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<38} {:<15} {:<18} {:<16} {:<22} {}",
+                item.target_id, item.alias, item.kind, default_marker, item.status, path_str
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Builds the merged target display projection (server catalogue + local
+/// config), including the workspace default Agent Runtime marker. Exposed
+/// separately from `target_list` so the projection is testable without
+/// capturing stdout.
+pub async fn build_target_display_items(
+    paths: &ConnectorPaths,
+) -> Result<Vec<TargetDisplayItem>, TargetError> {
     let bound_profile = if paths.credential_file().exists() {
         Some(crate::config::load_bound_profile(paths)?)
     } else {
@@ -531,6 +566,7 @@ pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<()
                 local_path: Some(lt.local_path.clone()),
                 status,
                 disabled: st.disabled,
+                is_default_agent_runtime: st.is_default_agent_runtime,
                 active_binding_count: st.active_binding_count,
                 repository: st.repository.map(|r| r.full_name),
             });
@@ -548,6 +584,7 @@ pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<()
                 local_path: Some(lt.local_path.clone()),
                 status,
                 disabled: false,
+                is_default_agent_runtime: false,
                 active_binding_count: 0,
                 repository: None,
             });
@@ -574,27 +611,39 @@ pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<()
             local_path: None,
             status,
             disabled: st.disabled,
+            is_default_agent_runtime: st.is_default_agent_runtime,
             active_binding_count: st.active_binding_count,
             repository: st.repository.map(|r| r.full_name),
         });
     }
 
-    if json_format {
-        println!("{}", serde_json::to_string_pretty(&display_items).unwrap());
-    } else {
-        println!(
-            "{:<38} {:<15} {:<18} {:<22} LOCAL_PATH",
-            "TARGET_ID", "ALIAS", "KIND", "STATUS"
-        );
-        println!("{}", "-".repeat(110));
-        for item in display_items {
-            let path_str = item.local_path.unwrap_or_else(|| "<none>".into());
-            println!(
-                "{:<38} {:<15} {:<18} {:<22} {}",
-                item.target_id, item.alias, item.kind, item.status, path_str
-            );
-        }
-    }
+    Ok(display_items)
+}
 
+/// Sets the workspace-scoped default Agent Runtime Target via the Server
+/// control plane (DeviceAuth). The server derives the target's workspace and
+/// enforces workspace-owner permission; no local config field is an
+/// authority for this routing state.
+pub async fn target_set_default_runtime(
+    paths: &ConnectorPaths,
+    target_id: &str,
+) -> Result<(), TargetError> {
+    paths.ensure_dirs()?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+
+    let res = client.set_default_runtime_target(&cred, target_id).await?;
+
+    println!(
+        "Target '{}' set as the default Agent Runtime target for workspace '{}'.{}",
+        res.target_id,
+        res.workspace_id,
+        if res.replayed {
+            " (already the default; replayed)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }

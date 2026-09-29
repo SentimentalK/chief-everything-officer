@@ -41,7 +41,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 13;
+export const IDENTITY_DB_USER_VERSION = 14;
 
 export interface ExternalIdentityRecord {
   id: string;
@@ -388,6 +388,18 @@ ON execution_targets(
 CREATE INDEX idx_device_target_bindings_device ON device_target_bindings(device_id);
 CREATE INDEX idx_device_target_bindings_target ON device_target_bindings(target_id);
 CREATE INDEX idx_device_target_bindings_device_state ON device_target_bindings(device_id, disabled_at_ms);
+
+CREATE TABLE workspace_execution_defaults (
+  workspace_id TEXT PRIMARY KEY NOT NULL,
+  default_agent_runtime_target_id TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+  FOREIGN KEY (default_agent_runtime_target_id) REFERENCES execution_targets(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_workspace_execution_defaults_target
+ON workspace_execution_defaults(default_agent_runtime_target_id);
 `;
 
 // Fixed expected tables and their NOT NULL columns (nullable columns excluded).
@@ -405,6 +417,7 @@ const EXPECTED_TABLES = [
   "device_credentials",
   "execution_targets",
   "device_target_bindings",
+  "workspace_execution_defaults",
 ] as const;
 
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
@@ -465,6 +478,12 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
   device_credentials: ["id", "device_id", "secret_digest", "issued_at_ms", "expires_at_ms"],
   execution_targets: ["id", "workspace_id", "alias", "display_name", "kind", "created_at_ms", "updated_at_ms"],
   device_target_bindings: ["id", "device_id", "target_id", "created_at_ms", "updated_at_ms"],
+  workspace_execution_defaults: [
+    "workspace_id",
+    "default_agent_runtime_target_id",
+    "created_at_ms",
+    "updated_at_ms",
+  ],
 };
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
@@ -496,6 +515,10 @@ const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referenc
   device_target_bindings: [
     { from: "device_id", to: "id", referencedTable: "devices" },
     { from: "target_id", to: "id", referencedTable: "execution_targets" },
+  ],
+  workspace_execution_defaults: [
+    { from: "workspace_id", to: "id", referencedTable: "workspaces" },
+    { from: "default_agent_runtime_target_id", to: "id", referencedTable: "execution_targets" },
   ],
 };
 
@@ -746,8 +769,10 @@ export class IdentityStore {
         pk: number;
       }>;
 
-      // PK must be exactly the expected primary key column ('workspace_id' for workspace_bootstraps, 'id' for other tables).
-      const expectedPk = table === "workspace_bootstraps" ? "workspace_id" : "id";
+      // PK must be exactly the expected primary key column ('workspace_id' for
+      // workspace_bootstraps / workspace_execution_defaults, 'id' for other tables).
+      const expectedPk =
+        table === "workspace_bootstraps" || table === "workspace_execution_defaults" ? "workspace_id" : "id";
       const pkColumns = columns.filter((c) => c.pk > 0).map((c) => c.name);
       if (pkColumns.length !== 1 || pkColumns[0] !== expectedPk) {
         throw new IdentityStructureError(
@@ -1257,6 +1282,48 @@ export class IdentityStore {
       }
     }
 
+    const workspaceDefaults = db.prepare(`
+      SELECT workspace_id, default_agent_runtime_target_id, created_at_ms, updated_at_ms
+      FROM workspace_execution_defaults;
+    `).all() as Array<{
+      workspace_id: string;
+      default_agent_runtime_target_id: string;
+      created_at_ms: number;
+      updated_at_ms: number;
+    }>;
+    for (const d of workspaceDefaults) {
+      if (typeof d.workspace_id !== "string" || d.workspace_id.trim().length === 0) {
+        throw new IdentityStructureError(`Invalid workspace_id in workspace_execution_defaults row '${String(d.workspace_id)}'.`);
+      }
+      if (
+        typeof d.default_agent_runtime_target_id !== "string" ||
+        !d.default_agent_runtime_target_id.startsWith("tgt_")
+      ) {
+        throw new IdentityStructureError(
+          `Invalid default_agent_runtime_target_id in workspace_execution_defaults row '${d.workspace_id}'.`,
+        );
+      }
+      const targetRow = db
+        .prepare("SELECT id, workspace_id FROM execution_targets WHERE id = ? LIMIT 1;")
+        .get(d.default_agent_runtime_target_id) as { id: string; workspace_id: string } | undefined;
+      if (!targetRow) {
+        throw new IdentityStructureError(
+          `workspace_execution_defaults row '${d.workspace_id}' references missing execution_target '${d.default_agent_runtime_target_id}'.`,
+        );
+      }
+      if (targetRow.workspace_id !== d.workspace_id) {
+        throw new IdentityStructureError(
+          `workspace_execution_defaults row '${d.workspace_id}' references execution_target '${d.default_agent_runtime_target_id}' from another workspace '${targetRow.workspace_id}'.`,
+        );
+      }
+      if (!Number.isInteger(d.created_at_ms) || d.created_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid created_at_ms in workspace_execution_defaults row '${d.workspace_id}'.`);
+      }
+      if (!Number.isInteger(d.updated_at_ms) || d.updated_at_ms < 0) {
+        throw new IdentityStructureError(`Invalid updated_at_ms in workspace_execution_defaults row '${d.workspace_id}'.`);
+      }
+    }
+
     const fkViolations = db.prepare("PRAGMA foreign_key_check;").all() as Array<{
       table: string;
       rowid: number;
@@ -1385,6 +1452,9 @@ export class IdentityStore {
           break;
         case 12:
           IdentityStore.migrateV12ToV13(db);
+          break;
+        case 13:
+          IdentityStore.migrateV13ToV14(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -2107,6 +2177,82 @@ export class IdentityStore {
       }
       if (error instanceof IdentityStructureError) throw error;
       throw new IdentityStructureError(`Failed to migrate identity database from version 12 to 13: ${error}`);
+    }
+  }
+
+  /**
+   * v13 -> v14: introduces the workspace-scoped `workspace_execution_defaults`
+   * control-plane mapping (one row per workspace; absence means "not
+   * configured"). Transactional and fail-closed: any missing required v13
+   * table aborts the migration and leaves the database untouched at v13.
+   * Existing v13 databases migrate with NO default rows: no default target is
+   * guessed from aliases, kinds, or existing targets. Operators must set the
+   * workspace default explicitly after rollout.
+   */
+  static migrateV13ToV14(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 13) {
+        throw new IdentityStructureError("migrateV13ToV14 requires user_version = 13.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+        "github_repository_bindings",
+        "workspace_bootstraps",
+        "onboarding_flows",
+        "devices",
+        "device_credentials",
+        "execution_targets",
+        "device_target_bindings",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v14: missing required v13 table '${table}'.`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE workspace_execution_defaults (
+          workspace_id TEXT PRIMARY KEY NOT NULL,
+          default_agent_runtime_target_id TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+          FOREIGN KEY (default_agent_runtime_target_id) REFERENCES execution_targets(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_workspace_execution_defaults_target
+        ON workspace_execution_defaults(default_agent_runtime_target_id);
+
+        PRAGMA user_version = 14;
+      `);
+
+      const defaultsCount = db.prepare(
+        "SELECT COUNT(*) AS c FROM workspace_execution_defaults;",
+      ).get() as { c: number };
+      if (Number(defaultsCount.c) !== 0) {
+        throw new IdentityStructureError(
+          "Cannot migrate to v14: workspace_execution_defaults must be created empty (no guessed defaults).",
+        );
+      }
+
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 13 to 14: ${error}`);
     }
   }
 

@@ -136,6 +136,8 @@ pub struct ConnectorTargetWire {
     pub kind: String,
     pub repository: Option<TargetRepositoryPart>,
     pub disabled: bool,
+    #[serde(default)]
+    pub is_default_agent_runtime: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +161,7 @@ pub struct ConnectorTargetProjection {
     pub kind: String,
     pub repository: Option<TargetRepositoryPart>,
     pub disabled: bool,
+    pub is_default_agent_runtime: bool,
     pub this_device_binding: Option<DeviceBindingPart>,
     pub active_binding_count: u32,
 }
@@ -173,6 +176,7 @@ impl From<ConnectorTargetItemWire> for ConnectorTargetProjection {
             kind: wire.target.kind,
             repository: wire.target.repository,
             disabled: wire.target.disabled,
+            is_default_agent_runtime: wire.target.is_default_agent_runtime,
             this_device_binding: wire.this_device_binding,
             active_binding_count: wire.active_binding_count,
         }
@@ -209,6 +213,18 @@ pub struct BindTargetResponse {
     pub binding_id: String,
     pub enabled: bool,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDefaultRuntimeResponse {
+    pub ok: bool,
+    pub workspace_id: String,
+    pub target_id: String,
+    pub is_default_agent_runtime: bool,
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,6 +661,55 @@ impl ConnectorClient {
 
         if status.is_success() {
             Ok(())
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::TargetError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 9b. Set workspace default agent runtime target
+    pub async fn set_default_runtime_target(
+        &self,
+        credential: &DeviceCredential,
+        target_id: &str,
+    ) -> Result<SetDefaultRuntimeResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!(
+            "{}/api/connector/targets/{}/default-runtime",
+            self.server_origin, target_id
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: SetDefaultRuntimeResponse = serde_json::from_str(&text)?;
+            Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)
         } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {

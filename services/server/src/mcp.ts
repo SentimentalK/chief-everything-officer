@@ -539,6 +539,7 @@ export function createMcpServer(
       const acquisitionService = new ResourceAcquisitionService(
         workspace,
         connectorJobs.coordinator,
+        connectorJobs.controlStore,
       );
       const scope = { user_id: identity.user_id, workspace_id: identity.workspace_id };
 
@@ -551,6 +552,8 @@ export function createMcpServer(
             "Unless the user explicitly requested link-only, use this tool after capturing a URL to submit an asynchronous deep acquisition job, " +
             "writing extracted content and permitted trusted source metadata back through the managed Resource result contract. " +
             "Never use generic job_submit as a substitute for resource_acquire. " +
+            "Routing is resolved by CEO from the workspace's configured default Agent Runtime target: the Host never supplies a target_id, " +
+            "and if no default runtime target is configured the acquisition fails without creating a Job (the original capture remains successful). " +
             "Default mode=if_missing skips if content.md already exists; mode=refresh re-extracts. " +
             "If the Connector is offline, the Job queues and waits up to 7 days for execution.",
           inputSchema: {
@@ -559,10 +562,6 @@ export function createMcpServer(
               .string()
               .regex(/^res-[0-9a-f-]{36}$/i)
               .describe("Target resource ID (res-<uuid>)"),
-            target_id: z
-              .string()
-              .min(1)
-              .describe("Execution target ID (tgt_<uuid>) from execution_targets()"),
             mode: z
               .enum(["if_missing", "refresh"])
               .optional()

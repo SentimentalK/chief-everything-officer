@@ -448,7 +448,7 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
       try {
         const items = controlStore.listTargetsVisibleToDevice(auth.device_id, { workspaceId });
         const targets = items.map((item) =>
-          toConnectorTargetProjection(item.target, item.thisBinding, item.activeBindingCount),
+          toConnectorTargetProjection(item.target, item.thisBinding, item.activeBindingCount, item.isDefaultAgentRuntime),
         );
         res.status(200).json({ targets });
       } catch (err) {
@@ -650,6 +650,77 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
         }
         if (err instanceof ConnectorNotFoundError) {
           res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 10. Native API: Set Workspace Default Agent Runtime Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.post(
+    "/api/connector/targets/:target_id/default-runtime",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const targetId = req.params.target_id;
+      if (!targetId || typeof targetId !== "string") {
+        res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND });
+        return;
+      }
+
+      if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Unexpected fields in set-default-runtime request." });
+        return;
+      }
+
+      try {
+        // The server derives the target's workspace; the caller never supplies it.
+        const target = controlStore.getExecutionTarget(targetId);
+        if (!target) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: `ExecutionTarget '${targetId}' not found.` });
+          return;
+        }
+
+        // Mask foreign targets: without membership it looks like a missing target.
+        const membership = identityStore.findWorkspaceMembership(target.workspace_id, auth.user_id);
+        if (!membership) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: `ExecutionTarget '${targetId}' not found.` });
+          return;
+        }
+
+        const result = controlStore.setDefaultAgentRuntimeTarget({
+          workspaceId: target.workspace_id,
+          targetId,
+          actorUserId: auth.user_id,
+        });
+
+        res.status(200).json({
+          ok: true,
+          workspace_id: result.record.workspace_id,
+          target_id: result.record.default_agent_runtime_target_id,
+          is_default_agent_runtime: true,
+          replayed: result.replayed,
+          updated_at_ms: result.record.updated_at_ms,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetDisabledError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_DISABLED, message: err.message });
           return;
         }
         if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {

@@ -25,7 +25,8 @@
             "external_id": "repo_12345",
             "full_name": "owner/repo"
           },
-          "disabled": false
+          "disabled": false,
+          "is_default_agent_runtime": false
         },
         "this_device_binding": {
           "id": "dtb_00000000-0000-0000-0000-000000000001",

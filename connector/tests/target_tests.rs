@@ -435,3 +435,240 @@ async fn active_target_mutation_rejected_with_target_in_use() {
         .unwrap_err();
     assert!(matches!(err, TargetError::TargetInUse(tid) if tid == "tgt_in_use"));
 }
+
+#[tokio::test]
+async fn target_set_default_runtime_success_and_replay() {
+    let server = MockServer::start().await;
+    let default_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    server.add_handler({
+        let seen = default_seen.clone();
+        move |req| {
+            if req.path == "/api/connector/targets/tgt_runtime/default-runtime"
+                && req.method == "POST"
+            {
+                let mut seen = seen.lock().unwrap();
+                seen.push(String::from("called"));
+                return MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "ok": true,
+                        "workspace_id": "ws_1",
+                        "target_id": "tgt_runtime",
+                        "is_default_agent_runtime": true,
+                        "replayed": false,
+                        "updated_at_ms": 1700000000000i64
+                    }),
+                );
+            }
+            MockResponse {
+                status: 0,
+                headers: vec![],
+                body: vec![],
+            }
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    ceo_connector::targets::target_set_default_runtime(&paths, "tgt_runtime")
+        .await
+        .unwrap();
+
+    let calls = default_seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+}
+
+#[tokio::test]
+async fn target_set_default_runtime_auth_and_error_behavior() {
+    // 401 maps to Unauthorized
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(200, &serde_json::json!({ "user_id": "usr_1" }));
+        }
+        if req.method == "POST" && req.path.contains("/default-runtime") {
+            return MockResponse::json(401, &serde_json::json!({ "error": "unauthorized" }));
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let err = ceo_connector::targets::target_set_default_runtime(&paths, "tgt_runtime")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TargetError::Client(ceo_connector::client::ClientError::Unauthorized)
+    ));
+
+    // Non-owner surfaces a structured TargetError with code
+    let server2 = MockServer::start().await;
+    server2.add_handler(|req| {
+        if req.method == "POST" && req.path.contains("/default-runtime") {
+            return MockResponse::json(
+                403,
+                &serde_json::json!({
+                    "error": "DEVICE_NOT_ELIGIBLE",
+                    "message": "Only workspace owners can change the workspace default agent runtime target."
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp2 = tempfile::tempdir().unwrap();
+    let paths2 =
+        ConnectorPaths::from_roots(temp2.path().join("config"), temp2.path().join("state"));
+    paths2.ensure_dirs().unwrap();
+
+    let cred2 = DeviceCredential::new(
+        server2.origin(),
+        "usr_2".into(),
+        "dev_2".into(),
+        "dcr_2".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred2.save(&paths2.credential_file()).unwrap();
+
+    let err2 = ceo_connector::targets::target_set_default_runtime(&paths2, "tgt_runtime")
+        .await
+        .unwrap_err();
+    match err2 {
+        TargetError::Client(ceo_connector::client::ClientError::TargetError { code, message }) => {
+            assert_eq!(code, "DEVICE_NOT_ELIGIBLE");
+            assert!(message.contains("workspace owners"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn target_list_marks_default_runtime_in_text_and_json() {
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [
+                        {
+                            "target": {
+                                "id": "tgt_default",
+                                "workspace_id": "ws_1",
+                                "alias": "runtime",
+                                "display_name": "Runtime Target",
+                                "kind": "general_automation",
+                                "repository": null,
+                                "disabled": false,
+                                "is_default_agent_runtime": true
+                            },
+                            "this_device_binding": {
+                                "id": "bnd_1",
+                                "enabled": true
+                            },
+                            "active_binding_count": 1
+                        },
+                        {
+                            "target": {
+                                "id": "tgt_other",
+                                "workspace_id": "ws_1",
+                                "alias": "other",
+                                "display_name": "Other Target",
+                                "kind": "coding",
+                                "repository": null,
+                                "disabled": false,
+                                "is_default_agent_runtime": false
+                            },
+                            "this_device_binding": null,
+                            "active_binding_count": 0
+                        }
+                    ]
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    // Build the same projection the text and JSON output paths render.
+    let items = ceo_connector::targets::build_target_display_items(&paths)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    let by_id: std::collections::BTreeMap<&str, &ceo_connector::targets::TargetDisplayItem> =
+        items.iter().map(|i| (i.target_id.as_str(), i)).collect();
+    assert!(by_id["tgt_default"].is_default_agent_runtime);
+    assert!(!by_id["tgt_other"].is_default_agent_runtime);
+
+    // JSON output includes the boolean.
+    let json = serde_json::to_string(items.first().unwrap()).unwrap();
+    assert!(json.contains("\"is_default_agent_runtime\":true"));
+
+    // Both printing paths succeed end-to-end (text marks DEFAULT_RUNTIME, JSON
+    // serializes the same items).
+    ceo_connector::targets::target_list(&paths, false)
+        .await
+        .unwrap();
+    ceo_connector::targets::target_list(&paths, true)
+        .await
+        .unwrap();
+
+    // No local config mapping is created by the server-only default marker.
+    let config = LocalConfig::load(&paths.config_file()).unwrap();
+    assert!(config.is_none_or(|c| c.targets.is_empty()));
+}

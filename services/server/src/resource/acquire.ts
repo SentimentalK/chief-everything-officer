@@ -6,11 +6,13 @@ import { resolveResourceLocationAtSnapshot } from "./locator.js";
 import { parseMetaMarkdown } from "./meta.js";
 import { getTreeEntry, readBlobUtf8 } from "../git.js";
 import type { SourceType } from "./types.js";
+import type { DefaultAgentRuntimeTargetResolution } from "../connector/control-store.js";
+
+export const ACQUISITION_TIMEOUT_SECONDS = 3600;
 
 export interface ResourceAcquireInput {
   request_id: string;
   resource_id: string;
-  target_id: string;
   mode?: "if_missing" | "refresh";
 }
 
@@ -32,6 +34,16 @@ export interface AcquisitionDescriptor {
   source_ref: string | null;
   canonical_ref: string | null;
   content_available: boolean;
+}
+
+/**
+ * Control-plane resolver for a workspace's explicit default Agent Runtime
+ * Target. `ConnectorControlStore` satisfies this structurally.
+ */
+export interface WorkspaceDefaultAgentRuntimeTargetResolver {
+  resolveDefaultAgentRuntimeTarget(
+    workspaceId: string,
+  ): DefaultAgentRuntimeTargetResolution;
 }
 
 export async function getAcquisitionDescriptor(
@@ -112,6 +124,7 @@ export class ResourceAcquisitionService {
   constructor(
     private readonly workspace: CeoWorkspace,
     private readonly coordinator: JobCoordinatorV2,
+    private readonly defaultRuntimeTargetResolver: WorkspaceDefaultAgentRuntimeTargetResolver,
   ) {}
 
   async acquire(
@@ -146,23 +159,23 @@ export class ResourceAcquisitionService {
       );
     }
 
-    // 2. Build canonical acquisition task + SubmitJobInput
+    // 2. Build canonical acquisition task
     const task = buildCanonicalAcquisitionTask(targetUrl, input.resource_id);
-    const submitInput: SubmitJobInputV2 = {
+
+    // 3. Idempotency replay BEFORE default runtime target resolution:
+    // If request_id matches an existing submission:
+    // - identical business request => returns existing Job even if the workspace
+    //   default runtime target changed since (historical immutable target_id
+    //   stays authoritative) or content now exists
+    // - materially different business request => throws IDEMPOTENCY_CONFLICT
+    const existingJob = await this.coordinator.checkExistingResourceAcquisitionSubmission(scope, {
       request_id: input.request_id,
-      target_id: input.target_id,
       prompt: task.prompt,
       acceptance: task.acceptance,
       resource_id: input.resource_id,
-      execution_timeout_seconds: 3600,
+      execution_timeout_seconds: ACQUISITION_TIMEOUT_SECONDS,
       result_target: "resource",
-    };
-
-    // 3. Coordinator existing submission check FIRST (with business digest verification):
-    // If request_id matches an existing submission:
-    // - identical business request => returns existing Job (even if completed & content exists)
-    // - different business request (different Resource, Target, etc.) => throws IDEMPOTENCY_CONFLICT
-    const existingJob = await this.coordinator.checkExistingSubmission(scope, submitInput);
+    });
     if (existingJob) {
       return {
         status: "queued",
@@ -171,7 +184,9 @@ export class ResourceAcquisitionService {
       };
     }
 
-    // 4. Satisfied check: mode=if_missing and content already exists
+    // 4. Satisfied check: mode=if_missing and content already exists.
+    // Deliberately before default target resolution: existing content must
+    // stay satisfied even when no default runtime target is configured.
     if (mode === "if_missing" && desc.content_available) {
       return {
         status: "already_satisfied",
@@ -180,7 +195,52 @@ export class ResourceAcquisitionService {
       };
     }
 
-    // 5. Submit canonical acquisition Job
+    // 5. Resolve the workspace-scoped default Agent Runtime Target from the
+    // explicit control-plane state. No alias/kind/count heuristics, no
+    // coding-target fallback, no hard-coded target ID.
+    const resolution =
+      this.defaultRuntimeTargetResolver.resolveDefaultAgentRuntimeTarget(scope.workspace_id);
+    if (resolution.status === "not_configured") {
+      throw new CeoError(
+        "RESOURCE_RUNTIME_TARGET_NOT_CONFIGURED",
+        `Workspace '${scope.workspace_id}' has no default Agent Runtime target configured; ` +
+          `Resource '${input.resource_id}' acquisition was not queued. ` +
+          `Configure one with the Connector CLI: ceo-connector target set-default-runtime --target-id <tgt_...>`,
+        {
+          resource_id: input.resource_id,
+          workspace_id: scope.workspace_id,
+          remediation: "ceo-connector target set-default-runtime --target-id <tgt_...>",
+        },
+      );
+    }
+    if (resolution.status === "unavailable") {
+      throw new CeoError(
+        "RESOURCE_RUNTIME_TARGET_UNAVAILABLE",
+        `The configured default Agent Runtime target for workspace '${scope.workspace_id}' is unavailable: ` +
+          `${resolution.reason} Resource '${input.resource_id}' acquisition was not queued. ` +
+          `Configure a valid default with the Connector CLI: ceo-connector target set-default-runtime --target-id <tgt_...>`,
+        {
+          resource_id: input.resource_id,
+          workspace_id: scope.workspace_id,
+          reason: resolution.reason,
+        },
+      );
+    }
+
+    // 6. Build SubmitJobInput using the resolved real target_id. The Host
+    // never supplies a target; the resolved target_id becomes the Job's
+    // immutable target and is never mutated afterwards.
+    const submitInput: SubmitJobInputV2 = {
+      request_id: input.request_id,
+      target_id: resolution.target.id,
+      prompt: task.prompt,
+      acceptance: task.acceptance,
+      resource_id: input.resource_id,
+      execution_timeout_seconds: ACQUISITION_TIMEOUT_SECONDS,
+      result_target: "resource",
+    };
+
+    // 7. Submit through the existing JobCoordinator.
     const submitRes = await this.coordinator.submit(scope, submitInput);
 
     return {

@@ -412,6 +412,90 @@ export class JobCoordinatorV2 {
     throw new V2IdempotencyConflictError("Request digest mismatch with existing job.");
   }
 
+  /**
+   * Runs idempotency replay for Resource acquisition submissions BEFORE any
+   * workspace default runtime target resolution. Looks up the existing Job for
+   * the same request_id and validates that it expresses the same Resource
+   * acquisition business request (resource_id, result_target, canonical
+   * prompt/acceptance, and execution_timeout_seconds). The existing Job's
+   * historical immutable target_id remains authoritative: current workspace
+   * default target drift is deliberately ignored on replay. A materially
+   * different business request surfaces the same idempotency conflict
+   * semantics used by job_submit.
+   */
+  async checkExistingResourceAcquisitionSubmission(
+    scope: JobSubmitScopeV2,
+    input: {
+      request_id: string;
+      prompt: string;
+      acceptance: string;
+      resource_id: string;
+      execution_timeout_seconds: number;
+      result_target: "resource";
+    },
+  ): Promise<JobRecordV2 | null> {
+    assertHostWorkspaceAccess(this.identityStore, scope);
+
+    if (!input.request_id || !REQUEST_ID_V2_RE.test(input.request_id)) {
+      throw new JobValidationError("Invalid request_id format.");
+    }
+    if (typeof input.prompt !== "string" || isWhitespaceOnly(input.prompt)) {
+      throw new JobValidationError("Prompt must not be empty or whitespace-only.");
+    }
+    if (typeof input.acceptance !== "string" || isWhitespaceOnly(input.acceptance)) {
+      throw new JobValidationError("Acceptance must not be empty or whitespace-only.");
+    }
+    if (
+      typeof input.execution_timeout_seconds !== "number" ||
+      !Number.isInteger(input.execution_timeout_seconds) ||
+      input.execution_timeout_seconds < MIN_TIMEOUT_SECONDS ||
+      input.execution_timeout_seconds > MAX_TIMEOUT_SECONDS
+    ) {
+      throw new JobValidationError(
+        `execution_timeout_seconds must be an integer between ${MIN_TIMEOUT_SECONDS} and ${MAX_TIMEOUT_SECONDS}.`,
+      );
+    }
+    if (input.result_target !== "resource") {
+      throw new JobValidationError("Resource acquisition replay requires result_target 'resource'.");
+    }
+    if (!input.resource_id || !RESOURCE_ID_V2_RE.test(input.resource_id)) {
+      throw new JobValidationError("resource_id is required for resource acquisition replay.");
+    }
+
+    const existingJobId = await this.store.getRequestJobId(scope.user_id, scope.workspace_id, input.request_id);
+    if (!existingJobId) {
+      return null;
+    }
+
+    const existingJob = await this.store.getJob(existingJobId);
+    if (!existingJob) {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", "Request placeholder references a missing Job.", "CORRUPT_SUBMISSION_REFERENCE");
+    }
+    if (
+      existingJob.user_id !== scope.user_id ||
+      existingJob.workspace_id !== scope.workspace_id ||
+      existingJob.request_id !== input.request_id
+    ) {
+      throw new V2IdempotencyConflictError("Existing job identity mismatch.");
+    }
+    if (existingJob.status === "preparing") {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", "Previous submission with this request ID was incomplete.", "INCOMPLETE_SUBMISSION");
+    }
+
+    // Identical business request, ignoring target_id (historical immutable target
+    // stays authoritative even if the workspace default target changed since).
+    const sameBusiness =
+      existingJob.result_target === "resource" &&
+      existingJob.resource_id === input.resource_id &&
+      existingJob.execution_timeout_seconds === input.execution_timeout_seconds &&
+      existingJob.prompt === input.prompt &&
+      existingJob.acceptance === input.acceptance;
+    if (sameBusiness) {
+      return existingJob;
+    }
+    throw new V2IdempotencyConflictError("Request digest mismatch with existing job.");
+  }
+
   async submit(
     scope: JobSubmitScopeV2,
     input: SubmitJobInputV2,

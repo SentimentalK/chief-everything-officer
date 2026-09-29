@@ -171,7 +171,7 @@ function createValidV11Database(dbPath: string): void {
 
 describe("Identity DB Migration v11 -> v12", () => {
   it("IDENTITY_DB_USER_VERSION is 13", () => {
-    expect(IDENTITY_DB_USER_VERSION).toBe(13);
+    expect(IDENTITY_DB_USER_VERSION).toBe(14);
   });
 
   it("fresh provisioned database has user_version 13, all 4 v12 tables, and no api_keys", async () => {
@@ -183,7 +183,7 @@ describe("Identity DB Migration v11 -> v12", () => {
 
     const db = new DatabaseSync(dbPath);
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(13);
+    expect(Number(versionRow.user_version)).toBe(14);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as Array<{ name: string }>;
     const names = tables.map((t) => t.name);

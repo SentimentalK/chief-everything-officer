@@ -160,6 +160,7 @@ export interface ConnectorTargetProjection {
     full_name: string;
   } | null;
   disabled: boolean;
+  is_default_agent_runtime: boolean;
 }
 
 export interface ConnectorTargetItem {
@@ -175,6 +176,7 @@ export function toConnectorTargetProjection(
   target: ExecutionTargetRecord,
   thisBinding: DeviceTargetBindingRecord | null,
   activeBindingCount: number,
+  isDefaultAgentRuntime = false,
 ): ConnectorTargetItem {
   const hasRepo =
     target.repository_provider !== null &&
@@ -196,6 +198,7 @@ export function toConnectorTargetProjection(
           }
         : null,
       disabled: target.disabled_at_ms !== null,
+      is_default_agent_runtime: isDefaultAgentRuntime,
     },
     this_device_binding: thisBinding
       ? {

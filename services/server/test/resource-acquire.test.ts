@@ -35,7 +35,8 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
 
   let userId: string;
   let workspaceId: string;
-  let targetId: string;
+  let codingTargetId: string;
+  let runtimeTargetId: string;
   let urlResourceId: string;
   let fileResourceId: string;
 
@@ -102,14 +103,30 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     });
     fileResourceId = String((fileCapture.resource as any).resource_id);
 
-    // 3. Execution Target
-    const target = controlStore.createExecutionTarget({
+    // 3. Execution Targets: one coding target and one general_automation target.
+    // The workspace default Agent Runtime target is set explicitly below.
+    const codingTarget = controlStore.createExecutionTarget({
       workspaceId,
-      alias: "target-main",
-      displayName: "Target Main",
+      alias: "ceo-repository",
+      displayName: "CEO Repository Target",
       kind: "coding",
     });
-    targetId = target.id;
+    codingTargetId = codingTarget.id;
+
+    const runtimeTarget = controlStore.createExecutionTarget({
+      workspaceId,
+      alias: "agent-runtime",
+      displayName: "Agent Runtime Target",
+      kind: "general_automation",
+    });
+    runtimeTargetId = runtimeTarget.id;
+
+    // Explicit workspace default Agent Runtime target (owner action).
+    controlStore.setDefaultAgentRuntimeTarget({
+      workspaceId,
+      targetId: runtimeTargetId,
+      actorUserId: userId,
+    });
 
     // 4. Fake Redis & Coordinator
     const fakeRedis = createFakeRedisRunner();
@@ -124,7 +141,7 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
         resId === urlResourceId || resId === fileResourceId,
     });
 
-    acquisitionService = new ResourceAcquisitionService(workspace, coordinator);
+    acquisitionService = new ResourceAcquisitionService(workspace, coordinator, controlStore);
   });
 
   afterEach(async () => {
@@ -139,7 +156,6 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
       acquisitionService.acquire(scope, {
         request_id: crypto.randomUUID(),
         resource_id: "res-00000000-0000-0000-0000-000000000000",
-        target_id: targetId,
         mode: "if_missing",
       }),
     ).rejects.toThrow("Resource 'res-00000000-0000-0000-0000-000000000000' does not exist.");
@@ -151,20 +167,18 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
       acquisitionService.acquire(scope, {
         request_id: crypto.randomUUID(),
         resource_id: fileResourceId,
-        target_id: targetId,
         mode: "if_missing",
       }),
     ).rejects.toThrow("is not an acquirable URL resource");
   });
 
-  it("submits acquisition job when content is missing", async () => {
+  it("submits acquisition job on the workspace default target when content is missing", async () => {
     const scope = { user_id: userId, workspace_id: workspaceId };
     const reqId = crypto.randomUUID();
 
     const res = await acquisitionService.acquire(scope, {
       request_id: reqId,
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "if_missing",
     });
 
@@ -172,8 +186,10 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     expect(res.resource_id).toBe(urlResourceId);
     expect(typeof res.job_id).toBe("string");
 
-    // Inspect submitted Job details
+    // Inspect submitted Job details: target must be the resolved workspace default.
     const hostJob = await coordinator.getJobForHost(scope, res.job_id!, { include_task: true });
+    expect(hostJob.target_id).toBe(runtimeTargetId);
+    expect(hostJob.target_id).not.toBe(codingTargetId);
     expect(hostJob.resource_id).toBe(urlResourceId);
     expect(hostJob.result_target).toBe("resource");
     expect(hostJob.task?.prompt).toContain("content.extract_url");
@@ -211,12 +227,43 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const res = await acquisitionService.acquire(scope, {
       request_id: crypto.randomUUID(),
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "if_missing",
     });
 
     expect(res.status).toBe("already_satisfied");
     expect(res.resource_id).toBe(urlResourceId);
+    expect(res.job_id).toBeNull();
+  });
+
+  it("returns already_satisfied with existing content even without any default target configured", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+
+    // Remove the workspace default configured in beforeEach
+    identityStore.withDb((db) => {
+      db.prepare("DELETE FROM workspace_execution_defaults WHERE workspace_id = ?;").run(workspaceId);
+    });
+    expect(controlStore.getDefaultAgentRuntimeTarget(workspaceId)).toBeNull();
+
+    await resourceService.apply({
+      resource_id: urlResourceId,
+      base_commit: (await workspace.captureReadSnapshot()).commit,
+      summary: "Add extracted transcript",
+      operations: [
+        {
+          op: "upsert_content",
+          provenance: "trusted_adapter",
+          content: "Transcript already present.",
+        },
+      ],
+    });
+
+    const res = await acquisitionService.acquire(scope, {
+      request_id: crypto.randomUUID(),
+      resource_id: urlResourceId,
+      mode: "if_missing",
+    });
+
+    expect(res.status).toBe("already_satisfied");
     expect(res.job_id).toBeNull();
   });
 
@@ -240,12 +287,84 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const res = await acquisitionService.acquire(scope, {
       request_id: crypto.randomUUID(),
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "refresh",
     });
 
     expect(res.status).toBe("queued");
     expect(typeof res.job_id).toBe("string");
+  });
+
+  it("fails before Job creation with RESOURCE_RUNTIME_TARGET_NOT_CONFIGURED when no default is set", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+    const reqId = crypto.randomUUID();
+
+    identityStore.withDb((db) => {
+      db.prepare("DELETE FROM workspace_execution_defaults WHERE workspace_id = ?;").run(workspaceId);
+    });
+
+    const err = await acquisitionService
+      .acquire(scope, {
+        request_id: reqId,
+        resource_id: urlResourceId,
+        mode: "if_missing",
+      })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(CeoError);
+    expect(err.code).toBe("RESOURCE_RUNTIME_TARGET_NOT_CONFIGURED");
+    expect(err.message).toContain("ceo-connector target set-default-runtime");
+
+    // No Job may be created
+    expect(await v2Store.getRequestJobId(userId, workspaceId, reqId)).toBeNull();
+    const jobs = await coordinator.listJobsForHost(scope, {});
+    expect(jobs.jobs.length).toBe(0);
+  });
+
+  it("fails before Job creation with RESOURCE_RUNTIME_TARGET_UNAVAILABLE when the configured default target is disabled", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+    const reqId = crypto.randomUUID();
+
+    controlStore.disableExecutionTarget(runtimeTargetId);
+
+    const err = await acquisitionService
+      .acquire(scope, {
+        request_id: reqId,
+        resource_id: urlResourceId,
+        mode: "if_missing",
+      })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(CeoError);
+    expect(err.code).toBe("RESOURCE_RUNTIME_TARGET_UNAVAILABLE");
+    expect(err.message).toContain("set-default-runtime");
+    expect(await v2Store.getRequestJobId(userId, workspaceId, reqId)).toBeNull();
+    const jobs = await coordinator.listJobsForHost(scope, {});
+    expect(jobs.jobs.length).toBe(0);
+  });
+
+  it("fails before Job creation with RESOURCE_RUNTIME_TARGET_UNAVAILABLE when the configured default target is missing", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+    const reqId = crypto.randomUUID();
+
+    // Simulate cascade removal of the default target (ON DELETE CASCADE removes the mapping)
+    identityStore.withDb((db) => {
+      db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(runtimeTargetId);
+    });
+    expect(controlStore.getDefaultAgentRuntimeTarget(workspaceId)).toBeNull();
+
+    const err = await acquisitionService
+      .acquire(scope, {
+        request_id: reqId,
+        resource_id: urlResourceId,
+        mode: "if_missing",
+      })
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(CeoError);
+    expect(err.code).toBe("RESOURCE_RUNTIME_TARGET_NOT_CONFIGURED");
+    expect(await v2Store.getRequestJobId(userId, workspaceId, reqId)).toBeNull();
+    const jobs = await coordinator.listJobsForHost(scope, {});
+    expect(jobs.jobs.length).toBe(0);
   });
 
   it("enforces strict request_id idempotency: replaying same request_id returns same Job even if completed", async () => {
@@ -256,7 +375,6 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const firstRes = await acquisitionService.acquire(scope, {
       request_id: reqId,
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "if_missing",
     });
     expect(firstRes.status).toBe("queued");
@@ -282,12 +400,57 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const replayRes = await acquisitionService.acquire(scope, {
       request_id: reqId,
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "if_missing",
     });
 
     expect(replayRes.status).toBe("queued");
     expect(replayRes.job_id).toBe(originalJobId);
+  });
+
+  it("request_id replay returns the original Job even if the workspace default target changed after original submission", async () => {
+    const scope = { user_id: userId, workspace_id: workspaceId };
+    const reqId = crypto.randomUUID();
+
+    const firstRes = await acquisitionService.acquire(scope, {
+      request_id: reqId,
+      resource_id: urlResourceId,
+      mode: "if_missing",
+    });
+    expect(firstRes.status).toBe("queued");
+    const originalJobId = firstRes.job_id!;
+    expect(originalJobId).toBeTruthy();
+
+    const originalJob = await coordinator.getJobForHost(scope, originalJobId);
+    expect(originalJob.target_id).toBe(runtimeTargetId);
+
+    // Change the workspace default AFTER the original submission.
+    const changed = controlStore.setDefaultAgentRuntimeTarget({
+      workspaceId,
+      targetId: codingTargetId,
+      actorUserId: userId,
+    });
+    expect(changed.record.default_agent_runtime_target_id).toBe(codingTargetId);
+
+    // Replay must return the original Job with its historical immutable target.
+    const replayRes = await acquisitionService.acquire(scope, {
+      request_id: reqId,
+      resource_id: urlResourceId,
+      mode: "if_missing",
+    });
+
+    expect(replayRes.status).toBe("queued");
+    expect(replayRes.job_id).toBe(originalJobId);
+    const replayJob = await coordinator.getJobForHost(scope, replayRes.job_id!);
+    expect(replayJob.target_id).toBe(runtimeTargetId);
+
+    // A brand-new request after the default change routes to the new default.
+    const newRes = await acquisitionService.acquire(scope, {
+      request_id: crypto.randomUUID(),
+      resource_id: urlResourceId,
+      mode: "refresh",
+    });
+    const newJob = await coordinator.getJobForHost(scope, newRes.job_id!);
+    expect(newJob.target_id).toBe(codingTargetId);
   });
 
   it("rejects request_id reuse with conflicting business parameters with IDEMPOTENCY_CONFLICT", async () => {
@@ -298,7 +461,6 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const firstRes = await acquisitionService.acquire(scope, {
       request_id: reqId,
       resource_id: urlResourceId,
-      target_id: targetId,
       mode: "if_missing",
     });
     expect(firstRes.status).toBe("queued");
@@ -317,13 +479,12 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
       acquisitionService.acquire(scope, {
         request_id: reqId,
         resource_id: secondResourceId,
-        target_id: targetId,
         mode: "if_missing",
       }),
     ).rejects.toThrow(/IDEMPOTENCY_CONFLICT|Request digest mismatch/);
   });
 
-  it("invokes resource_acquire through MCP server", async () => {
+  it("invokes resource_acquire through MCP server and ignores any Host-supplied target_id", async () => {
     const productPolicy = await loadProductPolicy();
     const server = createMcpServer(workspace, productPolicy, {
       identity: { user_id: userId, workspace_id: workspaceId },
@@ -340,11 +501,18 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     const tools = (server as any)._registeredTools;
     expect(tools["resource_acquire"]).toBeDefined();
 
-    const mcpHandler = tools["resource_acquire"].handler;
-    const response = await mcpHandler({
+    // Public MCP schema must not expose target_id anymore.
+    const schemaJson = JSON.stringify(tools["resource_acquire"].inputSchema);
+    expect(schemaJson).toContain("request_id");
+    expect(schemaJson).toContain("resource_id");
+    expect(schemaJson).toContain("mode");
+    expect(schemaJson).not.toContain("target_id");
+
+    const response = await tools["resource_acquire"].handler({
       request_id: reqId,
       resource_id: urlResourceId,
-      target_id: targetId,
+      // A Host cannot route: an arbitrary target_id payload field is ignored.
+      target_id: "tgt_00000000-0000-0000-0000-00000000dead",
       mode: "if_missing",
     });
 
@@ -354,5 +522,13 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     expect(structured.status).toBe("queued");
     expect(structured.resource_id).toBe(urlResourceId);
     expect(typeof structured.job_id).toBe("string");
+
+    // The Job executes on the resolved workspace default target, never the
+    // arbitrary target supplied by the Host.
+    const hostJob = await coordinator.getJobForHost(
+      { user_id: userId, workspace_id: workspaceId },
+      structured.job_id,
+    );
+    expect(hostJob.target_id).toBe(runtimeTargetId);
   });
 });

@@ -119,6 +119,11 @@ enum TargetSubcommands {
         #[arg(long)]
         agent_command: String,
     },
+    /// Set the workspace default agent runtime target (server-side routing state)
+    SetDefaultRuntime {
+        #[arg(long)]
+        target_id: String,
+    },
     /// Remove this device's binding for a target
     Remove {
         #[arg(long)]
@@ -279,6 +284,14 @@ async fn main() -> ExitCode {
                 .await
                 {
                     eprintln!("Target set-agent failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            TargetSubcommands::SetDefaultRuntime { target_id } => {
+                if let Err(e) =
+                    ceo_connector::targets::target_set_default_runtime(&paths, &target_id).await
+                {
+                    eprintln!("Target set-default-runtime failed: {}", e);
                     return ExitCode::FAILURE;
                 }
             }

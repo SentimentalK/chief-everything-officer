@@ -62,6 +62,18 @@ export interface DeviceTargetBindingRecord {
   disabled_at_ms: number | null;
 }
 
+export interface WorkspaceExecutionDefaultRecord {
+  workspace_id: string;
+  default_agent_runtime_target_id: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export type DefaultAgentRuntimeTargetResolution =
+  | { status: "not_configured" }
+  | { status: "unavailable"; reason: string }
+  | { status: "ok"; target: ExecutionTargetRecord };
+
 export interface EligibleBindingResolution {
   eligible: boolean;
   binding?: DeviceTargetBindingRecord;
@@ -539,6 +551,166 @@ export class ConnectorControlStore {
           AND repository_external_id = ?;
       `).run(input.fullName, now, input.provider, input.externalId);
       return Number(res.changes);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Workspace Default Agent Runtime Target
+  // ---------------------------------------------------------------------------
+
+  getDefaultAgentRuntimeTarget(workspaceId: string): WorkspaceExecutionDefaultRecord | null {
+    return this.identityStore.withDb((db) => {
+      const row = db
+        .prepare(
+          "SELECT workspace_id, default_agent_runtime_target_id, created_at_ms, updated_at_ms FROM workspace_execution_defaults WHERE workspace_id = ? LIMIT 1;",
+        )
+        .get(workspaceId) as WorkspaceExecutionDefaultRecord | undefined;
+      return row ?? null;
+    });
+  }
+
+  /**
+   * Resolves a workspace's explicit default Agent Runtime Target. Fails closed:
+   * returns not_configured when no row exists, and unavailable when the stored
+   * mapping references a missing, cross-workspace, or disabled target. Never
+   * guesses by alias/kind/count and never requires an active DeviceTargetBinding
+   * (offline queueing is a product invariant).
+   */
+  resolveDefaultAgentRuntimeTarget(workspaceId: string): DefaultAgentRuntimeTargetResolution {
+    return this.identityStore.withDb((db) => {
+      const defaultRow = db
+        .prepare(
+          "SELECT workspace_id, default_agent_runtime_target_id FROM workspace_execution_defaults WHERE workspace_id = ? LIMIT 1;",
+        )
+        .get(workspaceId) as { default_agent_runtime_target_id: string } | undefined;
+      if (!defaultRow) {
+        return { status: "not_configured" } as const;
+      }
+
+      const target = db
+        .prepare(
+          `SELECT id, workspace_id, alias, display_name, kind,
+                  repository_provider, repository_external_id, repository_full_name,
+                  created_at_ms, updated_at_ms, disabled_at_ms
+           FROM execution_targets WHERE id = ? LIMIT 1;`,
+        )
+        .get(defaultRow.default_agent_runtime_target_id) as ExecutionTargetRecord | undefined;
+      if (!target) {
+        return {
+          status: "unavailable" as const,
+          reason: "The configured default Agent Runtime target no longer exists.",
+        };
+      }
+      if (target.workspace_id !== workspaceId) {
+        return {
+          status: "unavailable" as const,
+          reason: "The configured default Agent Runtime target belongs to another workspace.",
+        };
+      }
+      if (target.disabled_at_ms !== null) {
+        return {
+          status: "unavailable" as const,
+          reason: "The configured default Agent Runtime target is disabled.",
+        };
+      }
+      return { status: "ok" as const, target };
+    });
+  }
+
+  /**
+   * Sets the workspace-scoped default Agent Runtime Target. A workspace-level
+   * privileged action: the actor must be the workspace owner. The target must
+   * belong to this workspace and be enabled. Re-setting the same target is an
+   * idempotent replay. The Server control plane is the single authority for
+   * this routing state.
+   */
+  setDefaultAgentRuntimeTarget(input: {
+    workspaceId: string;
+    targetId: string;
+    actorUserId: string;
+    nowMs?: number;
+  }): { record: WorkspaceExecutionDefaultRecord; replayed: boolean } {
+    return this.identityStore.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const ws = db.prepare("SELECT id FROM workspaces WHERE id = ? LIMIT 1;").get(input.workspaceId);
+        if (!ws) {
+          throw new ConnectorNotFoundError(`Workspace '${input.workspaceId}' not found.`);
+        }
+
+        const target = db
+          .prepare("SELECT id, workspace_id, disabled_at_ms FROM execution_targets WHERE id = ? LIMIT 1;")
+          .get(input.targetId) as { id: string; workspace_id: string; disabled_at_ms: number | null } | undefined;
+        if (!target || target.workspace_id !== input.workspaceId) {
+          throw new ConnectorNotFoundError(`ExecutionTarget '${input.targetId}' not found.`);
+        }
+        if (target.disabled_at_ms !== null) {
+          throw new ConnectorTargetDisabledError(`ExecutionTarget '${input.targetId}' is disabled.`);
+        }
+
+        const membership = db
+          .prepare("SELECT role FROM workspace_memberships WHERE workspace_id = ? AND user_id = ? LIMIT 1;")
+          .get(input.workspaceId, input.actorUserId) as { role: string } | undefined;
+        if (!membership) {
+            throw new ConnectorPermissionError(
+              `User '${input.actorUserId}' is not a member of workspace '${input.workspaceId}'.`,
+            );
+        }
+        if (membership.role !== "owner") {
+            throw new ConnectorPermissionError(
+              "Only workspace owners can change the workspace default agent runtime target.",
+            );
+        }
+
+        const now = input.nowMs ?? Date.now();
+        const existing = db
+          .prepare(
+            "SELECT default_agent_runtime_target_id, created_at_ms FROM workspace_execution_defaults WHERE workspace_id = ? LIMIT 1;",
+          )
+          .get(input.workspaceId) as
+          | { default_agent_runtime_target_id: string; created_at_ms: number }
+          | undefined;
+
+        if (existing) {
+          const replayed = existing.default_agent_runtime_target_id === input.targetId;
+          if (!replayed) {
+            db.prepare(
+              "UPDATE workspace_execution_defaults SET default_agent_runtime_target_id = ?, updated_at_ms = ? WHERE workspace_id = ?;",
+            ).run(input.targetId, now, input.workspaceId);
+          }
+          db.exec("COMMIT;");
+          return {
+            record: {
+              workspace_id: input.workspaceId,
+              default_agent_runtime_target_id: input.targetId,
+              created_at_ms: existing.created_at_ms,
+              updated_at_ms: now,
+            },
+            replayed,
+          };
+        }
+
+        db.prepare(
+          "INSERT INTO workspace_execution_defaults (workspace_id, default_agent_runtime_target_id, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?);",
+        ).run(input.workspaceId, input.targetId, now, now);
+        db.exec("COMMIT;");
+        return {
+          record: {
+            workspace_id: input.workspaceId,
+            default_agent_runtime_target_id: input.targetId,
+            created_at_ms: now,
+            updated_at_ms: now,
+          },
+          replayed: false,
+        };
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
     });
   }
 
@@ -1111,6 +1283,7 @@ export class ConnectorControlStore {
     target: ExecutionTargetRecord;
     thisBinding: DeviceTargetBindingRecord | null;
     activeBindingCount: number;
+    isDefaultAgentRuntime: boolean;
   }> {
     return this.identityStore.withDb((db) => {
       const device = db.prepare("SELECT id, user_id, revoked_at_ms FROM devices WHERE id = ? LIMIT 1;").get(deviceId) as
@@ -1170,6 +1343,20 @@ export class ConnectorControlStore {
           AND u.disabled_at IS NULL;
       `);
 
+      const defaultStmt = db.prepare(
+        "SELECT default_agent_runtime_target_id FROM workspace_execution_defaults WHERE workspace_id = ? LIMIT 1;",
+      );
+      const defaultCache = new Map<string, string | null>();
+      const defaultIdFor = (workspaceId: string): string | null => {
+        if (!defaultCache.has(workspaceId)) {
+          const row = defaultStmt.get(workspaceId) as
+            | { default_agent_runtime_target_id: string }
+            | undefined;
+          defaultCache.set(workspaceId, row?.default_agent_runtime_target_id ?? null);
+        }
+        return defaultCache.get(workspaceId) ?? null;
+      };
+
       return targets.map((target) => {
         const thisBinding = (bindingStmt.get(deviceId, target.id) as DeviceTargetBindingRecord | undefined) ?? null;
         const countRow = countStmt.get(target.workspace_id, target.id) as { cnt: number } | undefined;
@@ -1180,6 +1367,7 @@ export class ConnectorControlStore {
           target,
           thisBinding,
           activeBindingCount: effectiveActiveBindingCount,
+          isDefaultAgentRuntime: defaultIdFor(target.workspace_id) === target.id,
         };
       });
     });
@@ -1192,6 +1380,7 @@ export class ConnectorControlStore {
     target: ExecutionTargetRecord;
     workspaceRole: string;
     activeBindingCount: number;
+    isDefaultAgentRuntime: boolean;
   }> {
     return this.identityStore.withDb((db) => {
       const user = db.prepare("SELECT id, disabled_at FROM users WHERE id = ? LIMIT 1;").get(userId) as
@@ -1236,6 +1425,20 @@ export class ConnectorControlStore {
           AND u.disabled_at IS NULL;
       `);
 
+      const defaultStmt = db.prepare(
+        "SELECT default_agent_runtime_target_id FROM workspace_execution_defaults WHERE workspace_id = ? LIMIT 1;",
+      );
+      const defaultCache = new Map<string, string | null>();
+      const defaultIdFor = (workspaceId: string): string | null => {
+        if (!defaultCache.has(workspaceId)) {
+          const row = defaultStmt.get(workspaceId) as
+            | { default_agent_runtime_target_id: string }
+            | undefined;
+          defaultCache.set(workspaceId, row?.default_agent_runtime_target_id ?? null);
+        }
+        return defaultCache.get(workspaceId) ?? null;
+      };
+
       return rows.map((r) => {
         const { workspace_role, ...target } = r;
         const countRow = countStmt.get(target.workspace_id, target.id) as { cnt: number } | undefined;
@@ -1246,6 +1449,7 @@ export class ConnectorControlStore {
           target,
           workspaceRole: workspace_role,
           activeBindingCount: effectiveActiveBindingCount,
+          isDefaultAgentRuntime: defaultIdFor(target.workspace_id) === target.id,
         };
       });
     });

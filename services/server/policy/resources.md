@@ -139,14 +139,14 @@ Resource 讨论不会仅因为“聊过”就自动修改 State。只有确实�
 
 3. **第 3 步：自动触发深度提取（除非用户明确说明只记链接）**  
    若用户明确表达“只记链接”或“不用抓正文”，流程在完成重命名后立即停止。否则：
-   - 调用 `execution_targets()` 检查工作空间是否有可用 target（`active_binding_count > 0`）。
-   - 若存在可用 target：由 Host 根据目标选择 `target_id`，并**唯一调用 `resource_acquire(resource_id, target_id, mode="if_missing")`** 提交异步提取任务。告知用户：“已保存 Resource；深度内容提取任务已提交，本地 Connector 执行完毕后会自动写入 content.md 与来源元数据（若设备离线，任务将在队列中安全等待，最多等待 7 天）。”
-   - 若无可用 target 或 Connector 队列不可用：告知用户：“链接与元数据已保存；当前暂无可用执行目标，正文尚未提取。”
+   - 直接**唯一调用 `resource_acquire(request_id, resource_id, mode="if_missing")`** 提交异步提取任务。路由由 CEO 从工作空间默认 Agent Runtime target 解析，Host 不提供也不选择 `target_id`；不要为了选择提取 target 而调用 `execution_targets()`。
+   - 若提交成功：告知用户“已保存 Resource；深度内容提取任务已提交，本地 Connector 执行完毕后会自动写入 content.md 与来源元数据（若设备离线，任务将在队列中安全等待，最多等待 7 天）。”
+   - 若返回“未配置默认 Agent Runtime target”之类的失败：说明 capture 本身已经成功，告知用户“链接与元数据已保存；当前工作空间尚未配置默认执行目标，正文尚未提取（需要运维者通过 Connector CLI 配置）。”
 
 ### 核心边界原则
 - **`resource_acquire` 是唯一入口**：`resource_acquire` 是 Resource 深度提取任务的唯一 Host-facing 入口。**严禁使用底层通用的 `job_submit` 手工构造 Resource 提取任务**。
 - **不预先过滤 resource_kind**：不要根据解析出的 resource_kind 决定是否调用 acquire。URL 是否可提取字幕或正文由 `content.extract_url` 能力自行判定，不要手工设卡。
-- **Target 语义**：Host 根据 `execution_targets()` 选择 `target_id`，Job 创建时 Target 已完全确定。Connector 只负责在绑定该 Target 的本地路径上执行，不选择 Target。
+- **Target 语义**：提取路由由服务端根据工作空间默认 Agent Runtime target 决定，Host 永远不提供 `target_id`。若默认 target 未配置或不可用，acquisition 在创建 Job 之前失败，且不影响已完成 capture。Connector 只负责在绑定该 Target 的本地路径上执行，不选择 Target。
 - **离线容忍与幂等**：Connector 离线不是错误，Job 会在队列中安全暂存（TTL 最长 7 天）；重复重试复用同一 request_id。
 
 ## 删除与销毁
