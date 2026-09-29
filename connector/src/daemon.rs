@@ -17,8 +17,8 @@ use crate::execution_contract::{
 use crate::local_state::{remove_durable, ExecutionLock};
 use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
-    compute_report_sha256, deliver_outbox_record, flush_outbox, OutboxError, OutboxRecord,
-    OUTBOX_SCHEMA_VERSION,
+    compute_report_sha256, deliver_outbox_record, flush_outbox, flushable_outbox_files,
+    OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION,
 };
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{
@@ -195,10 +195,14 @@ pub async fn run_daemon_with_hooks(
             continue;
         }
 
-        let has_outbox = paths.outbox_dir().exists()
-            && fs::read_dir(paths.outbox_dir())
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
+        // Real durable outbox records are flushed before claiming new Jobs.
+        // Gating is based ONLY on actual flushable outbox records using the
+        // exact same selection semantics as flush_outbox(); non-JSON entries
+        // (backups, editor temp files, directories) must never starve
+        // pending-job polling.
+        let has_outbox = flushable_outbox_files(paths)
+            .map(|records| !records.is_empty())
+            .unwrap_or(false);
         if has_outbox {
             let _ = flush_outbox(paths, &client, &cred).await;
             tokio::time::sleep(Duration::from_millis(500)).await;

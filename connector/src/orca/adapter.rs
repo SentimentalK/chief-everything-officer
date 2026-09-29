@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::client::{OrcaCliClient, OrcaError};
+use super::types::{OrcaTerminalItem, TerminalLiveness};
 use crate::config::LocalTarget;
 use crate::scheduler::{
     ActiveAttempt, CleanupOutcome, DispatchOutcome, DispatchReconciliation, ExecutionAdapter,
@@ -113,13 +114,21 @@ impl OrcaExecutionAdapter {
         }
     }
     pub async fn derive_pane_key(&self, terminal_id: &str) -> Option<String> {
-        match self.client.show_terminal(terminal_id).await {
-            Ok(Some(term)) => match (term.tab_id, term.leaf_id) {
-                (Some(t), Some(l)) => Some(format!("{t}:{l}")),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.client
+            .show_terminal(terminal_id)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(pane_key_of)
+    }
+}
+
+/// Extracts the `tab:leaf` pane key from a terminal item, if present.
+fn pane_key_of(term: &OrcaTerminalItem) -> Option<String> {
+    match (&term.tab_id, &term.leaf_id) {
+        (Some(tab), Some(leaf)) => Some(format!("{tab}:{leaf}")),
+        _ => None,
     }
 }
 
@@ -597,7 +606,28 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         terminal_id: &str,
         remaining_timeout: Duration,
     ) -> Result<WaitOutcome, String> {
-        let pane_key = self.derive_pane_key(terminal_id).await;
+        // Inspect the authoritative terminal state as part of every wait
+        // tick. Orca may retain a terminal tombstone object (orphaned=true
+        // and/or an explicit exitCause like operator_close) instead of
+        // returning a terminal_not_found error; such a terminal must
+        // immediately interrupt the waiting attempt instead of short-polling
+        // until the execution deadline.
+        //
+        // Transient show/transport failures (and `terminal_not_found`, which
+        // the client maps to Ok(None)) are deliberately NOT treated as
+        // terminal death here; they fall through to the existing bounded
+        // observation below, which retains the current not-found/exited
+        // error handling.
+        let shown_terminal = self.client.show_terminal(terminal_id).await.ok().flatten();
+        if let Some(ref term) = shown_terminal {
+            if let TerminalLiveness::DefinitelyExited { reason } = term.liveness() {
+                return Ok(WaitOutcome::Interrupted {
+                    reason: format!("terminal '{terminal_id}' is no longer live: {reason}"),
+                });
+            }
+        }
+
+        let pane_key = shown_terminal.as_ref().and_then(pane_key_of);
         if let Some(ref pk) = pane_key {
             if let Ok(resp) = self
                 .client

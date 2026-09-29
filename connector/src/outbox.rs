@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use sha2::{Digest, Sha256};
@@ -303,25 +303,45 @@ pub async fn deliver_outbox_record(
     }
 }
 
+/// Single source of truth for what counts as a flushable outbox record.
+///
+/// Both `flush_outbox()` and the daemon's scheduler gating MUST use this
+/// predicate (via `flushable_outbox_files`) so a stray unrelated entry in the
+/// outbox directory (backup files like `*.json.bak.<ts>`, editor temp files,
+/// directories, etc.) can never starve pending-job polling.
+pub fn is_flushable_outbox_entry(path: &Path) -> bool {
+    path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+/// Lists all flushable outbox-record paths in the outbox directory, in
+/// directory order, ignoring unrelated/non-JSON entries. Unknown entries are
+/// listed nowhere and never mutated or deleted.
+pub fn flushable_outbox_files(paths: &ConnectorPaths) -> Result<Vec<PathBuf>, std::io::Error> {
+    let outbox_dir = paths.outbox_dir();
+    if !outbox_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(outbox_dir)? {
+        let path = entry?.path();
+        if is_flushable_outbox_entry(&path) {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
 /// Flushes all pending outbox records in the outbox directory.
 pub async fn flush_outbox(
     paths: &ConnectorPaths,
     client: &ConnectorClient,
     cred: &DeviceCredential,
 ) -> Result<usize, OutboxError> {
-    if !paths.outbox_dir().exists() {
-        return Ok(0);
-    }
-
     let mut delivered_count = 0;
-    for entry in fs::read_dir(paths.outbox_dir())? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let record = OutboxRecord::load(&path)?;
-            deliver_outbox_record(paths, client, cred, &path, &record).await?;
-            delivered_count += 1;
-        }
+    for path in flushable_outbox_files(paths)? {
+        let record = OutboxRecord::load(&path)?;
+        deliver_outbox_record(paths, client, cred, &path, &record).await?;
+        delivered_count += 1;
     }
 
     Ok(delivered_count)

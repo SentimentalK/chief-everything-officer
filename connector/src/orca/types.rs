@@ -104,6 +104,14 @@ pub struct OrcaRepoItem {
     pub path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaTerminalExitCause {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrcaTerminalItem {
@@ -114,6 +122,60 @@ pub struct OrcaTerminalItem {
     pub tab_id: Option<String>,
     pub leaf_id: Option<String>,
     pub preview: Option<String>,
+    // Authoritative structured liveness fields. Orca may retain a terminal
+    // tombstone object after the terminal is no longer live (e.g. after an
+    // operator close) instead of returning a terminal_not_found error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected: Option<bool>,
+    // Parsed for payload fidelity only: a temporary non-writable state is NOT
+    // terminal death and must never be treated as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_cause: Option<OrcaTerminalExitCause>,
+}
+
+/// Authoritative structured liveness classification of an Orca terminal.
+///
+/// Based only on structured Orca fields (never title/preview heuristics):
+/// - [`TerminalLiveness::DefinitelyExited`] means Orca authoritatively
+///   reported the terminal as no longer live (an explicit structured exit
+///   cause and/or `orphaned: true`), so waiting attempts must be interrupted
+///   immediately instead of polling until the execution deadline.
+/// - [`TerminalLiveness::Unknown`] means the liveness fields are absent or
+///   ambiguous; callers must retain their existing bounded/retryable
+///   behavior and must not infer terminal death.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalLiveness {
+    Live,
+    DefinitelyExited { reason: String },
+    Unknown,
+}
+
+impl OrcaTerminalItem {
+    /// Classifies the structured liveness of this terminal as reported by Orca.
+    pub fn liveness(&self) -> TerminalLiveness {
+        if let Some(cause) = self.exit_cause.as_ref().filter(|c| !c.kind.is_empty()) {
+            let mut reason = format!("exitCause.kind={}", cause.kind);
+            if let Some(msg) = cause.message.as_deref().filter(|m| !m.is_empty()) {
+                reason.push_str(&format!(": {msg}"));
+            }
+            return TerminalLiveness::DefinitelyExited { reason };
+        }
+        if self.orphaned == Some(true) {
+            return TerminalLiveness::DefinitelyExited {
+                reason: "orphaned".into(),
+            };
+        }
+        // Note: `writable` alone is deliberately NOT treated as death.
+        if self.connected == Some(true) {
+            TerminalLiveness::Live
+        } else {
+            TerminalLiveness::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

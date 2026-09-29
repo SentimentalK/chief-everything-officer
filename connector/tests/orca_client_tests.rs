@@ -1,7 +1,10 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+mod common;
 
 use ceo_connector::config::{LocalExecutorConfig, LocalTarget};
 use ceo_connector::orca::adapter::{validate_tui_idle_wait, ValidatedWait};
@@ -1780,4 +1783,476 @@ fi
             panic!("expected TuiIdle fallback when worktree ps transiently fails, got {other:?}")
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2 regression: Orca operator-closed / orphaned terminal tombstones.
+// Orca can retain an authoritative non-live terminal object (tombstone)
+// instead of returning terminal_not_found; wait/recovery must classify such
+// state as interrupted immediately instead of polling until the execution
+// deadline. Ambiguous/transient failures and non-writable-only states must
+// NOT be treated as terminal death.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_terminal_liveness_classification() {
+    // 1. Reproduced operator-close tombstone (real dogfood response shape).
+    let tombstone: OrcaTerminalItem = serde_json::from_str(
+        r#"{"handle":"term_1","orphaned":true,"connected":false,"writable":false,
+            "exitCause":{"kind":"operator_close"},"paneRuntimeId":-1}"#,
+    )
+    .unwrap();
+    match tombstone.liveness() {
+        TerminalLiveness::DefinitelyExited { reason } => {
+            assert!(reason.contains("operator_close"), "reason: {reason}");
+        }
+        other => panic!("expected DefinitelyExited, got {other:?}"),
+    }
+
+    // 2. orphaned=true alone (no structured exit cause) must classify as exited.
+    let orphaned_only: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_2","orphaned":true}"#).unwrap();
+    match orphaned_only.liveness() {
+        TerminalLiveness::DefinitelyExited { reason } => {
+            assert!(reason.contains("orphaned"), "reason: {reason}");
+        }
+        other => panic!("expected DefinitelyExited, got {other:?}"),
+    }
+
+    // 3. connected=false with an explicit exit cause (no orphaned flag) must
+    //    classify as exited and include the exitCause kind.
+    let exit_cause_only: OrcaTerminalItem = serde_json::from_str(
+        r#"{"handle":"term_3","connected":false,"exitCause":{"kind":"operator_close"}}"#,
+    )
+    .unwrap();
+    match exit_cause_only.liveness() {
+        TerminalLiveness::DefinitelyExited { reason } => {
+            assert!(reason.contains("operator_close"), "reason: {reason}");
+        }
+        other => panic!("expected DefinitelyExited, got {other:?}"),
+    }
+
+    // 4. Structured exited state via exitCause kind variations.
+    let exited: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_4","exitCause":{"kind":"terminal_exited"}}"#)
+            .unwrap();
+    match exited.liveness() {
+        TerminalLiveness::DefinitelyExited { reason } => {
+            assert!(reason.contains("terminal_exited"), "reason: {reason}");
+        }
+        other => panic!("expected DefinitelyExited, got {other:?}"),
+    }
+
+    // 5. Live connected terminal classifies as Live.
+    let live: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_5","connected":true}"#).unwrap();
+    assert_eq!(live.liveness(), TerminalLiveness::Live);
+
+    // 6. Non-writable alone must NOT be terminal death.
+    let non_writable: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_6","writable":false}"#).unwrap();
+    assert!(!matches!(
+        non_writable.liveness(),
+        TerminalLiveness::DefinitelyExited { .. }
+    ));
+
+    // 7. connected=false without any explicit exit cause stays ambiguous.
+    let disconnected_only: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_7","connected":false}"#).unwrap();
+    assert!(!matches!(
+        disconnected_only.liveness(),
+        TerminalLiveness::DefinitelyExited { .. }
+    ));
+
+    // 8. Legacy payload without liveness fields classifies as Unknown.
+    let legacy: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_8","tabId":"tab1","leafId":"leaf1"}"#).unwrap();
+    assert_eq!(legacy.liveness(), TerminalLiveness::Unknown);
+}
+
+fn waiting_attempt_without_executor() -> ActiveAttempt {
+    ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "j".into(),
+        attempt_id: "a".into(),
+        claim_token: "t".into(),
+        device_id: "d".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "w".into(),
+        target_id: "tg".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    }
+}
+
+async fn wait_with_script(script: &str) -> (WaitOutcome, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let wait_log = temp.path().join("wait_invocations.log");
+    let script = script.replace("{WAIT_LOG}", &wait_log.display().to_string());
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let attempt = waiting_attempt_without_executor();
+    let outcome = adapter
+        .wait(&attempt, "term_x", Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let invoked = fs::read_to_string(&wait_log).unwrap_or_default();
+    (outcome, invoked)
+}
+
+#[tokio::test]
+async fn test_wait_operator_closed_tombstone_interrupts_immediately() {
+    // Full reproduced dogfood state: orphaned, disconnected, non-writable,
+    // exitCause.kind=operator_close. The wait command would report
+    // satisfied=true (claiming completion) but must never be reached.
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_x","title":"ceo:att","preview":"stale","orphaned":true,"connected":false,"writable":false,"exitCause":{"kind":"operator_close"},"paneRuntimeId":-1}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{WAIT_LOG}"
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":10}}}'
+else
+    echo '{"ok":false,"error":{"code":"unknown_command","message":"unexpected"}}'
+fi
+"#;
+
+    let (outcome, wait_invoked) = wait_with_script(script).await;
+    match outcome {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("operator_close"), "reason: {reason}");
+            assert!(reason.contains("term_x"), "reason: {reason}");
+        }
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+    // Interrupt must happen immediately: no bounded tui-idle polling and no
+    // waiting until the execution deadline.
+    assert!(!wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_wait_orphaned_only_tombstone_interrupts_immediately() {
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_x","orphaned":true}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{WAIT_LOG}"
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":10}}}'
+else
+    echo '{"ok":false,"error":{"code":"unknown_command","message":"unexpected"}}'
+fi
+"#;
+
+    let (outcome, wait_invoked) = wait_with_script(script).await;
+    match outcome {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("orphaned"), "reason: {reason}");
+        }
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+    assert!(!wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_wait_connected_with_exit_cause_interrupts_immediately() {
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_x","connected":false,"exitCause":{"kind":"operator_close","message":"user closed the pane"}}}}'
+else
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":10}}}'
+fi
+"#;
+
+    let (outcome, _wait_invoked) = wait_with_script(script).await;
+    match outcome {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("operator_close"), "reason: {reason}");
+        }
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_wait_live_connected_terminal_continues_existing_wait_behavior() {
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_x","connected":true,"tabId":"tab1","leafId":"leaf1"}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{WAIT_LOG}"
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":100}}}'
+else
+    echo '{"ok":false,"error":{"code":"internal_error","message":"daemon busy"}}'
+fi
+"#;
+
+    let (outcome, wait_invoked) = wait_with_script(script).await;
+    match outcome {
+        WaitOutcome::TuiIdle { .. } => {}
+        other => panic!("expected TuiIdle for live terminal, got {other:?}"),
+    }
+    assert!(wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_wait_non_writable_alone_is_not_interrupted() {
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_x","writable":false}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":100}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+
+    let (outcome, _wait_invoked) = wait_with_script(script).await;
+    assert_eq!(outcome, WaitOutcome::TuiIdle { elapsed_ms: 100 });
+}
+
+#[tokio::test]
+async fn test_wait_transient_show_failure_is_not_falsely_interrupted() {
+    // Show transport/garbage failure must retain ambiguous/bounded behavior;
+    // the existing bounded tui-idle observation continues.
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo 'totally not json' >&2
+    exit 1
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":false,"elapsedMs":1500}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+
+    let (outcome, _wait_invoked) = wait_with_script(script).await;
+    assert!(matches!(outcome, WaitOutcome::TimedOut { .. }));
+}
+
+#[tokio::test]
+async fn test_wait_terminal_not_found_error_path_remains_interrupted() {
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":false,"error":{"code":"terminal_not_found","message":"no such terminal"}}'
+    exit 1
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":false,"error":{"code":"terminal_not_found","message":"no such terminal"}}'
+    exit 1
+else
+    echo '{"ok":false}'
+fi
+"#;
+
+    let (outcome, _wait_invoked) = wait_with_script(script).await;
+    match outcome {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("terminal_not_found"), "reason: {reason}");
+        }
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon recovery regression: a Waiting attempt whose Orca terminal was
+// operator-closed while the Connector was down must converge automatically to
+// the documented dogfood semantics (interrupted / TERMINAL_EXITED / FAILED)
+// and clear the durable active attempt through the existing lifecycle,
+// without waiting for the execution deadline.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_daemon_recovery_waiting_with_operator_closed_terminal_converges_to_interrupted() {
+    use ceo_connector::client::ConnectorClient;
+    use ceo_connector::credential::DeviceCredential;
+    use ceo_connector::daemon::{drive_active_attempt, DaemonHooks};
+    use ceo_connector::outbox::flush_outbox;
+    use ceo_connector::paths::ConnectorPaths;
+    use common::mock_server::{MockResponse, MockServer};
+
+    let server = MockServer::start().await;
+    let report_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let report_bodies_clone = report_bodies.clone();
+
+    server.add_handler(move |req| {
+        if req.path.contains("/report") && req.method == "POST" {
+            report_bodies_clone
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&req.body).to_string());
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-28T12:00:00.000Z"
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+
+    // Fake Orca: authoritative show returns the operator-closed tombstone.
+    // The wait command would claim satisfied=true, but it must be
+    // short-circuited immediately by the tombstone classification.
+    let wait_log = temp.path().join("wait_invocations.log");
+    let script = format!(
+        r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_orphan","orphaned":true,"connected":false,"writable":false,"exitCause":{{"kind":"operator_close"}},"paneRuntimeId":-1}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{}"
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_orphan","condition":"tui-idle","satisfied":true,"elapsedMs":10}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command","message":"unexpected"}}}}'
+fi
+"#,
+        wait_log.display()
+    );
+    let bin = create_mock_orca_script(&temp, &script);
+    let adapter = OrcaExecutionAdapter::new(OrcaCliClient::new(bin));
+    let client = ConnectorClient::new(&server.origin()).unwrap();
+
+    // Reproduce the real observed pre-crash attempt state: already claimed,
+    // prepared, dispatched, started, waiting with a 3600s execution timeout.
+    let now = chrono::Utc::now().timestamp_millis();
+    let attempt_id = format!("att-{}", uuid::Uuid::new_v4());
+    let mut exec = AttemptExecutorState::new_orca();
+    exec.orca_version = Some("1.4.209".into());
+    exec.worktree_id = Some("wt_orphan".into());
+    exec.terminal_id = Some("term_orphan".into());
+    exec.agent_id = Some("agy".into());
+    exec.agent_ready_at_ms = Some(now - 120_000);
+    exec.dispatch_send_count = 1;
+    exec.dispatch_started_at_ms = Some(now - 60_000);
+    exec.execution_deadline_ms = Some(now + 3_600_000);
+    exec.dispatch_request_id = Some("req_disp_orphan".into());
+    exec.dispatch_turn_started = true;
+    exec.turn_started_observed = true;
+
+    let payload_sha256 = ActiveAttempt::compute_payload_sha256(
+        "job_orphan",
+        "ws_1",
+        "tgt_1",
+        None,
+        "run the task",
+        "task done",
+        3600,
+        "none",
+    );
+
+    let active = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        server_origin: server.origin(),
+        device_id: "dev_1".into(),
+        job_id: "job_orphan".into(),
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        attempt_id: attempt_id.clone(),
+        claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        phase: AttemptPhase::Waiting,
+        resource_id: None,
+        prompt: Some("run the task".into()),
+        acceptance: Some("task done".into()),
+        execution_timeout_seconds: Some(3600),
+        result_target: Some("none".into()),
+        payload_sha256: Some(payload_sha256),
+        claimed_at_ms: Some(now - 120_000),
+        terminal_report_sha256: None,
+        executor: Some(exec),
+    };
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    // Drive 1: Waiting -> adapter wait observes the tombstone -> Interrupted
+    // -> OutcomeRecorded. Must NOT wait until the 3600s execution deadline.
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(Arc::new(adapter.clone()) as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    let current = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.phase, AttemptPhase::OutcomeRecorded);
+    let exec = current.executor.as_ref().unwrap();
+    assert_eq!(
+        exec.runtime_completion_kind.as_deref(),
+        Some("interrupted"),
+        "must converge to runtime_completion_kind=interrupted"
+    );
+    let err = exec.runtime_error.as_ref().expect("runtime_error expected");
+    assert_eq!(err.stage, "runtime");
+    assert_eq!(err.code, "TERMINAL_EXITED");
+    assert!(
+        err.message.contains("operator_close"),
+        "message: {}",
+        err.message
+    );
+
+    // Drive 2: OutcomeRecorded -> outbox written -> FinalizedLocal + delivery.
+    let advanced = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(Arc::new(adapter) as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert!(advanced);
+
+    // Report delivered with FAILED / FAILED / TERMINAL_EXITED semantics.
+    let bodies = report_bodies.lock().unwrap().clone();
+    assert!(
+        !bodies.is_empty(),
+        "terminal report must have been delivered"
+    );
+    let body = &bodies[0];
+    assert!(body.contains("TERMINAL_EXITED"), "report body: {body}");
+    assert!(body.contains("FAILED"), "report body: {body}");
+
+    // Durable lifecycle cleanup: active attempt and outbox record cleared.
+    assert!(!paths.active_attempt_file().exists());
+    assert!(!paths.outbox_file("job_orphan", &attempt_id).exists());
+    assert!(paths.history_file("job_orphan", &attempt_id).exists());
+
+    // Flush is a no-op afterwards.
+    let flushed = flush_outbox(&paths, &client, &cred).await.unwrap();
+    assert_eq!(flushed, 0);
+
+    // No bounded wait polling happened: the tombstone interrupted immediately.
+    let wait_log = fs::read_to_string(&wait_log).unwrap_or_default();
+    assert!(!wait_log.contains("WAIT_INVOKED"));
 }

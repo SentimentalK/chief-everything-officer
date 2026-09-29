@@ -558,3 +558,204 @@ async fn outbox_delivers_managed_result_before_report() {
     // Verify runtime directory cleaned up
     assert!(!runtime_dir.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Scheduler-gating starvation regression: non-JSON entries in the outbox
+// directory must never gate pending-job polling (they are not flushable outbox
+// records), while real *.json records must still be gated/flushed first.
+// ---------------------------------------------------------------------------
+
+fn write_gating_env(
+    server_origin: &str,
+    temp: &std::path::Path,
+) -> (ConnectorPaths, DeviceCredential) {
+    let paths = ConnectorPaths::from_roots(temp.join("config"), temp.join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server_origin.into(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let config = LocalConfig::new(server_origin.to_string()).unwrap();
+    config.save(&paths.config_file()).unwrap();
+
+    (paths, cred)
+}
+
+#[tokio::test]
+async fn non_json_outbox_entries_do_not_gate_pending_job_polling() {
+    let server = MockServer::start().await;
+    let pending_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending_calls_clone = pending_calls.clone();
+
+    server.add_handler(move |req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_1",
+                    "device": { "id": "dev_1", "display_name": "Dev", "platform": "linux-x_64" },
+                    "credential": { "id": "dcr_1", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(200, &serde_json::json!({ "targets": [] }));
+        }
+        if req.path.starts_with("/api/connector/jobs/pending") && req.method == "GET" {
+            pending_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({ "jobs": [] }));
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let (paths, _cred) = write_gating_env(&server.origin(), temp.path());
+
+    // Outbox directory contains ONLY unrelated entries:
+    // manually-backed-up bad record, editor temp files, a directory, a txt file.
+    let outbox_dir = paths.outbox_dir();
+    fs::write(
+        outbox_dir.join("job-abc.att-abc.json.bak.1770000000000"),
+        "backed up bad outbox record",
+    )
+    .unwrap();
+    fs::write(outbox_dir.join("#job-abc.att-abc.json#"), "emacs temp").unwrap();
+    fs::write(outbox_dir.join(".job-abc.att-abc.json.swp"), "vi temp").unwrap();
+    fs::write(outbox_dir.join("notes.txt"), "unrelated").unwrap();
+    fs::create_dir_all(outbox_dir.join("job-abc.att-abc.json.dir")).unwrap();
+
+    // With the old "any directory entry" gate the loop spun on flush_outbox
+    // forever and NEVER reached pending-job polling; it must now poll.
+    let adapter = Arc::new(UnavailableExecutionAdapter);
+    run_daemon(&paths, adapter, Some(2)).await.unwrap();
+
+    assert!(
+        pending_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "pending-job polling must not be starved by non-JSON outbox entries"
+    );
+
+    // Unknown entries are ignored, never mutated or deleted.
+    assert!(outbox_dir
+        .join("job-abc.att-abc.json.bak.1770000000000")
+        .exists());
+    assert!(outbox_dir.join("#job-abc.att-abc.json#").exists());
+    assert!(outbox_dir.join(".job-abc.att-abc.json.swp").exists());
+    assert!(outbox_dir.join("notes.txt").exists());
+    assert!(outbox_dir.join("job-abc.att-abc.json.dir").is_dir());
+}
+
+#[tokio::test]
+async fn valid_json_outbox_record_still_gates_pending_claiming_with_retry_before_new_claim() {
+    let server = MockServer::start().await;
+    let pending_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending_calls_clone = pending_calls.clone();
+
+    server.add_handler(move |req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_1",
+                    "device": { "id": "dev_1", "display_name": "Dev", "platform": "linux-x64" },
+                    "credential": { "id": "dcr_1", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path.starts_with("/api/connector/jobs/pending") && req.method == "GET" {
+            pending_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({ "jobs": [] }));
+        }
+        // Outbox report delivery fails retryably (500).
+        if req.path.contains("/report") && req.method == "POST" {
+            return MockResponse::json(500, &serde_json::json!({ "error": "boom" }));
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let (paths, _cred) = write_gating_env(&server.origin(), temp.path());
+    let record = OutboxRecord {
+        schema_version: 1,
+        server_origin: server.origin(),
+        device_id: "dev_1".into(),
+        job_id: "job_gate".into(),
+        attempt_id: "att-00000000-0000-0000-0000-0000000000gate".into(),
+        claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        report: sample_report(),
+        managed_result: None,
+        managed_result_sha256: None,
+        created_at_ms: 1000,
+    };
+    let outbox_file = paths.outbox_file("job_gate", "att-00000000-0000-0000-0000-0000000000gate");
+    record.save(&outbox_file).unwrap();
+
+    let adapter = Arc::new(UnavailableExecutionAdapter);
+    run_daemon(&paths, adapter, Some(2)).await.unwrap();
+
+    // A real *.json outbox record still gates: the daemon must keep retrying
+    // durable delivery before claiming any new Jobs.
+    assert_eq!(
+        pending_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "pending-job polling must stay gated while a flushable outbox record exists"
+    );
+    // Retryable delivery failure retains the record.
+    assert!(outbox_file.exists());
+}
+
+#[test]
+fn flushable_outbox_selection_matches_flush_outbox_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    paths.ensure_dirs().unwrap();
+
+    let outbox_dir = paths.outbox_dir();
+    fs::write(outbox_dir.join("real-job.real-att.json"), "{}").unwrap();
+    fs::write(
+        outbox_dir.join("real-job.real-att.json.bak.1770000000000"),
+        "{}",
+    )
+    .unwrap();
+    fs::write(outbox_dir.join("#real-job.real-att.json#"), "{}").unwrap();
+    fs::write(outbox_dir.join(".real-job.real-att.json.swp"), "vi temp").unwrap();
+    fs::write(outbox_dir.join("notes.txt"), "unrelated").unwrap();
+    fs::create_dir_all(outbox_dir.join("real-job.real-att.json.dir")).unwrap();
+
+    let selected = ceo_connector::outbox::flushable_outbox_files(&paths).unwrap();
+    let names: Vec<String> = selected
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["real-job.real-att.json".to_string()]);
+
+    // Selection never deletes unknown entries.
+    assert!(outbox_dir
+        .join("real-job.real-att.json.bak.1770000000000")
+        .exists());
+    assert!(outbox_dir.join("notes.txt").exists());
+    assert!(outbox_dir.join("real-job.real-att.json.dir").is_dir());
+
+    // The shared predicate is the exact gate used by flush_outbox.
+    for path in selected {
+        assert!(ceo_connector::outbox::is_flushable_outbox_entry(&path));
+    }
+    assert!(!ceo_connector::outbox::is_flushable_outbox_entry(
+        &outbox_dir.join("real-job.real-att.json.bak.1770000000000")
+    ));
+}
