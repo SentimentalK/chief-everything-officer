@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import express, { type Request, type Response, type NextFunction } from "express";
-import { createMcpExpressApp } from "@modelcontextprotocol/express";
+import { localhostHostValidation, localhostOriginValidation } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { loadConfig } from "./config.js";
 import { createMcpServer } from "./mcp.js";
 import { loadProductPolicy } from "./product-policy.js";
 import { createProtocolCorsMiddleware } from "./http/protocol-cors.js";
+import { createRouteAwareJsonParser } from "./http/body-parsers.js";
 import { attachMcpProtocolLog } from "./http/mcp-observability.js";
 import {
   createHostGuard,
@@ -142,7 +143,27 @@ const v2Coordinator = v2Store
     })
   : null;
 
-const app = createMcpExpressApp({ host: config.bindHost });
+// ---- Express app assembly ----
+// createMcpExpressApp() from @modelcontextprotocol/express hard-wires a global
+// express.json() parser (default 100 KiB) as the app's first middleware. That
+// parser runs before protocol CORS and before every route, so it would reject
+// valid large /mcp atomic change-set requests (business contract:
+// LIMITS.maxTotalWriteBytes = 2 MiB plus JSON escaping overhead) with HTTP 413
+// and would also defeat the Connector managed-result route's own 3 MiB parser.
+// Assemble the app directly instead — preserving the SDK's DNS-rebinding
+// protection semantics for the same bind hosts — and install the route-aware
+// parser below, after protocol CORS, so parser errors stay readable by
+// browser clients.
+const app = express();
+if (["127.0.0.1", "localhost", "::1"].includes(config.bindHost)) {
+  app.use(localhostHostValidation());
+  app.use(localhostOriginValidation());
+} else if (config.bindHost === "0.0.0.0" || config.bindHost === "::") {
+  process.stderr.write(
+    `Warning: Server is binding to ${config.bindHost} without DNS rebinding protection. ` +
+      "Consider using the allowedHosts option to restrict allowed hosts, or use authentication to protect your server.\n",
+  );
+}
 
 const protocolCors = createProtocolCorsMiddleware(config.protocolAllowedOrigins);
 // Protocol CORS must run before the global JSON parser so browser clients can
@@ -152,14 +173,14 @@ app.use("/.well-known", protocolCors);
 app.use("/register", protocolCors);
 app.use("/token", protocolCors);
 
-// Ordinary JSON body parser for subsequent routes (default 100 KiB)
-// Skips /api/connector/jobs/:job_id/result which has its own route-scoped 3 MiB parser
-app.use((req, res, next) => {
-  if (req.path.match(/^\/api\/connector\/jobs\/[^/]+\/result$/)) {
-    return next();
-  }
-  express.json()(req, res, next);
-});
+// Route-aware JSON body parser (see src/http/body-parsers.ts for the
+// MCP transport cap derivation):
+// - /mcp gets an explicit larger limit sized for the 2 MiB atomic change-set
+//   contract plus JSON/MCP envelope and worst-case string-escaping overhead.
+// - /api/connector/jobs/:job_id/result is skipped; that route owns its own
+//   route-scoped 3 MiB parser.
+// - Every other JSON route keeps Express's default 100 KiB limit.
+app.use(createRouteAwareJsonParser());
 
 // Probes
 app.get("/healthz", (_req, res) => {
