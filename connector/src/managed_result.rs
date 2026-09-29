@@ -88,22 +88,74 @@ impl ManagedResultEnvelope {
             ));
         }
         for (idx, op) in self.operations.iter().enumerate() {
-            if let Some(obj) = op.as_object() {
-                if let Some(op_kind) = obj.get("op").and_then(|v| v.as_str()) {
-                    if op_kind == "attach_source_asset" {
-                        return Err(ManagedResultError::InvalidContent(format!(
-                            "operation[{idx}] 'attach_source_asset' is unsupported in V1.8 managed results"
-                        )));
-                    }
-                } else {
+            let obj = op.as_object().ok_or_else(|| {
+                ManagedResultError::InvalidContent(format!(
+                    "operation[{idx}] must be a JSON object"
+                ))
+            })?;
+            let op_kind = obj.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+                ManagedResultError::InvalidContent(format!(
+                    "operation[{idx}] missing 'op' discriminator string"
+                ))
+            })?;
+
+            // Business-schema validation aligned with the Server's
+            // applyManagedJobResult contract: a managed result that passes here
+            // must also be accepted by the Server, so a malformed operation can
+            // never reach the durable outbox and poison daemon recovery.
+            match op_kind {
+                "attach_source_asset" => {
                     return Err(ManagedResultError::InvalidContent(format!(
-                        "operation[{idx}] missing 'op' discriminator string"
+                        "operation[{idx}] 'attach_source_asset' is unsupported in V1.8 managed results"
                     )));
                 }
-            } else {
-                return Err(ManagedResultError::InvalidContent(format!(
-                    "operation[{idx}] must be a JSON object"
-                )));
+                "upsert_content" => {
+                    match obj.get("content") {
+                        Some(serde_json::Value::String(_)) => {}
+                        _ => {
+                            return Err(ManagedResultError::InvalidContent(format!(
+                                "operation[{idx}] 'upsert_content' requires a string 'content' field"
+                            )));
+                        }
+                    }
+                    if let Some(provenance) = obj.get("provenance") {
+                        if provenance.as_str() != Some("worker") {
+                            return Err(ManagedResultError::InvalidContent(format!(
+                                "operation[{idx}] forbidden provenance '{provenance}': only 'worker' is permitted in managed results"
+                            )));
+                        }
+                    }
+                }
+                "merge_source_metadata" => {
+                    const METADATA_FIELDS: [&str; 4] =
+                        ["title", "author", "published_at", "language"];
+                    let mut has_nonempty = false;
+                    for field in METADATA_FIELDS {
+                        match obj.get(field) {
+                            None | Some(serde_json::Value::Null) => {}
+                            Some(serde_json::Value::String(s)) => {
+                                if !s.trim().is_empty() {
+                                    has_nonempty = true;
+                                }
+                            }
+                            Some(_) => {
+                                return Err(ManagedResultError::InvalidContent(format!(
+                                    "operation[{idx}] 'merge_source_metadata' field '{field}' must be a string or null"
+                                )));
+                            }
+                        }
+                    }
+                    if !has_nonempty {
+                        return Err(ManagedResultError::InvalidContent(format!(
+                            "operation[{idx}] 'merge_source_metadata' requires at least one non-empty string field among: title, author, published_at, language"
+                        )));
+                    }
+                }
+                other => {
+                    return Err(ManagedResultError::InvalidContent(format!(
+                        "operation[{idx}] op '{other}' is not permitted in managed results. Allowed ops: 'upsert_content', 'merge_source_metadata'"
+                    )));
+                }
             }
         }
         Ok(())
@@ -230,8 +282,10 @@ mod tests {
                     "content": "New resolved body"
                 }),
                 serde_json::json!({
-                    "op": "rename",
-                    "display_name": "New Resource Title"
+                    "op": "merge_source_metadata",
+                    "title": "Source Title",
+                    "author": "Source Author",
+                    "published_at": "2026-01-01"
                 }),
             ],
         };
@@ -247,7 +301,7 @@ mod tests {
         let digest = envelope.compute_canonical_sha256().unwrap();
         assert_eq!(
             digest,
-            "404a4afe34a4729475ffae07d577d195ca36374eba39ee2e271a9b72b2a41685"
+            "9a4bf46b83967ca2d976003f876192c5a73f566d62b9a596f50d9ad5bb63e22e"
         );
 
         // Verify key ordering in JCS does not change digest
@@ -264,7 +318,7 @@ mod tests {
             attempt_id: "att-1".into(),
             resource_id: "res-1".into(),
             summary: "Summary".into(),
-            operations: vec![serde_json::json!({"op": "patch", "patch": "diff"})],
+            operations: vec![serde_json::json!({"op": "upsert_content", "content": "body"})],
         };
 
         // Mismatched job_id
@@ -321,6 +375,153 @@ mod tests {
     }
 
     #[test]
+    fn test_operation_business_schema_rejects_nested_metadata_object() {
+        // Regression: worker emitted {"op":"merge_source_metadata","metadata":{...}}
+        // with real data nested under "metadata"; Server expects flat fields and
+        // rejects the whole result, poisoning the durable outbox.
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![
+                serde_json::json!({"op": "upsert_content", "content": "body"}),
+                serde_json::json!({
+                    "op": "merge_source_metadata",
+                    "metadata": {"title": "Real Title", "author": "Real Author"}
+                }),
+            ],
+        };
+        let err = envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at least one non-empty string field"));
+    }
+
+    #[test]
+    fn test_operation_business_schema_rejects_all_empty_metadata_fields() {
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![
+                serde_json::json!({"op": "upsert_content", "content": "body"}),
+                serde_json::json!({
+                    "op": "merge_source_metadata",
+                    "title": "  ",
+                    "author": "",
+                    "published_at": null,
+                    "language": ""
+                }),
+            ],
+        };
+        let err = envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at least one non-empty string field"));
+    }
+
+    #[test]
+    fn test_operation_business_schema_rejects_non_string_metadata_field() {
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![serde_json::json!({
+                "op": "merge_source_metadata",
+                "title": 42
+            })],
+        };
+        let err = envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .unwrap_err();
+        assert!(err.to_string().contains("must be a string or null"));
+    }
+
+    #[test]
+    fn test_operation_business_schema_accepts_flat_partial_metadata() {
+        // Missing fields are omitted (not empty strings); at least one non-empty required.
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![serde_json::json!({
+                "op": "merge_source_metadata",
+                "title": "为什么我劝所有男人练薄肌？",
+                "author": "Alan Shao",
+                "published_at": "2026-08-29"
+            })],
+        };
+        assert!(envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_operation_business_schema_rejects_unknown_op() {
+        let envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![serde_json::json!({"op": "rename", "display_name": "x"})],
+        };
+        let err = envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .unwrap_err();
+        assert!(err.to_string().contains("'rename' is not permitted"));
+    }
+
+    #[test]
+    fn test_operation_business_schema_upsert_content_and_provenance_rules() {
+        // upsert_content without content string -> rejected
+        let mut envelope = ManagedResultEnvelope {
+            schema_version: 1,
+            job_id: "job-1".into(),
+            attempt_id: "att-1".into(),
+            resource_id: "res-1".into(),
+            summary: "Valid".into(),
+            operations: vec![serde_json::json!({"op": "upsert_content"})],
+        };
+        assert!(envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .is_err());
+
+        // forbidden provenance -> rejected (only 'worker' permitted)
+        envelope.operations = vec![serde_json::json!({
+            "op": "upsert_content",
+            "content": "body",
+            "provenance": "host_semantic"
+        })];
+        let err = envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .unwrap_err();
+        assert!(err.to_string().contains("only 'worker' is permitted"));
+
+        // provenance 'worker' -> accepted
+        envelope.operations = vec![serde_json::json!({
+            "op": "upsert_content",
+            "content": "body",
+            "provenance": "worker"
+        })];
+        assert!(envelope
+            .validate_correlation("job-1", "att-1", Some("res-1"))
+            .is_ok());
+    }
+
+    #[test]
     fn test_symlink_rejection() {
         let dir = tempdir().unwrap();
         let target_file = dir.path().join("real.json");
@@ -332,7 +533,7 @@ mod tests {
             attempt_id: "att-1".into(),
             resource_id: "res-1".into(),
             summary: "Valid".into(),
-            operations: vec![serde_json::json!({"op": "patch", "patch": "diff"})],
+            operations: vec![serde_json::json!({"op": "upsert_content", "content": "body"})],
         };
 
         fs::write(&target_file, serde_json::to_string(&envelope).unwrap()).unwrap();

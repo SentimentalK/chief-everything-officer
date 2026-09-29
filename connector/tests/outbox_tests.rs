@@ -499,7 +499,7 @@ async fn outbox_delivers_managed_result_before_report() {
         attempt_id: attempt_id.into(),
         resource_id: "res_1".into(),
         summary: "Completed V1.8 job".into(),
-        operations: vec![serde_json::json!({ "op": "replace_body", "content": "hello" })],
+        operations: vec![serde_json::json!({ "op": "upsert_content", "content": "hello" })],
     };
     let payload_sha256 = managed_result.compute_canonical_sha256().unwrap();
 

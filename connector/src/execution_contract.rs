@@ -224,7 +224,7 @@ pub fn build_execution_prompt(
     // Optional Managed Result Contract (DELIVERY)
     if let Some(mc) = managed_contract {
         let contract = format!(
-            "托管结果契约\n\nCEO JOB\nJob ID: {job_id}\nAttempt ID: {attempt_id}\nResource ID: {resource_id}\n\n完成屏障（Completion Barrier）：\n此结果文件是本任务的完成屏障。一旦此路径出现合法文件，Connector 会立即判定任务完成并关闭终端。\n因此：\n1. 必须在所有业务操作完整完成后，再最终写入此文件。这必须是任务执行的最后一个操作。\n2. 写入此文件后，不要再进行任何后续业务操作。\n3. 推荐模式：先写入临时文件（如 {path}.tmp），校验完整后原子重命名（rename）为目标路径。\n\n任务完成后，必须将单独的 JSON 结果文件写入此确切绝对路径：\n{path}\n\n该 JSON 必须符合以下结构（schema_version: 1）：\n{{\n  \"schema_version\": 1,\n  \"job_id\": \"{job_id}\",\n  \"attempt_id\": \"{attempt_id}\",\n  \"resource_id\": \"{resource_id}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"upsert_content\",\n      \"content\": \"<full extracted content as string>\"\n    }}\n  ]\n}}\n\noperations 数组中的操作必须严格符合上方“任务”与“验收标准”的要求。\n禁止的操作类型：attach_source_asset\n\n规则：\n1. 不要将此结果文件放入 git 仓库中。\n2. 仅写入有效的 UTF-8 编码 JSON。\n3. 不要生成空文件或不完整文件。\n4. 不要直接调用 CEO Server API。\n5. 不要直接修改 git 工作区中的 resources/**。\n6. job_id, attempt_id, resource_id 已由上方明确给出，不要猜测或伪造。",
+            "托管结果契约\n\nCEO JOB\nJob ID: {job_id}\nAttempt ID: {attempt_id}\nResource ID: {resource_id}\n\n完成屏障（Completion Barrier）：\n此结果文件是本任务的完成屏障。一旦此路径出现合法文件，Connector 会立即判定任务完成并关闭终端。\n因此：\n1. 必须在所有业务操作完整完成后，再最终写入此文件。这必须是任务执行的最后一个操作。\n2. 写入此文件后，不要再进行任何后续业务操作。\n3. 推荐模式：先写入临时文件（如 {path}.tmp），校验完整后原子重命名（rename）为目标路径。\n\n任务完成后，必须将单独的 JSON 结果文件写入此确切绝对路径：\n{path}\n\n该 JSON 必须符合以下结构（schema_version: 1）：\n{{\n  \"schema_version\": 1,\n  \"job_id\": \"{job_id}\",\n  \"attempt_id\": \"{attempt_id}\",\n  \"resource_id\": \"{resource_id}\",\n  \"summary\": \"<1-2 sentence description>\",\n  \"operations\": [\n    {{\n      \"op\": \"upsert_content\",\n      \"content\": \"<full extracted content as string>\"\n    }},\n    {{\n      \"op\": \"merge_source_metadata\",\n      \"title\": \"<non-empty source title>\",\n      \"author\": \"<non-empty source author>\",\n      \"published_at\": \"<non-empty source publish date>\",\n      \"language\": \"<non-empty ISO language code>\"\n    }}\n  ]\n}}\n\noperations 仅允许两种操作类型：\n1. \"upsert_content\"：必须包含字符串类型的 \"content\" 字段。\n2. \"merge_source_metadata\"：可选字段为 title、author、published_at、language，必须直接放在该 operation 对象的顶层，禁止嵌套在 \"metadata\" 等子对象中；只包含真实来源的值，缺失的字段直接省略整个键，禁止填空字符串或 null 占位；至少需要一个非空字段。\n禁止的操作类型：除上述两种以外的一切 op（包括 attach_source_asset、rename）。\n\noperations 数组中的操作必须严格符合上方“任务”与“验收标准”的要求。\n\n规则：\n1. 不要将此结果文件放入 git 仓库中。\n2. 仅写入有效的 UTF-8 编码 JSON。\n3. 不要生成空文件或不完整文件。\n4. 不要直接调用 CEO Server API。\n5. 不要直接修改 git 工作区中的 resources/**。\n6. job_id, attempt_id, resource_id 已由上方明确给出，不要猜测或伪造。",
             job_id = mc.job_id,
             attempt_id = mc.attempt_id,
             resource_id = mc.resource_id,
@@ -327,6 +327,8 @@ mod tests {
         assert!(prompt.contains("\"attempt_id\": \"att-123\""));
         // Correct op; no forbidden op
         assert!(prompt.contains("\"op\": \"upsert_content\""));
+        assert!(prompt.contains("\"op\": \"merge_source_metadata\""));
+        assert!(prompt.contains("禁止嵌套在 \"metadata\" 等子对象中"));
         assert!(!prompt.contains("replace_body"));
     }
 }

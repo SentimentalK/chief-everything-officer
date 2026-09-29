@@ -63,12 +63,19 @@ fn test_contract_example_round_trips_through_validator() {
         )
         .expect("Contract envelope generated from prompt MUST pass validate_correlation");
 
-    // 7. Verify the operation is upsert_content
-    assert_eq!(envelope.operations.len(), 1);
+    // 7. Verify the example now documents both permitted ops and both pass validation
+    assert_eq!(envelope.operations.len(), 2);
     assert_eq!(
         envelope.operations[0].get("op").and_then(|v| v.as_str()),
         Some("upsert_content")
     );
+    assert_eq!(
+        envelope.operations[1].get("op").and_then(|v| v.as_str()),
+        Some("merge_source_metadata")
+    );
+    // merge_source_metadata example must use flat top-level fields, not a nested object
+    assert!(envelope.operations[1].get("metadata").is_none());
+    assert!(envelope.operations[1].get("title").is_some());
 }
 
 #[test]

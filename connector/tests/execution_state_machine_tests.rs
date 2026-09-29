@@ -445,7 +445,7 @@ async fn test_resource_result_target_executes_and_collects_managed_result() {
                 "summary": "Updated resource content",
                 "operations": [
                     {
-                        "op": "replace_body",
+                        "op": "upsert_content",
                         "content": "new body"
                     }
                 ]
