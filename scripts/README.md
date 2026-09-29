@@ -24,7 +24,7 @@ python3 scripts/manage_user.py inspect usr_3716f414-f645-4d59-bbd7-73f003a1556f
 
 #### 3. Reset a User (Clean Test Account)
 Atomically and cleanly purges all data for a user across:
-- `identity.sqlite`: `workspace_bootstraps`, `github_repository_bindings`, `onboarding_flows`, `api_keys`, `workspace_memberships`, `workspaces`, `github_installation_users`, `external_identities`, `users`, orphan `github_installations`.
+- `identity.sqlite`: `workspace_bootstraps`, `github_repository_bindings`, `onboarding_flows`, `workspace_memberships`, `workspaces`, `github_installation_users`, `external_identities`, `users`, orphan `github_installations`.
 - `oauth.sqlite`: all tokens, codes, and authorization requests.
 - `ceo-trace.sqlite`: traces for that workspace.
 - `/data/workspaces/<workspace_id>`: checked out repository files on disk.

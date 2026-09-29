@@ -28,7 +28,7 @@ async function setupTestEnv() {
   cleanupDirs.push(dir);
 
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
   const identStore = IdentityStore.open(identDbPath);
   cleanupIdentStores.push(identStore);
 

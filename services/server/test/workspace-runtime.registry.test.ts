@@ -55,7 +55,7 @@ describe("WorkspaceRuntimeRegistry", () => {
     cleanupDirs.push(tempDir);
     dbPath = path.join(tempDir, "identity.sqlite");
 
-    seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@github.com:test-owner/test-repo.git", branch: "main" }, "test-key");
+    seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@github.com:test-owner/test-repo.git", branch: "main" });
 
     store = IdentityStore.open(dbPath);
     cleanupStores.push(store);

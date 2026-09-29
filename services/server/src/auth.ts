@@ -1,9 +1,5 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
-import type { IdentityService, AuthIdentity } from "./identity/service.js";
-import {
-  WorkspaceAccessDeniedError,
-  WorkspaceSelectionRequiredError,
-} from "./identity/service.js";
+import type { AuthIdentity } from "./identity/service.js";
 import { IdentityDbUnavailable } from "./identity/store.js";
 
 declare global {
@@ -15,78 +11,18 @@ declare global {
 }
 
 /**
- * Single unified bearer credential entry point. Every protected route (/mcp,
- * /api/audit/traces bearer, /api/identity) resolves identity here.
+ * MCP resource-server authentication middleware. `/mcp` is OAuth 2.1 only:
+ * a Bearer access token must validate against OAuthService with scope `mcp`
+ * and matching canonical resource `${publicOrigin}/mcp`. Legacy DB-backed
+ * API keys are no longer accepted and are rejected as invalid tokens.
  *
  * Status contract:
- *   - missing / wrong / revoked key, or disabled user  -> 401
- *   - authenticated but lacks workspace access or requires selection -> 403
- *   - identity database unavailable on a live request  -> 503
- *
- * Identity is never taken from the body, query, or X-User-ID.
- */
-export function createIdentityAuthMiddleware(identityService: IdentityService): RequestHandler {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    let identity: AuthIdentity;
-    try {
-      const token = readBearer(req);
-      if (token === null) {
-        rejectMissingBearer(res);
-        return;
-      }
-      const credential = identityService.authenticateApiKey(token);
-      if (credential === null) {
-        res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
-        return;
-      }
-      try {
-        identity = identityService.resolveRequestIdentity(credential);
-      } catch (error) {
-        if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
-          process.stderr.write(`auth: rejected workspace binding: ${error.message}\n`);
-          res.status(403).json({
-            jsonrpc: "2.0",
-            error: {
-              code: -32003,
-              message: error instanceof WorkspaceSelectionRequiredError
-                ? "Forbidden: workspace selection required"
-                : "Forbidden: workspace access denied",
-            },
-            id: null,
-          });
-          return;
-        }
-        throw error;
-      }
-    } catch (error) {
-      if (error instanceof IdentityDbUnavailable) {
-        process.stderr.write(`auth: identity database unavailable: ${error.message}\n`);
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: { code: -32050, message: "Identity service unavailable" },
-          id: null,
-        });
-        return;
-      }
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal error" },
-        id: null,
-      });
-      return;
-    }
-
-    res.locals.identity = identity;
-    next();
-  };
-}
-
-/**
- * Dual-bearer authentication middleware for the /mcp endpoint:
- * Accepts either:
- * 1. DB-backed API key verified against IdentityService.
- * 2. OAuth 2.1 Bearer access token verified against OAuthService (with scope 'mcp'
- *    and matching canonical resource `${publicOrigin}/mcp`).
+ *   - missing / invalid / expired / revoked / wrong-resource token -> 401
+ *     (with RFC 9728 WWW-Authenticate resource_metadata and scope where available)
+ *   - valid token without `mcp` scope                            -> 403
+ *   - OAuth/identity backing-store failure on a live request     -> 503
+ *   - OAuth disabled (CEO_OAUTH_ENABLED=false)                    -> 503 for every
+ *     request; /mcp fails closed and never accepts an opaque bearer token.
  *
  * Includes RFC 9728 resource_metadata in WWW-Authenticate 401/403 challenge headers.
  */
@@ -94,20 +30,26 @@ import type { OAuthService } from "./oauth/service.js";
 import { OAuthStoreUnavailable } from "./oauth/store.js";
 import { writeOAuthFlowLog } from "./oauth/observability.js";
 
-export function createMcpAuthMiddleware(
-  identityService: IdentityService,
-  oauthService: OAuthService | null,
-): RequestHandler {
+export function createMcpAuthMiddleware(oauthService: OAuthService | null): RequestHandler {
   const resourceMetadataUrl = oauthService
     ? `${oauthService.publicOrigin}/.well-known/oauth-protected-resource/mcp`
     : undefined;
 
   return (req: Request, res: Response, next: NextFunction): void => {
+    // Fail closed when OAuth is unavailable: /mcp is explicitly unavailable
+    // and no bearer token of any kind is interpreted through the identity store.
+    if (oauthService === null) {
+      res.status(503).json({
+        jsonrpc: "2.0",
+        error: { code: -32050, message: "MCP authentication unavailable: OAuth is not enabled" },
+        id: null,
+      });
+      return;
+    }
+
     const token = readBearer(req);
     if (token === null) {
-      if (resourceMetadataUrl) {
-        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="mcp"`);
-      }
+      res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="mcp"`);
       res.status(401).json({
         jsonrpc: "2.0",
         error: { code: -32001, message: "Unauthorized: Bearer token required" },
@@ -116,128 +58,76 @@ export function createMcpAuthMiddleware(
       return;
     }
 
-    // 1. Try DB-backed API key
     try {
-      const apiKeyResult = identityService.authenticateApiKey(token);
-      if (apiKeyResult !== null) {
-        try {
-          const authIdentity = identityService.resolveRequestIdentity(apiKeyResult);
-          res.locals.identity = authIdentity;
-          next();
-          return;
-        } catch (error) {
-          if (error instanceof WorkspaceAccessDeniedError || error instanceof WorkspaceSelectionRequiredError) {
-            res.status(403).json({
-              jsonrpc: "2.0",
-              error: {
-                code: -32003,
-                message: error instanceof WorkspaceSelectionRequiredError
-                  ? "Forbidden: workspace selection required"
-                  : "Forbidden: workspace access denied",
-              },
-              id: null,
-            });
-            return;
-          }
-          throw error;
-        }
-      }
-    } catch (error) {
-      if (error instanceof IdentityDbUnavailable) {
-        process.stderr.write(`auth: identity database unavailable: ${error.message}\n`);
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: { code: -32050, message: "Identity service unavailable" },
-          id: null,
+      const oauthResult = oauthService.validateAccessToken(token);
+      if (oauthResult.valid) {
+        writeOAuthFlowLog("mcp-auth:", {
+          outcome: "success",
+          credential: "oauth",
+          user: oauthResult.user_id,
+          workspace: oauthResult.workspace_id,
         });
+        res.locals.identity = {
+          user_id: oauthResult.user_id,
+          workspace_id: oauthResult.workspace_id,
+        };
+        next();
         return;
       }
-      throw error;
-    }
 
-    // 2. If OAuth is enabled, try OAuth access token
-    if (oauthService !== null) {
-      try {
-        const oauthResult = oauthService.validateAccessToken(token);
-        if (oauthResult.valid) {
-          writeOAuthFlowLog("mcp-auth:", {
-            outcome: "success",
-            credential: "oauth",
-            user: oauthResult.user_id,
-            workspace: oauthResult.workspace_id,
-          });
-          res.locals.identity = {
-            user_id: oauthResult.user_id,
-            workspace_id: oauthResult.workspace_id,
-            api_key_id: "oauth",
-          };
-          next();
-          return;
-        }
-
-        if (oauthResult.error === "insufficient_scope") {
-          writeOAuthFlowLog("mcp-auth:", {
-            outcome: "rejected",
-            credential: "oauth",
-            reason: "insufficient_scope",
-            status: 403,
-          });
-          res.setHeader(
-            "WWW-Authenticate",
-            `Bearer error="insufficient_scope", scope="mcp", resource_metadata="${resourceMetadataUrl}"`,
-          );
-          res.status(403).json({
-            jsonrpc: "2.0",
-            error: { code: -32003, message: `Forbidden: ${oauthResult.description}` },
-            id: null,
-          });
-          return;
-        }
-
-        // Token invalid, expired, revoked, or wrong target resource
+      if (oauthResult.error === "insufficient_scope") {
         writeOAuthFlowLog("mcp-auth:", {
           outcome: "rejected",
           credential: "oauth",
-          reason: oauthResult.error,
-          status: 401,
+          reason: "insufficient_scope",
+          status: 403,
         });
         res.setHeader(
           "WWW-Authenticate",
-          `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}", scope="mcp"`,
+          `Bearer error="insufficient_scope", scope="mcp", resource_metadata="${resourceMetadataUrl}"`,
         );
-        res.status(401).json({
+        res.status(403).json({
           jsonrpc: "2.0",
-          error: { code: -32001, message: `Unauthorized: ${oauthResult.description}` },
-          id: null,
-        });
-        return;
-      } catch (error) {
-        if (error instanceof OAuthStoreUnavailable || error instanceof IdentityDbUnavailable) {
-          res.status(503).json({
-            jsonrpc: "2.0",
-            error: { code: -32050, message: "Authentication store unavailable" },
-            id: null,
-          });
-          return;
-        }
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: { code: -32050, message: "Authentication service error" },
+          error: { code: -32003, message: `Forbidden: ${oauthResult.description}` },
           id: null,
         });
         return;
       }
-    }
 
-    // Neither legacy key nor OAuth
-    if (resourceMetadataUrl) {
-      res.setHeader("WWW-Authenticate", `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}", scope="mcp"`);
+      // Token invalid, expired, revoked, wrong target resource, or a legacy
+      // raw API key (which is no longer an MCP credential at all).
+      writeOAuthFlowLog("mcp-auth:", {
+        outcome: "rejected",
+        credential: "oauth",
+        reason: oauthResult.error,
+        status: 401,
+      });
+      res.setHeader(
+        "WWW-Authenticate",
+        `Bearer error="invalid_token", error_description="${oauthResult.description}", resource_metadata="${resourceMetadataUrl}", scope="mcp"`,
+      );
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: `Unauthorized: ${oauthResult.description}` },
+        id: null,
+      });
+      return;
+    } catch (error) {
+      if (error instanceof OAuthStoreUnavailable || error instanceof IdentityDbUnavailable) {
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: { code: -32050, message: "Authentication store unavailable" },
+          id: null,
+        });
+        return;
+      }
+      res.status(503).json({
+        jsonrpc: "2.0",
+        error: { code: -32050, message: "Authentication service error" },
+        id: null,
+      });
+      return;
     }
-    res.status(401).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "Unauthorized" },
-      id: null,
-    });
   };
 }
 
@@ -248,12 +138,6 @@ function readBearer(req: Request): string | null {
   const token = authHeader.substring(7);
   if (!token) return null;
   return token;
-}
-
-function rejectMissingBearer(res: Response): void {
-  process.stderr.write("auth: rejected reason=missing_or_invalid_scheme\n");
-  res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
-  return;
 }
 
 export function createHostGuard(allowedHosts: string[]): RequestHandler {

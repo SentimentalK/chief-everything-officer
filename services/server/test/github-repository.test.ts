@@ -65,7 +65,7 @@ async function createTestContext(options?: { withoutInitialWorkspace?: boolean }
   cleanupDirs.push(dir);
   const dbPath = path.join(dir, "identity.sqlite");
 
-  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
   const store = IdentityStore.open(dbPath);
   cleanupStores.push(store);

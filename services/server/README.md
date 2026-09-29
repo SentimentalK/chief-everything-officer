@@ -1,6 +1,6 @@
 # CEO Server (@sentimentalk/ceo-server)
 
-A Git-backed MCP and state server for durable personal workspaces. It exposes MCP tools for safe state interaction, runtime policy queries, and audit trace persistence. Each authenticated request resolves a workspace from DB-backed credentials; the process no longer clones or serves a single deployment repository at startup. The audit web console is maintained separately in `web/`.
+A Git-backed MCP and state server for durable personal workspaces. It exposes MCP tools for safe state interaction, runtime policy queries, and audit trace persistence. Each authenticated request resolves a workspace from its authenticated identity; the process no longer clones or serves a single deployment repository at startup. The audit web console is maintained separately in `web/`.
 
 ## Tools
 
@@ -25,7 +25,7 @@ Requires Node.js 22+ and Git.
 
 ```
 CEO_DATA_ROOT
-├── identity/          # control-plane SQLite (users, workspaces, keys)
+├── identity/          # control-plane SQLite (users, workspaces, memberships)
 ├── audit/             # workspace-scoped trace database
 └── workspaces/
     └── <workspace_id>/
@@ -59,33 +59,30 @@ Git repositories are created per workspace under `workspaces/<workspace_id>/` wh
 | `CEO_REDIS_URL` | unset | Redis URL for Connector job coordination. Redis is not a `/readyz` blocker |
 | `CEO_OAUTH_ENABLED` | `false` | Enable OAuth 2.1; requires `CEO_PUBLIC_ORIGIN` (https origin) |
 
-`CEO_REMOTE`, `CEO_BRANCH`, `CEO_SSH_KEY_PATH`, and `MCP_API_KEY` are not server configuration. Authentication is DB-backed; workspace git uses GitHub App installation credentials.
+`CEO_REMOTE`, `CEO_BRANCH`, `CEO_SSH_KEY_PATH`, and `MCP_API_KEY` are not server configuration. Authentication is OAuth / session / device-credential based; workspace git uses GitHub App installation credentials.
 
 ## Authentication
 
-Requests authenticate against the stored identity, not against a process env token.
+There is no DB-backed API-key credential anymore (identity schema v13 retired `api_keys`; a v12 database is migrated on startup). Two current authorities exist:
 
-1. Bearer token → credential (`api_key_id`, `user_id`) via digest lookup. Unknown, revoked, or disabled-user keys return `401`.
-2. Credential → membership. Exactly one accessible workspace is selected as the request workspace. Zero memberships or more than one membership return `403`.
-3. Success stores `AuthIdentity` (`user_id`, `workspace_id`, `api_key_id`) in `res.locals.identity`. Identity is never taken from request bodies, query strings, `X-User-ID`, or a global current user.
+- **Host / MCP** (`/mcp`): OAuth 2.1 Bearer access token only, validated against the built-in authorization server with scope `mcp` and resource `${CEO_PUBLIC_ORIGIN}/mcp`. Historical raw API keys are rejected with `401`. With `CEO_OAUTH_ENABLED=false` the `/mcp` endpoint fails closed (`503`, explicitly unavailable) and never accepts an opaque bearer token.
+- **CEO Connector** (`/api/connector/*`): revocable `DeviceCredential` via the device-auth routes, unchanged. Product users sign in through GitHub (session cookie) flows.
 
-Identity database unavailable on a live request → `503`. `/healthz` and `/readyz` are unauthenticated.
+After authentication, the request workspace is resolved from membership: exactly one accessible workspace is selected. Zero memberships or more than one membership return `403`. Success stores `AuthIdentity` (`user_id`, `workspace_id`) in `res.locals.identity`. Identity is never taken from request bodies, query strings, `X-User-ID`, or a global current user.
 
-`GET /api/identity` (Bearer-authenticated) returns who this key connects to:
+Identity/OAuth database unavailable on a live request → `503`. `/healthz` and `/readyz` are unauthenticated.
 
-`{ user_id, workspace_id, deployment_mode: "request_scoped_workspace" }`.
-
-The audit console uses the product GitHub cookie (`ceo_user_session`) plus `users.is_admin`. Authentication (who you are) is the CEO user session; authorization (whether you can open Audit) is the admin bit. V1 only lists traces for the admin user's own single workspace — it is not a global admin console. `grant-admin` / `revoke-admin` on `node dist/identity/cli.js` set the bit; migration defaults everyone to `0`. MCP Bearer API keys are unchanged.
+The audit console uses the product GitHub cookie (`ceo_user_session`) plus `users.is_admin`. Authentication (who you are) is the CEO user session; authorization (whether you can open Audit) is the admin bit. V1 only lists traces for the admin user's own single workspace — it is not a global admin console. `grant-admin` / `revoke-admin` on `node dist/identity/cli.js` set the bit; migration defaults everyone to `0`. Host MCP authentication is OAuth-only.
 
 Audit traces are stored with `workspace_id NOT NULL` and queried only for the authenticated request workspace. An old Audit SQLite that lacks `workspace_id` is **fail-incompatible, not migrated**. The audit database is disposable: delete the local file and allow a fresh workspace-scoped schema.
 
 ### Persistent identity database
 
-CEO keeps a durable control-plane identity in `<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`). The schema supports multiple users, workspaces, memberships, and API keys.
+CEO keeps a durable control-plane identity in `<CEO_DATA_ROOT>/identity/identity.sqlite` (directory `0700`, file `0600`). The schema supports multiple users, workspaces, and memberships.
 
 This database is **created only by** `node dist/identity/cli.js init`; the service never creates one silently. On missing/corrupt/structurally-mismatched identity the server fails to start and instructs to initialize.
 
-`init` provisions an empty control-plane database: **0 users, 0 workspaces, 0 API keys**. It does not seed a deployment key or a repository binding. Re-running `init` is idempotent and will not overwrite an existing valid database.
+`init` provisions an empty control-plane database: **0 users, 0 workspaces**. It does not seed a deployment repository binding. Re-running `init` is idempotent and will not overwrite an existing valid database.
 
 The server boots with that empty (or later populated) database and a constructable GitHub App client. It does not clone git at startup. Workspaces appear after product onboarding (GitHub App install → workspace provisioning).
 
@@ -108,7 +105,7 @@ It does not run git commands, does not call GitHub, and does not require Redis.
    ```
    Output reports `deployment_mode: multi_workspace_runtime` and the database path. It does not print `user_id`/`workspace_id`.
 4. Start the server. `/readyz` should be `READY` with zero users.
-5. Complete GitHub App install and workspace provisioning so a user, membership, and API key exist. Then verify MCP, Audit, and `GET /api/identity`.
+5. Complete GitHub App install and workspace provisioning so a user and membership exist. Enable OAuth (`CEO_OAUTH_ENABLED=true`, `CEO_PUBLIC_ORIGIN`) and verify MCP via an OAuth access token and Audit via its session.
 
 If an existing dogfood volume still has a pre-workspace-scoped Audit SQLite, delete `audit/` and let the server create a fresh file. Do not treat that fail-fast as a server regression.
 

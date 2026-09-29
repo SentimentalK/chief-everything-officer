@@ -3,32 +3,23 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import os from "node:os";
 import { rm, mkdtemp } from "node:fs/promises";
-import express from "express";
-import type { Server as HttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import {
   IdentityService,
   WorkspaceAccessDeniedError,
   WorkspaceSelectionRequiredError,
-  IdentityDbUnavailable,
 } from "../src/identity/service.js";
-import { IDENTITY_DDL, IDENTITY_DB_USER_VERSION, sha256Hex } from "../src/identity/store.js";
-import { createIdentityAuthMiddleware } from "../src/auth.js";
+import { IDENTITY_DDL, IDENTITY_DB_USER_VERSION } from "../src/identity/store.js";
 
 import { OAuthService } from "../src/oauth/service.js";
 import { OAuthStore } from "../src/oauth/store.js";
 import { OAUTH_DDL, OAUTH_DB_USER_VERSION } from "../src/oauth/store.js";
 
-describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
+describe("Step 4B.1: Request-scoped user to workspace resolution", () => {
   const cleanupDirs: string[] = [];
   const cleanupServices: IdentityService[] = [];
-  const cleanupServers: HttpServer[] = [];
   const cleanupOAuthStores: OAuthStore[] = [];
 
   afterEach(async () => {
-    for (const s of cleanupServers.splice(0)) {
-      await new Promise<void>((resolve) => s.close(() => resolve()));
-    }
     for (const svc of cleanupServices.splice(0)) svc.close();
     for (const store of cleanupOAuthStores.splice(0)) store.close();
     await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -63,12 +54,6 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
       "owner",
       now,
     );
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_deploy",
-      "usr_deploy",
-      sha256Hex("key_deploy"),
-      now,
-    );
 
     // User Single: has exactly 1 workspace membership
     db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_single", now);
@@ -86,21 +71,9 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
       "owner",
       now,
     );
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_single",
-      "usr_single",
-      sha256Hex("key_single"),
-      now,
-    );
 
     // User Zero: has 0 workspace memberships
     db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_zero", now);
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_zero",
-      "usr_zero",
-      sha256Hex("key_zero"),
-      now,
-    );
 
     // User Multi: has 2 workspace memberships
     db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_multi", now);
@@ -119,23 +92,17 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
       now,
     );
     db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
-      "wsm_multi_1",
-      "ws_multi_1",
-      "usr_multi",
-      "owner",
-      now,
-    );
-    db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
       "wsm_multi_2",
       "ws_multi_2",
       "usr_multi",
       "owner",
       now + 100,
     );
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_multi",
+    db.prepare("INSERT INTO workspace_memberships VALUES (?, ?, ?, ?, ?);").run(
+      "wsm_multi_1",
+      "ws_multi_1",
       "usr_multi",
-      sha256Hex("key_multi"),
+      "owner",
       now,
     );
 
@@ -174,35 +141,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     };
   }
 
-  it("resolveRequestIdentity: 1 membership selects workspace; 0 memberships rejects 403; >1 rejects 403", async () => {
-    const { identityService } = await createTestEnv();
-
-    // 1. Single workspace membership resolves cleanly
-    const credSingle = identityService.authenticateApiKey("key_single");
-    expect(credSingle).not.toBeNull();
-    const authSingle = identityService.resolveRequestIdentity(credSingle!);
-    expect(authSingle).toEqual({
-      user_id: "usr_single",
-      api_key_id: "ak_single",
-      workspace_id: "ws_single",
-    });
-
-    // 2. Zero workspace memberships throws WorkspaceAccessDeniedError
-    const credZero = identityService.authenticateApiKey("key_zero");
-    expect(credZero).not.toBeNull();
-    expect(() => identityService.resolveRequestIdentity(credZero!)).toThrow(
-      WorkspaceAccessDeniedError,
-    );
-
-    // 3. Multiple workspace memberships throws WorkspaceSelectionRequiredError
-    const credMulti = identityService.authenticateApiKey("key_multi");
-    expect(credMulti).not.toBeNull();
-    expect(() => identityService.resolveRequestIdentity(credMulti!)).toThrow(
-      WorkspaceSelectionRequiredError,
-    );
-  });
-
-  it("resolveUserWorkspace: 1 membership selects; 0 and >1 fail closed without guessing", async () => {
+  it("resolveUserWorkspace: 1 membership selects workspace; 0 memberships rejects; >1 rejects", async () => {
     const { identityService } = await createTestEnv();
 
     expect(identityService.resolveUserWorkspace("usr_single")).toEqual({
@@ -213,61 +152,7 @@ describe("Step 4B.1: Request-scoped credential to workspace resolution", () => {
     expect(() => identityService.resolveUserWorkspace("usr_multi")).toThrow(
       WorkspaceSelectionRequiredError,
     );
-  });
-
-  it("createIdentityAuthMiddleware: verifies 200 for single, 403 for 0 and >1, 503 on DB fault", async () => {
-    const { identityService } = await createTestEnv();
-
-    const app = express();
-    app.use(express.json());
-    app.get("/identity", createIdentityAuthMiddleware(identityService), (_req, res) => {
-      res.status(200).json(res.locals.identity);
-    });
-
-    const server = await new Promise<HttpServer>((resolve) => {
-      const s = app.listen(0, "127.0.0.1", () => resolve(s));
-    });
-    cleanupServers.push(server);
-    const port = (server.address() as AddressInfo).port;
-    const url = `http://127.0.0.1:${port}/identity`;
-
-    // 1. User with 1 workspace gets 200 with request-scoped workspace
-    const resSingle = await fetch(url, { headers: { Authorization: "Bearer key_single" } });
-    expect(resSingle.status).toBe(200);
-    const bodySingle = await resSingle.json();
-    expect(bodySingle).toEqual({
-      user_id: "usr_single",
-      api_key_id: "ak_single",
-      workspace_id: "ws_single",
-    });
-
-    // 2. User with 0 workspaces gets 403 Forbidden: workspace access denied
-    const resZero = await fetch(url, { headers: { Authorization: "Bearer key_zero" } });
-    expect(resZero.status).toBe(403);
-    const bodyZero = await resZero.json();
-    expect(bodyZero.error.message).toBe("Forbidden: workspace access denied");
-
-    // 3. User with >1 workspaces gets 403 Forbidden: workspace selection required
-    const resMulti = await fetch(url, { headers: { Authorization: "Bearer key_multi" } });
-    expect(resMulti.status).toBe(403);
-    const bodyMulti = await resMulti.json();
-    expect(bodyMulti.error.message).toBe("Forbidden: workspace selection required");
-
-    // 4. DB failure in listWorkspaceMembershipsForUser returns 503
-    const origList = identityService.storeInstance.listWorkspaceMembershipsForUser.bind(identityService.storeInstance);
-    identityService.storeInstance.listWorkspaceMembershipsForUser = () => {
-      throw new IdentityDbUnavailable("DB disconnected");
-    };
-
-    try {
-      const res503 = await fetch(url, { headers: { Authorization: "Bearer key_single" } });
-      expect(res503.status).toBe(503);
-      const body503 = await res503.json();
-      expect(body503.error.code).toBe(-32050);
-      expect(body503.error.message).toBe("Identity service unavailable");
-    } finally {
-      identityService.storeInstance.listWorkspaceMembershipsForUser = origList;
-    }
+    expect(() => identityService.resolveUserWorkspace("usr_unknown")).toThrow(WorkspaceAccessDeniedError);
   });
 
   it("OAuth approveConsent: binds to user's single workspace; rejects 0 and >1 memberships", async () => {

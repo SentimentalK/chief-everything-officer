@@ -53,7 +53,7 @@ async function setupTestApp(mockFetch?: typeof fetch, seedDogfoodBinding = false
   cleanupDirs.push(dir);
   const dbPath = path.join(dir, "identity.sqlite");
 
-  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
   if (seedDogfoodBinding) {
     seedExternalIdentity(dbPath, {
@@ -311,12 +311,12 @@ describe("GitHub OAuth PKCE Flow & User Session", () => {
       const wsCount = raw.prepare("SELECT COUNT(*) AS c FROM workspaces WHERE owner_user_id = ?;").get(bound!.user_id) as {
         c: number;
       };
-      const keyCount = raw.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?;").get(bound!.user_id) as {
-        c: number;
-      };
+      const membershipCount = raw.prepare(
+        "SELECT COUNT(*) AS c FROM workspace_memberships WHERE user_id = ?;",
+      ).get(bound!.user_id) as { c: number };
       raw.close();
       expect(Number(wsCount.c)).toBe(0);
-      expect(Number(keyCount.c)).toBe(0);
+      expect(Number(membershipCount.c)).toBe(0);
 
       const sessionToken = callbackRes.headers.get("set-cookie")!.match(/ceo_user_session=([^;]+)/)![1];
       const sessionRes = await fetch(`${env.baseUrl}/api/user/session`, {

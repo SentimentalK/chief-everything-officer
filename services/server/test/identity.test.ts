@@ -13,7 +13,7 @@ import {
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
 import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
-import { seedIdentity, requestIdentity } from "./helpers.js";
+import { seedIdentity } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
 const cleanupStores: IdentityStore[] = [];
@@ -43,8 +43,8 @@ async function tempCtx(): Promise<Ctx> {
   };
 }
 
-function provision(ctx: Ctx, apiKey = "key-1") {
-  return seedIdentity({ identityDbPath: ctx.dbPath, remoteUrl: ctx.remoteUrl, branch: ctx.branch }, apiKey);
+function provision(ctx: Ctx) {
+  return seedIdentity({ identityDbPath: ctx.dbPath, remoteUrl: ctx.remoteUrl, branch: ctx.branch });
 }
 
 function openRaw(ctx: Ctx): IdentityStore {
@@ -84,7 +84,7 @@ describe("Identity store: schema, invariants and permissions", () => {
 
   it("rejects a structurally invalid database (wrong user_version)", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const raw = new DatabaseSync(ctx.dbPath);
     raw.exec("PRAGMA user_version = 99;");
     raw.close();
@@ -196,9 +196,9 @@ describe("structural contract rejects bad schemas", () => {
 });
 
 describe("current schema tables", () => {
-  it("provisions fresh database with current tables", async () => {
+  it("provisions fresh database with current tables and no legacy api_keys table", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const raw = new DatabaseSync(ctx.dbPath);
     const versionRow = raw.prepare("PRAGMA user_version;").get() as { user_version: number };
     expect(Number(versionRow.user_version)).toBe(IDENTITY_DB_USER_VERSION);
@@ -209,6 +209,10 @@ describe("current schema tables", () => {
     expect(names).toContain("github_installations");
     expect(names).toContain("github_installation_users");
     expect(names).toContain("github_repository_bindings");
+    // Legacy API-key credential surface is fully retired from the current schema.
+    expect(names).not.toContain("api_keys");
+    const indexes = raw.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_api_keys_user';").all();
+    expect(indexes.length).toBe(0);
     raw.close();
   });
 });
@@ -218,7 +222,6 @@ function countRows(
   table:
     | "users"
     | "workspaces"
-    | "api_keys"
     | "external_identities"
     | "workspace_memberships"
     | "github_installations"
@@ -235,11 +238,10 @@ function countRows(
 describe("workspace_memberships invariants", () => {
   it("fresh provision creates owner membership that matches workspace.owner_user_id", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     expect(countRows(ctx.dbPath, "users")).toBe(1);
     expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
     expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -258,7 +260,7 @@ describe("workspace_memberships invariants", () => {
 
   it("F. duplicate (user, workspace) membership violates UNIQUE constraint", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const raw = new DatabaseSync(ctx.dbPath);
     expect(() =>
       raw.prepare(
@@ -270,7 +272,7 @@ describe("workspace_memberships invariants", () => {
 
   it("G. duplicate owner for same workspace violates partial unique index", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const raw = new DatabaseSync(ctx.dbPath);
     const ws = raw.prepare("SELECT id FROM workspaces LIMIT 1;").get() as { id: string };
     raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES ('usr_other', 2000, NULL);").run();
@@ -284,7 +286,7 @@ describe("workspace_memberships invariants", () => {
 
   it("H. shadow mismatch fails open()", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const raw = new DatabaseSync(ctx.dbPath);
     raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES ('usr_other', 2000, NULL);").run();
     raw.exec("UPDATE workspaces SET owner_user_id = 'usr_other' WHERE 1=1;");
@@ -326,7 +328,7 @@ function seedExternalIdentity(
 describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
   it("A. existing dogfood binding resolves same user without side effects", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
     seedExternalIdentity(ctx.dbPath, {
       id: "ext_a",
@@ -338,7 +340,6 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
     const usersBefore = countRows(ctx.dbPath, "users");
     const wsBefore = countRows(ctx.dbPath, "workspaces");
-    const keysBefore = countRows(ctx.dbPath, "api_keys");
 
     const provisioner = new IdentityAccountProvisioner(store);
     const res = provisioner.resolveOrCreate("github", "123", "dogfood");
@@ -347,12 +348,11 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
     expect(res.userId).toBe(ident.user_id);
     expect(countRows(ctx.dbPath, "users")).toBe(usersBefore);
     expect(countRows(ctx.dbPath, "workspaces")).toBe(wsBefore);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(keysBefore);
   });
 
-  it("B. new GitHub user creates user + identity with zero workspace and zero api keys", async () => {
+  it("B. new GitHub user creates user + external identity with zero workspaces", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
@@ -361,15 +361,13 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
     const raw = new DatabaseSync(ctx.dbPath);
     const ws = raw.prepare("SELECT COUNT(*) AS c FROM workspaces WHERE owner_user_id = ?;").get(res.userId) as { c: number };
-    const keys = raw.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?;").get(res.userId) as { c: number };
     raw.close();
     expect(Number(ws.c)).toBe(0);
-    expect(Number(keys.c)).toBe(0);
   });
 
   it("C. repeat login is idempotent", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
@@ -384,7 +382,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("D. two different GitHub subjects resolve to different users", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
@@ -395,7 +393,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("E. login rename refreshes provider_login metadata", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
@@ -412,7 +410,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("preserves provider_login when providerLogin is omitted on existing binding", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
     seedExternalIdentity(ctx.dbPath, {
       id: "ext_keep",
@@ -430,7 +428,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("F. same login with different GitHub IDs creates two users", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
@@ -441,7 +439,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("G. disabled bound user fails without creating replacement account", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -465,7 +463,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("M. external identity insert failure rolls back user creation", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -516,14 +514,13 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
     expect(() => IdentityStore.open(ctx.dbPath)).toThrow(IdentityStructureError);
   });
 
-  it("O. creating ten GitHub users does not create workspaces, api keys, or extra side effects", async () => {
+  it("O. creating ten GitHub users does not create workspaces or extra side effects", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
     const provisioner = new IdentityAccountProvisioner(store);
 
     const wsBefore = countRows(ctx.dbPath, "workspaces");
-    const keysBefore = countRows(ctx.dbPath, "api_keys");
 
     for (let i = 0; i < 10; i++) {
       provisioner.resolveOrCreate("github", String(10_000 + i), `user-${i}`);
@@ -532,7 +529,6 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
     expect(countRows(ctx.dbPath, "users")).toBe(1 + 10);
     expect(countRows(ctx.dbPath, "external_identities")).toBe(10);
     expect(countRows(ctx.dbPath, "workspaces")).toBe(wsBefore);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(keysBefore);
 
     const runtimeWs = new DatabaseSync(ctx.dbPath);
     const runtimeOwner = runtimeWs.prepare("SELECT owner_user_id FROM workspaces WHERE id = ?;").get(ident.workspace_id) as {
@@ -544,7 +540,7 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 
   it("P. store reopen resolves same user for existing subject", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
 
     const storeA = IdentityStore.open(ctx.dbPath);
     const provisionerA = new IdentityAccountProvisioner(storeA);
@@ -560,15 +556,15 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
     expect(resolved.userId).toBe(created.userId);
   });
 
-  it("J. IdentityService.open still authenticates the original key after unrelated user creation", async () => {
+  it("J. IdentityService.open still resolves the user workspace after unrelated user creation", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
-    const before = requestIdentity(openService(ctx), "key-1");
+    const ident = provision(ctx);
+    const before = openService(ctx).resolveUserWorkspace(ident.user_id);
 
     const store = openRaw(ctx);
     new IdentityAccountProvisioner(store).resolveOrCreate("github", "456", "other");
 
-    const after = requestIdentity(openService(ctx), "key-1");
+    const after = openService(ctx).resolveUserWorkspace(ident.user_id);
     expect(after).toEqual(before);
   });
 });
@@ -576,11 +572,10 @@ describe("IdentityAccountProvisioner / resolveOrCreateExternalUser", () => {
 describe("github_installations", () => {
   it("fresh provision has zero installation rows at current user_version", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     expect(countRows(ctx.dbPath, "users")).toBe(1);
     expect(countRows(ctx.dbPath, "workspaces")).toBe(1);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(1);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(1);
     expect(countRows(ctx.dbPath, "external_identities")).toBe(0);
     expect(countRows(ctx.dbPath, "github_installations")).toBe(0);
     expect(countRows(ctx.dbPath, "github_installation_users")).toBe(0);
@@ -594,7 +589,7 @@ describe("github_installations", () => {
 
   it("E. duplicate callbacks for same user and installation are idempotent via ON CONFLICT", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const first = store.upsertGitHubInstallationWithUser({
@@ -640,7 +635,7 @@ describe("github_installations", () => {
 
   it("F. shared installation across two CEO users links correctly (M:N)", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const userB = store.resolveOrCreateExternalUser({
@@ -685,7 +680,7 @@ describe("github_installations", () => {
 
   it("G. multiple installations for one CEO user links correctly (M:N)", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     store.upsertGitHubInstallationWithUser({
@@ -720,7 +715,7 @@ describe("github_installations", () => {
 
   it("H. validation rejects non-numeric IDs, invalid enums, negative suspended_at, and disabled users", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     // Non-numeric installation id
@@ -822,7 +817,7 @@ describe("github_installations", () => {
 
   it("I. positive decimal string and positive suspended_at_ms validation (write and open-time)", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     // Rejects zero, signs, leading zero, decimals, empty as IDs at write-time
@@ -911,7 +906,7 @@ describe("github_installations", () => {
 describe("github_repository_bindings", () => {
   it("fresh provision has github_repository_bindings and zero bindings", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(0);
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -927,7 +922,7 @@ describe("github_repository_bindings", () => {
 
   it("5. duplicate workspace binding rejected by DB constraint", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const instResult = store.upsertGitHubInstallationWithUser({
@@ -963,7 +958,7 @@ describe("github_repository_bindings", () => {
 
   it("6. duplicate GitHub repo binding rejected by DB constraint", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
 
     const testUser = store.resolveOrCreateExternalUser({
@@ -1024,9 +1019,9 @@ describe("github_repository_bindings", () => {
     raw.close();
   });
 
-  it("7. atomic new workspace operation creates exactly Workspace + owner WorkspaceMembership + binding and no API key; owner shadow/membership match; workspace remote has no token", async () => {
+  it("7. atomic new workspace operation creates exactly Workspace + owner WorkspaceMembership + binding; owner shadow/membership match; workspace remote has no token", async () => {
     const ctx = await tempCtx();
-    provision(ctx, "key-1");
+    provision(ctx);
     const store = openRaw(ctx);
 
     const testUser = store.resolveOrCreateExternalUser({
@@ -1048,7 +1043,6 @@ describe("github_repository_bindings", () => {
     const beforeWs = countRows(ctx.dbPath, "workspaces");
     const beforeMemb = countRows(ctx.dbPath, "workspace_memberships");
     const beforeBindings = countRows(ctx.dbPath, "github_repository_bindings");
-    const beforeKeys = countRows(ctx.dbPath, "api_keys");
 
     const created = store.createWorkspaceWithRepositoryBinding({
       userId: testUser.user_id,
@@ -1064,7 +1058,6 @@ describe("github_repository_bindings", () => {
     expect(countRows(ctx.dbPath, "workspaces")).toBe(beforeWs + 1);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(beforeMemb + 1);
     expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(beforeBindings + 1);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(beforeKeys); // NO API key created!
 
     expect(created.workspace.id).toMatch(/^ws_/);
     expect(created.workspace.owner_user_id).toBe(testUser.user_id);
@@ -1101,7 +1094,7 @@ describe("github_repository_bindings", () => {
 
   it("8. store transaction failure leaves no partial workspace/membership/binding", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const beforeWs = countRows(ctx.dbPath, "workspaces");
@@ -1164,7 +1157,7 @@ describe("github_repository_bindings", () => {
 
   it("9. validation of IDs, strings, branch with NUL character, and open-time integrity", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const inst = store.upsertGitHubInstallationWithUser({
@@ -1254,7 +1247,7 @@ describe("github_repository_bindings", () => {
 describe("workspace_bootstraps lifecycle", () => {
   it("fresh provision has workspace_bootstraps table and zero rows", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(0);
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -1271,9 +1264,9 @@ describe("workspace_bootstraps lifecycle", () => {
     expect(store.findWorkspaceBootstrapByWorkspaceId(ident.workspace_id)).toBeNull();
   });
 
-  it("E. new createWorkspaceWithRepositoryBinding atomically creates exactly Workspace + owner membership + binding + PENDING bootstrap, no API key", async () => {
+  it("E. new createWorkspaceWithRepositoryBinding atomically creates exactly Workspace + owner membership + binding + PENDING bootstrap", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const inst = store.upsertGitHubInstallationWithUser({
@@ -1332,19 +1325,18 @@ describe("workspace_bootstraps lifecycle", () => {
       ready_at_ms: null,
     });
 
-    // Verify DB counts: no API key created
+    // Verify DB counts
     expect(countRows(ctx.dbPath, "workspaces")).toBe(2);
     expect(countRows(ctx.dbPath, "workspace_memberships")).toBe(2);
     expect(countRows(ctx.dbPath, "github_repository_bindings")).toBe(1);
     expect(countRows(ctx.dbPath, "workspace_bootstraps")).toBe(1);
-    expect(countRows(ctx.dbPath, "api_keys")).toBe(1); // Only the initial key for user 1
 
     expect(store.findWorkspaceBootstrapByWorkspaceId(result.workspace.id)).toEqual(result.bootstrap);
   });
 
   it("F. forced transaction failure leaves none of those partial rows", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const inst = store.upsertGitHubInstallationWithUser({
@@ -1411,7 +1403,7 @@ describe("workspace_bootstraps lifecycle", () => {
 
   it("G. begin attempt increments count and records opaque attempt id; stale attempt cannot mark READY/failure after a newer attempt begins", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const inst = store.upsertGitHubInstallationWithUser({
@@ -1507,7 +1499,7 @@ describe("workspace_bootstraps lifecycle", () => {
 
   it("H. READY/failure state semantic validation rejects impossible combinations", async () => {
     const ctx = await tempCtx();
-    const ident = provision(ctx, "key-1");
+    const ident = provision(ctx);
     const store = openRaw(ctx);
 
     const inst = store.upsertGitHubInstallationWithUser({

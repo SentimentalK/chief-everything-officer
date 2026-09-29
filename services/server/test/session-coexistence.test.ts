@@ -32,9 +32,11 @@ async function setupApp() {
 
   const dbPath = path.join(dir, "identity.sqlite");
   const auditDbPath = path.join(dir, "audit.sqlite");
-  const apiKey = "mcp-secret-key-123";
+  // Arbitrary opaque bearer string; the legacy API-key surface is retired, so this
+  // is never interpreted through the identity store and must always be rejected.
+  const apiKey = "opaque-legacy-mcp-bearer-string";
 
-  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, apiKey);
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
   const identityService = IdentityService.open(dbPath);
   cleanupServices.push(identityService);

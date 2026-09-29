@@ -7,12 +7,12 @@ import { rm } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { createIdentityAuthMiddleware, createHostGuard, createOriginGuard } from "../src/auth.js";
+import { createHostGuard, createOriginGuard } from "../src/auth.js";
 import { createMcpServer } from "../src/mcp.js";
 import { loadProductPolicy } from "../src/product-policy.js";
 import { CeoWorkspace } from "../src/workspace.js";
 import { BUILD_INFO } from "../src/build-info.js";
-import { fixture, createIdentityService, requestIdentity } from "./helpers.js";
+import { fixture, createIdentityService } from "./helpers.js";
 import type { IdentityService } from "../src/identity/service.js";
 
 const cleanupDirs: string[] = [];
@@ -121,16 +121,21 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
 
     const config = {
       ...item.config,
-      mcpApiKey: "secret-test-token-123",
       allowedHosts: ["localhost", "127.0.0.1"],
       allowedOrigins: ["http://localhost"],
     };
 
-    // Seed the identity db + open the runtime identity service under the same
-    // remote/branch/key tuple that this real HTTP server will validate requests against.
-    const identityService = createIdentityService(config, "secret-test-token-123");
+    // Seed the identity db + resolve the request-scoped workspace identity this
+    // real HTTP server will authorize requests with (MCP auth authority in
+    // production is OAuth; auth middleware behavior is covered separately).
+    const identityService = createIdentityService(config);
     cleanupServices.push(identityService);
-    const workspaceIdentity = requestIdentity(identityService, "secret-test-token-123");
+    const workspaces = identityService.storeInstance.listAllWorkspaces();
+    expect(workspaces.length).toBe(1);
+    const workspaceIdentity = {
+      user_id: workspaces[0]!.owner_user_id,
+      workspace_id: workspaces[0]!.id,
+    };
 
     const app = createMcpExpressApp({ host: config.bindHost });
     const handler = createMcpHandler(() => createMcpServer(workspace, policy, { identity: workspaceIdentity }), { legacy: "reject" });
@@ -140,7 +145,6 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "/mcp",
       createHostGuard(config.allowedHosts),
       createOriginGuard(config.allowedOrigins),
-      createIdentityAuthMiddleware(identityService),
       (req, res) => {
         void nodeHandler(req, res, req.body);
       },
@@ -153,28 +157,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     const port = (httpServer.address() as AddressInfo).port;
     const url = `http://127.0.0.1:${port}/mcp`;
 
-    // 1. Missing Authorization header -> 401
-    const missingAuthRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        Host: "127.0.0.1",
-        "Content-Type": "application/json",
-      },
-    });
-    expect(missingAuthRes.status).toBe(401);
-
-    // 2. Invalid Bearer token -> 401
-    const badTokenRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        Host: "127.0.0.1",
-        Authorization: "Bearer wrong-token",
-        "Content-Type": "application/json",
-      },
-    });
-    expect(badTokenRes.status).toBe(401);
-
-    // 3. Wrong Host -> 421 Misdirected Request
+    // 1. Wrong Host -> 421 Misdirected Request
     const wrongHostStatus = await new Promise<number>((resolve, reject) => {
       const r = http.request(
         {
@@ -184,7 +167,6 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
           method: "POST",
           headers: {
             host: "evil.domain.com",
-            authorization: "Bearer secret-test-token-123",
             "content-type": "application/json",
           },
         },
@@ -195,25 +177,23 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
     });
     expect([403, 421]).toContain(wrongHostStatus);
 
-    // 4. Disallowed Origin -> 403 Forbidden
+    // 2. Disallowed Origin -> 403 Forbidden
     const badOriginRes = await fetch(url, {
       method: "POST",
       headers: {
         Host: "127.0.0.1",
         Origin: "https://evil.attacker.com",
-        Authorization: "Bearer secret-test-token-123",
         "Content-Type": "application/json",
       },
     });
     expect(badOriginRes.status).toBe(403);
 
-    // 5. Valid credentials -> official modern Client connects through real Express endpoint
+    // 3. Valid request -> official modern Client connects through real Express endpoint
     const transport = new StreamableHTTPClientTransport(new URL(url), {
       requestInit: {
         headers: {
           Host: "127.0.0.1",
           Origin: "http://localhost",
-          Authorization: "Bearer secret-test-token-123",
         },
       },
     });
@@ -240,7 +220,7 @@ describe("Protocol & Runtime Modernization (Stage 1)", () => {
       "resource_delete",
     ]);
 
-    // Real tool call through Express + auth endpoint succeeds
+    // Real tool call through the real Express endpoint succeeds
     const statusCall = await client.callTool({ name: "workspace_status" });
     expect(statusCall.isError).toBeFalsy();
     expect(statusCall.structuredContent).toMatchObject({

@@ -11,7 +11,6 @@ import { attachMcpProtocolLog } from "./http/mcp-observability.js";
 import {
   createHostGuard,
   createOriginGuard,
-  createIdentityAuthMiddleware,
   createMcpAuthMiddleware,
 } from "./auth.js";
 import { IdentityService } from "./identity/service.js";
@@ -177,22 +176,6 @@ app.get("/readyz", (_req, res) => {
     build: BUILD_INFO.build,
   });
 });
-
-// Read-only identity endpoint: which user/workspace this key connects to.
-app.get(
-  "/api/identity",
-  createHostGuard(config.allowedHosts),
-  createOriginGuard(config.allowedOrigins),
-  createIdentityAuthMiddleware(identityService),
-  (_req: Request, res: Response) => {
-    const identity = res.locals.identity!;
-    res.status(200).json({
-      user_id: identity.user_id,
-      workspace_id: identity.workspace_id,
-      deployment_mode: "request_scoped_workspace",
-    });
-  },
-);
 
 // Audit routes use the product GitHub user session plus users.is_admin.
 app.use(
@@ -442,9 +425,7 @@ const workspaceRuntimeMiddleware = async (
 app.all(
   "/mcp",
   createHostGuard(config.allowedHosts),
-  config.oauthEnabled && oauthService
-    ? createMcpAuthMiddleware(identityService, oauthService)
-    : createIdentityAuthMiddleware(identityService),
+  createMcpAuthMiddleware(oauthService),
   workspaceRuntimeMiddleware,
   async (req: Request, res: Response) => {
     attachMcpProtocolLog(req, res);

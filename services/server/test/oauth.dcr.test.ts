@@ -42,7 +42,7 @@ async function setupDcrEnv() {
   cleanupDirs.push(dir);
 
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
   const identityService = IdentityService.open(identDbPath);
   cleanupIdentServices.push(identityService);
   const identStore = identityService.storeInstance;
@@ -74,7 +74,7 @@ async function setupDcrEnv() {
   app.use(express.json());
   app.use(createDcrRouter({ dcrService }));
   app.use(createOAuthRouter({ oauthService, sessionManager }));
-  app.all("/mcp", createMcpAuthMiddleware(identityService, oauthService), (_req, res) => {
+  app.all("/mcp", createMcpAuthMiddleware(oauthService), (_req, res) => {
     res.status(200).json({
       ok: true,
       user_id: res.locals.identity?.user_id,

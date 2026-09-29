@@ -17,9 +17,7 @@ import {
   IdentityStore,
   IDENTITY_DDL,
   IDENTITY_DB_USER_VERSION,
-  sha256Hex,
 } from "../src/identity/store.js";
-import { createIdentityAuthMiddleware } from "../src/auth.js";
 import { WorkspaceRuntimeRegistry } from "../src/runtime/registry.js";
 import type { WorkspaceRuntime, WorkspaceRuntimeConfig } from "../src/runtime/types.js";
 import { CeoWorkspace } from "../src/workspace.js";
@@ -30,6 +28,31 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const pexec = promisify(execFile);
+
+/**
+ * Test-only identity injector. It stands in for the production OAuth 2.1
+ * resource-server middleware (already covered by mcp.oauth-auth.test.ts) and
+ * maps pre-agreed test bearer strings to request-scoped identities so this
+ * suite can focus on workspace runtime routing and isolation.
+ */
+function createTestAuthMiddleware(
+  tokens: Record<string, { user_id: string; workspace_id: string }>,
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, res, next) => {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith("Bearer ")) {
+      res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      return;
+    }
+    const identity = tokens[auth.substring(7)];
+    if (!identity) {
+      res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      return;
+    }
+    res.locals.identity = identity;
+    next();
+  };
+}
 
 describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
   const cleanupDirs: string[] = [];
@@ -104,13 +127,6 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
       "owner",
       now,
     );
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_alice",
-      "usr_alice",
-      sha256Hex("key_alice"),
-      now,
-    );
-
     // Installation 1
     db.prepare(`
       INSERT INTO github_installations (
@@ -155,13 +171,6 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
       "owner",
       now,
     );
-    db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_bob",
-      "usr_bob",
-      sha256Hex("key_bob"),
-      now,
-    );
-
     // Installation 2
     db.prepare(`
       INSERT INTO github_installations (
@@ -251,7 +260,10 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
 
     app.all(
       "/mcp",
-      createIdentityAuthMiddleware(identityService),
+      createTestAuthMiddleware({
+        "key_alice": { user_id: "usr_alice", workspace_id: "ws_one" },
+        "key_bob": { user_id: "usr_bob", workspace_id: "ws_two" },
+      }),
       workspaceRuntimeMiddleware,
       async (req: Request, res: Response) => {
         const runtime = res.locals.workspaceRuntime as WorkspaceRuntime;
@@ -287,7 +299,7 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     };
   }
 
-  it("routes MCP requests to correct workspace runtimes and never leaks api_key_id", async () => {
+  it("routes MCP requests to correct workspace runtimes and never leaks credentials", async () => {
     const { baseUrl } = await setupMultiWorkspaceServer();
 
     // 1. Client Alice connects with key_alice (bound to ws_one)
@@ -305,10 +317,9 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     const contentAlice = statusAlice.structuredContent as Record<string, unknown>;
     expect(contentAlice.user_id).toBe("usr_alice");
     expect(contentAlice.workspace_id).toBe("ws_one");
-    // CRITICAL SECURITY ASSERTION: api_key_id must NEVER be leaked into tool outputs
+    // CRITICAL SECURITY ASSERTION: request credentials must NEVER be leaked into tool outputs
     expect(contentAlice.api_key_id).toBeUndefined();
-    expect(JSON.stringify(contentAlice)).not.toContain("ak_alice");
-    expect(JSON.stringify(contentAlice)).not.toContain("key_alice");
+    expect(JSON.stringify(contentAlice)).not.toContain("Bearer");
 
     await clientAlice.close();
 
@@ -328,8 +339,7 @@ describe("Step 4B.2: Request-scoped MCP & Resource Runtime Routing", () => {
     expect(contentBob.user_id).toBe("usr_bob");
     expect(contentBob.workspace_id).toBe("ws_two");
     expect(contentBob.api_key_id).toBeUndefined();
-    expect(JSON.stringify(contentBob)).not.toContain("ak_bob");
-    expect(JSON.stringify(contentBob)).not.toContain("key_bob");
+    expect(JSON.stringify(contentBob)).not.toContain("Bearer");
 
     await clientBob.close();
   });

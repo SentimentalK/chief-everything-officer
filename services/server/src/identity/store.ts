@@ -5,24 +5,19 @@ import crypto from "node:crypto";
 
 /**
  * MCP-visible sanitized request workspace identity. Populated per request
- * from credential → membership resolution. It deliberately omits `api_key_id`,
- * which is a per-request authentication outcome.
+ * from identity → membership resolution (OAuth access token or product session).
+ * Per-request authentication outcomes are never carried on this identity.
  */
 export interface WorkspaceIdentity {
   user_id: string;
   workspace_id: string;
 }
 
-/** Authenticated credential identity decoupled from any workspace resolution. */
-export interface CredentialIdentity {
-  user_id: string;
-  api_key_id: string;
-}
-
-/** Per-request authentication result. Extends the sanitized workspace identity. */
-export interface AuthIdentity extends WorkspaceIdentity {
-  api_key_id: string;
-}
+/**
+ * Per-request authenticated request identity. Represents the request-scoped
+ * workspace only (user_id + workspace_id).
+ */
+export interface AuthIdentity extends WorkspaceIdentity {}
 
 export class IdentityError extends Error {}
 
@@ -46,7 +41,7 @@ export class IdentityDbUnavailable extends IdentityError {}
  */
 export class IdentityConflictError extends IdentityError {}
 
-export const IDENTITY_DB_USER_VERSION = 12;
+export const IDENTITY_DB_USER_VERSION = 13;
 
 export interface ExternalIdentityRecord {
   id: string;
@@ -187,15 +182,6 @@ CREATE TABLE workspaces (
   FOREIGN KEY (owner_user_id) REFERENCES users(id)
 );
 
-CREATE TABLE api_keys (
-  id TEXT PRIMARY KEY NOT NULL,
-  user_id TEXT NOT NULL,
-  key_digest TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL,
-  revoked_at INTEGER,
-  FOREIGN KEY (user_id) REFERENCES users(id)
-);
-
 CREATE TABLE external_identities (
   id TEXT PRIMARY KEY NOT NULL,
   provider TEXT NOT NULL,
@@ -301,7 +287,6 @@ CREATE TABLE onboarding_flows (
 );
 
 CREATE INDEX idx_workspaces_owner ON workspaces(owner_user_id);
-CREATE INDEX idx_api_keys_user ON api_keys(user_id);
 CREATE INDEX idx_external_identities_user ON external_identities(user_id);
 CREATE INDEX idx_workspace_memberships_user ON workspace_memberships(user_id);
 CREATE INDEX idx_workspace_memberships_workspace ON workspace_memberships(workspace_id);
@@ -409,7 +394,6 @@ CREATE INDEX idx_device_target_bindings_device_state ON device_target_bindings(d
 const EXPECTED_TABLES = [
   "users",
   "workspaces",
-  "api_keys",
   "external_identities",
   "workspace_memberships",
   "github_installations",
@@ -426,7 +410,6 @@ const EXPECTED_TABLES = [
 const REQUIRED_NOT_NULL: Record<string, string[]> = {
   users: ["id", "created_at", "is_admin"],
   workspaces: ["id", "owner_user_id", "remote_url", "branch", "created_at"],
-  api_keys: ["id", "user_id", "key_digest", "created_at"],
   external_identities: ["id", "provider", "provider_subject", "user_id", "created_at_ms", "updated_at_ms"],
   workspace_memberships: ["id", "workspace_id", "user_id", "role", "created_at"],
   github_installations: [
@@ -486,7 +469,6 @@ const REQUIRED_NOT_NULL: Record<string, string[]> = {
 
 const REQUIRED_FOREIGN_KEYS: Record<string, { from: string; to: string; referencedTable: string }[]> = {
   workspaces: [{ from: "owner_user_id", to: "id", referencedTable: "users" }],
-  api_keys: [{ from: "user_id", to: "id", referencedTable: "users" }],
   external_identities: [{ from: "user_id", to: "id", referencedTable: "users" }],
   workspace_memberships: [
     { from: "workspace_id", to: "id", referencedTable: "workspaces" },
@@ -522,7 +504,7 @@ export function sha256Hex(value: string): string {
 }
 
 export function newId(
-  prefix: "usr" | "ws" | "ak" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba" | "onb" | "dev" | "dcr" | "tgt" | "dtb",
+  prefix: "usr" | "ws" | "ext" | "wsm" | "ghi" | "ghiu" | "grb" | "wba" | "onb" | "dev" | "dcr" | "tgt" | "dtb",
 ): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
@@ -539,7 +521,7 @@ function unlinkDbFiles(dbPath: string): void {
 
 /**
  * Creates a brand-new, empty control-plane identity database that publishes atomically.
- * Contains 0 users, 0 workspaces, and 0 API keys with the latest schema.
+ * Contains 0 users and 0 workspaces with the latest schema.
  * If the database already exists, it validates the existing database without clobbering.
  */
 export function provisionEmptyControlPlaneDatabase(dbPath: string): void {
@@ -804,7 +786,6 @@ export class IdentityStore {
       }
     }
 
-    this.requireUniqueIndex(db, "api_keys", ["key_digest"]);
     this.requireUniqueIndex(db, "external_identities", ["provider", "provider_subject"]);
     this.requireUniqueIndex(db, "external_identities", ["provider", "user_id"]);
     this.requireUniqueIndex(db, "workspace_memberships", ["workspace_id", "user_id"]);
@@ -1361,62 +1342,6 @@ export class IdentityStore {
     );
   }
 
-  /**
-   * Authenticates a raw bearer token (by digest). Returns the CredentialIdentity,
-   * or null when no active key matches or its user is disabled.
-   * Does NOT join or guess any workspace.
-   */
-  authenticateCredentialByDigest(digest: string): CredentialIdentity | null {
-    return this.withDb((db) => {
-      const row = db.prepare(
-        `SELECT k.id AS api_key_id, k.user_id
-         FROM api_keys k
-         JOIN users u ON u.id = k.user_id
-         WHERE k.key_digest = ? AND k.revoked_at IS NULL AND u.disabled_at IS NULL
-         LIMIT 1;`,
-      ).get(digest) as { api_key_id: string; user_id: string } | undefined;
-      if (!row) return null;
-      return { user_id: row.user_id, api_key_id: row.api_key_id };
-    });
-  }
-
-  authenticateByDigest(digest: string): CredentialIdentity | null {
-    return this.authenticateCredentialByDigest(digest);
-  }
-
-  /**
-   * Re-derives credential identity from known api_key_id + user_id.
-   * Returns null if the key is revoked or user disabled.
-   * Does NOT join or guess any workspace.
-   */
-  resolveCredentialByKey(api_key_id: string, user_id: string): CredentialIdentity | null {
-    return this.withDb((db) => {
-      const row = db.prepare(
-        `SELECT k.id AS api_key_id, k.user_id
-         FROM api_keys k
-         JOIN users u ON u.id = k.user_id
-         WHERE k.id = ? AND k.user_id = ? AND k.revoked_at IS NULL AND u.disabled_at IS NULL
-         LIMIT 1;`,
-      ).get(api_key_id, user_id) as { api_key_id: string; user_id: string } | undefined;
-      if (!row) return null;
-      return { user_id: row.user_id, api_key_id: row.api_key_id };
-    });
-  }
-
-  resolveAuthIdentityByKey(api_key_id: string, user_id: string): CredentialIdentity | null {
-    return this.resolveCredentialByKey(api_key_id, user_id);
-  }
-
-  /** Whether a digest corresponds to an already-revoked key. */
-  isRevokedDigest(digest: string): boolean {
-    return this.withDb((db) => {
-      const row = db.prepare("SELECT id FROM api_keys WHERE key_digest = ? AND revoked_at IS NOT NULL;").get(digest) as
-        | { id: string }
-        | undefined;
-      return Boolean(row);
-    });
-  }
-
   static migrateToCurrent(db: DatabaseSync): void {
     while (true) {
       const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
@@ -1457,6 +1382,9 @@ export class IdentityStore {
           break;
         case 11:
           IdentityStore.migrateV11ToV12(db);
+          break;
+        case 12:
+          IdentityStore.migrateV12ToV13(db);
           break;
         default:
           throw new IdentityStructureError(
@@ -2116,6 +2044,72 @@ export class IdentityStore {
     }
   }
 
+  /**
+   * v12 -> v13: retires the legacy DB-backed API-key credential model.
+   * Drops the `api_keys` table (and its index) from a valid v12 database
+   * while preserving all modern identity / control-plane data. Transactional
+   * and fail-closed: any missing required v12 table aborts the migration and
+   * leaves the database untouched at v12. No other table references
+   * `api_keys`, so dropping it is safe under `PRAGMA foreign_keys = ON`.
+   */
+  static migrateV12ToV13(db: DatabaseSync): void {
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+      const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
+      if (Number(versionRow.user_version) !== 12) {
+        throw new IdentityStructureError("migrateV12ToV13 requires user_version = 12.");
+      }
+
+      for (const table of [
+        "users",
+        "workspaces",
+        "api_keys",
+        "external_identities",
+        "workspace_memberships",
+        "github_installations",
+        "github_installation_users",
+        "github_repository_bindings",
+        "workspace_bootstraps",
+        "onboarding_flows",
+        "devices",
+        "device_credentials",
+        "execution_targets",
+        "device_target_bindings",
+      ] as const) {
+        const row = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?;",
+        ).get(table) as { name: string } | undefined;
+        if (!row) {
+          throw new IdentityStructureError(`Cannot migrate to v13: missing required v12 table '${table}'.`);
+        }
+      }
+
+      // DROP TABLE drops its indexes (idx_api_keys_user) with it.
+      db.exec(`
+        DROP TABLE api_keys;
+
+        PRAGMA user_version = 13;
+      `);
+
+      const leftover = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_keys';",
+      ).get() as { name: string } | undefined;
+      if (leftover) {
+        throw new IdentityStructureError("Cannot migrate to v13: api_keys table removal failed.");
+      }
+
+      db.exec("COMMIT;");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK;");
+      } catch {
+        /* ignore */
+      }
+      if (error instanceof IdentityStructureError) throw error;
+      throw new IdentityStructureError(`Failed to migrate identity database from version 12 to 13: ${error}`);
+    }
+  }
+
   findExternalIdentity(provider: string, providerSubject: string): ExternalIdentityRecord | null {
     return this.withDb((db) => {
       const row = db.prepare(
@@ -2179,7 +2173,7 @@ export class IdentityStore {
 
   /**
    * Atomically resolve an existing CEO user by external identity or create a new
-   * user + external identity pair. Never creates workspaces or API keys.
+   * user + external identity pair. Never creates workspaces or credentials.
    */
   resolveOrCreateExternalUser(input: {
     provider: string;

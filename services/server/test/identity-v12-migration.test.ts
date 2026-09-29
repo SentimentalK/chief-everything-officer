@@ -170,11 +170,11 @@ function createValidV11Database(dbPath: string): void {
 }
 
 describe("Identity DB Migration v11 -> v12", () => {
-  it("IDENTITY_DB_USER_VERSION is 12", () => {
-    expect(IDENTITY_DB_USER_VERSION).toBe(12);
+  it("IDENTITY_DB_USER_VERSION is 13", () => {
+    expect(IDENTITY_DB_USER_VERSION).toBe(13);
   });
 
-  it("fresh provisioned database has user_version 12 and all 4 new tables", async () => {
+  it("fresh provisioned database has user_version 13, all 4 v12 tables, and no api_keys", async () => {
     const { dbPath } = await tempDbPath();
     provisionEmptyControlPlaneDatabase(dbPath);
 
@@ -183,7 +183,7 @@ describe("Identity DB Migration v11 -> v12", () => {
 
     const db = new DatabaseSync(dbPath);
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(12);
+    expect(Number(versionRow.user_version)).toBe(13);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table';").all() as Array<{ name: string }>;
     const names = tables.map((t) => t.name);
@@ -191,11 +191,12 @@ describe("Identity DB Migration v11 -> v12", () => {
     expect(names).toContain("device_credentials");
     expect(names).toContain("execution_targets");
     expect(names).toContain("device_target_bindings");
+    expect(names).not.toContain("api_keys");
 
     db.close();
   });
 
-  it("successfully migrates v11 database to v12 on IdentityStore.open without data loss", async () => {
+  it("successfully migrates v11 database through v12 to v13 on IdentityStore.open without data loss", async () => {
     const { dbPath } = await tempDbPath();
     createValidV11Database(dbPath);
 
@@ -204,7 +205,13 @@ describe("Identity DB Migration v11 -> v12", () => {
 
     const db = new DatabaseSync(dbPath);
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(Number(versionRow.user_version)).toBe(12);
+    expect(Number(versionRow.user_version)).toBe(IDENTITY_DB_USER_VERSION);
+
+    // v12->v13 retirement: the legacy api_keys table is dropped
+    const apiKeysLeft = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='api_keys';",
+    ).get();
+    expect(apiKeysLeft).toBeUndefined();
 
     // Verify existing v11 data is intact
     const userRow = db.prepare("SELECT id FROM users WHERE id = 'usr_alice';").get() as { id: string } | undefined;
@@ -220,7 +227,7 @@ describe("Identity DB Migration v11 -> v12", () => {
     expect(memberships.length).toBe(1);
     expect(memberships[0]?.workspace_id).toBe("ws_alice");
 
-    // Verify 4 new tables exist and are empty
+    // Verify v12 tables exist and are empty
     for (const table of ["devices", "device_credentials", "execution_targets", "device_target_bindings"]) {
       const count = db.prepare(`SELECT COUNT(*) AS c FROM ${table};`).get() as { c: number };
       expect(Number(count.c)).toBe(0);

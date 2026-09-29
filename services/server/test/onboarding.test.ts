@@ -81,10 +81,7 @@ async function createTestContext(): Promise<TestContext> {
   const identDbPath = path.join(dir, "identity.sqlite");
 
   // Seed user with 1 workspace
-  const ident = seedIdentity(
-    { identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" },
-    "test-key",
-  );
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
   const store = IdentityStore.open(identDbPath);
   cleanupStores.push(store);
 

@@ -3,14 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import express from "express";
-import type { Server as HttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import {
   IdentityStore,
   IdentityDbUnavailable,
-  sha256Hex,
   IDENTITY_DDL,
   IDENTITY_DB_USER_VERSION,
 } from "../src/identity/store.js";
@@ -19,19 +15,12 @@ import {
   WorkspaceAccessDeniedError,
   WorkspaceSelectionRequiredError,
 } from "../src/identity/service.js";
-import { createIdentityAuthMiddleware } from "../src/auth.js";
 
 const cleanupDirs: string[] = [];
 const cleanupStores: IdentityStore[] = [];
 const cleanupServices: IdentityService[] = [];
-const cleanupServers: HttpServer[] = [];
 
 afterEach(async () => {
-  for (const s of cleanupServers.splice(0)) {
-    s.closeAllConnections?.();
-    s.closeIdleConnections?.();
-    await new Promise<void>((resolve) => s.close(() => resolve()));
-  }
   for (const svc of cleanupServices.splice(0)) svc.close();
   for (const st of cleanupStores.splice(0)) st.close();
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -44,12 +33,10 @@ interface MultiRowCtx {
   branchA: string;
   userA: string;
   workspaceA: string;
-  keyA: string;
   remoteB: string;
   branchB: string;
   userB: string;
   workspaceB: string;
-  keyB: string;
 }
 
 async function createMultiRowCtx(): Promise<MultiRowCtx> {
@@ -65,12 +52,10 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     branchA: "main",
     userA: "usr_alice",
     workspaceA: "ws_alpha",
-    keyA: "secret-key-alice",
     remoteB: "git@example.com:org/repo-b.git",
     branchB: "main",
     userB: "usr_bob",
     workspaceB: "ws_bravo",
-    keyB: "secret-key-bob",
   };
 
   const db = new DatabaseSync(dbPath);
@@ -94,12 +79,6 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     "owner",
     nowMs,
   );
-  db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-    "ak_alice_1",
-    ctx.userA,
-    sha256Hex(ctx.keyA),
-    nowMs,
-  );
 
   db.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(ctx.userB, nowMs + 1);
   db.prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?);").run(
@@ -116,137 +95,52 @@ async function createMultiRowCtx(): Promise<MultiRowCtx> {
     "owner",
     nowMs + 1,
   );
-  db.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-    "ak_bob_1",
-    ctx.userB,
-    sha256Hex(ctx.keyB),
-    nowMs + 1,
-  );
 
   db.close();
   return ctx;
 }
 
 describe("Identity request-scoped cardinality", () => {
-  it("I. API key A and B resolve request-scoped workspace identities; user with 0 workspaces rejected 403; unknown/revoked key remains 401", async () => {
+  it("I. users A and B resolve request-scoped workspace identities; user with 0 workspaces is denied; workspaces are isolated", async () => {
     const ctx = await createMultiRowCtx();
 
-    const userC = "usr_charlie";
-    const keyC = "secret-key-charlie";
     const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(userC, 1000);
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_charlie_1",
-      userC,
-      sha256Hex(keyC),
-      1000,
-    );
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?);").run(
-      "ak_alice_revoked",
-      ctx.userA,
-      sha256Hex("revoked-alice-key"),
-      1000,
-      2000,
-    );
+    raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run("usr_charlie", 1000);
     raw.close();
 
     const service = IdentityService.open(ctx.dbPath);
     cleanupServices.push(service);
 
-    const app = express();
-    app.use(express.json());
-    app.get("/test", createIdentityAuthMiddleware(service), (_req, res) => {
-      res.status(200).json({ identity: res.locals.identity });
+    // User A and B each resolve their one workspace deterministically
+    const identityA = service.resolveUserWorkspace(ctx.userA);
+    expect(identityA).toEqual({
+      user_id: ctx.userA,
+      workspace_id: ctx.workspaceA,
+    });
+    const identityB = service.resolveUserWorkspace(ctx.userB);
+    expect(identityB).toEqual({
+      user_id: ctx.userB,
+      workspace_id: ctx.workspaceB,
     });
 
-    const server = await new Promise<HttpServer>((resolve) => {
-      const s = app.listen(0, "127.0.0.1", () => resolve(s));
-    });
-    cleanupServers.push(server);
-    const port = (server.address() as AddressInfo).port;
-    const baseUrl = `http://127.0.0.1:${port}`;
-
-    const resA = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${ctx.keyA}` },
-    });
-    expect(resA.status).toBe(200);
-    const bodyA = (await resA.json()) as { identity: { user_id: string; workspace_id: string } };
-    expect(bodyA.identity.user_id).toBe(ctx.userA);
-    expect(bodyA.identity.workspace_id).toBe(ctx.workspaceA);
-
-    const resB = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${ctx.keyB}` },
-    });
-    expect(resB.status).toBe(200);
-    const bodyB = (await resB.json()) as { identity: { user_id: string; workspace_id: string } };
-    expect(bodyB.identity.user_id).toBe(ctx.userB);
-    expect(bodyB.identity.workspace_id).toBe(ctx.workspaceB);
-
-    const credB = service.authenticateApiKey(ctx.keyB);
-    expect(credB).not.toBeNull();
-    expect(service.resolveRequestIdentity(credB!).workspace_id).toBe(ctx.workspaceB);
+    // Workspace access is scoped: a user cannot reach another user's workspace
+    expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userA)).toBe(true);
     expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userB)).toBe(false);
+    expect(service.hasWorkspaceAccess(ctx.workspaceB, ctx.userB)).toBe(true);
+    expect(service.hasWorkspaceAccess(ctx.workspaceB, ctx.userA)).toBe(false);
 
-    const resC = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${keyC}` },
-    });
-    expect(resC.status).toBe(403);
-
-    const credC = service.authenticateApiKey(keyC);
-    expect(credC).not.toBeNull();
-    expect(() => service.resolveRequestIdentity(credC!)).toThrow(WorkspaceAccessDeniedError);
-
-    const resUnknown = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer not-a-real-key` },
-    });
-    expect(resUnknown.status).toBe(401);
-
-    const resRevoked = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer revoked-alice-key` },
-    });
-    expect(resRevoked.status).toBe(401);
+    // User with 0 memberships fails closed (no workspace is guessed)
+    expect(() => service.resolveUserWorkspace("usr_charlie")).toThrow(WorkspaceAccessDeniedError);
   });
 
-  it("I2. DB failure during workspace-authorization phase returns 503, while access denial returns 403 and unexpected errors return 500", async () => {
+  it("I2. DB failure during workspace resolution propagates IdentityDbUnavailable (fail-closed); unexpected errors propagate", async () => {
     const ctx = await createMultiRowCtx();
-
-    const userC = "usr_charlie_i2";
-    const keyC = "secret-key-charlie-i2";
-    const raw = new DatabaseSync(ctx.dbPath);
-    raw.prepare("INSERT INTO users (id, created_at, disabled_at) VALUES (?, ?, NULL);").run(userC, 1000);
-    raw.prepare("INSERT INTO api_keys VALUES (?, ?, ?, ?, NULL);").run(
-      "ak_charlie_i2",
-      userC,
-      sha256Hex(keyC),
-      1000,
-    );
-    raw.close();
 
     const service = IdentityService.open(ctx.dbPath);
     cleanupServices.push(service);
 
-    const app = express();
-    app.use(express.json());
-    app.get("/test", createIdentityAuthMiddleware(service), (_req, res) => {
-      res.status(200).json({ identity: res.locals.identity });
-    });
-
-    const server = await new Promise<HttpServer>((resolve) => {
-      const s = app.listen(0, "127.0.0.1", () => resolve(s));
-    });
-    cleanupServers.push(server);
-    const port = (server.address() as AddressInfo).port;
-    const baseUrl = `http://127.0.0.1:${port}`;
-
-    const normalRes = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${ctx.keyA}` },
-    });
-    expect(normalRes.status).toBe(200);
-
-    const resC = await fetch(`${baseUrl}/test`, {
-      headers: { Authorization: `Bearer ${keyC}` },
-    });
-    expect(resC.status).toBe(403);
+    // Baseline resolution works
+    expect(service.resolveUserWorkspace(ctx.userA).workspace_id).toBe(ctx.workspaceA);
 
     const origMethod = service.storeInstance.listWorkspaceMembershipsForUser.bind(service.storeInstance);
     service.storeInstance.listWorkspaceMembershipsForUser = () => {
@@ -254,16 +148,7 @@ describe("Identity request-scoped cardinality", () => {
     };
 
     try {
-      const dbFailRes = await fetch(`${baseUrl}/test`, {
-        headers: { Authorization: `Bearer ${ctx.keyA}` },
-      });
-      expect(dbFailRes.status).toBe(503);
-      const dbFailBody = await dbFailRes.json();
-      expect(dbFailBody).toEqual({
-        jsonrpc: "2.0",
-        error: { code: -32050, message: "Identity service unavailable" },
-        id: null,
-      });
+      expect(() => service.resolveUserWorkspace(ctx.userA)).toThrow(IdentityDbUnavailable);
     } finally {
       service.storeInstance.listWorkspaceMembershipsForUser = origMethod;
     }
@@ -273,22 +158,13 @@ describe("Identity request-scoped cardinality", () => {
     };
 
     try {
-      const unexpectedErrRes = await fetch(`${baseUrl}/test`, {
-        headers: { Authorization: `Bearer ${ctx.keyA}` },
-      });
-      expect(unexpectedErrRes.status).toBe(500);
-      const unexpectedErrBody = await unexpectedErrRes.json();
-      expect(unexpectedErrBody).toEqual({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal error" },
-        id: null,
-      });
+      expect(() => service.resolveUserWorkspace(ctx.userA)).toThrow(TypeError);
     } finally {
       service.storeInstance.listWorkspaceMembershipsForUser = origMethod;
     }
   });
 
-  it("J. Revalidation does not infer a workspace with LIMIT 1 and preserves revoke semantics", async () => {
+  it("J. workspace resolution never infers a workspace with LIMIT 1 once a user owns several", async () => {
     const ctx = await createMultiRowCtx();
 
     const raw = new DatabaseSync(ctx.dbPath);
@@ -311,20 +187,13 @@ describe("Identity request-scoped cardinality", () => {
     const service = IdentityService.open(ctx.dbPath);
     cleanupServices.push(service);
 
-    const credA = service.storeInstance.resolveCredentialByKey("ak_alice_1", ctx.userA);
-    expect(credA).not.toBeNull();
-    expect(() => service.resolveRequestIdentity(credA!)).toThrow(WorkspaceSelectionRequiredError);
+    // A second workspace makes selection required; no single workspace is inferred
+    expect(() => service.resolveUserWorkspace(ctx.userA)).toThrow(WorkspaceSelectionRequiredError);
     expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userA)).toBe(true);
     expect(service.hasWorkspaceAccess("ws_alpha_2", ctx.userA)).toBe(true);
 
-    const credB = service.storeInstance.resolveCredentialByKey("ak_bob_1", ctx.userB);
-    expect(credB).not.toBeNull();
+    // User B is unaffected
+    expect(service.resolveUserWorkspace(ctx.userB).workspace_id).toBe(ctx.workspaceB);
     expect(service.hasWorkspaceAccess(ctx.workspaceA, ctx.userB)).toBe(false);
-
-    const raw2 = new DatabaseSync(ctx.dbPath);
-    raw2.prepare("UPDATE api_keys SET revoked_at = ? WHERE id = 'ak_alice_1';").run(Date.now());
-    raw2.close();
-
-    expect(service.storeInstance.resolveCredentialByKey("ak_alice_1", ctx.userA)).toBeNull();
   });
 });

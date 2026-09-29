@@ -5,16 +5,14 @@ import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import type { Config } from "../src/config.js";
 import type { WorkspaceConfig } from "../src/git.js";
-import type { AuthIdentity } from "../src/identity/store.js";
 import {
   IdentityStore,
   newId,
   provisionEmptyControlPlaneDatabase,
-  sha256Hex,
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
 
-export type TestConfig = Config & WorkspaceConfig & { mcpApiKey: string };
+export type TestConfig = Config & WorkspaceConfig;
 
 export interface SeededIdentity {
   user_id: string;
@@ -70,7 +68,6 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
     gitAuthorEmail: "ceo-test@example.com",
     gitCommitterName: "CEO State MCP Committer",
     gitCommitterEmail: "ceo-committer@example.com",
-    mcpApiKey: "test-mcp-api-key",
     allowedHosts: ["localhost", "127.0.0.1"],
     allowedOrigins: [],
     protocolAllowedOrigins: [],
@@ -89,20 +86,16 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
 
 /**
  * Test fixture: empty control-plane schema plus one production-valid
- * user / workspace / owner membership / API key. Inserts via a raw
+ * user / workspace / owner membership. Inserts via a raw
  * `node:sqlite` connection, then validates with IdentityStore.open.
  */
-export function seedIdentity(
-  config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string },
-  apiKey = config.mcpApiKey ?? "test-mcp-api-key",
-): SeededIdentity {
+export function seedIdentity(config: Config & { remoteUrl?: string; branch?: string }): SeededIdentity {
   const dbPath = config.identityDbPath;
   provisionEmptyControlPlaneDatabase(dbPath);
 
   const userId = newId("usr");
   const workspaceId = newId("ws");
   const membershipId = newId("wsm");
-  const apiKeyId = newId("ak");
   const nowMs = Date.now();
   const remoteUrl = config.remoteUrl ?? "dummy-remote";
   const branch = config.branch ?? "main";
@@ -119,9 +112,6 @@ export function seedIdentity(
       db.prepare(
         "INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, 'owner', ?);",
       ).run(membershipId, workspaceId, userId, nowMs);
-      db.prepare(
-        "INSERT INTO api_keys (id, user_id, key_digest, created_at, revoked_at) VALUES (?, ?, ?, ?, NULL);",
-      ).run(apiKeyId, userId, sha256Hex(apiKey), nowMs);
       db.exec("COMMIT;");
     } catch (error) {
       try {
@@ -142,18 +132,8 @@ export function seedIdentity(
 
 /** Seeds an identity DB and opens a runtime IdentityService for it. */
 export function createIdentityService(
-  config: Config & { remoteUrl?: string; branch?: string; mcpApiKey?: string },
-  apiKey = config.mcpApiKey ?? "test-mcp-api-key",
+  config: Config & { remoteUrl?: string; branch?: string },
 ): IdentityService {
-  seedIdentity(config, apiKey);
+  seedIdentity(config);
   return IdentityService.open(config.identityDbPath);
-}
-
-/** Resolve request-scoped identity for a seeded API key. */
-export function requestIdentity(service: IdentityService, apiKey: string): AuthIdentity {
-  const credential = service.authenticateApiKey(apiKey);
-  if (!credential) {
-    throw new Error("test fixture: API key did not authenticate");
-  }
-  return service.resolveRequestIdentity(credential);
 }

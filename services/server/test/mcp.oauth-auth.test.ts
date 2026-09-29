@@ -8,14 +8,14 @@ import {
   sha256Base64Url,
 } from "../src/oauth/store.js";
 import {
-  IdentityStore,
   sha256Hex,
 } from "../src/identity/store.js";
 import { IdentityService } from "../src/identity/service.js";
 import { seedIdentity } from "./helpers.js";
 import { OAuthService } from "../src/oauth/service.js";
 import { createCimdOnlyClientResolver } from "../src/oauth/client-resolver.js";
-import { createMcpAuthMiddleware, createIdentityAuthMiddleware } from "../src/auth.js";
+import { createMcpAuthMiddleware } from "../src/auth.js";
+import { OAuthStoreUnavailable } from "../src/oauth/store.js";
 
 const cleanupDirs: string[] = [];
 const cleanupOAuthStores: OAuthStore[] = [];
@@ -27,14 +27,19 @@ afterEach(async () => {
   await Promise.all(cleanupDirs.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+/**
+ * A historical raw MCP API key. It is NOT stored anywhere: the legacy
+ * DB-backed API-key credential surface is fully retired, so this string
+ * must always be rejected as an invalid token.
+ */
+const LEGACY_RAW_API_KEY = "test-legacy-mcp-api-key";
+
 async function setupMcpAuthTestApp() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-oauth-test-"));
   cleanupDirs.push(dir);
 
-  const rawApiKey = "test-legacy-mcp-api-key";
-
   const identDbPath = path.join(dir, "identity.sqlite");
-  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, rawApiKey);
+  const ident = seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
   const identityService = IdentityService.open(identDbPath);
   cleanupIdentServices.push(identityService);
@@ -53,10 +58,10 @@ async function setupMcpAuthTestApp() {
   const app = express();
   app.use(express.json());
 
-  // Protected /mcp endpoint with dual-bearer middleware
+  // Protected /mcp endpoint (OAuth-only resource-server middleware)
   app.all(
     "/mcp",
-    createMcpAuthMiddleware(identityService, oauthService),
+    createMcpAuthMiddleware(oauthService),
     (req: Request, res: Response) => {
       res.status(200).json({
         jsonrpc: "2.0",
@@ -64,19 +69,9 @@ async function setupMcpAuthTestApp() {
           authenticated: true,
           user_id: res.locals.identity?.user_id,
           workspace_id: res.locals.identity?.workspace_id,
-          api_key_id: res.locals.identity?.api_key_id,
         },
         id: null,
       });
-    }
-  );
-
-  // Protected identity route (strictly single-key IdentityService)
-  app.get(
-    "/api/test/protected",
-    createIdentityAuthMiddleware(identityService),
-    (req: Request, res: Response) => {
-      res.status(200).json({ ok: true, identity: res.locals.identity });
     }
   );
 
@@ -85,7 +80,6 @@ async function setupMcpAuthTestApp() {
   const baseUrl = `http://127.0.0.1:${port}`;
 
   return {
-    rawApiKey,
     ident,
     identityService,
     oauthStore,
@@ -96,22 +90,22 @@ async function setupMcpAuthTestApp() {
   };
 }
 
-describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
-  it("authenticates /mcp using legacy MCP_API_KEY", async () => {
+describe("MCP Resource Server OAuth-Only Authentication Integration", () => {
+  it("rejects a historical legacy raw MCP API key with 401 (invalid_token)", async () => {
     const env = await setupMcpAuthTestApp();
     try {
       const res = await fetch(`${env.baseUrl}/mcp`, {
         headers: {
-          Authorization: `Bearer ${env.rawApiKey}`,
+          Authorization: `Bearer ${LEGACY_RAW_API_KEY}`,
         },
       });
 
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(401);
+      const wwwAuth = res.headers.get("www-authenticate");
+      expect(wwwAuth).toContain('error="invalid_token"');
+      expect(wwwAuth).toContain(`resource_metadata="${env.publicOrigin}/.well-known/oauth-protected-resource/mcp"`);
       const data = (await res.json()) as any;
-      expect(data.result.authenticated).toBe(true);
-      expect(data.result.user_id).toBe(env.ident.user_id);
-      expect(data.result.workspace_id).toBe(env.ident.workspace_id);
-      expect(data.result.api_key_id).toMatch(/^ak_/);
+      expect(data.error.code).toBe(-32001);
     } finally {
       await env.close();
     }
@@ -160,7 +154,6 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
       expect(data.result.authenticated).toBe(true);
       expect(data.result.user_id).toBe(env.ident.user_id);
       expect(data.result.workspace_id).toBe(env.ident.workspace_id);
-      expect(data.result.api_key_id).toBe("oauth");
     } finally {
       await env.close();
     }
@@ -287,7 +280,7 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
   it("returns 403 with insufficient_scope if access token lacks mcp scope", async () => {
     const env = await setupMcpAuthTestApp();
     try {
-      // Manually insert an access token with scope "other_scope"
+      // Manually insert an access token with scope "read_only"
       const now = Date.now();
       const rawToken = "ceo_at_wrong_scope_token";
       const digest = sha256Hex(rawToken);
@@ -315,70 +308,39 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
     }
   });
 
-  it("ensures identity-authenticated routes only accept MCP_API_KEY and reject OAuth tokens", async () => {
+  it("fail-closes with 503 when the OAuth backing store fails", async () => {
     const env = await setupMcpAuthTestApp();
     try {
-      // 1. Accepts MCP_API_KEY
-      const goodRes = await fetch(`${env.baseUrl}/api/test/protected`, {
-        headers: {
-          Authorization: `Bearer ${env.rawApiKey}`,
-        },
-      });
-      expect(goodRes.status).toBe(200);
+      const origValidate = env.oauthService.validateAccessToken.bind(env.oauthService);
+      (env.oauthService as any).validateAccessToken = () => {
+        throw new OAuthStoreUnavailable("Simulated OAuth store failure");
+      };
 
-      // 2. Rejects OAuth token
-      const verifier = "verifier_worker_boundary_test_1234567890123";
-      const challenge = sha256Base64Url(verifier);
-      const reqId = "oar_worker_bnd";
-
-      env.oauthStore.createAuthorizationRequest({
-        id: reqId,
-        client_id: "https://chatgpt.com/client.json",
-        client_name: "ChatGPT",
-        redirect_uri: "https://chatgpt.com/callback",
-        resource: "https://ceo.sentimentalk.com/mcp",
-        scope: "mcp offline_access",
-        state: null,
-        code_challenge: challenge,
-        code_challenge_method: "S256",
-        created_at_ms: Date.now(),
-        expires_at_ms: Date.now() + 600000,
+      const res = await fetch(`${env.baseUrl}/mcp`, {
+        headers: { Authorization: `Bearer ${LEGACY_RAW_API_KEY}` },
       });
+      expect(res.status).toBe(503);
+      const body = (await res.json()) as any;
+      expect(body.error.code).toBe(-32050);
 
-      const nonce = env.oauthService.createConsentNonce(reqId);
-      const approval = env.oauthService.approveConsent(reqId, nonce, env.ident.user_id);
-      const tokens = env.oauthService.exchangeAuthorizationCode({
-        clientId: "https://chatgpt.com/client.json",
-        redirectUri: "https://chatgpt.com/callback",
-        code: approval.code,
-        codeVerifier: verifier,
-        resource: "https://ceo.sentimentalk.com/mcp",
-      });
-
-      const badRes = await fetch(`${env.baseUrl}/api/test/protected`, {
-        headers: {
-          Authorization: `Bearer ${tokens.access_token}`,
-        },
-      });
-      expect(badRes.status).toBe(401);
+      (env.oauthService as any).validateAccessToken = origValidate;
     } finally {
       await env.close();
     }
   });
 
-  it("preserves exact legacy behavior without WWW-Authenticate when OAuth is disabled", async () => {
+  it("fail-closes /mcp entirely (503) when OAuth is disabled; never accepts opaque bearer tokens", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "ceo-mcp-no-oauth-test-"));
     cleanupDirs.push(dir);
-    const rawApiKey = "legacy-only-key";
     const identDbPath = path.join(dir, "identity.sqlite");
-    seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, rawApiKey);
+    seedIdentity({ identityDbPath: identDbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
     const identityService = IdentityService.open(identDbPath);
     cleanupIdentServices.push(identityService);
 
     const app = express();
     app.all(
       "/mcp",
-      createMcpAuthMiddleware(identityService, null),
+      createMcpAuthMiddleware(null),
       (_req: Request, res: Response) => {
         res.status(200).json({ ok: true });
       }
@@ -389,23 +351,20 @@ describe("MCP Resource Server OAuth & Dual-Bearer Integration", () => {
     const baseUrl = `http://127.0.0.1:${port}`;
 
     try {
-      // 1. Missing token returns 401 and NO WWW-Authenticate
+      // Missing token: unavailable, fail closed
       const resMissing = await fetch(`${baseUrl}/mcp`);
-      expect(resMissing.status).toBe(401);
+      expect(resMissing.status).toBe(503);
+      const bodyMissing = (await resMissing.json()) as any;
+      expect(bodyMissing.error.code).toBe(-32050);
       expect(resMissing.headers.get("www-authenticate")).toBeNull();
 
-      // 2. Invalid token returns 401 and NO WWW-Authenticate
-      const resBad = await fetch(`${baseUrl}/mcp`, {
-        headers: { Authorization: "Bearer bad-token" },
+      // Opaque/legacy token: never interpreted through the identity store
+      const resToken = await fetch(`${baseUrl}/mcp`, {
+        headers: { Authorization: `Bearer ${LEGACY_RAW_API_KEY}` },
       });
-      expect(resBad.status).toBe(401);
-      expect(resBad.headers.get("www-authenticate")).toBeNull();
-
-      // 3. Valid legacy key returns 200
-      const resGood = await fetch(`${baseUrl}/mcp`, {
-        headers: { Authorization: `Bearer ${rawApiKey}` },
-      });
-      expect(resGood.status).toBe(200);
+      expect(resToken.status).toBe(503);
+      const bodyToken = (await resToken.json()) as any;
+      expect(bodyToken.error.code).toBe(-32050);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

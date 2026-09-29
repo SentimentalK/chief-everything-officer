@@ -422,7 +422,7 @@ async function createBootstrapTestContext(): Promise<TestContext> {
   cleanupDirs.push(dir);
   const dbPath = path.join(dir, "identity.sqlite");
 
-  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+  const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
   const store = IdentityStore.open(dbPath);
   cleanupStores.push(store);
@@ -1457,7 +1457,7 @@ describe("Step 3.6B: Workspace Bootstrap Lifecycle & GitHub Engine", () => {
     const dbPath = path.join(dir, "identity.sqlite");
 
     // Provision legacy database with unbound initial workspace
-    const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" }, "test-key");
+    const ident = seedIdentity({ identityDbPath: dbPath, remoteUrl: "git@example.com:test/repo.git", branch: "main" });
 
     const store = IdentityStore.open(dbPath);
     cleanupStores.push(store);

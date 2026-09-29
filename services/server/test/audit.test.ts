@@ -389,7 +389,8 @@ describe("AuditStore & Boundary Tracing", () => {
 });
 
 describe("Audit HTTP API & Session Management", () => {
-  async function setupTestApp(apiKey = "test-secret-key") {
+  async function setupTestApp() {
+    const apiKey = "opaque-legacy-mcp-bearer-string";
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), "ceo-audit-api-test-"));
     cleanupDirs.push(tmpDir);
     const dbPath = path.join(tmpDir, "ceo-trace.sqlite");
@@ -397,10 +398,7 @@ describe("Audit HTTP API & Session Management", () => {
     cleanupStores.push(auditStore);
 
     const identityDbPath = path.join(tmpDir, "identity", "identity.sqlite");
-    const ident = seedIdentity(
-      { identityDbPath, remoteUrl: "dummy-remote", branch: "main" },
-      apiKey,
-    );
+    const ident = seedIdentity({ identityDbPath, remoteUrl: "dummy-remote", branch: "main" });
     const service = IdentityService.open(identityDbPath);
     cleanupServices.push(service);
 

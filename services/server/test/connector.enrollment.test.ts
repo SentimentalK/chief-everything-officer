@@ -4,7 +4,7 @@ import os from "os";
 import crypto from "node:crypto";
 import http from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
-import express, { type Request, type Response } from "express";
+import express from "express";
 import {
   IdentityStore,
   provisionEmptyControlPlaneDatabase,
@@ -17,7 +17,6 @@ import { UserSessionManager } from "../src/auth/user-session.js";
 import { createGitHubAuthRouter } from "../src/auth/github.js";
 import { IdentityAccountProvisioner } from "../src/identity/provisioner.js";
 import {
-  createIdentityAuthMiddleware,
   createHostGuard,
   createOriginGuard,
 } from "../src/auth.js";
@@ -127,15 +126,6 @@ function createTestServer(options?: {
         return new Response("Not Found", { status: 404 });
       },
     }),
-  );
-
-  // Host user identity endpoint mock with identity auth to test surface isolation
-  app.get(
-    "/api/identity-guarded/test",
-    createIdentityAuthMiddleware(identityService),
-    (_req: Request, res: Response) => {
-      res.status(200).json({ ok: true });
-    },
   );
 
   const server = app.listen(0);
@@ -514,18 +504,26 @@ describe("CEO Connector V1.2 - E2E Trusted Device Enrollment", () => {
 
       const deviceToken = `ceo_dev1.${cred.id}.${secret}`;
 
-      // 1. Device credential cannot access host user identity endpoint (/api/identity-guarded/test)
-      const legacyRes = await fetch(`${baseUrl}/api/identity-guarded/test`, {
+      // A device credential remains functional on its own authority
+      const deviceRes = await fetch(`${baseUrl}/api/connector/identity`, {
         headers: { Authorization: `Bearer ${deviceToken}` },
       });
-      expect(legacyRes.status).toBe(401);
+      expect(deviceRes.status).toBe(200);
 
-      // 2. Legacy API key or host OAuth token cannot access /api/connector/identity
+      // 1. Legacy API key-style or host OAuth bearer strings are rejected by
+      //    the Connector device-auth authority
       const fakeLegacyToken = "ceo_key1.some_legacy_key";
       const connRes = await fetch(`${baseUrl}/api/connector/identity`, {
         headers: { Authorization: `Bearer ${fakeLegacyToken}` },
       });
       expect(connRes.status).toBe(401);
+
+      // 2. A host OAuth-shaped opaque token is also rejected
+      const fakeOauthToken = `ceo_dev1.${cred.id}.definitely-not-the-secret`;
+      const connRes2 = await fetch(`${baseUrl}/api/connector/identity`, {
+        headers: { Authorization: `Bearer ${fakeOauthToken}` },
+      });
+      expect(connRes2.status).toBe(401);
     } finally {
       close();
     }

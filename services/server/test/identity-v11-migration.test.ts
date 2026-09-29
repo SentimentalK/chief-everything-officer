@@ -111,7 +111,7 @@ function createValidV10Database(dbPath: string): void {
 
 describe("Identity DB Migration v10 -> v11", () => {
   it("IDENTITY_DB_USER_VERSION is 12", () => {
-    expect(IDENTITY_DB_USER_VERSION).toBe(12);
+    expect(IDENTITY_DB_USER_VERSION).toBe(13);
   });
 
   it("successfully migrates v10 database to v11 (and v12) on IdentityStore.open", async () => {

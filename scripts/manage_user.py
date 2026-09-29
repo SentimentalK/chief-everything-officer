@@ -202,7 +202,6 @@ def reset_user(identifier: str, restart: bool = True):
     DELETE FROM workspace_bootstraps WHERE workspace_id = '{ws_id}';
     DELETE FROM github_repository_bindings WHERE workspace_id = '{ws_id}';
     DELETE FROM onboarding_flows WHERE user_id = '{uid}';
-    DELETE FROM api_keys WHERE user_id = '{uid}';
     DELETE FROM workspace_memberships WHERE user_id = '{uid}';
     DELETE FROM workspaces WHERE id = '{ws_id}';
     DELETE FROM github_installation_users WHERE user_id = '{uid}';

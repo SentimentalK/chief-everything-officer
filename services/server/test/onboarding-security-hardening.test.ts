@@ -46,7 +46,7 @@ describe("Onboarding & Host Runtime Security Hardening", () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), "ceo-sec-hardening-"));
     dbPath = path.join(tempDir, "identity.sqlite");
-    seedIdentity({ identityDbPath: dbPath, remoteUrl: "https://github.com/test-owner/test-repo.git", branch: "main" }, "test-key");
+    seedIdentity({ identityDbPath: dbPath, remoteUrl: "https://github.com/test-owner/test-repo.git", branch: "main" });
 
     store = IdentityStore.open(dbPath);
     onboardingStore = new OnboardingStore(store);
