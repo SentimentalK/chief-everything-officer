@@ -36,7 +36,7 @@ fn sample_report() -> ExecutionReport {
 
 async fn setup_race_environment(server: &MockServer) -> (tempfile::TempDir, ConnectorPaths) {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let target_dir = temp.path().join("repo");
@@ -439,7 +439,7 @@ async fn race_logout_wins_prevents_active_attempt() {
 #[tokio::test]
 async fn concurrent_daemon_lock_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let _held_lock = ExecutionLock::acquire(&paths.daemon_lock_file()).unwrap();

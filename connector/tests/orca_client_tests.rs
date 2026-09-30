@@ -2105,7 +2105,7 @@ async fn test_daemon_recovery_waiting_with_operator_closed_terminal_converges_to
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(

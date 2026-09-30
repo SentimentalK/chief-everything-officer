@@ -151,7 +151,7 @@ fn setup_test_env(
 ) {
     let server_origin = normalize_server_origin(raw_server_origin).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(

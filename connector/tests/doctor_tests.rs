@@ -32,7 +32,7 @@ fn init_git_repo(path: &std::path::Path, remote_url: &str) {
 #[tokio::test]
 async fn doctor_detects_expired_credential() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let expired_cred = DeviceCredential::new(
@@ -60,7 +60,7 @@ async fn doctor_detects_expired_credential() {
 #[tokio::test]
 async fn doctor_detects_server_origin_mismatch() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -133,7 +133,7 @@ async fn doctor_detects_missing_path_and_disabled_target() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -228,7 +228,7 @@ async fn doctor_healthy_report_detects_git_and_targets() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(

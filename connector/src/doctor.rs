@@ -128,72 +128,37 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
 }
 
 fn check_filesystem(paths: &ConnectorPaths, checks: &mut Vec<DiagnosticCheck>) {
-    if !paths.config_dir.exists() {
+    if !paths.root_dir.exists() {
         checks.push(DiagnosticCheck {
-            name: "Config Directory".into(),
+            name: "Connector Root".into(),
             severity: DiagnosticSeverity::Fail,
             message: format!(
-                "Config directory does not exist: {}",
-                paths.config_dir.display()
+                "Connector root does not exist (run `ceo-connector login` or any command that initializes it): {}",
+                paths.root_dir.display()
             ),
         });
     } else {
-        let sym_res = reject_control_ancestor_symlinks(&paths.config_dir);
-        let mode = fs::metadata(&paths.config_dir)
+        let sym_res = reject_control_ancestor_symlinks(&paths.root_dir);
+        let mode = fs::metadata(&paths.root_dir)
             .map(|m| m.permissions().mode() & 0o777)
             .unwrap_or(0);
         if sym_res.is_err() {
             checks.push(DiagnosticCheck {
-                name: "Config Directory".into(),
+                name: "Connector Root".into(),
                 severity: DiagnosticSeverity::Fail,
-                message: "Config directory or ancestor is a symlink".into(),
+                message: "Connector root or ancestor is a symlink".into(),
             });
         } else if mode != 0o700 {
             checks.push(DiagnosticCheck {
-                name: "Config Directory".into(),
+                name: "Connector Root".into(),
                 severity: DiagnosticSeverity::Warn,
                 message: format!("Permissions are 0{:o}, expected 0700", mode),
             });
         } else {
             checks.push(DiagnosticCheck {
-                name: "Config Directory".into(),
+                name: "Connector Root".into(),
                 severity: DiagnosticSeverity::Pass,
-                message: format!("Valid (0700) at {}", paths.config_dir.display()),
-            });
-        }
-    }
-
-    if !paths.state_dir.exists() {
-        checks.push(DiagnosticCheck {
-            name: "State Directory".into(),
-            severity: DiagnosticSeverity::Fail,
-            message: format!(
-                "State directory does not exist: {}",
-                paths.state_dir.display()
-            ),
-        });
-    } else {
-        let sym_res = reject_control_ancestor_symlinks(&paths.state_dir);
-        let mode = fs::metadata(&paths.state_dir)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0);
-        if sym_res.is_err() {
-            checks.push(DiagnosticCheck {
-                name: "State Directory".into(),
-                severity: DiagnosticSeverity::Fail,
-                message: "State directory or ancestor is a symlink".into(),
-            });
-        } else if mode != 0o700 {
-            checks.push(DiagnosticCheck {
-                name: "State Directory".into(),
-                severity: DiagnosticSeverity::Warn,
-                message: format!("Permissions are 0{:o}, expected 0700", mode),
-            });
-        } else {
-            checks.push(DiagnosticCheck {
-                name: "State Directory".into(),
-                severity: DiagnosticSeverity::Pass,
-                message: format!("Valid (0700) at {}", paths.state_dir.display()),
+                message: format!("Valid (0700) at {}", paths.root_dir.display()),
             });
         }
     }

@@ -73,18 +73,11 @@ fn strict_schemas_deny_unknown_fields() {
 #[test]
 fn control_directories_and_files_permissions() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
-    let cfg_mode = fs::metadata(&paths.config_dir)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(cfg_mode, 0o700);
-
-    let state_mode = fs::metadata(&paths.state_dir).unwrap().permissions().mode() & 0o777;
-    assert_eq!(state_mode, 0o700);
+    let root_mode = fs::metadata(&paths.root_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(root_mode, 0o700);
 
     let cred = DeviceCredential::new(
         "https://api.ceo.dev".into(),
@@ -113,9 +106,9 @@ fn symlink_control_path_rejected() {
     let outside = temp.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
 
-    let link_config = temp.path().join("config_symlink");
-    symlink(&outside, &link_config).unwrap();
+    let link_root = temp.path().join("root_symlink");
+    symlink(&outside, &link_root).unwrap();
 
-    let paths = ConnectorPaths::from_roots(link_config, temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(link_root);
     assert!(paths.ensure_dirs().is_err());
 }

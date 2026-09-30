@@ -38,7 +38,7 @@ fn sample_report() -> ExecutionReport {
 #[tokio::test]
 async fn outbox_device_mismatch_prevents_delivery() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let client = ConnectorClient::new("http://127.0.0.1:4000").unwrap();
@@ -98,7 +98,7 @@ async fn report_delivery_terminal_cleanup() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let client = ConnectorClient::new(&server.origin()).unwrap();
@@ -192,7 +192,7 @@ async fn crash_recovery_after_outbox_unlink_clears_active_attempt() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -294,7 +294,7 @@ async fn crash_window_history_written_outbox_still_present_replays_safely() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -388,7 +388,7 @@ async fn crash_window_history_written_outbox_still_present_replays_safely() {
 #[test]
 fn invalid_numeric_report_cannot_be_persisted_into_outbox() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let mut report = sample_report();
@@ -437,7 +437,7 @@ fn invalid_numeric_report_cannot_be_persisted_into_outbox() {
 async fn outbox_delivers_managed_result_before_report() {
     let server = MockServer::start().await;
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let client = ConnectorClient::new(&server.origin()).unwrap();
@@ -569,7 +569,7 @@ fn write_gating_env(
     server_origin: &str,
     temp: &std::path::Path,
 ) -> (ConnectorPaths, DeviceCredential) {
-    let paths = ConnectorPaths::from_roots(temp.join("config"), temp.join("state"));
+    let paths = ConnectorPaths::from_root(temp.join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -722,7 +722,7 @@ async fn valid_json_outbox_record_still_gates_pending_claiming_with_retry_before
 #[test]
 fn flushable_outbox_selection_matches_flush_outbox_semantics() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let outbox_dir = paths.outbox_dir();

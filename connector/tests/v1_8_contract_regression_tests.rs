@@ -6,7 +6,7 @@ use ceo_connector::managed_result::ManagedResultEnvelope;
 #[test]
 fn test_contract_example_round_trips_through_validator() {
     let contract = ManagedContract {
-        path: PathBuf::from("/home/user/.local/state/ceo/connector/runtime/att-bbbbbbbb-0000-0000-0000-000000000002/managed-result.json"),
+        path: PathBuf::from("/home/user/.ceo/connector/runtime/att-bbbbbbbb-0000-0000-0000-000000000002/managed-result.json"),
         job_id: "job-aaaaaaaa-0000-0000-0000-000000000001".into(),
         attempt_id: "att-bbbbbbbb-0000-0000-0000-000000000002".into(),
         resource_id: "res-cccccccc-0000-0000-0000-000000000003".into(),

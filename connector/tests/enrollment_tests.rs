@@ -122,7 +122,7 @@ async fn successful_enrollment_and_identity_verification() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
 
     login_flow(&paths, &server.origin(), Some("Test Device".into()), true)
         .await
@@ -197,7 +197,7 @@ async fn crash_recovery_resumes_pending_enrollment_after_server_finalization() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     // Plant existing pending enrollment session on disk (simulating crash before token poll / credential write)
@@ -273,7 +273,7 @@ async fn logout_safety_guards() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(

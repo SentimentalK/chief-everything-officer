@@ -42,7 +42,7 @@ fn setup_env(
 ) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join(".ceo");
-    let paths = ConnectorPaths::from_roots(&root, &root);
+    let paths = ConnectorPaths::from_root(&root);
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(

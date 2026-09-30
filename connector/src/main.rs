@@ -7,6 +7,7 @@ use ceo_connector::status::{get_status, print_status};
 
 #[derive(Parser)]
 #[command(name = "ceo-connector")]
+#[command(version)]
 #[command(about = "Chief Everything Officer - Real Connector Execution Plane Daemon & CLI")]
 struct Cli {
     #[command(subcommand)]

@@ -98,7 +98,7 @@ async fn target_add_general_automation_and_repo_null_coding() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -218,7 +218,7 @@ async fn target_add_with_workspace_repository_verification() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -329,7 +329,7 @@ async fn target_bind_and_remove_lifecycle() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -369,7 +369,7 @@ async fn target_bind_and_remove_lifecycle() {
 #[tokio::test]
 async fn active_target_mutation_rejected_with_target_in_use() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -469,7 +469,7 @@ async fn target_set_default_runtime_success_and_replay() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -510,7 +510,7 @@ async fn target_set_default_runtime_auth_and_error_behavior() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
@@ -552,8 +552,7 @@ async fn target_set_default_runtime_auth_and_error_behavior() {
     });
 
     let temp2 = tempfile::tempdir().unwrap();
-    let paths2 =
-        ConnectorPaths::from_roots(temp2.path().join("config"), temp2.path().join("state"));
+    let paths2 = ConnectorPaths::from_root(temp2.path().join("root"));
     paths2.ensure_dirs().unwrap();
 
     let cred2 = DeviceCredential::new(
@@ -631,7 +630,7 @@ async fn target_list_marks_default_runtime_in_text_and_json() {
     });
 
     let temp = tempfile::tempdir().unwrap();
-    let paths = ConnectorPaths::from_roots(temp.path().join("config"), temp.path().join("state"));
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
 
     let cred = DeviceCredential::new(
