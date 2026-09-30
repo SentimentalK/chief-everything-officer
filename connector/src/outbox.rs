@@ -23,6 +23,19 @@ pub fn compute_report_sha256(report: &ExecutionReport) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Deterministic digest identifying an authoritative operator cancellation for
+/// a job/attempt pair. Shared by the daemon (live interruption) and the outbox
+/// (late-report drop) so a locally terminalized operator cancel always carries
+/// the same marker as the server's synthetic report receipt concept.
+pub fn operator_cancel_digest(job_id: &str, attempt_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ceo:operator-cancel\0");
+    hasher.update(job_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(attempt_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Error, Debug)]
 pub enum OutboxError {
     #[error("IO error: {0}")]
@@ -284,6 +297,39 @@ pub async fn deliver_outbox_record(
             Err(OutboxError::AuthRequired)
         }
         Err(ClientError::JobError { code, message }) => {
+            // Race precedence: if the server already terminalized the job via an
+            // authoritative operator cancel, the late report must NOT overwrite
+            // or churn. Converge locally: record a cancelled history entry and
+            // drop the outbox record (deterministic cancel-wins rule).
+            if code == "REPORT_CONFLICT" || code == "ATTEMPT_MISMATCH" {
+                let active_opt = ActiveAttempt::load(&paths.active_attempt_file())
+                    .ok()
+                    .flatten();
+                let target_id = active_opt.as_ref().and_then(|a| {
+                    if a.job_id == record.job_id && a.attempt_id == record.attempt_id {
+                        Some(a.target_id.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(target_id) = target_id {
+                    if let Ok(detail) = client.get_job(cred, &record.job_id, false).await {
+                        if detail.state == "terminal"
+                            && detail.execution_status.as_deref() == Some("CANCELLED")
+                        {
+                            record_operator_cancelled_history(
+                                paths,
+                                &record.job_id,
+                                &record.attempt_id,
+                                &target_id,
+                            )?;
+                            remove_durable(outbox_file)?;
+                            remove_durable(&paths.active_attempt_file())?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             // Confirmed server rejections / conflict / invalid lifecycle: retain outbox and enter RECOVERY_REQUIRED
             Err(OutboxError::RecoveryRequired(format!("{code}: {message}")))
         }
@@ -301,6 +347,30 @@ pub async fn deliver_outbox_record(
             "Unexpected client error: {other}"
         ))),
     }
+}
+
+/// Writes a sanitized "cancelled" history record for an operator-cancelled
+/// attempt and is safe to call for replays (idempotent outcome by caller).
+pub fn record_operator_cancelled_history(
+    paths: &ConnectorPaths,
+    job_id: &str,
+    attempt_id: &str,
+    target_id: &str,
+) -> Result<(), OutboxError> {
+    let history = SanitizedHistoryRecord {
+        schema_version: HISTORY_SCHEMA_VERSION,
+        job_id: job_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        target_id: target_id.to_string(),
+        status: "cancelled".to_string(),
+        receipt_sha256: None,
+        duration_ms: None,
+        terminal_report_sha256: operator_cancel_digest(job_id, attempt_id),
+        recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let hist_file = paths.history_file(job_id, attempt_id);
+    atomic_write_json(&hist_file, &history)?;
+    Ok(())
 }
 
 /// Single source of truth for what counts as a flushable outbox record.

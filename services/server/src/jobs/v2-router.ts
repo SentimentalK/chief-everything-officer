@@ -323,6 +323,45 @@ export function createConnectorJobsRouter(
     }
   });
 
+  // POST /api/connector/jobs/:job_id/cancel — device-scoped operator cancel (Wave 2B)
+  router.post("/:job_id/cancel", async (req: Request, res: Response) => {
+    const device = res.locals.deviceIdentity;
+    if (!device) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+
+    const jobId = typeof req.params.job_id === "string" ? req.params.job_id : "";
+
+    if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+      res
+        .status(400)
+        .json({ error: "INVALID_REQUEST", message: "Unexpected fields in cancel request." });
+      return;
+    }
+
+    try {
+      const result = await coordinator.cancelJobForDevice(device.device_id, device.user_id, jobId);
+      res.status(200).json(result);
+    } catch (err) {
+      if (err instanceof JobValidationError) {
+        res.status(400).json({ error: "INVALID_REQUEST", message: err.message });
+        return;
+      }
+      if (err instanceof V2JobNotFoundError) {
+        // Authorization-scoped: inaccessible jobs are indistinguishable from
+        // missing ones (no existence leak).
+        res.status(404).json({ error: "JOB_NOT_FOUND" });
+        return;
+      }
+      if (err instanceof V2StoreError) {
+        res.status(503).json({ error: "QUEUE_UNAVAILABLE", message: err.message });
+        return;
+      }
+      res.status(500).json({ error: "INTERNAL_ERROR" });
+    }
+  });
+
   // POST /api/connector/jobs/:job_id/report
   router.post("/:job_id/report", async (req: Request, res: Response) => {
     const device = res.locals.deviceIdentity;

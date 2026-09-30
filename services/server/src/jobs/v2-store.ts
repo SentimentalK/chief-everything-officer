@@ -16,13 +16,14 @@ import {
   type JobRecordV2,
   type AttemptRecordV1,
 } from "./v2-schema.js";
-import { type ExecutionReport, type PersistedJobResult } from "./execution-contract.js";
+import { type ExecutionReport, type PersistedJobResult, type ExecutionStatus, type BusinessOutcome } from "./execution-contract.js";
 import {
   V2_CREATE_JOB_SCRIPT,
   V2_CLAIM_JOB_SCRIPT,
   V2_START_JOB_SCRIPT,
   V2_REPORT_JOB_SCRIPT,
   V2_RECORD_RESULT_SCRIPT,
+  V2_CANCEL_JOB_SCRIPT,
 } from "./v2-assignment-script.js";
 
 export class V2StoreError extends StoreError {
@@ -90,12 +91,34 @@ export class V2ReportConflictError extends Error {
   }
 }
 
+/**
+ * Internal retry signal: the caller's pre-read of the job went stale between
+ * read and cancel script execution (e.g. a claim landed). No state was
+ * mutated; callers should re-read and retry with a bounded budget.
+ */
+export class V2CancelRaceError extends Error {
+  constructor() {
+    super("Job attempt linkage changed during cancel; retry with a fresh read.");
+    this.name = "V2CancelRaceError";
+  }
+}
+
+export interface JobCancelOutcome {
+  status: "cancelled" | "replayed" | "no_change";
+  result: "cancelled" | "already_cancelled" | "already_terminal";
+  execution_status: ExecutionStatus;
+  business_outcome: BusinessOutcome;
+  attempt_id: string | null;
+  server_time_ms: number;
+}
+
 export class RedisJobStoreV2 {
   private createScriptSha: string | null = null;
   private claimScriptSha: string | null = null;
   private startScriptSha: string | null = null;
   private reportScriptSha: string | null = null;
   private recordResultScriptSha: string | null = null;
+  private cancelScriptSha: string | null = null;
 
   constructor(private readonly redis: RedisRunner) {}
 
@@ -506,6 +529,70 @@ export class RedisJobStoreV2 {
       server_time_ms: Number(parsed.server_time_ms),
       commit: String(parsed.commit),
       resource_id: String(parsed.resource_id),
+    };
+  }
+
+  async cancelJob(params: {
+    job_id: string;
+    expected_attempt_id: string | null;
+    expected_target_id: string;
+    device_id: string;
+    reason: string;
+    cancel_receipt_sha256: string;
+  }): Promise<JobCancelOutcome> {
+    const expectedAttemptId = params.expected_attempt_id ?? "";
+    const keys = [
+      jobKeyV2(params.job_id),
+      attemptKeyV1(expectedAttemptId === "" ? "none" : expectedAttemptId),
+      targetQueueKeyV1(params.expected_target_id),
+    ];
+    const args = [
+      expectedAttemptId,
+      params.device_id,
+      params.reason,
+      params.cancel_receipt_sha256,
+    ];
+
+    const raw = await this.evalScript(
+      V2_CANCEL_JOB_SCRIPT,
+      () => this.cancelScriptSha,
+      (s) => (this.cancelScriptSha = s),
+      keys,
+      args,
+    );
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new V2StoreError("QUEUE_UNAVAILABLE", `Corrupt cancel script response: ${raw}`, "SCRIPT_CORRUPTION");
+    }
+
+    if (parsed.error) {
+      const err = String(parsed.error);
+      if (err === "JOB_NOT_FOUND") throw new V2JobNotFoundError();
+      if (err === "CANCEL_RACE") throw new V2CancelRaceError();
+      if (
+        err === "CORRUPT_JOB_RECORD" ||
+        err === "CORRUPT_ATTEMPT_RECORD" ||
+        err === "INVALID_ATTEMPT_PHASE" ||
+        err === "INVALID_JOB_STATUS"
+      ) {
+        throw new V2StoreError("QUEUE_UNAVAILABLE", `Cancel failed: ${err}`, err, {
+          phase: parsed.phase,
+          status: parsed.status,
+        });
+      }
+      throw new V2StoreError("QUEUE_UNAVAILABLE", `Cancel failed: ${err}`, err);
+    }
+
+    return {
+      status: parsed.status as JobCancelOutcome["status"],
+      result: parsed.result as JobCancelOutcome["result"],
+      execution_status: parsed.execution_status as ExecutionStatus,
+      business_outcome: parsed.business_outcome as BusinessOutcome,
+      attempt_id: (parsed.attempt_id as string | null) ?? null,
+      server_time_ms: Number(parsed.server_time_ms),
     };
   }
 

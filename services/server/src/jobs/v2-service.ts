@@ -36,6 +36,8 @@ import {
   V2ReportConflictError,
   V2AttemptLifecycleError,
   V2StoreError,
+  V2CancelRaceError,
+  type JobCancelOutcome,
 } from "./v2-store.js";
 import type {
   ConnectorControlStore,
@@ -166,7 +168,10 @@ export function deriveHostJobState(
   }
 
   if (job.status === "terminal") {
+    // Wave 2B: a job cancelled by an operator before any claim terminalizes
+    // without an attempt; the durable cancel record carries the outcome.
     if (!attempt) {
+      if (job.cancel) return "terminal";
       throw new V2StoreError(
         "QUEUE_UNAVAILABLE",
         `Terminal job '${job.job_id}' has no attempt record.`,
@@ -186,6 +191,32 @@ export function deriveHostJobState(
     `Job '${job.job_id}' has unrecognized status '${job.status}'.`,
     "CORRUPT_JOB_STATE",
   );
+}
+
+/**
+ * Read-model execution status. Operator-cancelled jobs that never created an
+ * attempt (cancel-before-claim) derive CANCELLED from the durable job cancel
+ * record.
+ */
+export function jobExecutionStatusView(
+  job: JobRecordV2,
+  attempt: AttemptRecordV1 | null,
+): ExecutionStatus | null {
+  if (attempt?.report) return attempt.report.execution_status;
+  if (job.cancel) return "CANCELLED";
+  return null;
+}
+
+/**
+ * Read-model business outcome; NOT_STARTED for cancel-before-claim jobs.
+ */
+export function jobBusinessOutcomeView(
+  job: JobRecordV2,
+  attempt: AttemptRecordV1 | null,
+): BusinessOutcome | null {
+  if (attempt?.report) return attempt.report.business_outcome;
+  if (job.cancel) return "NOT_STARTED";
+  return null;
 }
 
 export interface JobSubmitScopeV2 {
@@ -245,6 +276,26 @@ export interface ReportJobResult {
   replayed: boolean;
   server_time: string;
 }
+
+/**
+ * Typed device-scoped operator cancel outcome (Wave 2B).
+ * action:
+ * - cancelled: cancellation was newly applied by this request.
+ * - already_cancelled: job was already operator-cancelled (idempotent replay).
+ * - already_terminal: job finished with a non-cancelled outcome; history preserved.
+ */
+export interface JobCancelResult {
+  job_id: string;
+  previous_state: HostJobState;
+  state: "terminal";
+  execution_status: ExecutionStatus;
+  business_outcome: BusinessOutcome;
+  action: "cancelled" | "already_cancelled" | "already_terminal";
+  attempt_id: string | null;
+  message: string;
+}
+
+export const JOB_CANCEL_MAX_RACE_RETRIES = 3;
 
 export class JobValidationError extends Error {
   constructor(message: string) {
@@ -564,6 +615,7 @@ export class JobCoordinatorV2 {
       latest_attempt_id: null,
       created_at_ms: now,
       claim_deadline_ms: claimDeadlineMs,
+      cancel: null,
     };
 
     const res = await this.store.createJob(jobRecord, input.request_id);
@@ -898,6 +950,129 @@ export class JobCoordinatorV2 {
     };
   }
 
+  /**
+   * Wave 2B: device-scoped operator cancel with server-authoritative,
+   * state-dependent semantics:
+   *
+   * - queued/expired (not yet claimed): terminalize immediately; no attempt
+   *   is created; idempotent on replay.
+   * - claimed/running: the CURRENT attempt is terminalized authoritatively
+   *   with a CANCELLED report (no second attempt). A live Connector observes
+   *   the cancellation via its read surface and stops; a late runner report
+   *   deterministically loses (REPORT_CONFLICT).
+   * - already terminal: no mutation. Repeating a cancel on an
+   *   operator-cancelled job is idempotent (already_cancelled); any other
+   *   terminal outcome is reported explicitly (already_terminal) and history
+   *   is never rewritten to CANCELLED.
+   *
+   * Authorization mirrors the device read surface: the device must hold a
+   * binding to the job's target; inaccessible jobs are indistinguishable
+   * from missing ones (404, no existence leak).
+   */
+  async cancelJobForDevice(
+    deviceId: string,
+    userId: string,
+    jobId: string,
+  ): Promise<JobCancelResult> {
+    if (!jobId || !JOB_ID_V2_RE.test(jobId)) {
+      throw new JobValidationError("Invalid job_id format.");
+    }
+
+    // Bounded race-retry budget: a claim/report landing between our read and
+    // the atomic cancel script raises CANCEL_RACE; re-read and retry.
+    let lastRaceError: V2CancelRaceError | null = null;
+    for (let round = 0; round < JOB_CANCEL_MAX_RACE_RETRIES; round++) {
+      const job = await this.store.getJob(jobId);
+      if (!job) {
+        throw new V2JobNotFoundError();
+      }
+
+      // Do not reveal whether the job exists for unauthorized devices.
+      this.assertDeviceTargetAccess(deviceId, job.target_id);
+
+      const attempt = job.latest_attempt_id
+        ? await this.store.getAttempt(job.latest_attempt_id)
+        : null;
+      const previousState = deriveHostJobState(job, attempt, this.nowMs());
+
+      if (previousState === "terminal") {
+        // Terminal jobs are immutable; decide from current durable records
+        // without any store mutation.
+        const executionStatus = jobExecutionStatusView(job, attempt) ?? "CANCELLED";
+        const businessOutcome = jobBusinessOutcomeView(job, attempt) ?? "NOT_STARTED";
+        const action: JobCancelResult["action"] =
+          executionStatus === "CANCELLED" ? "already_cancelled" : "already_terminal";
+        return {
+          job_id: job.job_id,
+          previous_state: previousState,
+          state: "terminal",
+          execution_status: executionStatus,
+          business_outcome: businessOutcome,
+          action,
+          attempt_id: attempt?.attempt_id ?? null,
+          message:
+            action === "already_cancelled"
+              ? "Job was already cancelled by operator. No change."
+              : `Job already finished with execution status '${executionStatus}'. History preserved; not rewritten to CANCELLED.`,
+        };
+      }
+
+      // Device cancellation is a device-scoped action: the cancel record
+      // attributes the operator action to the calling device.
+      const expectedAttemptId = job.latest_attempt_id ?? "";
+      const cancelReceiptSha256 = crypto
+        .createHash("sha256")
+        .update(`ceo:operator-cancel\u0000${job.job_id}\u0000${expectedAttemptId}\u0000${deviceId}`, "utf8")
+        .digest("hex");
+
+      let outcome: JobCancelOutcome;
+      try {
+        outcome = await this.store.cancelJob({
+          job_id: job.job_id,
+          expected_attempt_id: job.latest_attempt_id,
+          expected_target_id: job.target_id,
+          device_id: deviceId,
+          reason: `operator cancel by user ${userId} via ceo-connector CLI`,
+          cancel_receipt_sha256: cancelReceiptSha256,
+        });
+      } catch (err) {
+        if (err instanceof V2CancelRaceError) {
+          lastRaceError = err;
+          continue;
+        }
+        throw err;
+      }
+
+      const action: JobCancelResult["action"] =
+        outcome.result === "cancelled" ? "cancelled" : "already_cancelled";
+      const message =
+        action === "cancelled"
+          ? previousState === "running"
+            ? "Running job terminalized by operator cancel. The owning Connector will observe the cancellation and stop."
+            : previousState === "claimed"
+              ? "Claimed job cancelled by operator before execution started."
+              : "Job cancelled before claim. No attempt was created."
+          : "Job was already cancelled by operator. No change.";
+
+      return {
+        job_id: job.job_id,
+        previous_state: previousState,
+        state: "terminal",
+        execution_status: outcome.execution_status,
+        business_outcome: outcome.business_outcome,
+        action,
+        attempt_id: outcome.attempt_id,
+        message,
+      };
+    }
+
+    throw new V2StoreError(
+      "QUEUE_UNAVAILABLE",
+      "Job state kept changing during cancel (claim/report race); retry.",
+      "CANCEL_RACE_EXHAUSTED",
+    );
+  }
+
   async getJobIdByRequestId(
     scope: JobSubmitScopeV2,
     requestId: string,
@@ -963,8 +1138,8 @@ export class JobCoordinatorV2 {
       target_id: job.target_id,
       target_alias: target.alias,
       state: hostState,
-      execution_status: attempt?.report?.execution_status ?? null,
-      business_outcome: attempt?.report?.business_outcome ?? null,
+      execution_status: jobExecutionStatusView(job, attempt),
+      business_outcome: jobBusinessOutcomeView(job, attempt),
       created_at: new Date(job.created_at_ms).toISOString(),
       expires_at: expiresAt,
       execution_timeout_seconds: job.execution_timeout_seconds,
@@ -1199,8 +1374,8 @@ export class JobCoordinatorV2 {
           target_id: job.target_id,
           target_alias: target.alias,
           state: hostState,
-          execution_status: attempt?.report?.execution_status ?? null,
-          business_outcome: attempt?.report?.business_outcome ?? null,
+          execution_status: jobExecutionStatusView(job, attempt),
+          business_outcome: jobBusinessOutcomeView(job, attempt),
           created_at: new Date(job.created_at_ms).toISOString(),
           expires_at: expiresAt,
           resource_id: job.resource_id,

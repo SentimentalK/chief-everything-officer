@@ -55,6 +55,7 @@ describe("Redis V2 Coordination Schema", () => {
     latest_attempt_id: null,
     created_at_ms: 1000,
     claim_deadline_ms: 2000,
+    cancel: null,
   };
 
   const validAttempt: AttemptRecordV1 = {

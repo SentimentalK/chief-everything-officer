@@ -210,6 +210,12 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            JobSubcommands::Cancel { job_id, json } => {
+                if let Err(e) = ceo_connector::jobs::job_cancel(&paths, &job_id, json).await {
+                    eprintln!("Job cancel failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
         },
         Commands::Doctor { json } => {
             let report = ceo_connector::doctor::run_doctor(&paths, json).await;

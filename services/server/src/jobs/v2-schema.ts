@@ -74,6 +74,19 @@ export function targetQueueKeyV1(target_id: string): string {
 export type JobRecordV2Status = "preparing" | "queued" | "active" | "terminal";
 export type AttemptRecordV1Phase = "claimed" | "running" | "terminal";
 
+/**
+ * Durable operator-cancel record (Wave 2B). Present on jobs terminalized by
+ * an operator cancel before any attempt was created. For jobs cancelled
+ * while claimed/running, the authoritative CANCELLED outcome lives on the
+ * terminalized attempt's report; the cancel record is still attached to the
+ * job for provenance.
+ */
+export interface JobCancelRecordV2 {
+  cancelled_at_ms: number;
+  requested_by_device_id: string;
+  reason: string;
+}
+
 export interface JobRecordV2 {
   schema_version: typeof JOBS_V2_SCHEMA_VERSION;
   job_id: string;
@@ -92,6 +105,7 @@ export interface JobRecordV2 {
   latest_attempt_id: string | null;
   created_at_ms: number;
   claim_deadline_ms: number;
+  cancel: JobCancelRecordV2 | null;
 }
 
 export interface AttemptRecordV1 {
@@ -168,6 +182,7 @@ const ALLOWED_JOB_V2_KEYS = new Set([
   "latest_attempt_id",
   "created_at_ms",
   "claim_deadline_ms",
+  "cancel",
 ]);
 
 export function parseJobRecordV2(raw: unknown): JobRecordV2 {
@@ -327,14 +342,52 @@ export function parseJobRecordV2(raw: unknown): JobRecordV2 {
     }
   }
 
-  // terminal: stream_entry_id != null, latest_attempt_id != null
+  // terminal: stream_entry_id != null, and either latest_attempt_id != null
+  // (normal report/result path) or a durable operator cancel record (Wave 2B
+  // cancel-before-claim path, which never creates an attempt).
   if (rec.status === "terminal") {
     if (rec.stream_entry_id === null) {
       throw new V2SchemaError("Job in 'terminal' state must have non-null stream_entry_id.");
     }
-    if (rec.latest_attempt_id === null) {
-      throw new V2SchemaError("Job in 'terminal' state must have non-null latest_attempt_id.");
+    if (rec.latest_attempt_id === null && !rec.cancel) {
+      throw new V2SchemaError(
+        "Job in 'terminal' state must have non-null latest_attempt_id or an operator cancel record.",
+      );
     }
+  }
+
+  // Validate the operator cancel record (additive, Wave 2B). Older records
+  // predate the field and normalize to null.
+  let validatedCancel: JobCancelRecordV2 | null = null;
+  if (rec.cancel !== null && rec.cancel !== undefined) {
+    if (typeof rec.cancel !== "object" || Array.isArray(rec.cancel)) {
+      throw new V2SchemaError("Invalid job record: 'cancel' must be null or an object.");
+    }
+    const c = rec.cancel as Record<string, unknown>;
+    for (const key of Object.keys(c)) {
+      if (!["cancelled_at_ms", "requested_by_device_id", "reason"].includes(key)) {
+        throw new V2SchemaError(`Invalid job record: forbidden or unknown field 'cancel.${key}'.`);
+      }
+    }
+    if (
+      typeof c.cancelled_at_ms !== "number" ||
+      !Number.isInteger(c.cancelled_at_ms) ||
+      c.cancelled_at_ms < 0 ||
+      c.cancelled_at_ms > Number.MAX_SAFE_INTEGER
+    ) {
+      throw new V2SchemaError("Invalid job record: 'cancel.cancelled_at_ms' must be a non-negative safe integer.");
+    }
+    if (typeof c.requested_by_device_id !== "string" || !DEVICE_ID_V2_RE.test(c.requested_by_device_id)) {
+      throw new V2SchemaError("Invalid job record: 'cancel.requested_by_device_id' must be formatted as dev_<uuid>.");
+    }
+    if (typeof c.reason !== "string" || c.reason.length === 0 || c.reason.length > 256) {
+      throw new V2SchemaError("Invalid job record: 'cancel.reason' must be a non-empty string of at most 256 characters.");
+    }
+    validatedCancel = {
+      cancelled_at_ms: c.cancelled_at_ms,
+      requested_by_device_id: c.requested_by_device_id,
+      reason: c.reason,
+    };
   }
 
   return {
@@ -355,6 +408,7 @@ export function parseJobRecordV2(raw: unknown): JobRecordV2 {
     latest_attempt_id: (rec.latest_attempt_id as string | null) ?? null,
     created_at_ms: rec.created_at_ms as number,
     claim_deadline_ms: rec.claim_deadline_ms as number,
+    cancel: validatedCancel,
   };
 }
 

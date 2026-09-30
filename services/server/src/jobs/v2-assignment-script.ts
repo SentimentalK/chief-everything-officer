@@ -446,6 +446,176 @@ redis.call('SET', KEYS[1], cjson.encode(job))
 return cjson.encode({ status = 'reported', server_time_ms = now_ms })
 `;
 
+// ---------------------------------------------------------------------------
+// Wave 2B: operator cancel.
+//
+// Server-authoritative, idempotent job cancel with explicit per-state
+// semantics. No queue keys are deleted as a cancel mechanism: the queued
+// branch performs the same orderly ZREM the claim path performs, and the
+// active branch terminalizes the CURRENT attempt in place (never creates a
+// second attempt).
+//
+// KEYS: [jobKey, attemptKey(latest attempt or sentinel), targetQueueKey]
+// ARGS: [expectedAttemptId('' when job should have none), deviceId, reason, cancelReceiptSha256]
+//
+// Outcomes:
+// - queued (+ expired-unclaimed): terminalize immediately, no attempt, attach cancel record.
+// - active (claimed/running): terminalize the current attempt with a synthetic
+//   CANCELLED report; attach cancel record. A late runner report deterministically
+//   loses: the report script sees a terminal attempt with a different report and
+//   returns REPORT_CONFLICT.
+// - terminal: no mutation. already-cancelled replays as 'replayed'; any other
+//   terminal outcome returns 'no_change' so history is never rewritten.
+// - CANCEL_RACE: caller's pre-read of the job went stale (claim landed between
+//   read and script). Caller re-reads and retries; no state was mutated.
+// ---------------------------------------------------------------------------
+export const V2_CANCEL_JOB_SCRIPT = `
+local function badtype(key, ok)
+  local t = redis.call('TYPE', key)
+  local tt = type(t) == 'table' and t.ok or tostring(t)
+  if (tt ~= 'none') and (tt ~= ok) then return true end
+  return false
+end
+
+if badtype(KEYS[1], 'string') then
+  return redis.error_reply('WRONGTYPE_JOB_KEY')
+end
+if badtype(KEYS[2], 'string') then
+  return redis.error_reply('WRONGTYPE_ATTEMPT_KEY')
+end
+-- Target queue may be 'none' or 'zset' (ZREM of last item deletes the key)
+if badtype(KEYS[3], 'zset') then
+  return redis.error_reply('WRONGTYPE_TARGET_QUEUE')
+end
+
+local time_parts = redis.call('TIME')
+local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
+
+local job_raw = redis.call('GET', KEYS[1])
+if not job_raw then
+  return cjson.encode({ error = 'JOB_NOT_FOUND' })
+end
+local okj, job = pcall(cjson.decode, job_raw)
+if not okj then
+  return cjson.encode({ error = 'CORRUPT_JOB_RECORD' })
+end
+
+-- Normalize cjson.null to nil for optional fields
+local latest_attempt = job.latest_attempt_id
+if latest_attempt == cjson.null then latest_attempt = nil end
+local existing_cancel = job.cancel
+if existing_cancel == cjson.null then existing_cancel = nil end
+
+-- Terminal: idempotent no-mutation outcomes
+if job.status == 'terminal' then
+  if latest_attempt then
+    local att_raw = redis.call('GET', KEYS[2])
+    if not att_raw then
+      return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+    end
+    local oka, attempt = pcall(cjson.decode, att_raw)
+    if not oka or attempt.phase ~= 'terminal' or not attempt.report then
+      return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+    end
+    if attempt.report.execution_status == 'CANCELLED' then
+      return cjson.encode({ status = 'replayed', result = 'already_cancelled', execution_status = 'CANCELLED', business_outcome = attempt.report.business_outcome, attempt_id = attempt.attempt_id, server_time_ms = now_ms })
+    end
+    return cjson.encode({ status = 'no_change', result = 'already_terminal', execution_status = attempt.report.execution_status, business_outcome = attempt.report.business_outcome, attempt_id = attempt.attempt_id, server_time_ms = now_ms })
+  end
+  if existing_cancel then
+    return cjson.encode({ status = 'replayed', result = 'already_cancelled', execution_status = 'CANCELLED', business_outcome = 'NOT_STARTED', attempt_id = cjson.null, server_time_ms = now_ms })
+  end
+  return cjson.encode({ error = 'CORRUPT_JOB_RECORD' })
+end
+
+if job.status == 'preparing' then
+  return cjson.encode({ error = 'INVALID_JOB_STATUS', status = job.status })
+end
+
+-- Race guard: the caller derived the attempt linkage from a pre-read. If the
+-- linkage changed (e.g. a claim landed), retry with a fresh read instead of
+-- acting on the wrong attempt key.
+local expected_attempt_id = ARGV[1]
+if (latest_attempt or '') ~= expected_attempt_id then
+  return cjson.encode({ error = 'CANCEL_RACE' })
+end
+
+local cancel_record = {
+  cancelled_at_ms = now_ms,
+  requested_by_device_id = ARGV[2],
+  reason = ARGV[3]
+}
+
+-- Claimed/running: authoritative operator terminalization of the CURRENT attempt.
+if job.status == 'active' then
+  local att_raw = redis.call('GET', KEYS[2])
+  if not att_raw then
+    return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+  end
+  local oka, attempt = pcall(cjson.decode, att_raw)
+  if not oka then
+    return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+  end
+  if attempt.job_id ~= job.job_id or attempt.attempt_id ~= job.latest_attempt_id then
+    return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+  end
+  if attempt.phase ~= 'claimed' and attempt.phase ~= 'running' then
+    return cjson.encode({ error = 'INVALID_ATTEMPT_PHASE', phase = attempt.phase })
+  end
+
+  -- The server-visible attempt phase is the dispatch truth: 'running' means
+  -- the runner already reported start (dispatch accepted); 'claimed' means
+  -- execution had not started server-side.
+  local task_dispatched = attempt.phase == 'running'
+  local duration_ms = 0
+  if task_dispatched then
+    if type(attempt.started_at_ms) ~= 'number' then
+      return cjson.encode({ error = 'CORRUPT_ATTEMPT_RECORD' })
+    end
+    duration_ms = now_ms - attempt.started_at_ms
+    if duration_ms < 0 then duration_ms = 0 end
+  end
+
+  attempt.phase = 'terminal'
+  attempt.report = {
+    schema_version = 2,
+    execution_status = 'CANCELLED',
+    business_outcome = task_dispatched and 'UNVERIFIED' or 'NOT_STARTED',
+    task_dispatched = task_dispatched,
+    finished_at_ms = now_ms,
+    duration_ms = duration_ms,
+    executor = { type = 'operator', version = '1.0.0' },
+    receipt_sha256 = ARGV[4],
+    error = {
+      stage = 'orchestration',
+      code = 'OPERATOR_CANCELLED',
+      message = 'Job cancelled by operator before completion.'
+    },
+    received_at_ms = now_ms
+  }
+  job.status = 'terminal'
+  job.cancel = cancel_record
+
+  redis.call('SET', KEYS[2], cjson.encode(attempt))
+  redis.call('SET', KEYS[1], cjson.encode(job))
+
+  return cjson.encode({ status = 'cancelled', result = 'cancelled', execution_status = 'CANCELLED', business_outcome = attempt.report.business_outcome, attempt_id = attempt.attempt_id, server_time_ms = now_ms })
+end
+
+-- Queued (including expired-unclaimed): immediate terminalization, no attempt.
+if job.status == 'queued' then
+  job.status = 'terminal'
+  job.cancel = cancel_record
+
+  redis.call('ZREM', KEYS[3], job.job_id)
+  redis.call('SET', KEYS[1], cjson.encode(job))
+
+  return cjson.encode({ status = 'cancelled', result = 'cancelled', execution_status = 'CANCELLED', business_outcome = 'NOT_STARTED', attempt_id = cjson.null, server_time_ms = now_ms })
+end
+
+return cjson.encode({ error = 'INVALID_JOB_STATUS', status = job.status })
+`;
+
 export const V2_RECORD_RESULT_SCRIPT = `
 local function badtype(key, ok)
   local t = redis.call('TYPE', key)

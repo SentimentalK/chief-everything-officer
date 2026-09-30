@@ -62,6 +62,7 @@ function makeJobRecord(patch: Partial<JobRecordV2> = {}): JobRecordV2 {
     latest_attempt_id: null,
     created_at_ms: now,
     claim_deadline_ms: now + 3600 * 1000,
+    cancel: null,
     ...patch,
   };
 }

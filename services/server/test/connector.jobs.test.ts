@@ -1046,4 +1046,309 @@ describe("Connector Jobs Protocol (/api/connector/jobs)", () => {
       expect(data.error).toBe("JOB_NOT_FOUND");
     });
   });
+
+  describe("Job Cancel (Wave 2B operator control)", () => {
+    async function submitJobForAlice(requestId: string, prompt = "cancel-me") {
+      return coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: requestId,
+          target_id: targetA.id,
+          prompt,
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+    }
+
+    async function cancelViaApi(jobId: string, token = aliceDevToken) {
+      return fetch(`${baseUrl}/api/connector/jobs/${jobId}/cancel`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+    }
+
+    it("cancels a queued job immediately: terminal/CANCELLED with no attempt created", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a1");
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+
+      const body = await res.json();
+      expect(body).toMatchObject({
+        job_id: job.job_id,
+        previous_state: "queued",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        business_outcome: "NOT_STARTED",
+        action: "cancelled",
+        attempt_id: null,
+      });
+      expect(typeof body.message).toBe("string");
+
+      // No attempt was created and the durable record reflects it.
+      const stored = await v2Store.getJob(job.job_id);
+      expect(stored?.status).toBe("terminal");
+      expect(stored?.latest_attempt_id).toBeNull();
+      expect(stored?.cancel?.requested_by_device_id).toBe(aliceDeviceId);
+
+      // Read models reflect the cancelled terminal state.
+      const detail = await coordinator.getJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+      expect(detail.state).toBe("terminal");
+      expect(detail.execution_status).toBe("CANCELLED");
+      expect(detail.business_outcome).toBe("NOT_STARTED");
+      expect(detail.execution).toBeNull();
+      expect(detail.report).toBeNull();
+    });
+
+    it("replays queued cancel idempotently", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a2");
+      const res1 = await cancelViaApi(job.job_id);
+      expect(res1.status).toBe(200);
+      const body1 = await res1.json();
+      expect(body1.action).toBe("cancelled");
+
+      const res2 = await cancelViaApi(job.job_id);
+      expect(res2.status).toBe(200);
+      const body2 = await res2.json();
+      expect(body2).toMatchObject({
+        previous_state: "terminal",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        action: "already_cancelled",
+        attempt_id: null,
+      });
+    });
+
+    it("cancels a running job: current attempt terminalized authoritatively (stale runner convergence)", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a3");
+      const attemptId = "att_00000000-0000-0000-0000-0000000000a3";
+      const claimToken = "a".repeat(64);
+      await coordinator.claimJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+      await coordinator.startJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        job_id: job.job_id,
+        previous_state: "running",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        action: "cancelled",
+        attempt_id: attemptId,
+      });
+
+      // No second attempt was created; the original attempt carries the
+      // authoritative operator-cancelled report (stale-runner convergence
+      // does not require the original device to come back online).
+      const stored = await v2Store.getJob(job.job_id);
+      expect(stored?.status).toBe("terminal");
+      expect(stored?.latest_attempt_id).toBe(attemptId);
+      const attempt = await v2Store.getAttempt(attemptId);
+      expect(attempt?.phase).toBe("terminal");
+      expect(attempt?.report?.execution_status).toBe("CANCELLED");
+      expect(attempt?.report?.task_dispatched).toBe(true);
+      expect(attempt?.report?.error?.code).toBe("OPERATOR_CANCELLED");
+
+      const detail = await coordinator.getJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+      expect(detail.state).toBe("terminal");
+      expect(detail.execution_status).toBe("CANCELLED");
+      expect(detail.report?.execution_status).toBe("CANCELLED");
+    });
+
+    it("cancels a claimed (not started) job without dispatch metadata", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a4");
+      const attemptId = "att_00000000-0000-0000-0000-0000000000a4";
+      const claimToken = "b".repeat(64);
+      await coordinator.claimJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        previous_state: "claimed",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        business_outcome: "NOT_STARTED",
+        action: "cancelled",
+        attempt_id: attemptId,
+      });
+
+      const attempt = await v2Store.getAttempt(attemptId);
+      expect(attempt?.phase).toBe("terminal");
+      expect(attempt?.report?.task_dispatched).toBe(false);
+      expect(attempt?.report?.business_outcome).toBe("NOT_STARTED");
+    });
+
+    it("replays cancel on an already-cancelled running job idempotently", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a5");
+      const attemptId = "att_00000000-0000-0000-0000-0000000000a5";
+      const claimToken = "c".repeat(64);
+      await coordinator.claimJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+      await coordinator.startJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+
+      const res1 = await cancelViaApi(job.job_id);
+      expect(res1.status).toBe(200);
+      const body1 = await res1.json();
+      expect(body1.action).toBe("cancelled");
+
+      const res2 = await cancelViaApi(job.job_id);
+      expect(res2.status).toBe(200);
+      const body2 = await res2.json();
+      expect(body2).toMatchObject({
+        previous_state: "terminal",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        action: "already_cancelled",
+        attempt_id: attemptId,
+      });
+    });
+
+    it("does not rewrite COMPLETED history into CANCELLED", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a6");
+      const attemptId = "att_00000000-0000-0000-0000-0000000000a6";
+      const claimToken = "d".repeat(64);
+      await coordinator.claimJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+      await coordinator.startJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+      await coordinator.reportJob(aliceDeviceId, job.job_id, attemptId, claimToken, {
+        schema_version: 2,
+        execution_status: "COMPLETED",
+        business_outcome: "UNVERIFIED",
+        task_dispatched: true,
+        finished_at_ms: Date.now(),
+        duration_ms: 120,
+        executor: { type: "local", version: "1.0.0" },
+        receipt_sha256: "0".repeat(64),
+        error: null,
+      });
+
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        previous_state: "terminal",
+        state: "terminal",
+        execution_status: "COMPLETED",
+        action: "already_terminal",
+        attempt_id: attemptId,
+      });
+      expect(body.message).toMatch(/not rewritten/i);
+
+      const detail = await coordinator.getJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+      expect(detail.state).toBe("terminal");
+      expect(detail.execution_status).toBe("COMPLETED");
+    });
+
+    it("deterministic late-report race precedence: operator cancel wins, late COMPLETED report is rejected", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a7");
+      const attemptId = "att_00000000-0000-0000-0000-0000000000a7";
+      const claimToken = "e".repeat(64);
+      await coordinator.claimJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+      await coordinator.startJob(aliceDeviceId, job.job_id, attemptId, claimToken);
+
+      // Operator cancel lands first (authoritative terminalization).
+      const cancelRes = await cancelViaApi(job.job_id);
+      expect(cancelRes.status).toBe(200);
+      expect((await cancelRes.json()).action).toBe("cancelled");
+
+      // The live runner's late COMPLETED report must not overwrite it.
+      const reportRes = await fetch(`${baseUrl}/api/connector/jobs/${job.job_id}/report`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${aliceDevToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          claim_token: claimToken,
+          report: {
+            schema_version: 2,
+            execution_status: "COMPLETED",
+            business_outcome: "UNVERIFIED",
+            task_dispatched: true,
+            finished_at_ms: Date.now(),
+            duration_ms: 500,
+            executor: { type: "local", version: "1.0.0" },
+            receipt_sha256: "0".repeat(64),
+            error: null,
+          },
+        }),
+      });
+      expect(reportRes.status).toBe(409);
+
+      const detail = await coordinator.getJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+      expect(detail.state).toBe("terminal");
+      expect(detail.execution_status).toBe("CANCELLED");
+    });
+
+    it("cancels an expired (unclaimed) job to terminal CANCELLED", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a8");
+      const runner = (v2Store as any).redis;
+      const expired = {
+        ...job,
+        created_at_ms: job.created_at_ms - 8 * 24 * 60 * 60 * 1000,
+        claim_deadline_ms: job.claim_deadline_ms - 8 * 24 * 60 * 60 * 1000,
+      };
+      await runner.set(`ceo:job:v2:${job.job_id}`, JSON.stringify(expired));
+
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        previous_state: "expired",
+        state: "terminal",
+        execution_status: "CANCELLED",
+        action: "cancelled",
+        attempt_id: null,
+      });
+    });
+
+    it("does not leak inaccessible jobs and validates input", async () => {
+      // Bob's device cannot see Alice's job on Target A: 404, same as missing.
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000a9");
+      const bobRes = await cancelViaApi(job.job_id, bobDevToken);
+      expect(bobRes.status).toBe(404);
+      expect(await bobRes.json()).toEqual({ error: "JOB_NOT_FOUND" });
+
+      // Job remains untouched.
+      const detail = await coordinator.getJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+      expect(detail.state).toBe("queued");
+
+      // Invalid job id format -> 400.
+      const badRes = await cancelViaApi("not-a-job-id");
+      expect(badRes.status).toBe(400);
+
+      // Unknown job -> 404.
+      const unknownRes = await cancelViaApi(
+        "job-00000000-0000-0000-0000-0000000000ff",
+      );
+      expect(unknownRes.status).toBe(404);
+    });
+
+    it("cancelling a job removes it from pending discovery", async () => {
+      const { job } = await submitJobForAlice("req-00000000-0000-0000-0000-0000000000b1");
+      expect((await coordinator.getPendingJobs(aliceDeviceId, 20)).map((p) => p.job_id)).toContain(
+        job.job_id,
+      );
+
+      const res = await cancelViaApi(job.job_id);
+      expect(res.status).toBe(200);
+
+      expect((await coordinator.getPendingJobs(aliceDeviceId, 20)).map((p) => p.job_id)).not.toContain(
+        job.job_id,
+      );
+      const terminalList = await coordinator.listJobsForDevice(aliceDeviceId, userAliceId, {
+        state: "terminal",
+      });
+      expect(terminalList.jobs.map((j) => j.job_id)).toContain(job.job_id);
+      const cancelledJob = terminalList.jobs.find((j) => j.job_id === job.job_id);
+      expect(cancelledJob?.execution_status).toBe("CANCELLED");
+    });
+  });
 });

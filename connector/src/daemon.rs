@@ -14,11 +14,12 @@ use crate::execution_contract::{
     BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionReportExecutor,
     ExecutionStatus, REPORT_SCHEMA_VERSION,
 };
-use crate::local_state::{remove_durable, ExecutionLock};
+use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
 use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
     compute_report_sha256, deliver_outbox_record, flush_outbox, flushable_outbox_files,
-    OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION,
+    operator_cancel_digest, OutboxError, OutboxRecord, SanitizedHistoryRecord,
+    HISTORY_SCHEMA_VERSION, OUTBOX_SCHEMA_VERSION,
 };
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{
@@ -423,6 +424,45 @@ pub async fn run_daemon_with_hooks(
     }
 }
 
+/// Terminalizes a local active attempt as operator-cancelled (Wave 2B).
+///
+/// Used when the server has authoritatively CANCELLED the job (stale runner
+/// convergence or live interruption). Best-effort idempotent: if the active
+/// attempt on disk no longer matches (already cleaned up), this is a no-op.
+fn finalize_local_operator_cancelled(
+    paths: &ConnectorPaths,
+    active: &ActiveAttempt,
+) -> Result<(), DaemonError> {
+    let _lock = ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )?;
+
+    // Re-check under the lock: another path may have already cleaned up.
+    let current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+        Some(c) if c.attempt_id == active.attempt_id => c,
+        _ => return Ok(()),
+    };
+
+    let history = SanitizedHistoryRecord {
+        schema_version: HISTORY_SCHEMA_VERSION,
+        job_id: current.job_id.clone(),
+        attempt_id: current.attempt_id.clone(),
+        target_id: current.target_id.clone(),
+        status: "cancelled".to_string(),
+        receipt_sha256: None,
+        duration_ms: None,
+        terminal_report_sha256: operator_cancel_digest(&current.job_id, &current.attempt_id),
+        recorded_at_ms: now_utc_ms(),
+    };
+    let hist_file = paths.history_file(&current.job_id, &current.attempt_id);
+    atomic_write_json(&hist_file, &history)?;
+
+    remove_durable(&paths.active_attempt_file())?;
+    Ok(())
+}
+
 pub async fn drive_active_attempt(
     paths: &ConnectorPaths,
     client: &ConnectorClient,
@@ -514,6 +554,7 @@ pub async fn drive_active_attempt(
                 Err(ClientError::JobError { ref code, .. })
                     if code == "JOB_ALREADY_CLAIMED"
                         || code == "JOB_EXPIRED"
+                        || code == "JOB_FINISHED"
                         || code == "JOB_NOT_FOUND" =>
                 {
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -522,7 +563,7 @@ pub async fn drive_active_attempt(
                         Duration::from_millis(50),
                     )?;
                     remove_durable(&paths.active_attempt_file())?;
-                    println!("Job was consumed by another worker or expired. Cleared local claim intent.");
+                    println!("Job was consumed by another worker, expired, or operator-cancelled. Cleared local claim intent.");
                     Ok(false)
                 }
                 Err(ClientError::JobError {
@@ -623,6 +664,27 @@ pub async fn drive_active_attempt(
                     || code == "ATTEMPT_MISMATCH"
                     || code == "JOB_NOT_CLAIMED" =>
                 {
+                    // Operator-cancel precedence (Wave 2B): if the server has
+                    // authoritatively terminalized this job as CANCELLED, honor
+                    // it locally instead of entering recovery churn.
+                    if code == "JOB_NOT_ACTIVE"
+                        || code == "INVALID_ATTEMPT_PHASE"
+                        || code == "ATTEMPT_MISMATCH"
+                        || code == "ATTEMPT_NOT_FOUND"
+                    {
+                        if let Ok(detail) = client.get_job(cred, &active.job_id, false).await {
+                            if detail.state == "terminal"
+                                && detail.execution_status.as_deref() == Some("CANCELLED")
+                            {
+                                finalize_local_operator_cancelled(paths, &active)?;
+                                println!(
+                                    "Job '{}' was operator-cancelled; local attempt terminalized as cancelled.",
+                                    active.job_id
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    }
                     let _lock = ExecutionLock::acquire_with_retry(
                         &paths.state_lock_file(),
                         Duration::from_secs(5),
@@ -1195,6 +1257,33 @@ pub async fn drive_active_attempt(
             let mut completion_err: Option<ExecutionReportError> = None;
 
             while now_utc_ms() < deadline_ms {
+                // Operator-cancel observation (Wave 2B): poll the server's
+                // device-scoped read model each tick. If the job has been
+                // authoritatively cancelled, interrupt the live attempt through
+                // the existing Orca adapter path and terminalize locally.
+                // Poll failures are tolerated (best-effort; loop continues).
+                match client.get_job(cred, &active.job_id, false).await {
+                    Ok(detail)
+                        if detail.state == "terminal"
+                            && detail.execution_status.as_deref() == Some("CANCELLED") =>
+                    {
+                        let _ = adapter.interrupt(&active, &terminal_id).await;
+                        finalize_local_operator_cancelled(paths, &active)?;
+                        println!(
+                            "Job '{}' was operator-cancelled while running; attempt interrupted and terminalized locally.",
+                            active.job_id
+                        );
+                        return Ok(true);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "Operator-cancel poll failed for job '{}' (tolerated): {}",
+                            active.job_id, e
+                        );
+                    }
+                }
+
                 if active.result_target.as_deref() == Some("resource")
                     && crate::managed_result::durable_capture_managed_result(paths, cred, &active)
                         .is_ok()

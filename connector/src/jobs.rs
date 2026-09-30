@@ -1,6 +1,8 @@
 use thiserror::Error;
 
-use crate::client::{ClientError, ConnectorClient, JobDetail, JobListQuery, JobListResponse};
+use crate::client::{
+    CancelJobResponse, ClientError, ConnectorClient, JobDetail, JobListQuery, JobListResponse,
+};
 use crate::config::{ConfigError, ProfileError};
 use crate::credential::CredentialError;
 use crate::paths::ConnectorPaths;
@@ -110,6 +112,47 @@ pub async fn job_show(
         print!("{}", render_job_detail(&detail));
     }
     Ok(())
+}
+
+/// Operator cancel (Wave 2B). The server is authoritative for job lifecycle;
+/// this only forwards the request and renders the typed outcome.
+pub async fn job_cancel(
+    paths: &ConnectorPaths,
+    job_id: &str,
+    json_format: bool,
+) -> Result<(), JobError> {
+    let profile = crate::config::load_bound_profile(paths)?;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+    let res = client.cancel_job(&cred, job_id).await?;
+
+    if json_format {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    } else {
+        print!("{}", render_job_cancel(&res));
+    }
+    Ok(())
+}
+
+/// Renders the cancel outcome as a vertical block, consistent with Wave 2A
+/// read-model output.
+pub fn render_job_cancel(res: &CancelJobResponse) -> String {
+    let mut out = String::new();
+    push_line(&mut out, 0, "Job cancel");
+    push_field(&mut out, 2, "ID", &res.job_id);
+    push_field(&mut out, 2, "Previous state", &res.previous_state);
+    push_field(&mut out, 2, "State", &res.state);
+    push_opt_field(&mut out, 2, "Execution status", &res.execution_status);
+    push_opt_field(&mut out, 2, "Attempt", &res.attempt_id);
+    let result = match res.action.as_str() {
+        "cancelled" => "cancelled".to_string(),
+        "already_cancelled" => "already cancelled (no change)".to_string(),
+        "already_terminal" => "already terminal; history preserved".to_string(),
+        other => other.to_string(),
+    };
+    push_field(&mut out, 2, "Result", &result);
+    push_field(&mut out, 2, "Message", &res.message);
+    out
 }
 
 /// Renders the job list as vertical blocks, newest first (server order).

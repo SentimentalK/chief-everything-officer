@@ -123,6 +123,7 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
       latest_attempt_id: null,
       created_at_ms: 1000,
       claim_deadline_ms: 2000,
+      cancel: null,
     };
 
     it("derives queued when now < claim_deadline_ms", () => {

@@ -393,6 +393,23 @@ pub struct JobMutationAck {
     pub server_time: String,
 }
 
+/// Typed device-scoped operator cancel outcome (Wave 2B).
+/// `action`:
+/// - "cancelled": cancellation was newly applied by this request.
+/// - "already_cancelled": job was already operator-cancelled (idempotent replay).
+/// - "already_terminal": job finished with a non-cancelled outcome; history preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelJobResponse {
+    pub job_id: String,
+    pub previous_state: String,
+    pub state: String,
+    pub execution_status: Option<String>,
+    pub business_outcome: Option<String>,
+    pub action: String,
+    pub attempt_id: Option<String>,
+    pub message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -1106,6 +1123,65 @@ impl ConnectorClient {
             Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::JobError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 17. Cancel job (device-scoped operator action, Wave 2B)
+    pub async fn cancel_job(
+        &self,
+        credential: &DeviceCredential,
+        job_id: &str,
+    ) -> Result<CancelJobResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!(
+            "{}/api/connector/jobs/{}/cancel",
+            self.server_origin, job_id
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: CancelJobResponse = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if status.as_u16() == 404 {
+            Err(ClientError::JobError {
+                code: "JOB_NOT_FOUND".into(),
+                message: format!("Job '{job_id}' was not found or is not visible to this device."),
+            })
+        } else if status.is_server_error() {
+            Err(ClientError::ServerUnavailable {
+                status: status.as_u16(),
+                message: text,
+            })
         } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
             let code = err_json
                 .get("error")

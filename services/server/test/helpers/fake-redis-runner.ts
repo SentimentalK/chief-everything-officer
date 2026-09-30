@@ -562,6 +562,162 @@ export function createFakeRedisRunner(): RedisRunner & {
         });
       }
 
+      if (script.includes("CANCEL_RACE")) {
+        // V2_CANCEL_JOB_SCRIPT
+        // Keys: [jobKey, attemptKey, targetQueueKey]
+        // Args: [expectedAttemptId, deviceId, reason, cancelReceiptSha256]
+        const [jobKey, attemptKey, targetQueueKey] = keys;
+        const [expectedAttemptId, deviceId, reason, cancelReceiptSha256] = args;
+        const nowMs = Date.now();
+
+        const jobRaw = strings.get(jobKey);
+        if (!jobRaw) return JSON.stringify({ error: "JOB_NOT_FOUND" });
+        let job: any;
+        try {
+          job = JSON.parse(jobRaw);
+        } catch {
+          return JSON.stringify({ error: "CORRUPT_JOB_RECORD" });
+        }
+
+        if (job.status === "terminal") {
+          if (job.latest_attempt_id) {
+            const attRaw = strings.get(attemptKey);
+            if (!attRaw) return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+            let attempt: any;
+            try {
+              attempt = JSON.parse(attRaw);
+            } catch {
+              return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+            }
+            if (attempt.phase !== "terminal" || !attempt.report) {
+              return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+            }
+            if (attempt.report.execution_status === "CANCELLED") {
+              return JSON.stringify({
+                status: "replayed",
+                result: "already_cancelled",
+                execution_status: "CANCELLED",
+                business_outcome: attempt.report.business_outcome,
+                attempt_id: attempt.attempt_id,
+                server_time_ms: nowMs,
+              });
+            }
+            return JSON.stringify({
+              status: "no_change",
+              result: "already_terminal",
+              execution_status: attempt.report.execution_status,
+              business_outcome: attempt.report.business_outcome,
+              attempt_id: attempt.attempt_id,
+              server_time_ms: nowMs,
+            });
+          }
+          if (job.cancel) {
+            return JSON.stringify({
+              status: "replayed",
+              result: "already_cancelled",
+              execution_status: "CANCELLED",
+              business_outcome: "NOT_STARTED",
+              attempt_id: null,
+              server_time_ms: nowMs,
+            });
+          }
+          return JSON.stringify({ error: "CORRUPT_JOB_RECORD" });
+        }
+
+        if (job.status === "preparing") {
+          return JSON.stringify({ error: "INVALID_JOB_STATUS", status: job.status });
+        }
+
+        if ((job.latest_attempt_id ?? "") !== expectedAttemptId) {
+          return JSON.stringify({ error: "CANCEL_RACE" });
+        }
+
+        const cancelRecord = {
+          cancelled_at_ms: nowMs,
+          requested_by_device_id: deviceId,
+          reason,
+        };
+
+        if (job.status === "active") {
+          const attRaw = strings.get(attemptKey);
+          if (!attRaw) return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+          let attempt: any;
+          try {
+            attempt = JSON.parse(attRaw);
+          } catch {
+            return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+          }
+          if (attempt.job_id !== job.job_id || attempt.attempt_id !== job.latest_attempt_id) {
+            return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+          }
+          if (attempt.phase !== "claimed" && attempt.phase !== "running") {
+            return JSON.stringify({ error: "INVALID_ATTEMPT_PHASE", phase: attempt.phase });
+          }
+
+          const taskDispatched = attempt.phase === "running";
+          let durationMs = 0;
+          if (taskDispatched) {
+            if (typeof attempt.started_at_ms !== "number") {
+              return JSON.stringify({ error: "CORRUPT_ATTEMPT_RECORD" });
+            }
+            durationMs = Math.max(0, nowMs - attempt.started_at_ms);
+          }
+
+          attempt.phase = "terminal";
+          attempt.report = {
+            schema_version: 2,
+            execution_status: "CANCELLED",
+            business_outcome: taskDispatched ? "UNVERIFIED" : "NOT_STARTED",
+            task_dispatched: taskDispatched,
+            finished_at_ms: nowMs,
+            duration_ms: durationMs,
+            executor: { type: "operator", version: "1.0.0" },
+            receipt_sha256: cancelReceiptSha256,
+            error: {
+              stage: "orchestration",
+              code: "OPERATOR_CANCELLED",
+              message: "Job cancelled by operator before completion.",
+            },
+            received_at_ms: nowMs,
+          };
+          job.status = "terminal";
+          job.cancel = cancelRecord;
+          strings.set(attemptKey, JSON.stringify(attempt));
+          strings.set(jobKey, JSON.stringify(job));
+
+          return JSON.stringify({
+            status: "cancelled",
+            result: "cancelled",
+            execution_status: "CANCELLED",
+            business_outcome: attempt.report.business_outcome,
+            attempt_id: attempt.attempt_id,
+            server_time_ms: nowMs,
+          });
+        }
+
+        if (job.status === "queued") {
+          job.status = "terminal";
+          job.cancel = cancelRecord;
+          const tq = zsets.get(targetQueueKey);
+          if (tq) {
+            tq.delete(job.job_id);
+            if (tq.size === 0) zsets.delete(targetQueueKey);
+          }
+          strings.set(jobKey, JSON.stringify(job));
+
+          return JSON.stringify({
+            status: "cancelled",
+            result: "cancelled",
+            execution_status: "CANCELLED",
+            business_outcome: "NOT_STARTED",
+            attempt_id: null,
+            server_time_ms: nowMs,
+          });
+        }
+
+        return JSON.stringify({ error: "INVALID_JOB_STATUS", status: job.status });
+      }
+
       throw new Error(`Unknown script in fake runner: ${script}`);
     },
   };

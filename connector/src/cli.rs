@@ -172,4 +172,13 @@ pub enum JobSubcommands {
         #[arg(long, default_value_t = false)]
         include_task: bool,
     },
+    /// Cancel a job (server-authoritative, idempotent operator action)
+    Cancel {
+        /// Job ID (job-<uuid>)
+        job_id: String,
+
+        /// Output in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
