@@ -123,6 +123,19 @@ pub enum TargetSubcommands {
         #[arg(long)]
         agent_command: String,
     },
+    /// Set or clear an optional per-target model override for the agent executor
+    SetModel {
+        #[arg(long)]
+        target_id: String,
+        /// Model ID to force for every newly launched execution on this target
+        /// (verified Cursor contract, e.g. `gpt-5` or
+        /// `claude-opus-4-8[context=1m,effort=high,fast=false]`)
+        #[arg(long)]
+        model: Option<String>,
+        /// Clear any existing model override
+        #[arg(long, default_value_t = false)]
+        clear: bool,
+    },
     /// Set the workspace default agent runtime target (server-side routing state)
     SetDefaultRuntime {
         #[arg(long)]

@@ -36,6 +36,7 @@ fn sample_item() -> ceo_connector::targets::TargetDisplayItem {
         repository: Some("SentimentalK/chief-everything-officer".into()),
         agent_id: Some("cursor".into()),
         agent_command: Some("/home/sentimentalk/.local/bin/agent".into()),
+        model: None,
     }
 }
 

@@ -164,6 +164,35 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            TargetSubcommands::SetModel {
+                target_id,
+                model,
+                clear,
+            } => {
+                // Exactly one of --model or --clear is required.
+                let result = match (&model, clear) {
+                    (Some(_), true) => {
+                        eprintln!("Error: --model and --clear are mutually exclusive; provide exactly one.");
+                        return ExitCode::FAILURE;
+                    }
+                    (None, false) => {
+                        eprintln!(
+                            "Error: provide exactly one of `--model <model-id>` or `--clear`."
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    (Some(m), false) => {
+                        ceo_connector::targets::target_set_model(&paths, &target_id, Some(m)).await
+                    }
+                    (None, true) => {
+                        ceo_connector::targets::target_set_model(&paths, &target_id, None).await
+                    }
+                };
+                if let Err(e) = result {
+                    eprintln!("Target set-model failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
             TargetSubcommands::SetDefaultRuntime { target_id } => {
                 if let Err(e) =
                     ceo_connector::targets::target_set_default_runtime(&paths, &target_id).await

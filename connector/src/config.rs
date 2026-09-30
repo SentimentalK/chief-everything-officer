@@ -31,17 +31,44 @@ pub struct LocalExecutorConfig {
     pub kind: String,
     pub agent_id: String,
     pub command: String,
+    /// Optional per-target model override applied by the shared core launch
+    /// policy when creating a new agent terminal/session. Absent (None)
+    /// preserves the agent's normal default/Auto model selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
+
+/// Maximum accepted length for a model override value.
+pub const MAX_EXECUTOR_MODEL_LEN: usize = 128;
 
 impl LocalExecutorConfig {
     pub fn new(agent_id: String, command: String) -> Result<Self, ConfigError> {
+        Self::new_with_model(agent_id, command, None)
+    }
+
+    pub fn new_with_model(
+        agent_id: String,
+        command: String,
+        model: Option<String>,
+    ) -> Result<Self, ConfigError> {
         let cfg = Self {
             kind: "orca_tui".to_string(),
             agent_id,
             command,
+            model,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Explicit executor capability mapping for per-target model overrides.
+    /// Intentionally minimal: only the Cursor Agent CLI has a verified launch
+    /// contract (`--model <model>`). Future agents add their own entry after
+    /// their CLI contract is verified. This shared-core mapping is the single
+    /// place model-capable agents are declared; platform modules and Orca
+    /// never own model routing.
+    pub fn agent_supports_model_override(agent_id: &str) -> bool {
+        agent_id == "cursor"
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -91,7 +118,68 @@ impl LocalExecutorConfig {
                 "command cannot contain NUL byte".into(),
             ));
         }
+        if let Some(model) = &self.model {
+            Self::validate_model_override(&self.agent_id, command, model)?;
+        }
         Ok(())
+    }
+
+    fn validate_model_override(
+        agent_id: &str,
+        command: &str,
+        model: &str,
+    ) -> Result<(), ConfigError> {
+        if !Self::agent_supports_model_override(agent_id) {
+            return Err(ConfigError::InvalidExecutor(format!(
+                "model override is not supported for agent '{agent_id}' (only 'cursor' has a verified model launch contract)"
+            )));
+        }
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ConfigError::InvalidExecutor("model cannot be empty".into()));
+        }
+        if model.len() > MAX_EXECUTOR_MODEL_LEN {
+            return Err(ConfigError::InvalidExecutor(
+                "model exceeds maximum length of 128 bytes".into(),
+            ));
+        }
+        for c in model.chars() {
+            if c.is_ascii_control() || c == '\0' {
+                return Err(ConfigError::InvalidExecutor(
+                    "model cannot contain NUL, newline, or other control characters".into(),
+                ));
+            }
+            if c.is_whitespace() {
+                return Err(ConfigError::InvalidExecutor(
+                    "model cannot contain whitespace (the verified Cursor CLI contract takes a single argument, e.g. `gpt-5` or `claude-opus-4-8[context=1m,effort=high,fast=false]`)".into(),
+                ));
+            }
+        }
+        // The model flag is appended to the existing command; a command that
+        // already carries `--model` would result in the flag appearing twice.
+        if command.split_whitespace().any(|t| t == "--model") {
+            return Err(ConfigError::InvalidExecutor(
+                "command already contains '--model'; remove it from the command before setting a model override".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the effective agent launch command used when creating a *new*
+    /// agent terminal/session for this Target (shared core launch policy).
+    ///
+    /// - No model override: the configured command is returned unchanged.
+    /// - Model override set: the verified Cursor CLI `--model <model>` option
+    ///   is appended exactly once to the configured command.
+    ///
+    /// Recovery/reconciliation of an existing recorded terminal must not use
+    /// this to restart a terminal; the override only applies at creation time.
+    pub fn effective_command(&self) -> Result<String, ConfigError> {
+        self.validate()?;
+        match &self.model {
+            None => Ok(self.command.clone()),
+            Some(model) => Ok(format!("{} --model {}", self.command, model)),
+        }
     }
 }
 
@@ -372,6 +460,7 @@ mod tests {
             kind: "other".into(),
             agent_id: "agy".into(),
             command: "agy".into(),
+            model: None,
         };
         assert!(invalid_kind.validate().is_err());
 
@@ -390,6 +479,176 @@ mod tests {
 
         let long_cmd = LocalExecutorConfig::new("agy".into(), "a".repeat(1025));
         assert!(long_cmd.is_err());
+    }
+
+    #[test]
+    fn executor_model_override_validation() {
+        // Valid cursor model (plain id and bracket-parameterized form)
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "/home/sentimentalk/.local/bin/agent -f --trust".into(),
+            Some("gpt-5".into())
+        )
+        .is_ok());
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "/home/sentimentalk/.local/bin/agent -f --trust".into(),
+            Some("claude-opus-4-8[context=1m,effort=high,fast=false]".into())
+        )
+        .is_ok());
+
+        // Unsupported agent + model fails explicitly, no silent fallback
+        let err =
+            LocalExecutorConfig::new_with_model("agy".into(), "agy".into(), Some("gpt-5".into()));
+        assert!(
+            matches!(err, Err(ConfigError::InvalidExecutor(msg)) if msg.contains("not supported for agent 'agy'"))
+        );
+
+        // Empty
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("   ".into())
+        )
+        .is_err());
+        // NUL
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("gpt\0-5".into())
+        )
+        .is_err());
+        // Newline / control chars
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("gpt\n-5".into())
+        )
+        .is_err());
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("gpt\u{7}-5".into())
+        )
+        .is_err());
+        // Whitespace (would split arguments at the terminal boundary)
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("gpt 5".into())
+        )
+        .is_err());
+        // Overlong
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent".into(),
+            Some("a".repeat(MAX_EXECUTOR_MODEL_LEN + 1))
+        )
+        .is_err());
+        // Command already carries --model -> would appear twice
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent --model gpt-5".into(),
+            Some("gpt-5".into())
+        )
+        .is_err());
+        // '--models' as part of another token is not a duplicate --model flag
+        assert!(LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "agent --models-dir /x".into(),
+            Some("gpt-5".into())
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn executor_effective_command_composition() {
+        let no_model =
+            LocalExecutorConfig::new("cursor".into(), "/path/agent -f --trust".into()).unwrap();
+        // Byte-for-byte unchanged when no model override
+        assert_eq!(
+            no_model.effective_command().unwrap(),
+            "/path/agent -f --trust"
+        );
+
+        let with_model = LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "/path/agent -f --trust".into(),
+            Some("gpt-5".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            with_model.effective_command().unwrap(),
+            "/path/agent -f --trust --model gpt-5"
+        );
+        // Idempotent: repeated calls append exactly once
+        assert_eq!(
+            with_model.effective_command().unwrap(),
+            with_model.effective_command().unwrap()
+        );
+
+        let unsupported =
+            LocalExecutorConfig::new_with_model("agy".into(), "agy".into(), Some("gpt-5".into()));
+        assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn executor_config_without_model_field_loads_as_default() {
+        let json = r#"{
+            "kind": "orca_tui",
+            "agent_id": "cursor",
+            "command": "/path/agent -f --trust"
+        }"#;
+        let cfg: LocalExecutorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.model, None);
+        assert_eq!(cfg.effective_command().unwrap(), "/path/agent -f --trust");
+    }
+
+    #[test]
+    fn executor_config_with_model_round_trips() {
+        let cfg = LocalExecutorConfig::new_with_model(
+            "cursor".into(),
+            "/path/agent -f --trust".into(),
+            Some("gpt-5".into()),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"model\":\"gpt-5\""));
+        let back: LocalExecutorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        // None model is omitted from serialization
+        let none_json = serde_json::to_string(
+            &LocalExecutorConfig::new("cursor".into(), "agent".into()).unwrap(),
+        )
+        .unwrap();
+        assert!(!none_json.contains("model"));
+    }
+
+    #[test]
+    fn config_v2_without_model_field_loads_unchanged() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.json");
+        let v2_json = r#"{
+            "schema_version": 2,
+            "server_url": "https://ceo.example.com",
+            "targets": {
+                "t1": {
+                    "workspace_id": "ws-1",
+                    "alias": "repo1",
+                    "kind": "coding",
+                    "local_path": "/tmp/repo1",
+                    "executor": {
+                        "kind": "orca_tui",
+                        "agent_id": "cursor",
+                        "command": "/path/agent -f --trust"
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&path, v2_json).unwrap();
+        let loaded = LocalConfig::load(&path).unwrap().unwrap();
+        let exec = loaded.targets.get("t1").unwrap().executor.as_ref().unwrap();
+        assert_eq!(exec.model, None);
     }
 
     #[test]

@@ -364,12 +364,25 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
             match matching_terminals.len() {
                 0 => {
+                    // Effective launch command derived from the executor config
+                    // in one place (shared core policy). Model override, when
+                    // set, is appended here for a NEW terminal only; recovery
+                    // of an existing recorded terminal never re-launches with
+                    // a different model.
+                    let launch_command = executor
+                        .effective_command()
+                        .map_err(|e| {
+                            format!(
+                                "RECOVERY_REQUIRED: invalid executor configuration for target '{}': {e}",
+                                target.local_path
+                            )
+                        })?;
                     let term = self
                         .client
                         .create_terminal(
                             &worktree.id,
                             &expected_title,
-                            Some(&executor.command),
+                            Some(&launch_command),
                             Some(&canonical_target_path),
                         )
                         .await

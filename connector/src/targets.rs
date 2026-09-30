@@ -79,6 +79,10 @@ pub struct TargetDisplayItem {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command: Option<String>,
+    /// Optional per-target model override (omitted when no override is set,
+    /// matching the Option-field JSON convention used by agent_id/command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Normalizes a GitHub remote URL (HTTPS or SSH) into an `owner/repo` string.
@@ -430,6 +434,18 @@ pub async fn target_set_agent(
         .get_mut(target_id)
         .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
 
+    // Preserve any existing model override: `set-agent` re-configures the
+    // agent_id/command but must not accidentally clear the model override.
+    let preserved_model = target.executor.as_ref().and_then(|e| e.model.clone());
+    let executor_cfg = if let Some(model) = preserved_model {
+        crate::config::LocalExecutorConfig::new_with_model(
+            agent_id.to_string(),
+            agent_command.to_string(),
+            Some(model),
+        )?
+    } else {
+        executor_cfg
+    };
     target.executor = Some(executor_cfg);
     config.save(&paths.config_file())?;
 
@@ -437,6 +453,61 @@ pub async fn target_set_agent(
         "Target '{}' agent executor updated: agent_id='{}', command='{}'.",
         target_id, agent_id, agent_command
     );
+    Ok(())
+}
+
+/// Sets or clears the optional per-target model override (local executor
+/// policy). `None` for `model` clears the override; the agent_id/command are
+/// always preserved. Refuses mutation while the target is in an active
+/// attempt (TARGET_IN_USE), consistent with `target_set_agent`.
+pub async fn target_set_model(
+    paths: &ConnectorPaths,
+    target_id: &str,
+    model: Option<&str>,
+) -> Result<(), TargetError> {
+    paths.ensure_dirs()?;
+
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(TargetError::ProfileBusy)
+        }
+        Err(e) => return Err(TargetError::Io(e)),
+    };
+    check_active_attempt_target_in_use(paths, target_id)?;
+
+    let mut config = crate::config::LocalConfig::load(&paths.config_file())?
+        .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
+
+    let target = config
+        .targets
+        .get_mut(target_id)
+        .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
+
+    let executor = target.executor.as_mut().ok_or_else(|| {
+        TargetError::Config(crate::config::ConfigError::InvalidExecutor(format!(
+            "target '{target_id}' has no agent executor configured; run `ceo-connector target set-agent --target-id {target_id} --agent-id <id> --agent-command <command>` first"
+        )))
+    })?;
+
+    executor.model = model.map(|m| m.to_string());
+    executor.validate()?;
+    config.save(&paths.config_file())?;
+
+    match model {
+        Some(m) => println!(
+            "Target '{}' model override set to '{}' (applies to newly launched executions).",
+            target_id, m
+        ),
+        None => println!(
+            "Target '{}' model override cleared; the agent will use its default model.",
+            target_id
+        ),
+    }
     Ok(())
 }
 
@@ -529,6 +600,10 @@ pub fn render_target_blocks(items: &[TargetDisplayItem]) -> String {
             }
             _ => push_line(&mut out, 2, "Agent: <not configured>"),
         }
+        match &item.model {
+            Some(model) => push_line(&mut out, 2, &format!("Model: {model}")),
+            None => push_line(&mut out, 2, "Model: <default>"),
+        }
         push_line(&mut out, 0, "");
     }
     out
@@ -610,6 +685,7 @@ pub async fn build_target_display_items(
                 repository: st.repository.map(|r| r.full_name),
                 agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
                 agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
+                model: lt.executor.as_ref().and_then(|e| e.model.clone()),
             });
         } else {
             let status = if !path_exists {
@@ -630,6 +706,7 @@ pub async fn build_target_display_items(
                 repository: None,
                 agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
                 agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
+                model: lt.executor.as_ref().and_then(|e| e.model.clone()),
             });
         }
     }
@@ -659,6 +736,7 @@ pub async fn build_target_display_items(
             repository: st.repository.map(|r| r.full_name),
             agent_id: None,
             agent_command: None,
+            model: None,
         });
     }
 

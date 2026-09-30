@@ -517,10 +517,16 @@ async fn check_server_integration(
                                 checks.push(DiagnosticCheck {
                                     name: format!("Target '{}' Executor Configuration", lt.alias),
                                     severity: DiagnosticSeverity::Pass,
-                                    message: format!(
-                                        "Configured for agent '{}' ({})",
-                                        exec.agent_id, exec.command
-                                    ),
+                                    message: match &exec.model {
+                                        Some(m) => format!(
+                                            "Configured for agent '{}' ({}) with model override '{}'",
+                                            exec.agent_id, exec.command, m
+                                        ),
+                                        None => format!(
+                                            "Configured for agent '{}' ({})",
+                                            exec.agent_id, exec.command
+                                        ),
+                                    },
                                 });
 
                                 let agent_found = find_in_path(&exec.command);
