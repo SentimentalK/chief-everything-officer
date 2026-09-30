@@ -1232,4 +1232,117 @@ export class JobCoordinatorV2 {
 
     return { jobs, next_cursor: nextCursor };
   }
+
+  // ---------------------------------------------------------------------
+  // Device-scoped read models (Connector CLI read side; read-only)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Device-scoped job detail. A device may read a job only when it has a
+   * binding (current or historical) to the job's target. Workspace-level
+   * authorization is inherited from getJobForHost via the device's user.
+   */
+  async getJobForDevice(
+    deviceId: string,
+    userId: string,
+    jobId: string,
+    options?: { include_task?: boolean },
+  ): Promise<HostJobDetail> {
+    if (!jobId || !JOB_ID_V2_RE.test(jobId)) {
+      throw new JobValidationError("Invalid job_id format.");
+    }
+
+    const job = await this.store.getJob(jobId);
+    if (!job) {
+      throw new V2JobNotFoundError();
+    }
+
+    this.assertDeviceTargetAccess(deviceId, job.target_id);
+
+    return this.getJobForHost(
+      { user_id: userId, workspace_id: job.workspace_id },
+      jobId,
+      options,
+    );
+  }
+
+  /**
+   * Device-scoped job list. Visibility is limited to jobs whose target is
+   * (or was) bound to this device. With a target_id filter, only that
+   * target's workspace is scanned.
+   */
+  async listJobsForDevice(
+    deviceId: string,
+    userId: string,
+    query: ListJobsQuery = {},
+  ): Promise<{ jobs: HostJobSummary[]; next_cursor: string | null }> {
+    const deviceTargetIds = new Set(
+      this.controlStore
+        .listBindingsForDevice(deviceId, { includeDisabled: true })
+        .map((b) => b.target_id),
+    );
+
+    let workspaceIds = new Set<string>();
+    for (const targetId of deviceTargetIds) {
+      const target = this.controlStore.getExecutionTarget(targetId);
+      if (target) {
+        workspaceIds.add(target.workspace_id);
+      }
+    }
+
+    if (query.target_id) {
+      if (!deviceTargetIds.has(query.target_id)) {
+        // Target exists but is not visible to this device: return an empty
+        // result rather than leaking target state.
+        return { jobs: [], next_cursor: null };
+      }
+      const target = this.controlStore.getExecutionTarget(query.target_id);
+      if (!target) {
+        return { jobs: [], next_cursor: null };
+      }
+      workspaceIds = new Set([target.workspace_id]);
+    }
+
+    if (workspaceIds.size === 0) {
+      return { jobs: [], next_cursor: null };
+    }
+
+    const workspaceList = [...workspaceIds];
+    if (workspaceList.length === 1 && workspaceList[0] !== undefined) {
+      return this.listJobsForHost(
+        { user_id: userId, workspace_id: workspaceList[0] },
+        query,
+      );
+    }
+
+    // Multi-workspace devices: merge newest-first across the device's
+    // workspaces. Cursor pagination is not supported across workspaces in
+    // this read model; page within a single workspace via target_id filter.
+    const limit = Math.min(
+      Math.max(1, query.limit ?? JOB_LIST_DEFAULT_LIMIT),
+      JOB_LIST_MAX_LIMIT,
+    );
+    const merged: HostJobSummary[] = [];
+    for (const workspaceId of workspaceIds) {
+      const res = await this.listJobsForHost(
+        { user_id: userId, workspace_id: workspaceId },
+        { ...query, limit, cursor: null },
+      );
+      merged.push(...res.jobs);
+    }
+    merged.sort((a, b) =>
+      a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0,
+    );
+    return { jobs: merged.slice(0, limit), next_cursor: null };
+  }
+
+  private assertDeviceTargetAccess(deviceId: string, targetId: string): void {
+    const bindings = this.controlStore.listBindingsForDevice(deviceId, {
+      includeDisabled: true,
+    });
+    if (!bindings.some((b) => b.target_id === targetId)) {
+      // Do not reveal whether the job exists.
+      throw new V2JobNotFoundError();
+    }
+  }
 }

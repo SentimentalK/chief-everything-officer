@@ -9,6 +9,7 @@ use crate::client::{ConnectorClient, ConnectorTargetProjection};
 use crate::config::LocalConfig;
 use crate::credential::DeviceCredential;
 use crate::paths::{reject_control_ancestor_symlinks, reject_symlink_target, ConnectorPaths};
+use crate::render::{push_field, push_line};
 use crate::targets::verify_local_repository;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,30 +102,28 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
     if json_format {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
-        println!("============================================================");
-        println!("  CEO Connector Doctor");
-        println!("============================================================");
-        for c in &report.checks {
-            let symbol = match c.severity {
-                DiagnosticSeverity::Pass => "✓",
-                DiagnosticSeverity::Warn => "!",
-                DiagnosticSeverity::Fail => "✗",
-            };
-            println!(
-                "  [{}] {:<5} {:<32} {}",
-                symbol, c.severity, c.name, c.message
-            );
-        }
-        println!("============================================================");
-        if overall_passed {
-            println!("  Result: ALL REQUIRED CHECKS PASSED");
-        } else {
-            println!("  Result: DOCTOR DETECTED ONE OR MORE FAILURES");
-        }
-        println!("============================================================");
+        print!("{}", render_doctor_human(&report));
     }
 
     report
+}
+
+/// Renders doctor human output as vertical blocks. Each check's name and
+/// message live on separate lines so long paths/IDs never break layout;
+/// no fixed-width table alignment is used.
+pub fn render_doctor_human(report: &DoctorReport) -> String {
+    let mut out = String::new();
+    push_line(&mut out, 0, "CEO Connector Doctor");
+    for c in &report.checks {
+        push_line(&mut out, 2, &format!("[{}] {}", c.severity, c.name));
+        push_field(&mut out, 4, "Message", &c.message);
+    }
+    if report.overall_passed {
+        push_line(&mut out, 0, "Result: ALL REQUIRED CHECKS PASSED");
+    } else {
+        push_line(&mut out, 0, "Result: DOCTOR DETECTED ONE OR MORE FAILURES");
+    }
+    out
 }
 
 fn check_filesystem(paths: &ConnectorPaths, checks: &mut Vec<DiagnosticCheck>) {

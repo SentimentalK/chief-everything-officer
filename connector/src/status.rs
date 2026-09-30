@@ -7,6 +7,7 @@ use crate::config::LocalConfig;
 use crate::credential::DeviceCredential;
 use crate::local_state::ExecutionLock;
 use crate::paths::ConnectorPaths;
+use crate::render::{push_field, push_line, push_opt_field};
 
 #[derive(Error, Debug)]
 pub enum StatusError {
@@ -27,6 +28,10 @@ pub struct ConnectorStatus {
     pub target_count: usize,
     pub active_attempt_job_id: Option<String>,
     pub outbox_pending_count: usize,
+    /// Single Connector state root (additive field; contract is append-only).
+    pub connector_root: String,
+    /// Connector version reported by the CLI (additive field).
+    pub connector_version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,6 +93,8 @@ pub fn get_status(paths: &ConnectorPaths) -> Result<ConnectorStatus, StatusError
         target_count,
         active_attempt_job_id,
         outbox_pending_count,
+        connector_root: paths.root_dir.display().to_string(),
+        connector_version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
@@ -109,31 +116,48 @@ pub fn print_status(status: &ConnectorStatus, json_format: bool) {
     if json_format {
         println!("{}", serde_json::to_string_pretty(status).unwrap());
     } else {
-        println!("============================================================");
-        println!("  CEO Connector Status");
-        println!("============================================================");
-        println!("  Logged in:      {}", status.logged_in);
-        if let Some(ref origin) = status.server_origin {
-            println!("  Server origin:  {}", origin);
-        }
-        if let Some(ref dev_id) = status.device_id {
-            println!("  Device ID:      {}", dev_id);
-        }
-        if let Some(exp) = status.credential_expires_at_ms {
+        print!("{}", render_status_human(status));
+    }
+}
+
+/// Renders status human output as a compact vertical block. Long IDs and
+/// paths get their own lines; no fixed-width alignment is used.
+pub fn render_status_human(status: &ConnectorStatus) -> String {
+    let mut out = String::new();
+    push_line(&mut out, 0, "CEO Connector Status");
+    push_field(&mut out, 2, "Logged in", &status.logged_in.to_string());
+    push_opt_field(&mut out, 2, "Server origin", &status.server_origin);
+    push_opt_field(&mut out, 2, "Device ID", &status.device_id);
+    match status.credential_expires_at_ms {
+        Some(exp) => {
             let dt = chrono::DateTime::from_timestamp_millis(exp)
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_else(|| exp.to_string());
-            println!("  Cred expires:   {}", dt);
+            push_field(&mut out, 2, "Credential expires", &dt);
         }
-        println!("  Daemon running: {}", status.daemon_running);
-        println!("  Paused:         {}", status.paused);
-        println!("  Local targets:  {}", status.target_count);
-        if let Some(ref job_id) = status.active_attempt_job_id {
-            println!("  Active attempt: {}", job_id);
-        } else {
-            println!("  Active attempt: None");
-        }
-        println!("  Outbox pending: {}", status.outbox_pending_count);
-        println!("============================================================");
+        None => push_field(&mut out, 2, "Credential expires", "<none>"),
     }
+    push_field(
+        &mut out,
+        2,
+        "Daemon running",
+        &status.daemon_running.to_string(),
+    );
+    push_field(&mut out, 2, "Paused", &status.paused.to_string());
+    push_field(
+        &mut out,
+        2,
+        "Local targets",
+        &status.target_count.to_string(),
+    );
+    push_opt_field(&mut out, 2, "Active attempt", &status.active_attempt_job_id);
+    push_field(
+        &mut out,
+        2,
+        "Outbox pending",
+        &status.outbox_pending_count.to_string(),
+    );
+    push_field(&mut out, 2, "Connector root", &status.connector_root);
+    push_field(&mut out, 2, "Connector version", &status.connector_version);
+    out
 }

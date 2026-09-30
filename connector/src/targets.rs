@@ -13,6 +13,7 @@ use crate::config::{ConfigError, LocalConfig, LocalTarget};
 use crate::credential::CredentialError;
 use crate::local_state::ExecutionLock;
 use crate::paths::ConnectorPaths;
+use crate::render::{push_field, push_line};
 
 #[derive(Error, Debug)]
 pub enum TargetError {
@@ -74,6 +75,10 @@ pub struct TargetDisplayItem {
     pub is_default_agent_runtime: bool,
     pub active_binding_count: u32,
     pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<String>,
 }
 
 /// Normalizes a GitHub remote URL (HTTPS or SSH) into an `owner/repo` string.
@@ -473,26 +478,60 @@ pub async fn target_list(paths: &ConnectorPaths, json_format: bool) -> Result<()
     if json_format {
         println!("{}", serde_json::to_string_pretty(&display_items).unwrap());
     } else {
-        println!(
-            "{:<38} {:<15} {:<18} {:<16} {:<22} LOCAL_PATH",
-            "TARGET_ID", "ALIAS", "KIND", "DEFAULT_RUNTIME", "STATUS"
-        );
-        println!("{}", "-".repeat(120));
-        for item in display_items {
-            let path_str = item.local_path.unwrap_or_else(|| "<none>".into());
-            let default_marker = if item.is_default_agent_runtime {
-                "DEFAULT".to_string()
-            } else {
-                "-".to_string()
-            };
-            println!(
-                "{:<38} {:<15} {:<18} {:<16} {:<22} {}",
-                item.target_id, item.alias, item.kind, default_marker, item.status, path_str
-            );
-        }
+        print!("{}", render_target_blocks(&display_items));
     }
 
     Ok(())
+}
+
+/// Renders target list human output as vertical blocks (one block per
+/// target). Long UUIDs, paths, and agent commands each get their own line;
+/// no fixed-width table alignment is used.
+pub fn render_target_blocks(items: &[TargetDisplayItem]) -> String {
+    if items.is_empty() {
+        return "No targets configured.\n".to_string();
+    }
+
+    let mut out = String::new();
+    for item in items {
+        push_line(&mut out, 0, &format!("Target: {}", item.alias));
+        push_field(&mut out, 2, "ID", &item.target_id);
+        push_field(&mut out, 2, "Kind", &item.kind);
+        push_field(&mut out, 2, "Status", &item.status);
+        push_field(
+            &mut out,
+            2,
+            "Default runtime",
+            if item.is_default_agent_runtime {
+                "yes"
+            } else {
+                "no"
+            },
+        );
+        match &item.local_path {
+            Some(path) => push_field(&mut out, 2, "Path", path),
+            None => push_field(&mut out, 2, "Path", "<not bound locally>"),
+        }
+        match &item.repository {
+            Some(repo) => push_field(&mut out, 2, "Repository", repo),
+            None => push_line(&mut out, 2, "Repository: <none>"),
+        }
+        push_field(
+            &mut out,
+            2,
+            "Active bindings",
+            &item.active_binding_count.to_string(),
+        );
+        match (&item.agent_id, &item.agent_command) {
+            (Some(id), Some(cmd)) => {
+                push_line(&mut out, 2, &format!("Agent: {id}"));
+                push_field(&mut out, 2, "Command", cmd);
+            }
+            _ => push_line(&mut out, 2, "Agent: <not configured>"),
+        }
+        push_line(&mut out, 0, "");
+    }
+    out
 }
 
 /// Builds the merged target display projection (server catalogue + local
@@ -569,6 +608,8 @@ pub async fn build_target_display_items(
                 is_default_agent_runtime: st.is_default_agent_runtime,
                 active_binding_count: st.active_binding_count,
                 repository: st.repository.map(|r| r.full_name),
+                agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
+                agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
             });
         } else {
             let status = if !path_exists {
@@ -587,6 +628,8 @@ pub async fn build_target_display_items(
                 is_default_agent_runtime: false,
                 active_binding_count: 0,
                 repository: None,
+                agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
+                agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
             });
         }
     }
@@ -614,6 +657,8 @@ pub async fn build_target_display_items(
             is_default_agent_runtime: st.is_default_agent_runtime,
             active_binding_count: st.active_binding_count,
             repository: st.repository.map(|r| r.full_name),
+            agent_id: None,
+            agent_command: None,
         });
     }
 

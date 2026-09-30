@@ -227,6 +227,121 @@ pub struct SetDefaultRuntimeResponse {
     pub updated_at_ms: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Job read models (device-scoped read surfaces; stable DTO contract)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummaryItem {
+    pub job_id: String,
+    pub request_id: String,
+    pub target_id: String,
+    pub target_alias: String,
+    pub state: String,
+    pub execution_status: Option<String>,
+    pub business_outcome: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub resource_id: Option<String>,
+    pub result_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobListResponse {
+    pub jobs: Vec<JobSummaryItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobExecutionPart {
+    pub attempt_id: String,
+    pub phase: String,
+    pub claimed_at: String,
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReportExecutorPart {
+    #[serde(rename = "type")]
+    pub executor_type: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReportErrorPart {
+    pub stage: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReportPart {
+    pub execution_status: String,
+    pub business_outcome: String,
+    pub task_dispatched: bool,
+    pub finished_at: String,
+    pub duration_ms: i64,
+    pub executor: JobReportExecutorPart,
+    pub receipt_sha256: String,
+    #[serde(default)]
+    pub error: Option<JobReportErrorPart>,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobResultMetaPart {
+    pub target: String,
+    pub attempt_id: String,
+    pub payload_sha256: String,
+    pub resource_id: String,
+    pub commit: String,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobTaskPart {
+    pub prompt: String,
+    pub acceptance: String,
+    pub timeout_seconds: u32,
+}
+
+/// Stable device-scoped job detail read model (GET /api/connector/jobs/:job_id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub job_id: String,
+    pub request_id: String,
+    pub target_id: String,
+    pub target_alias: String,
+    pub state: String,
+    pub execution_status: Option<String>,
+    pub business_outcome: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub resource_id: Option<String>,
+    pub result_target: String,
+    pub execution_timeout_seconds: u32,
+    #[serde(default)]
+    pub execution: Option<JobExecutionPart>,
+    #[serde(default)]
+    pub report: Option<JobReportPart>,
+    #[serde(default)]
+    pub result: Option<JobResultMetaPart>,
+    #[serde(default)]
+    pub task: Option<JobTaskPart>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingJobCandidate {
     pub job_id: String,
@@ -991,6 +1106,115 @@ impl ConnectorClient {
             Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::JobError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 15. Job list (device-scoped read model)
+    pub async fn list_jobs(
+        &self,
+        credential: &DeviceCredential,
+        query: &JobListQuery,
+    ) -> Result<JobListResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!("{}/api/connector/jobs", self.server_origin);
+
+        let mut req = self.http.get(&url).headers(headers);
+        if let Some(ref state) = query.state {
+            req = req.query(&[("state", state.as_str())]);
+        }
+        if let Some(ref target_id) = query.target_id {
+            req = req.query(&[("target_id", target_id.as_str())]);
+        }
+        if let Some(limit) = query.limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        if let Some(ref cursor) = query.cursor {
+            req = req.query(&[("cursor", cursor.as_str())]);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: JobListResponse = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if status.is_server_error() {
+            Err(ClientError::ServerUnavailable {
+                status: status.as_u16(),
+                message: text,
+            })
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::JobError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 16. Job detail (device-scoped read model)
+    pub async fn get_job(
+        &self,
+        credential: &DeviceCredential,
+        job_id: &str,
+        include_task: bool,
+    ) -> Result<JobDetail, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let mut url = format!("{}/api/connector/jobs/{}", self.server_origin, job_id);
+        if include_task {
+            url.push_str("?include_task=true");
+        }
+
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: JobDetail = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if status.as_u16() == 404 {
+            Err(ClientError::JobError {
+                code: "JOB_NOT_FOUND".into(),
+                message: format!("Job '{job_id}' was not found."),
+            })
+        } else if status.is_server_error() {
+            Err(ClientError::ServerUnavailable {
+                status: status.as_u16(),
+                message: text,
+            })
         } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
             let code = err_json
                 .get("error")

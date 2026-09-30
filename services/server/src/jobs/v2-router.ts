@@ -4,6 +4,7 @@ import { ZodError } from "zod/v4";
 import {
   JobCoordinatorV2,
   JobValidationError,
+  type HostJobState,
 } from "./v2-service.js";
 import {
   V2JobNotFoundError,
@@ -52,6 +53,89 @@ export function createConnectorJobsRouter(
       const jobs = await coordinator.getPendingJobs(device.device_id, limit);
       res.status(200).json({ jobs });
     } catch (err) {
+      if (err instanceof V2StoreError) {
+        res.status(503).json({ error: "QUEUE_UNAVAILABLE", message: err.message });
+        return;
+      }
+      res.status(500).json({ error: "INTERNAL_ERROR" });
+    }
+  });
+
+  // GET /api/connector/jobs — device-scoped job list (read-only)
+  router.get("/", async (req: Request, res: Response) => {
+    const device = res.locals.deviceIdentity;
+    if (!device) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+
+    const stateParam = typeof req.query.state === "string" ? req.query.state : "";
+    const validStates: HostJobState[] = [
+      "queued",
+      "expired",
+      "claimed",
+      "running",
+      "terminal",
+    ];
+    if (stateParam && !validStates.includes(stateParam as HostJobState)) {
+      res
+        .status(400)
+        .json({ error: "INVALID_REQUEST", message: "Invalid state filter." });
+      return;
+    }
+
+    const limitParam = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : NaN;
+    const limit = Number.isInteger(limitParam) && limitParam > 0 ? limitParam : undefined;
+
+    try {
+      const result = await coordinator.listJobsForDevice(device.device_id, device.user_id, {
+        target_id: typeof req.query.target_id === "string" ? req.query.target_id : undefined,
+        state: stateParam ? (stateParam as HostJobState) : undefined,
+        limit,
+        cursor: typeof req.query.cursor === "string" ? req.query.cursor : undefined,
+      });
+      res.status(200).json({ jobs: result.jobs, next_cursor: result.next_cursor });
+    } catch (err) {
+      if (err instanceof JobValidationError) {
+        res.status(400).json({ error: "INVALID_REQUEST", message: err.message });
+        return;
+      }
+      if (err instanceof V2StoreError) {
+        res.status(503).json({ error: "QUEUE_UNAVAILABLE", message: err.message });
+        return;
+      }
+      res.status(500).json({ error: "INTERNAL_ERROR" });
+    }
+  });
+
+  // GET /api/connector/jobs/:job_id — device-scoped job detail (read-only)
+  router.get("/:job_id", async (req: Request, res: Response) => {
+    const device = res.locals.deviceIdentity;
+    if (!device) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+
+    const jobId = typeof req.params.job_id === "string" ? req.params.job_id : "";
+    const includeTask = req.query.include_task === "true" || req.query.include_task === "1";
+
+    try {
+      const detail = await coordinator.getJobForDevice(
+        device.device_id,
+        device.user_id,
+        jobId,
+        { include_task: includeTask },
+      );
+      res.status(200).json(detail);
+    } catch (err) {
+      if (err instanceof JobValidationError) {
+        res.status(400).json({ error: "INVALID_REQUEST", message: err.message });
+        return;
+      }
+      if (err instanceof V2JobNotFoundError) {
+        res.status(404).json({ error: "JOB_NOT_FOUND" });
+        return;
+      }
       if (err instanceof V2StoreError) {
         res.status(503).json({ error: "QUEUE_UNAVAILABLE", message: err.message });
         return;

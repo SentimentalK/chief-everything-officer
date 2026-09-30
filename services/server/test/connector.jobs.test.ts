@@ -900,4 +900,150 @@ describe("Connector Jobs Protocol (/api/connector/jobs)", () => {
       expect(intactJobB?.status).toBe("queued");
     });
   });
+
+  describe("Device Read Surfaces (GET list & detail)", () => {
+    async function submitJobForAlice(requestId: string, prompt: string) {
+      return coordinator.submit(
+        { user_id: userAliceId, workspace_id: workspaceId },
+        {
+          request_id: requestId,
+          target_id: targetA.id,
+          prompt,
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+    }
+
+    it("lists device-visible jobs newest first and supports state/target/limit filters", async () => {
+      const job1 = await submitJobForAlice(
+        "req-00000000-0000-0000-0000-000000000080",
+        "first job",
+      );
+      const job2 = await submitJobForAlice(
+        "req-00000000-0000-0000-0000-000000000081",
+        "second job",
+      );
+
+      const res = await fetch(`${baseUrl}/api/connector/jobs`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      const ids: string[] = data.jobs.map((j: any) => j.job_id);
+      expect(ids).toContain(job1.job.job_id);
+      expect(ids).toContain(job2.job.job_id);
+      // Newest first
+      expect(data.jobs[0].job_id).toBe(job2.job.job_id);
+      expect(data.jobs[0].target_alias).toBe("target-a");
+      expect(data.jobs[0].state).toBe("queued");
+
+      // State filter: both jobs are queued
+      const queuedRes = await fetch(`${baseUrl}/api/connector/jobs?state=queued`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      const queuedData = await queuedRes.json();
+      expect(queuedData.jobs.length).toBe(2);
+
+      // Target filter
+      const targetRes = await fetch(
+        `${baseUrl}/api/connector/jobs?target_id=${targetA.id}`,
+        { headers: { Authorization: `Bearer ${aliceDevToken}` } },
+      );
+      const targetData = await targetRes.json();
+      expect(targetData.jobs.length).toBe(2);
+
+      // Limit
+      const limitRes = await fetch(`${baseUrl}/api/connector/jobs?limit=1`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      const limitData = await limitRes.json();
+      expect(limitData.jobs.length).toBe(1);
+
+      // Terminal state filter returns none (no terminal jobs yet)
+      const terminalRes = await fetch(`${baseUrl}/api/connector/jobs?state=terminal`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      const terminalData = await terminalRes.json();
+      expect(terminalData.jobs.length).toBe(0);
+    });
+
+    it("returns 400 for invalid state filter and 401 without auth", async () => {
+      const bad = await fetch(`${baseUrl}/api/connector/jobs?state=bogus`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      expect(bad.status).toBe(400);
+
+      const unauth = await fetch(`${baseUrl}/api/connector/jobs`);
+      expect(unauth.status).toBe(401);
+    });
+
+    it("hides jobs on targets the device has never been bound to", async () => {
+      // Bob submits a job to Target B (Bob's workspace); Alice must not see it.
+      const jobB = await coordinator.submit(
+        { user_id: userBobId, workspace_id: bobWorkspaceId },
+        {
+          request_id: "req-00000000-0000-0000-0000-000000000090",
+          target_id: targetB.id,
+          prompt: "bob-only job",
+          acceptance: "ok",
+          resource_id: null,
+          execution_timeout_seconds: 120,
+          result_target: "none",
+        },
+      );
+
+      const res = await fetch(`${baseUrl}/api/connector/jobs`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      const data = await res.json();
+      const ids: string[] = data.jobs.map((j: any) => j.job_id);
+      expect(ids).not.toContain(jobB.job.job_id);
+
+      const detail = await fetch(
+        `${baseUrl}/api/connector/jobs/${jobB.job.job_id}`,
+        { headers: { Authorization: `Bearer ${aliceDevToken}` } },
+      );
+      expect(detail.status).toBe(404);
+    });
+
+    it("returns job detail without task by default and with include_task=true", async () => {
+      const job = await submitJobForAlice(
+        "req-00000000-0000-0000-0000-000000000091",
+        "detail prompt body",
+      );
+
+      const noTask = await fetch(`${baseUrl}/api/connector/jobs/${job.job.job_id}`, {
+        headers: { Authorization: `Bearer ${aliceDevToken}` },
+      });
+      expect(noTask.status).toBe(200);
+      const noTaskData = await noTask.json();
+      expect(noTaskData.job_id).toBe(job.job.job_id);
+      expect(noTaskData.state).toBe("queued");
+      expect(noTaskData.task).toBeUndefined();
+
+      const withTask = await fetch(
+        `${baseUrl}/api/connector/jobs/${job.job.job_id}?include_task=true`,
+        { headers: { Authorization: `Bearer ${aliceDevToken}` } },
+      );
+      expect(withTask.status).toBe(200);
+      const withTaskData = await withTask.json();
+      expect(withTaskData.task).toBeDefined();
+      expect(withTaskData.task.prompt).toBe("detail prompt body");
+      expect(withTaskData.task.acceptance).toBe("ok");
+      expect(withTaskData.execution_timeout_seconds).toBe(120);
+    });
+
+    it("returns 404 for unknown job detail", async () => {
+      const res = await fetch(
+        `${baseUrl}/api/connector/jobs/job-00000000-0000-0000-0000-000000000099`,
+        { headers: { Authorization: `Bearer ${aliceDevToken}` } },
+      );
+      expect(res.status).toBe(404);
+      const data = await res.json();
+      expect(data.error).toBe("JOB_NOT_FOUND");
+    });
+  });
 });
