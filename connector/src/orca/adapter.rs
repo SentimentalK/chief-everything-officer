@@ -73,6 +73,22 @@ pub fn validate_tui_idle_wait(
 
 pub const ADVISORY_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Positive turn-start evidence from an Orca terminal-send response payload.
+///
+/// Only an explicit `turn_started` stage reported by Orca counts as proof
+/// that the dispatched turn began. `observation`/`provider` values of
+/// "unsupported" mean Orca lacks observability for this agent; they are the
+/// ABSENCE of evidence and must never be promoted into positive proof that
+/// the turn started. A pre-turn tui-idle observed while no positive turn-start
+/// evidence exists must keep waiting (never terminalize the attempt).
+pub fn send_prompt_turn_started(prompt: &super::types::OrcaSendPromptPart) -> bool {
+    prompt
+        .stages
+        .as_ref()
+        .map(|s| s.iter().any(|st| st == "turn_started"))
+        .unwrap_or(false)
+}
+
 impl OrcaExecutionAdapter {
     pub fn new(client: OrcaCliClient) -> Self {
         Self { client }
@@ -541,14 +557,8 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     }
                     if send.accepted {
                         if let Some(p) = send.prompt {
-                            if let Some(req_id) = p.request_id {
-                                let has_turn_started = p
-                                    .stages
-                                    .as_ref()
-                                    .map(|s| s.iter().any(|st| st == "turn_started"))
-                                    .unwrap_or(false)
-                                    || p.observation.as_deref() == Some("unsupported")
-                                    || p.provider.as_deref() == Some("unsupported");
+                            if let Some(req_id) = p.request_id.clone() {
+                                let has_turn_started = send_prompt_turn_started(&p);
                                 return Ok(DispatchOutcome::Accepted {
                                     request_id: req_id,
                                     accepted_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -877,5 +887,54 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         CleanupOutcome::VerifiedClosed {
             closed_at_ms: chrono::Utc::now().timestamp_millis(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::OrcaSendPromptPart;
+    use super::send_prompt_turn_started;
+
+    fn send_prompt(
+        stages: Option<Vec<&str>>,
+        provider: Option<&str>,
+        observation: Option<&str>,
+    ) -> OrcaSendPromptPart {
+        OrcaSendPromptPart {
+            request_id: Some("req_1".into()),
+            stages: stages.map(|s| s.into_iter().map(String::from).collect()),
+            provider: provider.map(String::from),
+            observation: observation.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_explicit_turn_started_stage_is_positive_evidence() {
+        let p = send_prompt(Some(vec!["input_accepted", "turn_started"]), None, None);
+        assert!(send_prompt_turn_started(&p));
+    }
+
+    #[test]
+    fn test_observation_unsupported_is_not_turn_start_evidence() {
+        let p = send_prompt(Some(vec!["input_accepted"]), None, Some("unsupported"));
+        assert!(!send_prompt_turn_started(&p));
+    }
+
+    #[test]
+    fn test_provider_unsupported_is_not_turn_start_evidence() {
+        let p = send_prompt(Some(vec!["input_accepted"]), Some("unsupported"), None);
+        assert!(!send_prompt_turn_started(&p));
+    }
+
+    #[test]
+    fn test_unsupported_alone_with_no_stages_is_not_turn_start_evidence() {
+        let p = send_prompt(None, Some("unsupported"), Some("unsupported"));
+        assert!(!send_prompt_turn_started(&p));
+    }
+
+    #[test]
+    fn test_missing_stages_is_not_turn_start_evidence() {
+        let p = send_prompt(None, Some("terminal"), Some("structured"));
+        assert!(!send_prompt_turn_started(&p));
     }
 }

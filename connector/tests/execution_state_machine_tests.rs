@@ -2648,3 +2648,362 @@ async fn test_non_resource_job_does_not_persist_redelivery_meta() {
         "Non-resource jobs must NOT persist redelivery metadata"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pre-turn tui-idle completion bug (OpenCode) regression tests.
+//
+// `observation`/`provider` = "unsupported" in the Orca send response means
+// lack of observability, NOT proof that the dispatched turn started. A
+// pre-turn tui-idle must therefore never terminalize an attempt (never
+// RESULT_MISSING), and completion must only occur via positive turn-start
+// evidence (explicit turn_started stage, WorkingObserved, new-generation
+// AgentDone) or the managed-result barrier.
+// ---------------------------------------------------------------------------
+
+fn write_valid_managed_result_file(
+    file: &std::path::Path,
+    job_id: &str,
+    attempt_id: &str,
+    resource_id: &str,
+) {
+    let valid = serde_json::json!({
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "resource_id": resource_id,
+        "summary": "Completed successfully",
+        "operations": [
+            {
+                "op": "upsert_content",
+                "content": "Acquired content"
+            }
+        ]
+    });
+    fs::write(file, serde_json::to_string(&valid).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn test_repeated_pre_turn_tui_idle_keeps_waiting_until_timeout_without_result_missing() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    // Short deadline so the waiting loop terminates quickly on timeout.
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }),
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }),
+        ])),
+        // Default fallback: keep reporting pre-turn tui-idle until deadline.
+        wait_result: Some(Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // Repeated pre-turn tui-idle must time out (durable deadline), never
+    // complete or report RESULT_MISSING.
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+    assert!(!exec.turn_started_observed);
+}
+
+#[tokio::test]
+async fn test_resource_job_pre_turn_tui_idle_without_managed_result_keeps_waiting() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_preturndef".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }),
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }),
+        ])),
+        wait_result: Some(Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // Resource job + pre-turn tui-idle + no managed-result => durable
+    // timeout, NOT RESULT_MISSING (no premature terminalization).
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+}
+
+#[tokio::test]
+async fn test_resource_job_managed_result_after_pre_turn_idle_completes_via_barrier() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_after_idle".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let result_file = paths.managed_result_file(&attempt_id);
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let rf_clone = result_file.clone();
+    let j_clone = job_id.clone();
+    let a_clone = attempt_id.clone();
+    let r_clone = resource_id.clone();
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        on_wait: Some(Arc::new(move || {
+            // Agent keeps running; managed-result appears after the early idle.
+            write_valid_managed_result_file(&rf_clone, &j_clone, &a_clone, &r_clone);
+        })),
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored; on_wait writes managed-result
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // Managed-result barrier completes the attempt even though the only
+    // prior runtime observation was a pre-turn tui-idle.
+    assert_eq!(
+        exec.runtime_completion_kind.as_deref(),
+        Some("managed_result")
+    );
+    assert!(exec.runtime_error.is_none());
+    let pres_res = paths.preserved_managed_result_file(&cur.job_id, &attempt_id);
+    assert!(pres_res.exists());
+}
+
+#[tokio::test]
+async fn test_resource_job_agent_done_after_pre_turn_idle_with_valid_result_completes() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let resource_id = "res_done_idle".to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    paths.ensure_attempt_runtime_dir(&attempt_id).unwrap();
+    let result_file = paths.managed_result_file(&attempt_id);
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "resource",
+        Some(&resource_id),
+        Some(executor),
+    );
+    let job_id = active.job_id.clone();
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let rf_clone = result_file.clone();
+    let j_clone = job_id.clone();
+    let a_clone = attempt_id.clone();
+    let r_clone = resource_id.clone();
+    let write_counter = Arc::new(AtomicUsize::new(0));
+    let wc_clone = write_counter.clone();
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        on_wait: Some(Arc::new(move || {
+            // Write the managed-result only when the AgentDone tick runs, so
+            // the AgentDone resource-capture path is exercised (not the
+            // earlier barrier check).
+            if wc_clone.fetch_add(1, Ordering::SeqCst) == 1 {
+                write_valid_managed_result_file(&rf_clone, &j_clone, &a_clone, &r_clone);
+            }
+        })),
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // Later OpenCode-style done: completes
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+    assert!(exec.runtime_error.is_none());
+    let pres_res = paths.preserved_managed_result_file(&cur.job_id, &attempt_id);
+    assert!(pres_res.exists());
+}
+
+#[tokio::test]
+async fn test_non_resource_agent_done_completes_without_explicit_turn_started() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // New-generation done: completes
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // AgentDone for a new generation completes even when explicit
+    // turn_started evidence was unavailable (OpenCode-style dispatch).
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+    assert!(exec.runtime_error.is_none());
+}

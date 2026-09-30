@@ -47,7 +47,10 @@ fn setup_dogfood_env_with_cmd(
         let script_content = if mode == "timeout" {
             "#!/bin/bash\nprintf \"cursor agent →\\n\"\nread line\nprintf \"working \\u280b ...\\n\"\nsleep 60\n"
         } else {
-            "#!/bin/bash\nprintf \"cursor agent →\\n\"\nread line\nprintf \"working \\u280b ...\\n\"\nsleep 1\nprintf \"cursor agent →\\n\"\nsleep 30\n"
+            // "normal" mode: agent consumes the prompt, goes idle briefly,
+            // then stays alive well past the 25s job deadline so the
+            // retained-terminal inspection below is deterministic.
+            "#!/bin/bash\nprintf \"cursor agent →\\n\"\nread line\nprintf \"working \\u280b ...\\n\"\nsleep 1\nprintf \"cursor agent →\\n\"\nsleep 90\n"
         };
         std::fs::write(&shim_path, script_content).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -117,9 +120,10 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
     let repo_path = "/home/sentimentalk/codes/chief-everything-officer";
 
     // =========================================================================
-    // Real Run 1: Normal Execution (completes to tui-idle)
+    // Real Run 1: Unobservable Synthetic Agent (pre-turn tui-idle must NOT
+    // complete; only the durable deadline may end the run)
     // =========================================================================
-    println!("\n=== [DOGFOOD] Starting Real Run 1: Normal Execution ===");
+    println!("\n=== [DOGFOOD] Starting Real Run 1: Unobservable Synthetic Agent ===");
     {
         let server = MockServer::start().await;
         let (_temp, paths, _cred, _config) =
@@ -211,7 +215,7 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
                             "resource_id": null,
                             "prompt": "echo 'v1.7 dogfood verification' and complete normally",
                             "acceptance": "Echo command completes",
-                            "timeout_seconds": 180,
+                            "timeout_seconds": 25,
                             "result_target": "none",
                         },
                         "claim_token": claim_token,
@@ -268,10 +272,17 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
             serde_json::to_string_pretty(report).unwrap()
         );
 
+        // Conservative completion semantics (OpenCode pre-turn tui-idle bug):
+        // the synthetic shim agent is unobservable (Orca reports
+        // observation/provider "unsupported" and never tracks it in
+        // `worktree ps`), so there is no positive turn-start evidence.
+        // A satisfied tui-idle must therefore NEVER terminalize the attempt:
+        // the run must only end at the durable deadline with EXECUTION_TIMEOUT,
+        // never FAILED/RESULT_MISSING from a pre-turn idle.
         assert_eq!(
             report.get("execution_status").and_then(|v| v.as_str()),
-            Some("COMPLETED"),
-            "Normal run must be COMPLETED"
+            Some("TIMED_OUT"),
+            "Unobservable agent run must not be completed by tui-idle; only durable timeout may end it"
         );
         assert_eq!(
             report.get("business_outcome").and_then(|v| v.as_str()),
@@ -283,21 +294,39 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
             Some(true),
             "task_dispatched must be true"
         );
+        let report_err = report.get("error");
+        assert_eq!(
+            report_err
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("EXECUTION_TIMEOUT"),
+            "Timeout (not RESULT_MISSING) is the only allowed failure for a pre-turn idle"
+        );
 
-        // Verify terminal was cleanly stopped and absent
+        // Verify terminal was retained for inspection per V1.8/V1.9 contract
         let client = OrcaCliClient::default();
         let active_terminals = client.list_terminals(None).await.unwrap();
-        let leaked = active_terminals.iter().find(|t| {
+        let retained = active_terminals.iter().find(|t| {
             t.title
                 .as_deref()
                 .map(|s| s.starts_with("ceo:att-"))
                 .unwrap_or(false)
+                || t.preview
+                    .as_deref()
+                    .map(|p| p.contains("working"))
+                    .unwrap_or(false)
         });
         assert!(
-            leaked.is_none(),
-            "Agent terminal must be cleanly removed from active inventory"
+            retained.is_some(),
+            "Agent terminal must be retained in active inventory for user inspection on TIMED_OUT"
         );
-        println!("[DOGFOOD] Normal execution verified: COMPLETED / UNVERIFIED / Cleaned up.");
+        println!(
+            "[DOGFOOD] Normal execution verified: pre-turn tui-idle did NOT complete; TIMED_OUT / UNVERIFIED / Terminal retained."
+        );
+
+        if let Some(term) = retained {
+            let _ = client.close_terminal(&term.handle).await;
+        }
     }
 
     // =========================================================================

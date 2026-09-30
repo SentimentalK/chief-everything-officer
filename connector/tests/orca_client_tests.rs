@@ -664,6 +664,121 @@ exit 1
 }
 
 #[tokio::test]
+async fn test_dispatch_turn_started_requires_explicit_stage_not_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_1".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::DispatchIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let attempt_ref = &attempt;
+    let run_dispatch = |script: &'static str| {
+        let bin = create_mock_orca_script(&temp, script);
+        let client = OrcaCliClient::new(bin);
+        let adapter = OrcaExecutionAdapter::new(client);
+        async move {
+            adapter
+                .dispatch(attempt_ref, "term_1", "test prompt")
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. Explicit turn_started stage => turn_started=true
+    let outcome = run_dispatch(
+        r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"requestId":"req_turn","stages":["input_accepted","turn_started"]}}}}'
+"#,
+    )
+    .await;
+    match outcome {
+        DispatchOutcome::Accepted {
+            request_id,
+            turn_started,
+            ..
+        } => {
+            assert_eq!(request_id, "req_turn");
+            assert!(turn_started);
+        }
+        other => panic!("Expected Accepted, got {other:?}"),
+    }
+
+    // 2. observation=unsupported alone => turn_started=false (request identity preserved)
+    let outcome = run_dispatch(
+        r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"requestId":"req_obs_unsup","stages":["input_accepted"],"observation":"unsupported"}}}}'
+"#,
+    )
+    .await;
+    match outcome {
+        DispatchOutcome::Accepted {
+            request_id,
+            turn_started,
+            ..
+        } => {
+            assert_eq!(request_id, "req_obs_unsup");
+            assert!(!turn_started);
+        }
+        other => panic!("Expected Accepted, got {other:?}"),
+    }
+
+    // 3. provider=unsupported alone => turn_started=false
+    let outcome = run_dispatch(
+        r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"requestId":"req_prov_unsup","stages":["input_accepted"],"provider":"unsupported"}}}}'
+"#,
+    )
+    .await;
+    match outcome {
+        DispatchOutcome::Accepted {
+            request_id,
+            turn_started,
+            ..
+        } => {
+            assert_eq!(request_id, "req_prov_unsup");
+            assert!(!turn_started);
+        }
+        other => panic!("Expected Accepted, got {other:?}"),
+    }
+
+    // 4. OpenCode-style: unsupported observation+provider, no stages => turn_started=false
+    let outcome = run_dispatch(
+        r#"#!/bin/bash
+echo '{"ok":true,"result":{"send":{"handle":"term_1","accepted":true,"prompt":{"requestId":"req_opencode","provider":"unsupported","observation":"unsupported","processIncarnation":"inc_1","generation":15}}}}'
+"#,
+    )
+    .await;
+    match outcome {
+        DispatchOutcome::Accepted {
+            request_id,
+            turn_started,
+            ..
+        } => {
+            assert_eq!(request_id, "req_opencode");
+            assert!(!turn_started);
+        }
+        other => panic!("Expected Accepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_fake_orca_wait_classification() {
     let temp = tempfile::tempdir().unwrap();
 
@@ -1782,6 +1897,108 @@ fi
         other => {
             panic!("expected TuiIdle fallback when worktree ps transiently fails, got {other:?}")
         }
+    }
+}
+
+#[tokio::test]
+async fn test_wait_baseline_generation_stale_done_does_not_complete() {
+    let temp = tempfile::tempdir().unwrap();
+
+    fn attempt_with_baseline(baseline: Option<i64>) -> ActiveAttempt {
+        ActiveAttempt {
+            schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            job_id: "job_gen".into(),
+            attempt_id: "att_gen".into(),
+            claim_token: "token".into(),
+            device_id: "dev_1".into(),
+            server_origin: "http://127.0.0.1:4000".into(),
+            phase: AttemptPhase::Waiting,
+            workspace_id: "ws_1".into(),
+            target_id: "tgt_1".into(),
+            resource_id: None,
+            prompt: None,
+            acceptance: None,
+            execution_timeout_seconds: None,
+            result_target: None,
+            payload_sha256: None,
+            claimed_at_ms: None,
+            terminal_report_sha256: None,
+            executor: Some(AttemptExecutorState {
+                executor_type: "orca".into(),
+                orca_version: Some("1.4.209".into()),
+                worktree_id: Some("wt_1".into()),
+                terminal_id: Some("term_my_pane".into()),
+                agent_id: Some("agy".into()),
+                agent_ready_at_ms: Some(1727000000),
+                dispatch_send_count: 1,
+                dispatch_started_at_ms: Some(1727000010),
+                execution_deadline_ms: Some(1727000000 + 60_000),
+                dispatch_request_id: Some("req_1".into()),
+                dispatch_accepted_at_ms: Some(1727000010),
+                dispatch_turn_started: false,
+                dispatch_baseline_state_started_at: baseline,
+                turn_started_observed: false,
+                last_dispatch_outcome: None,
+                runtime_completion_kind: None,
+                runtime_completed_at_ms: None,
+                runtime_error: None,
+            }),
+        }
+    }
+
+    // Pre-dispatch (baseline) agent state: done at 1727000100.
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1","connected":true}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    echo '{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"done","interrupted":false,"stateStartedAt":1727000100}]}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":true,"result":{"wait":{"handle":"term_my_pane","condition":"tui-idle","satisfied":false,"elapsedMs":100}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+    let bin = create_mock_orca_script(&temp, script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    // 1. Stale/baseline done (same stateStartedAt as baseline) must NOT
+    //    complete the turn: falls through to tui-idle wait (unsatisfied).
+    let attempt = attempt_with_baseline(Some(1727000100));
+    let wait_outcome = adapter
+        .wait(&attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    match wait_outcome {
+        WaitOutcome::TimedOut { .. } => {}
+        other => panic!("expected TimedOut for stale baseline done state, got {other:?}"),
+    }
+
+    // 2. New-generation done (different stateStartedAt) DOES complete as
+    //    AgentDone even without explicit turn_started evidence.
+    let attempt = attempt_with_baseline(Some(1727000100));
+    let script_new_gen = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1","connected":true}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    echo '{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"done","interrupted":false,"stateStartedAt":1727000200}]}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{"ok":true,"result":{"wait":{"handle":"term_my_pane","condition":"tui-idle","satisfied":false,"elapsedMs":100}}}'
+else
+    echo '{"ok":false}'
+fi
+"#;
+    let bin_new_gen = create_mock_orca_script(&temp, script_new_gen);
+    let client_new_gen = OrcaCliClient::new(bin_new_gen);
+    let adapter_new_gen = OrcaExecutionAdapter::new(client_new_gen);
+
+    let wait_outcome = adapter_new_gen
+        .wait(&attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    match wait_outcome {
+        WaitOutcome::AgentDone { .. } => {}
+        other => panic!("expected AgentDone for new-generation done state, got {other:?}"),
     }
 }
 
