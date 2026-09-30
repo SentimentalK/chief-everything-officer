@@ -227,6 +227,20 @@ pub struct SetDefaultRuntimeResponse {
     pub updated_at_ms: i64,
 }
 
+/// Server response for a target alias rename. The immutable `target_id` is
+/// unchanged by definition; `previous_alias`/`alias` are both name-oriented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameTargetResponse {
+    pub ok: bool,
+    pub target_id: String,
+    pub previous_alias: String,
+    pub alias: String,
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Job read models (device-scoped read surfaces; stable DTO contract)
 // ---------------------------------------------------------------------------
@@ -815,7 +829,58 @@ impl ConnectorClient {
         }
     }
 
-    // 9b. Set workspace default agent runtime target
+    // 9b. Rename target alias (server-authoritative; immutable target_id)
+    pub async fn rename_target(
+        &self,
+        credential: &DeviceCredential,
+        target_id: &str,
+        new_alias: &str,
+    ) -> Result<RenameTargetResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!(
+            "{}/api/connector/targets/{}/rename",
+            self.server_origin, target_id
+        );
+        let body = serde_json::json!({ "alias": new_alias });
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: RenameTargetResponse = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::TargetError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 9c. Set workspace default agent runtime target
     pub async fn set_default_runtime_target(
         &self,
         credential: &DeviceCredential,

@@ -33,8 +33,12 @@ pub enum TargetError {
     RepositoryMismatch { expected: String, actual: String },
     #[error("Workspace '{0}' not found or missing repository binding")]
     WorkspaceNotFound(String),
-    #[error("Target '{0}' not found on server")]
+    #[error("Target '{0}' not found. Use an exact target alias (case-sensitive, as shown by `ceo-connector target list`) or an exact target ID; partial or fuzzy matches are not accepted.")]
     TargetNotFound(String),
+    #[error(
+        "Target selector '{0}' is ambiguous: it matches both a target ID and another target's alias (SELECTOR_AMBIGUOUS). Use the full target ID or a distinct alias."
+    )]
+    AmbiguousSelector(String),
     #[error("Target '{0}' is currently in use by active attempt (TARGET_IN_USE)")]
     TargetInUse(String),
     #[error("Target '{0}' is disabled on server (TARGET_DISABLED)")]
@@ -226,6 +230,133 @@ fn resolve_executor_args(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Exact Target selector resolution (shared application service)
+// ---------------------------------------------------------------------------
+
+/// Outcome of resolving an exact Target selector against the
+/// server-authoritative catalogue. `projection` is `None` only when the
+/// selector was accepted as a direct target_id via the local device config
+/// (offline/direct-ID fallback for local-only commands); the Server catalogue
+/// is the only authority for aliases.
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub target_id: String,
+    pub projection: Option<crate::client::ConnectorTargetProjection>,
+}
+
+fn local_config_has_target(paths: &ConnectorPaths, target_id: &str) -> Result<bool, TargetError> {
+    let config = crate::config::LocalConfig::load(&paths.config_file())?;
+    Ok(config
+        .map(|c| c.targets.contains_key(target_id))
+        .unwrap_or(false))
+}
+
+/// Resolves a selector that is either an exact immutable target_id or an
+/// exact server-authoritative Target alias in the authenticated workspace
+/// catalogue.
+///
+/// Contract (PROJECT-036 Slice 1A):
+/// - exact target_id remains supported (raw ID for scripts/debugging);
+/// - otherwise the selector must exactly equal a Server alias — no substring,
+///   prefix, fuzzy, or case-insensitive matching;
+/// - the Server catalogue decides alias truth; local cached schema-v2 alias
+///   copies are never used to resolve or rewrite an alias;
+/// - an ID-vs-alias ambiguity referring to different Targets fails closed;
+/// - unknown selectors fail with an actionable error;
+/// - when the Server catalogue is unreachable (or the device is not logged
+///   in), a direct target_id already known to this device keeps working so
+///   existing local-only direct-ID behavior is preserved; aliases never
+///   resolve from local cache.
+pub async fn resolve_target_selector(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &crate::credential::DeviceCredential,
+    selector: &str,
+) -> Result<ResolvedTarget, TargetError> {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return Err(TargetError::TargetNotFound(selector.to_string()));
+    }
+
+    // Matching is strict: the selector string must exactly equal an immutable
+    // target_id or a server alias (no trimming/case folding/fuzzy matching).
+    let catalogue = client.list_targets(cred, None).await;
+    match catalogue {
+        Ok(targets) => resolve_selector_from_catalogue(paths, &targets, selector),
+        Err(client_err) => {
+            // Server catalogue unavailable: fall back to direct-ID only.
+            if local_config_has_target(paths, selector)? {
+                return Ok(ResolvedTarget {
+                    target_id: selector.to_string(),
+                    projection: None,
+                });
+            }
+            Err(TargetError::Client(client_err))
+        }
+    }
+}
+
+/// Pure catalogue-based resolution, split out for unit testing.
+pub fn resolve_selector_from_catalogue(
+    paths: &ConnectorPaths,
+    targets: &[crate::client::ConnectorTargetProjection],
+    selector: &str,
+) -> Result<ResolvedTarget, TargetError> {
+    // 1. Exact immutable target_id match wins.
+    if let Some(by_id) = targets.iter().find(|t| t.target_id == selector) {
+        // Fail closed if the same string is also another target's exact alias.
+        let ambiguous = targets
+            .iter()
+            .any(|t| t.target_id != by_id.target_id && t.alias == selector);
+        if ambiguous {
+            return Err(TargetError::AmbiguousSelector(selector.to_string()));
+        }
+        return Ok(ResolvedTarget {
+            target_id: by_id.target_id.clone(),
+            projection: Some(by_id.clone()),
+        });
+    }
+
+    // 2. Exact server-authoritative alias match (case-sensitive, whole string).
+    let alias_matches: Vec<&crate::client::ConnectorTargetProjection> =
+        targets.iter().filter(|t| t.alias == selector).collect();
+    match alias_matches.len() {
+        1 => {
+            let t = alias_matches[0];
+            Ok(ResolvedTarget {
+                target_id: t.target_id.clone(),
+                projection: Some(t.clone()),
+            })
+        }
+        0 => {
+            // Direct-ID fallback for local-only targets known to this device
+            // (e.g. server catalogue does not include this device's mapping).
+            if local_config_has_target(paths, selector)? {
+                return Ok(ResolvedTarget {
+                    target_id: selector.to_string(),
+                    projection: None,
+                });
+            }
+            Err(TargetError::TargetNotFound(selector.to_string()))
+        }
+        _ => Err(TargetError::AmbiguousSelector(selector.to_string())),
+    }
+}
+
+/// Builds a client + credential when the device is logged in; `None` when no
+/// credential exists (local-only direct-ID behavior is then preserved).
+fn try_load_client(
+    paths: &ConnectorPaths,
+) -> Result<Option<(ConnectorClient, crate::credential::DeviceCredential)>, TargetError> {
+    if !paths.credential_file().exists() {
+        return Ok(None);
+    }
+    let profile = crate::config::load_bound_profile(paths)?;
+    let client = ConnectorClient::new(&profile.credential.server_origin)?;
+    Ok(Some((client, profile.credential)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn target_add(
     paths: &ConnectorPaths,
@@ -333,7 +464,7 @@ pub async fn target_add(
 
 pub async fn target_bind(
     paths: &ConnectorPaths,
-    target_id: &str,
+    target_selector: &str,
     path_input: &str,
     agent_id: Option<String>,
     agent_command: Option<String>,
@@ -363,10 +494,21 @@ pub async fn target_bind(
         }
         Err(e) => return Err(TargetError::Io(e)),
     };
-    check_active_attempt_target_in_use(paths, target_id)?;
+    // Fail-fast local guard on the raw selector (works even when the server
+    // catalogue is unreachable); re-checked against the resolved immutable ID.
+    check_active_attempt_target_in_use(paths, target_selector)?;
+
+    // Exact selector resolution (alias or target_id) against the server
+    // catalogue; bind always needs the server projection.
+    let resolved = resolve_target_selector(paths, &client, &cred, target_selector).await?;
+    if resolved.projection.is_none() {
+        return Err(TargetError::TargetNotFound(target_selector.to_string()));
+    }
+    let target_id = resolved.target_id;
+    check_active_attempt_target_in_use(paths, &target_id)?;
 
     // Bind on server
-    client.bind_target(&cred, target_id).await?;
+    client.bind_target(&cred, &target_id).await?;
 
     // Authoritative verification after bind
     let targets = client.list_targets(&cred, None).await?;
@@ -405,13 +547,25 @@ pub async fn target_bind(
 
 pub async fn target_set_agent(
     paths: &ConnectorPaths,
-    target_id: &str,
+    target_selector: &str,
     agent_id: &str,
     agent_command: &str,
 ) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
     let executor_cfg =
         crate::config::LocalExecutorConfig::new(agent_id.to_string(), agent_command.to_string())?;
+
+    // Exact selector resolution: server catalogue when logged in (alias
+    // authority lives on the server); otherwise fall back to direct target_id
+    // only, preserving legacy offline direct-ID behavior.
+    let target_id = match try_load_client(paths)? {
+        Some((client, cred)) => {
+            resolve_target_selector(paths, &client, &cred, target_selector)
+                .await?
+                .target_id
+        }
+        None => target_selector.to_string(),
+    };
 
     let _lock = match ExecutionLock::acquire_with_retry(
         &paths.state_lock_file(),
@@ -424,14 +578,14 @@ pub async fn target_set_agent(
         }
         Err(e) => return Err(TargetError::Io(e)),
     };
-    check_active_attempt_target_in_use(paths, target_id)?;
+    check_active_attempt_target_in_use(paths, &target_id)?;
 
     let mut config = crate::config::LocalConfig::load(&paths.config_file())?
         .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
 
     let target = config
         .targets
-        .get_mut(target_id)
+        .get_mut(&target_id)
         .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
 
     // Preserve any existing model override: `set-agent` re-configures the
@@ -462,10 +616,22 @@ pub async fn target_set_agent(
 /// attempt (TARGET_IN_USE), consistent with `target_set_agent`.
 pub async fn target_set_model(
     paths: &ConnectorPaths,
-    target_id: &str,
+    target_selector: &str,
     model: Option<&str>,
 ) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
+
+    // Exact selector resolution: server catalogue when logged in (alias
+    // authority lives on the server); otherwise fall back to direct target_id
+    // only, preserving legacy offline direct-ID behavior.
+    let target_id = match try_load_client(paths)? {
+        Some((client, cred)) => {
+            resolve_target_selector(paths, &client, &cred, target_selector)
+                .await?
+                .target_id
+        }
+        None => target_selector.to_string(),
+    };
 
     let _lock = match ExecutionLock::acquire_with_retry(
         &paths.state_lock_file(),
@@ -478,14 +644,14 @@ pub async fn target_set_model(
         }
         Err(e) => return Err(TargetError::Io(e)),
     };
-    check_active_attempt_target_in_use(paths, target_id)?;
+    check_active_attempt_target_in_use(paths, &target_id)?;
 
     let mut config = crate::config::LocalConfig::load(&paths.config_file())?
         .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
 
     let target = config
         .targets
-        .get_mut(target_id)
+        .get_mut(&target_id)
         .ok_or_else(|| TargetError::TargetNotFound(target_id.to_string()))?;
 
     let executor = target.executor.as_mut().ok_or_else(|| {
@@ -749,14 +915,22 @@ pub async fn build_target_display_items(
 /// authority for this routing state.
 pub async fn target_set_default_runtime(
     paths: &ConnectorPaths,
-    target_id: &str,
+    target_selector: &str,
 ) -> Result<(), TargetError> {
     paths.ensure_dirs()?;
     let profile = crate::config::load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
-    let res = client.set_default_runtime_target(&cred, target_id).await?;
+    // Exact selector resolution (alias or target_id); this is a server
+    // mutation, so the server projection is required.
+    let resolved = resolve_target_selector(paths, &client, &cred, target_selector).await?;
+    if resolved.projection.is_none() {
+        return Err(TargetError::TargetNotFound(target_selector.to_string()));
+    }
+    let target_id = resolved.target_id;
+
+    let res = client.set_default_runtime_target(&cred, &target_id).await?;
 
     println!(
         "Target '{}' set as the default Agent Runtime target for workspace '{}'.{}",
@@ -768,5 +942,57 @@ pub async fn target_set_default_runtime(
             ""
         }
     );
+    Ok(())
+}
+
+/// Renames a Target's human alias on the Server. The current selector may be
+/// an exact alias or an exact immutable target_id; it is resolved via the
+/// shared exact selector service and the rename is sent for the immutable
+/// target_id (never a delete/recreate). Human output is name-oriented; raw
+/// IDs appear only in `--json` diagnostics.
+pub async fn target_rename(
+    paths: &ConnectorPaths,
+    target_selector: &str,
+    new_alias: &str,
+    json_format: bool,
+) -> Result<(), TargetError> {
+    paths.ensure_dirs()?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+
+    let resolved = resolve_target_selector(paths, &client, &cred, target_selector).await?;
+    if resolved.projection.is_none() {
+        return Err(TargetError::TargetNotFound(target_selector.to_string()));
+    }
+
+    let res = client
+        .rename_target(&cred, &resolved.target_id, new_alias)
+        .await?;
+
+    if json_format {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "target_id": res.target_id,
+                "previous_alias": res.previous_alias,
+                "alias": res.alias,
+                "replayed": res.replayed,
+                "updated_at_ms": res.updated_at_ms,
+            }))
+            .unwrap()
+        );
+    } else if res.replayed {
+        println!(
+            "Target '{}' already has alias '{}'; nothing changed.",
+            res.previous_alias, res.alias
+        );
+    } else {
+        println!(
+            "Target '{}' renamed to '{}'.",
+            res.previous_alias, res.alias
+        );
+    }
     Ok(())
 }

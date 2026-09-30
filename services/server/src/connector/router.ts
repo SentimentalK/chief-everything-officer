@@ -733,6 +733,78 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
   );
 
   // ---------------------------------------------------------------------------
+  // 10b. Native API: Rename Target Alias (Device-Auth)
+  // ---------------------------------------------------------------------------
+  router.post(
+    "/api/connector/targets/:target_id/rename",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const targetId = req.params.target_id;
+      if (!targetId || typeof targetId !== "string") {
+        res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND });
+        return;
+      }
+
+      const body = req.body;
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Request body must be a JSON object." });
+        return;
+      }
+      const keys = Object.keys(body);
+      if (keys.length !== 1 || keys[0] !== "alias") {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Rename request must contain exactly one field: 'alias'." });
+        return;
+      }
+      const alias = (body as Record<string, unknown>).alias;
+      if (typeof alias !== "string" || alias.trim().length === 0) {
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "alias must be a non-empty string." });
+        return;
+      }
+
+      try {
+        const result = controlStore.renameExecutionTarget({
+          targetId,
+          newAlias: alias,
+          actorUserId: auth.user_id,
+        });
+
+        res.status(200).json({
+          ok: true,
+          target_id: result.target.id,
+          previous_alias: result.previousAlias,
+          alias: result.target.alias,
+          replayed: result.replayed,
+          updated_at_ms: result.target.updated_at_ms,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetConflictError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_ALIAS_CONFLICT, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorValidationError) {
+          res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
   // 5. Browser UI: Enrollment Approval Page
   // ---------------------------------------------------------------------------
   router.get("/connector/enroll", (req: Request, res: Response) => {

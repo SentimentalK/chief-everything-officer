@@ -536,6 +536,89 @@ export class ConnectorControlStore {
     });
   }
 
+  /**
+   * Renames an existing ExecutionTarget by its immutable ID: atomically
+   * updates the workspace-unique human alias without recreating the row.
+   * The target keeps its id and every relationship attached to it
+   * (DeviceTargetBindings, workspace default-runtime row, job history keyed
+   * by target id, repository metadata, kind, enabled/disabled state).
+   *
+   * Authority: the actor must be an active member of the target's workspace
+   * (foreign actors get the same not-found mask as bind/unbind) and must hold
+   * the owner role, matching target creation. The new alias must pass the
+   * existing alias validation and be unique within the workspace; a conflict
+   * fails with no partial mutation. Renaming to the target's current alias is
+   * a safe idempotent replay. The old alias is released immediately; no
+   * redirect/compat alias is kept.
+   */
+  renameExecutionTarget(input: {
+    targetId: string;
+    newAlias: string;
+    actorUserId: string;
+    nowMs?: number;
+  }): { target: ExecutionTargetRecord; previousAlias: string; replayed: boolean } {
+    // Validate before opening the transaction so invalid aliases never touch it.
+    const normalizedAlias = normalizeTargetAlias(input.newAlias);
+    const now = input.nowMs ?? Date.now();
+
+    return this.identityStore.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const target = db
+          .prepare("SELECT id, workspace_id, alias FROM execution_targets WHERE id = ? LIMIT 1;")
+          .get(input.targetId) as { id: string; workspace_id: string; alias: string } | undefined;
+        if (!target) {
+          throw new ConnectorNotFoundError(`ExecutionTarget '${input.targetId}' not found.`);
+        }
+
+        // Mask cross-workspace access as not-found, matching bind/unbind.
+        const membership = db
+          .prepare("SELECT role FROM workspace_memberships WHERE workspace_id = ? AND user_id = ? LIMIT 1;")
+          .get(target.workspace_id, input.actorUserId) as { role: string } | undefined;
+        if (!membership) {
+          throw new ConnectorNotFoundError(`ExecutionTarget '${input.targetId}' not found.`);
+        }
+        if (membership.role !== "owner") {
+          throw new ConnectorPermissionError("Only workspace owners can rename execution targets.");
+        }
+
+        if (normalizedAlias === target.alias) {
+          db.exec("COMMIT;");
+          const current = this.getExecutionTarget(input.targetId)!;
+          return { target: current, previousAlias: target.alias, replayed: true };
+        }
+
+        const conflict = db
+          .prepare(
+            "SELECT id FROM execution_targets WHERE workspace_id = ? AND alias = ? AND id != ? LIMIT 1;",
+          )
+          .get(target.workspace_id, normalizedAlias, input.targetId);
+        if (conflict) {
+          throw new ConnectorTargetConflictError(
+            `ExecutionTarget with alias '${normalizedAlias}' already exists in workspace '${target.workspace_id}'.`,
+          );
+        }
+
+        db.prepare("UPDATE execution_targets SET alias = ?, updated_at_ms = ? WHERE id = ?;").run(
+          normalizedAlias,
+          now,
+          input.targetId,
+        );
+        db.exec("COMMIT;");
+
+        const updated = this.getExecutionTarget(input.targetId)!;
+        return { target: updated, previousAlias: target.alias, replayed: false };
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
+    });
+  }
+
   reconcileExecutionTargetRepositoryMetadata(input: {
     provider: string;
     externalId: string;

@@ -201,6 +201,18 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            TargetSubcommands::Rename {
+                selector,
+                new_alias,
+                json,
+            } => {
+                if let Err(e) =
+                    ceo_connector::targets::target_rename(&paths, &selector, &new_alias, json).await
+                {
+                    eprintln!("Target rename failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
             TargetSubcommands::Remove { target_id } => {
                 if let Err(e) = ceo_connector::targets::target_remove(&paths, &target_id).await {
                     eprintln!("Target remove failed: {}", e);

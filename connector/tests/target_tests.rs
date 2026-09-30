@@ -443,6 +443,27 @@ async fn target_set_default_runtime_success_and_replay() {
     server.add_handler({
         let seen = default_seen.clone();
         move |req| {
+            // Selector resolution now consults the server catalogue first.
+            if req.path == "/api/connector/targets" && req.method == "GET" {
+                return MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "targets": [{
+                            "target": {
+                                "id": "tgt_runtime",
+                                "workspace_id": "ws_1",
+                                "alias": "runtime",
+                                "display_name": "Runtime Target",
+                                "kind": "general_automation",
+                                "repository": null,
+                                "disabled": false
+                            },
+                            "this_device_binding": null,
+                            "active_binding_count": 0
+                        }]
+                    }),
+                );
+            }
             if req.path == "/api/connector/targets/tgt_runtime/default-runtime"
                 && req.method == "POST"
             {
@@ -493,11 +514,14 @@ async fn target_set_default_runtime_success_and_replay() {
 
 #[tokio::test]
 async fn target_set_default_runtime_auth_and_error_behavior() {
-    // 401 maps to Unauthorized
+    // 401 maps to Unauthorized (surfaces from selector resolution or the mutation)
     let server = MockServer::start().await;
     server.add_handler(|req| {
         if req.path == "/api/connector/identity" && req.method == "GET" {
             return MockResponse::json(200, &serde_json::json!({ "user_id": "usr_1" }));
+        }
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(401, &serde_json::json!({ "error": "unauthorized" }));
         }
         if req.method == "POST" && req.path.contains("/default-runtime") {
             return MockResponse::json(401, &serde_json::json!({ "error": "unauthorized" }));
@@ -535,6 +559,26 @@ async fn target_set_default_runtime_auth_and_error_behavior() {
     // Non-owner surfaces a structured TargetError with code
     let server2 = MockServer::start().await;
     server2.add_handler(|req| {
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": "tgt_runtime",
+                            "workspace_id": "ws_1",
+                            "alias": "runtime",
+                            "display_name": "Runtime Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": false
+                        },
+                        "this_device_binding": null,
+                        "active_binding_count": 0
+                    }]
+                }),
+            );
+        }
         if req.method == "POST" && req.path.contains("/default-runtime") {
             return MockResponse::json(
                 403,

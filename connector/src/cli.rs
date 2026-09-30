@@ -105,6 +105,7 @@ pub enum TargetSubcommands {
     },
     /// Bind an existing target to this device
     Bind {
+        /// Target selector: exact target alias or exact target ID
         #[arg(long)]
         target_id: String,
         #[arg(long)]
@@ -116,6 +117,7 @@ pub enum TargetSubcommands {
     },
     /// Configure the agent executor for a target
     SetAgent {
+        /// Target selector: exact target alias or exact target ID
         #[arg(long)]
         target_id: String,
         #[arg(long)]
@@ -125,6 +127,7 @@ pub enum TargetSubcommands {
     },
     /// Set or clear an optional per-target model override for the agent executor
     SetModel {
+        /// Target selector: exact target alias or exact target ID
         #[arg(long)]
         target_id: String,
         /// Model ID to force for every newly launched execution on this target
@@ -138,8 +141,22 @@ pub enum TargetSubcommands {
     },
     /// Set the workspace default agent runtime target (server-side routing state)
     SetDefaultRuntime {
+        /// Target selector: exact target alias or exact target ID
         #[arg(long)]
         target_id: String,
+    },
+    /// Rename a target's human alias (server-authoritative; no recreate)
+    Rename {
+        /// Current target selector: exact target alias or exact target ID
+        selector: String,
+
+        /// New alias (lowercase alphanumeric, hyphen, underscore; 1-64 chars,
+        /// unique within the workspace)
+        new_alias: String,
+
+        /// Output in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Remove this device's binding for a target
     Remove {

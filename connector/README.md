@@ -5,11 +5,35 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **1.0.0**. Check with:
+Current baseline: **1.3.0**. Check with:
 
 ```
 ceo-connector --version
 ```
+
+## Target Selectors & Rename (1.3.0)
+
+Target-affecting commands (`target bind`, `target set-agent`, `target set-model`,
+`target set-default-runtime`, `target rename`) accept a **target selector**:
+
+- the exact human alias (server-authoritative, case-sensitive; no fuzzy, partial,
+  or case-insensitive matching), or
+- the exact immutable target ID (`tgt_...`, kept for scripts/backward compatibility).
+
+Aliases are resolved against the authenticated Server catalogue on every use; locally
+cached alias copies are never treated as authority. A selector that is simultaneously
+one target's ID and another target's alias fails closed rather than guessing.
+
+### Rename a target's alias
+
+```
+ceo-connector target rename <current-selector> <new-alias>
+```
+
+The Server atomically updates the workspace-unique alias for the immutable target ID
+(no delete/recreate): bindings, the default-runtime relation, and job history stay
+attached. Renaming to the current alias is a safe no-op; the old alias is released
+immediately. Add `--json` for machine-readable output.
 
 ## Local State Root
 
