@@ -396,9 +396,11 @@ pub fn complete_path(input: &str) -> Vec<String> {
 
 /// True when both stdin and stdout are attached to a TTY, i.e. suitable for
 /// interactive arrow-key prompting. Used to fail `setup` fast/actionably and
-/// to keep non-interactive login runs non-blocking.
+/// to keep non-interactive login runs non-blocking. Portable via the
+/// standard `std::io::IsTerminal` abstraction (no libc dependency).
 pub fn is_interactive_terminal() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 }
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 // ---------------------------------------------------------------------------

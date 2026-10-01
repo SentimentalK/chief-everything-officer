@@ -1,26 +1,26 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paths::reject_symlink_target;
+use crate::platform;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// An exclusive advisory flock held on a lock file.
+/// An exclusive advisory lock held on a lock file.
 ///
-/// Ownership lives in the kernel open file description; the lock is released
-/// when the descriptor is closed (e.g. process exit), preventing permanently
-/// held locks on crash.
+/// Ownership lives in the OS lock primitive (flock on Unix/macOS via the
+/// `fs2` crate, `LockFileEx` on Windows); the lock is released when the
+/// handle is closed (e.g. process exit), preventing permanently held locks
+/// on crash.
 #[derive(Debug)]
 pub struct ExecutionLock {
     _file: File,
 }
 
 impl ExecutionLock {
-    /// Attempts non-blocking acquisition of an exclusive flock.
+    /// Attempts non-blocking acquisition of an exclusive lock.
     /// Returns `ErrorKind::WouldBlock` if another process holds the lock.
     pub fn acquire(lock_path: &Path) -> std::io::Result<Self> {
         reject_symlink_target(lock_path)?;
@@ -28,18 +28,8 @@ impl ExecutionLock {
             fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(lock_path)?;
-
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let file = platform::open_private_lock_file(lock_path)?;
+        platform::try_lock_exclusive(&file)?;
 
         Ok(ExecutionLock { _file: file })
     }
@@ -96,13 +86,9 @@ impl ExecutionLock {
     }
 }
 
-/// fsyncs a directory so file addition/removal is durable across power loss.
-pub fn sync_directory(dir: &Path) -> std::io::Result<()> {
-    let d = File::open(dir)?;
-    d.sync_all()
-}
-
-/// Removes a file and fsyncs its parent directory.
+/// Removes a file and syncs its parent directory where the platform allows
+/// directory fsync (Unix/macOS; unavailable on Windows — see the platform
+/// module's documented Windows durability envelope).
 pub fn remove_durable(path: &Path) -> std::io::Result<()> {
     reject_symlink_target(path)?;
     match fs::remove_file(path) {
@@ -113,7 +99,7 @@ pub fn remove_durable(path: &Path) -> std::io::Result<()> {
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            sync_directory(parent)?;
+            platform::sync_directory(parent)?;
         }
     }
     Ok(())
@@ -135,7 +121,15 @@ fn temp_sibling(target: &Path) -> PathBuf {
     ))
 }
 
-/// Atomically and durably writes `contents` to `path` with 0600 mode.
+/// Atomically and durably writes `contents` to `path` with private
+/// permissions (0600 on Unix/macOS, current-user-private ACL on Windows).
+///
+/// Durability sequencing (every platform): create a fresh temp sibling in
+/// the target's parent (same filesystem) → write → file sync → atomic
+/// publish/replace → best-available parent metadata durability. The target
+/// is NEVER deleted before the publish: replacement is a single atomic
+/// rename (POSIX) / `MoveFileExW(REPLACE_EXISTING)` (Windows), and a failed
+/// publish leaves the prior valid file untouched.
 pub fn atomic_write_durable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     reject_symlink_target(path)?;
     let parent = match path.parent() {
@@ -151,20 +145,17 @@ pub fn atomic_write_durable(path: &Path, contents: &[u8]) -> std::io::Result<()>
 
     let tmp = temp_sibling(path);
     let write_res = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut file = platform::create_private_file_new(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&tmp, path)?;
-        sync_directory(parent)?;
+        platform::publish_atomic(&tmp, path)?;
+        platform::sync_directory(parent)?;
         Ok(())
     })();
 
     if write_res.is_err() {
+        // Bounded cleanup of OUR OWN temp sibling only.
         let _ = fs::remove_file(&tmp);
     }
     write_res
@@ -180,10 +171,12 @@ pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_and_read_durable() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("sub").join("state.json");
         atomic_write_durable(&target, b"{\"hello\": \"world\"}").unwrap();
@@ -194,6 +187,82 @@ mod tests {
         );
         let perms = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(perms, 0o600);
+    }
+
+    /// Portable across Linux/macOS/Windows: first write creates the file,
+    /// every subsequent write atomically replaces the previous content.
+    #[test]
+    fn atomic_first_write_and_repeated_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("state.json");
+
+        atomic_write_durable(&target, b"v1").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v1");
+
+        for round in 2..=5 {
+            let content = format!("v{round}");
+            atomic_write_durable(&target, content.as_bytes()).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), content.as_bytes());
+        }
+
+        // No temp siblings may survive successful replacements.
+        let leftovers: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+    }
+
+    /// Portable: when the atomic publish fails (target is an existing
+    /// directory), the prior state is preserved and the temp sibling is
+    /// cleaned up.
+    #[test]
+    fn failed_publish_preserves_prior_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("state.json");
+        fs::create_dir(&target).unwrap();
+
+        assert!(atomic_write_durable(&target, b"new").is_err());
+        assert!(target.is_dir(), "prior state (directory) must be intact");
+
+        let leftovers: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+    }
+
+    /// Unix: when the temp write itself fails (read-only parent), the prior
+    /// valid file is preserved untouched. Probe-based skip for root.
+    #[cfg(unix)]
+    #[test]
+    fn temp_write_failure_preserves_prior_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("ro");
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("state.json");
+        atomic_write_durable(&target, b"good").unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let res = atomic_write_durable(&target, b"should-fail");
+        if res.is_ok() {
+            // Running as root: permission bits are not enforced and this
+            // failure cannot be simulated; nothing to assert.
+            return;
+        }
+
+        assert_eq!(fs::read(&target).unwrap(), b"good");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
     }
 
     #[test]
@@ -212,5 +281,22 @@ mod tests {
 
         let lock3 = ExecutionLock::acquire(&lock_path).unwrap();
         drop(lock3);
+    }
+
+    /// Portable: release after drop allows re-acquisition, including in a
+    /// fresh handle (process-lifetime release semantics).
+    #[test]
+    fn execution_lock_release_allows_reacquire() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("state.lock");
+
+        {
+            let lock = ExecutionLock::acquire(&lock_path).unwrap();
+            assert!(ExecutionLock::is_locked(&lock_path));
+            drop(lock);
+        }
+
+        let again = ExecutionLock::acquire(&lock_path).unwrap();
+        drop(again);
     }
 }

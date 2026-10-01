@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use crate::client::{ConnectorClient, ConnectorTargetProjection};
 use crate::credential::DeviceCredential;
 use crate::paths::{reject_control_ancestor_symlinks, reject_symlink_target, ConnectorPaths};
+use crate::platform::{diagnose_dir_privacy, diagnose_file_privacy, PrivacyStatus};
 use crate::render::{push_field, push_line};
 use crate::targets::verify_local_repository;
 
@@ -137,27 +136,30 @@ fn check_filesystem(paths: &ConnectorPaths, checks: &mut Vec<DiagnosticCheck>) {
         });
     } else {
         let sym_res = reject_control_ancestor_symlinks(&paths.root_dir);
-        let mode = fs::metadata(&paths.root_dir)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0);
         if sym_res.is_err() {
             checks.push(DiagnosticCheck {
                 name: "Connector Root".into(),
                 severity: DiagnosticSeverity::Fail,
                 message: "Connector root or ancestor is a symlink".into(),
             });
-        } else if mode != 0o700 {
-            checks.push(DiagnosticCheck {
-                name: "Connector Root".into(),
-                severity: DiagnosticSeverity::Warn,
-                message: format!("Permissions are 0{:o}, expected 0700", mode),
-            });
         } else {
-            checks.push(DiagnosticCheck {
-                name: "Connector Root".into(),
-                severity: DiagnosticSeverity::Pass,
-                message: format!("Valid (0700) at {}", paths.root_dir.display()),
-            });
+            match diagnose_dir_privacy(&paths.root_dir) {
+                Ok(PrivacyStatus::Private { detail }) => checks.push(DiagnosticCheck {
+                    name: "Connector Root".into(),
+                    severity: DiagnosticSeverity::Pass,
+                    message: format!("Valid ({detail}) at {}", paths.root_dir.display()),
+                }),
+                Ok(PrivacyStatus::Exposed { detail }) => checks.push(DiagnosticCheck {
+                    name: "Connector Root".into(),
+                    severity: DiagnosticSeverity::Warn,
+                    message: detail,
+                }),
+                Err(e) => checks.push(DiagnosticCheck {
+                    name: "Connector Root".into(),
+                    severity: DiagnosticSeverity::Warn,
+                    message: format!("Could not verify directory privacy: {e}"),
+                }),
+            }
         }
     }
 }
@@ -184,15 +186,22 @@ fn check_credentials(
         return None;
     }
 
-    let mode = fs::metadata(paths.credential_file())
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0);
-    if mode != 0o600 {
-        checks.push(DiagnosticCheck {
-            name: "Credential Permissions".into(),
-            severity: DiagnosticSeverity::Warn,
-            message: format!("Permissions are 0{:o}, expected 0600", mode),
-        });
+    match diagnose_file_privacy(&paths.credential_file()) {
+        Ok(PrivacyStatus::Private { .. }) => {}
+        Ok(PrivacyStatus::Exposed { detail }) => {
+            checks.push(DiagnosticCheck {
+                name: "Credential Permissions".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: detail,
+            });
+        }
+        Err(e) => {
+            checks.push(DiagnosticCheck {
+                name: "Credential Permissions".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!("Could not verify credential file privacy: {e}"),
+            });
+        }
     }
 
     match DeviceCredential::load(&paths.credential_file()) {

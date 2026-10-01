@@ -13,6 +13,7 @@ use crate::config::{normalize_server_origin, ConfigError, LocalConfig};
 use crate::credential::{CredentialError, DeviceCredential};
 use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
 use crate::paths::ConnectorPaths;
+use crate::platform::{hostname, open_url_best_effort, platform_name};
 
 pub const ENROLLMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -155,23 +156,10 @@ pub fn generate_secret_and_digest() -> (String, String) {
     (secret, digest)
 }
 
+/// Stable Server-facing platform string (display metadata only). Thin
+/// delegate to the platform boundary.
 pub fn default_platform() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "linux"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "macos"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "windows"
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        "unknown"
-    }
+    platform_name()
 }
 
 /// Executes the `ceo-connector login` flow with crash recovery and coexistence rules.
@@ -303,8 +291,9 @@ pub async fn login_flow(
             "{}/connector/enroll?user_code={}",
             session.server_origin, session.user_code
         );
-        // Best-effort open in browser
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        // Best-effort open in the default browser on every supported OS
+        // (cross-platform primitive; auth correctness never depends on it).
+        let _ = open_url_best_effort(&url);
     }
 
     // 4. Poll Loop:
@@ -424,25 +413,7 @@ pub async fn login_flow(
 }
 
 fn detect_hostname() -> String {
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        let trimmed = h.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Ok(content) = std::fs::read_to_string("/etc/hostname") {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Ok(user) = std::env::var("USER") {
-        let trimmed = user.trim();
-        if !trimmed.is_empty() {
-            return format!("{trimmed}-device");
-        }
-    }
-    "unknown-device".into()
+    hostname()
 }
 
 async fn create_fresh_enrollment(

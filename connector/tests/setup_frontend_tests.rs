@@ -482,12 +482,12 @@ fn cli_surface_setup_command_and_no_setup_flag_are_discoverable() {
 }
 
 #[test]
-fn interactive_terminal_detection_matches_libc_tty_state() {
+fn interactive_terminal_detection_matches_std_tty_state() {
     // In the cargo test harness stdin/stdout are not a TTY, so the guard
     // must report non-interactive (never claim interactivity it cannot
     // back). This pins the contract used by `setup` and the login handoff.
-    let interactive =
-        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     assert_eq!(
         ceo_connector::setup_frontend::is_interactive_terminal(),
         interactive

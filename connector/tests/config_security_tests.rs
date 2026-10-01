@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use ceo_connector::config::{normalize_server_origin, LocalConfig};
 use ceo_connector::credential::DeviceCredential;
@@ -71,7 +70,10 @@ fn strict_schemas_deny_unknown_fields() {
 }
 
 #[test]
+#[cfg(unix)]
 fn control_directories_and_files_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir().unwrap();
     let paths = ConnectorPaths::from_root(temp.path().join("root"));
     paths.ensure_dirs().unwrap();
@@ -98,7 +100,41 @@ fn control_directories_and_files_permissions() {
     assert_eq!(file_mode, 0o600);
 }
 
+/// Cross-platform: directories and sensitive files must be private under
+/// EACH platform's own security boundary (0700/0600 on Unix, explicit
+/// current-user-private ACLs on Windows).
 #[test]
+fn control_directories_and_files_are_platform_private() {
+    use ceo_connector::platform::{diagnose_dir_privacy, diagnose_file_privacy, PrivacyStatus};
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+
+    assert!(matches!(
+        diagnose_dir_privacy(&paths.root_dir).unwrap(),
+        PrivacyStatus::Private { .. }
+    ));
+
+    let cred = DeviceCredential::new(
+        "https://api.ceo.dev".into(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret123".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    assert!(matches!(
+        diagnose_file_privacy(&paths.credential_file()).unwrap(),
+        PrivacyStatus::Private { .. }
+    ));
+}
+
+#[test]
+#[cfg(unix)]
 fn symlink_control_path_rejected() {
     use std::os::unix::fs::symlink;
 

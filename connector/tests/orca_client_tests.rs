@@ -1,3 +1,7 @@
+#![cfg(unix)]
+// Unix-only integration suite: the Orca CLI fixtures are driven by bash shims
+// (shebang scripts + chmod). Not compiled on Windows.
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

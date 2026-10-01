@@ -1,6 +1,6 @@
 [package]
 name = "ceo-connector"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 
 [dependencies]
@@ -14,16 +14,36 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
 url = "2.5"
-libc = "0.2"
 rand = "0.8"
 base64 = "0.22"
 async-trait = "0.1"
 serde_json_canonicalizer = "0.3.2"
 dirs = "5.0"
+# Cross-platform exclusive advisory file locking (flock on Unix, LockFileEx
+# on Windows). Small, mature, and a drop-in replacement for the previous
+# direct libc::flock call.
+fs2 = "0.4"
+# Cross-platform best-effort default-browser opening (xdg-open/gio on Linux,
+# open on macOS, ShellExecuteW on Windows). No shell command lines anywhere.
+open = "5"
 # Guided-setup frontend: one small, mature, cross-platform terminal prompt
 # backend (crossterm) providing arrow-key Select + editable Text with Tab
 # completion. Unneeded features stay disabled to keep the footprint small.
 inquire = { version = "0.7", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only, minimal FFI bindings for the centralized platform boundary in
+# src/platform/windows.rs (current-user-private DACLs + reparse-point
+# detection). Compile-time feature-gated; adds nothing on Unix.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3.12"

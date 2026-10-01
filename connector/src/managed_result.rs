@@ -522,6 +522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_symlink_rejection() {
         let dir = tempdir().unwrap();
         let target_file = dir.path().join("real.json");

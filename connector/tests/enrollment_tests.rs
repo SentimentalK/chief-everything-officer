@@ -14,6 +14,22 @@ use ceo_connector::local_state::atomic_write_json;
 use ceo_connector::paths::ConnectorPaths;
 use common::mock_server::{MockResponse, MockServer};
 
+/// Pins the cross-platform boundary contract: shared enrollment never
+/// invokes an OS-specific browser launcher directly (e.g. `xdg-open`); it
+/// delegates to `platform::open_url_best_effort`.
+#[test]
+fn shared_enrollment_uses_platform_browser_boundary() {
+    let src = include_str!("../src/enrollment.rs");
+    assert!(
+        !src.contains("xdg-open"),
+        "shared enrollment must not hard-code xdg-open"
+    );
+    assert!(
+        src.contains("open_url_best_effort"),
+        "enrollment must open the browser through the platform boundary"
+    );
+}
+
 #[tokio::test]
 async fn secret_digest_and_redacted_debug() {
     let (secret, digest) = generate_secret_and_digest();

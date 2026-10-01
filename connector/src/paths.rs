@@ -1,6 +1,6 @@
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::platform;
 
 /// Environment variable that replaces the entire Connector root.
 ///
@@ -38,7 +38,7 @@ impl ConnectorPaths {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
-                    "cannot determine the user home directory; set {} or HOME explicitly",
+                    "cannot determine the user home directory; set {} (or HOME/USERPROFILE) explicitly",
                     ENV_CONNECTOR_ROOT
                 ),
             )
@@ -135,19 +135,19 @@ impl ConnectorPaths {
         self.root_dir.join("tmp")
     }
 
-    /// Ensures the attempt-specific runtime directory exists with 0700 permissions
-    /// and that its hierarchy contains no symlinks.
+    /// Ensures the attempt-specific runtime directory exists with private
+    /// permissions (0700 on Unix/macOS, current-user-private ACL on Windows)
+    /// and that its hierarchy contains no symlinks/reparse points.
     pub fn ensure_attempt_runtime_dir(&self, attempt_id: &str) -> std::io::Result<PathBuf> {
         let dir = self.attempt_runtime_dir(attempt_id);
         reject_control_ancestor_symlinks(&dir)?;
-        fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        platform::ensure_private_dir(&dir)?;
         Ok(dir)
     }
 
     /// Ensures the root and all owned subdirectories (locks, history, outbox,
-    /// results, runtime, tmp) exist with 0700 permissions and ensures no
-    /// component in the hierarchy is a symlink.
+    /// results, runtime, tmp) exist with private permissions and ensures no
+    /// component in the hierarchy is a symlink/reparse point.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         reject_control_ancestor_symlinks(&self.root_dir)?;
 
@@ -160,47 +160,24 @@ impl ConnectorPaths {
             &self.runtime_dir(),
             &self.tmp_dir(),
         ] {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            platform::ensure_private_dir(dir)?;
         }
         Ok(())
     }
 }
 
-/// Rejects any path whose destination is an existing symlink.
+/// Rejects any path whose destination is an existing symlink (Unix/macOS) or
+/// any reparse point — symlink/junction/mount point — (Windows). Thin
+/// delegate to the platform boundary.
 pub fn reject_symlink_target(path: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("control path is a symlink: {}", path.display()),
-        )),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    platform::reject_reparse_target(path)
 }
 
-/// Rejects if any existing component in `dir` or its ancestors is a symlink.
+/// Rejects if any existing component in `dir` or its ancestors is a symlink
+/// (Unix/macOS) or any reparse point (Windows). Thin delegate to the
+/// platform boundary.
 pub fn reject_control_ancestor_symlinks(dir: &Path) -> std::io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in dir.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("control ancestor is a symlink: {}", current.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // If an intermediate directory does not exist yet, it will be created as a real dir.
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+    platform::reject_reparse_ancestors(dir)
 }
 
 #[cfg(test)]
@@ -208,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_dirs_creates_all_0700_directories() {
+    fn ensure_dirs_creates_all_directories() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ConnectorPaths::from_root(temp.path().join("connector"));
         paths.ensure_dirs().unwrap();
@@ -222,24 +199,77 @@ mod tests {
             paths.runtime_dir(),
             paths.tmp_dir(),
         ] {
-            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert!(dir.is_dir(), "directory {:?} must exist", dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_creates_all_0700_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ConnectorPaths::from_root(temp.path().join("connector"));
+        paths.ensure_dirs().unwrap();
+
+        for dir in [
+            paths.root_dir.clone(),
+            paths.locks_dir(),
+            paths.history_dir(),
+            paths.outbox_dir(),
+            paths.results_dir(),
+            paths.runtime_dir(),
+            paths.tmp_dir(),
+        ] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "directory {:?} must be 0700", dir);
         }
     }
 
     #[test]
     fn rejects_symlink_target_and_ancestor() {
-        use std::os::unix::fs::symlink;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
-        let target_dir = temp.path().join("real_target");
-        fs::create_dir_all(&target_dir).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let target_dir = temp.path().join("real_target");
+            std::fs::create_dir_all(&target_dir).unwrap();
 
-        let link_dir = temp.path().join("symlinked_dir");
-        symlink(&target_dir, &link_dir).unwrap();
+            let link_dir = temp.path().join("symlinked_dir");
+            symlink(&target_dir, &link_dir).unwrap();
 
-        let paths = ConnectorPaths::from_root(link_dir.join("connector"));
-        assert!(paths.ensure_dirs().is_err());
+            let paths = ConnectorPaths::from_root(link_dir.join("connector"));
+            assert!(paths.ensure_dirs().is_err());
+        }
+        #[cfg(windows)]
+        {
+            use crate::platform;
+
+            let temp = tempfile::tempdir().unwrap();
+            let target_dir = temp.path().join("real_target");
+            std::fs::create_dir_all(&target_dir).unwrap();
+
+            // Junction (reparse point) planted at the root's parent level.
+            let link_dir = temp.path().join("junction_dir");
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link_dir.display().to_string(),
+                    &target_dir.display().to_string(),
+                ])
+                .output()
+                .unwrap();
+            assert!(status.status.success());
+
+            let paths = ConnectorPaths::from_root(link_dir.join("connector"));
+            assert!(paths.ensure_dirs().is_err());
+
+            // The platform primitives reject the junction explicitly.
+            assert!(platform::reject_reparse_target(&link_dir).is_err());
+        }
     }
 
     #[test]

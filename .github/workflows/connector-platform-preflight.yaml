@@ -1,0 +1,107 @@
+name: CEO Connector — Five-Platform Compile/Test Preflight
+
+# PROJECT-032 Slice A: MANUAL preflight only.
+# This workflow is deliberately NOT a push/PR gate — the cheap Linux gate
+# remains .github/workflows/connector.yaml. Dispatch it by hand for the
+# final branch/SHA before considering a Connector release train.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: connector
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (native: test/clippy/build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt --check
+        run: cargo fmt --check
+      - name: cargo test --locked
+        run: cargo test --locked
+      - name: cargo clippy --locked --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo build --locked
+        run: cargo build --locked
+      - name: version check
+        run: ./target/debug/ceo-connector --version
+
+  linux-aarch64:
+    name: Linux aarch64 (CROSS-BUILD, compile-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Install aarch64 cross linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: cargo check --locked (aarch64 target)
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+      - name: cargo build --locked (aarch64 target)
+        run: cargo build --locked --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Honest labeling
+        run: |
+          echo "Linux aarch64 was CROSS-BUILT (compile-only)."
+          echo "No runtime tests were executed on aarch64 hardware in this run."
+
+  macos-x86_64:
+    name: macOS x86_64 (native Intel: test/clippy/build)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo test --locked
+        run: cargo test --locked
+      - name: cargo clippy --locked --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo build --locked
+        run: cargo build --locked
+      - name: version check
+        run: ./target/debug/ceo-connector --version
+
+  macos-arm64:
+    name: macOS arm64 (native Apple Silicon: test/clippy/build)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo test --locked
+        run: cargo test --locked
+      - name: cargo clippy --locked --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo build --locked
+        run: cargo build --locked
+      - name: version check
+        run: ./target/debug/ceo-connector --version
+
+  windows-x86_64:
+    name: Windows x86_64 MSVC (native: test/clippy/build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo test --locked
+        run: cargo test --locked
+      - name: cargo clippy --locked --all-targets -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo build --locked
+        run: cargo build --locked
+      - name: version check
+        run: ./target/debug/ceo-connector.exe --version
