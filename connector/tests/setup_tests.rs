@@ -778,10 +778,16 @@ async fn agent_runtime_local_mapping_writes_only_v3_device_owned_fields() {
     init_git_repo_with_origin(&repo, AGENT_RUNTIME_REPO_CLONE_URL);
 
     let outcome = ensure_agent_runtime(&env.paths, &repo).await.unwrap();
-    let raw = env.raw_config_text();
-    assert!(raw.contains("\"schema_version\": 3"));
-    assert!(raw.contains(&outcome.local_path));
+    // Compare the persisted path through the typed config representation, not
+    // a raw-text substring: JSON escapes backslashes on Windows, so the file
+    // contains `C:\\Users\\...` while `outcome.local_path` holds
+    // `C:\Users\...`. Path equality must hold exactly across platforms.
+    let config = env.config().unwrap();
+    assert_eq!(config.schema_version, 3);
+    let lt = config.targets.get(&outcome.target_id).unwrap();
+    assert_eq!(lt.local_path, outcome.local_path);
     // Server-owned Target metadata never leaks into local state.
+    let raw = env.raw_config_text();
     assert!(!raw.contains("\"alias\""));
     assert!(!raw.contains("\"kind\""));
     assert!(!raw.contains("\"workspace_id\""));
