@@ -71,8 +71,14 @@ impl From<crate::config::ProfileError> for TargetError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetDisplayItem {
     pub target_id: String,
-    pub alias: String,
-    pub kind: String,
+    /// Server-authoritative alias. `None` when the Server catalogue cannot
+    /// supply it (e.g. a locally-mapped target absent from the catalogue);
+    /// local state never fabricates Server-owned names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Server-authoritative Target kind; `None` when unknown locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub local_path: Option<String>,
     pub status: String,
     pub disabled: bool,
@@ -256,12 +262,12 @@ fn local_config_has_target(paths: &ConnectorPaths, target_id: &str) -> Result<bo
 /// exact server-authoritative Target alias in the authenticated workspace
 /// catalogue.
 ///
-/// Contract (PROJECT-036 Slice 1A):
+/// Contract (PROJECT-036 Slice 1A + 1B):
 /// - exact target_id remains supported (raw ID for scripts/debugging);
 /// - otherwise the selector must exactly equal a Server alias — no substring,
 ///   prefix, fuzzy, or case-insensitive matching;
-/// - the Server catalogue decides alias truth; local cached schema-v2 alias
-///   copies are never used to resolve or rewrite an alias;
+/// - the Server catalogue decides alias truth; local schema-v3 config stores
+///   no alias at all, so aliases can never resolve from local cache;
 /// - an ID-vs-alias ambiguity referring to different Targets fails closed;
 /// - unknown selectors fail with an actionable error;
 /// - when the Server catalogue is unreachable (or the device is not logged
@@ -439,13 +445,11 @@ pub async fn target_add(
         verify_local_repository(&canonical_path, target_repo)?;
     }
 
-    // Atomically update local config
+    // Atomically update local config: only Device-owned v3 fields are stored
+    // locally. Alias/kind/workspace live solely in the Server catalogue.
     config.targets.insert(
         res.target.id.clone(),
         LocalTarget {
-            workspace_id: res.target.workspace_id,
-            alias: res.target.alias,
-            kind: res.target.kind,
             local_path: canonical_str,
             executor,
         },
@@ -527,10 +531,9 @@ pub async fn target_bind(
 
     config.targets.insert(
         target_id.to_string(),
+        // Only Device-owned v3 fields are stored locally; alias/kind/
+        // workspace stay Server-owned (read from the fresh projection above).
         LocalTarget {
-            workspace_id: target.workspace_id,
-            alias: target.alias,
-            kind: target.kind,
             local_path: canonical_str,
             executor,
         },
@@ -731,9 +734,20 @@ pub fn render_target_blocks(items: &[TargetDisplayItem]) -> String {
 
     let mut out = String::new();
     for item in items {
-        push_line(&mut out, 0, &format!("Target: {}", item.alias));
+        // Alias/kind are Server-owned: when the catalogue cannot supply them
+        // (e.g. LOCAL_ONLY targets) they render as unknown, never fabricated.
+        push_line(
+            &mut out,
+            0,
+            &format!("Target: {}", item.alias.as_deref().unwrap_or("<unknown>")),
+        );
         push_field(&mut out, 2, "ID", &item.target_id);
-        push_field(&mut out, 2, "Kind", &item.kind);
+        push_field(
+            &mut out,
+            2,
+            "Kind",
+            item.kind.as_deref().unwrap_or("<unknown>"),
+        );
         push_field(&mut out, 2, "Status", &item.status);
         push_field(
             &mut out,
@@ -779,6 +793,12 @@ pub fn render_target_blocks(items: &[TargetDisplayItem]) -> String {
 /// config), including the workspace default Agent Runtime marker. Exposed
 /// separately from `target_list` so the projection is testable without
 /// capturing stdout.
+///
+/// Authority split (PROJECT-036 Slice 1B): alias/kind/repository/disabled/
+/// binding/default-runtime come ONLY from the Server catalogue; local_path/
+/// executor/model come ONLY from the v3 local config, merged by immutable
+/// target_id. A logged-in device that cannot obtain the Server catalogue
+/// fails clearly instead of rendering stale/fabricated Server-owned metadata.
 pub async fn build_target_display_items(
     paths: &ConnectorPaths,
 ) -> Result<Vec<TargetDisplayItem>, TargetError> {
@@ -792,7 +812,7 @@ pub async fn build_target_display_items(
         (p.config, Some(p.credential))
     } else {
         let cfg = LocalConfig::load(&paths.config_file())?.unwrap_or_else(|| LocalConfig {
-            schema_version: 1,
+            schema_version: crate::config::CONFIG_SCHEMA_VERSION,
             server_url: "".into(),
             targets: BTreeMap::new(),
         });
@@ -801,7 +821,9 @@ pub async fn build_target_display_items(
 
     let server_targets: Vec<ConnectorTargetProjection> = if let Some(ref c) = cred {
         let client = ConnectorClient::new(&c.server_origin)?;
-        client.list_targets(c, None).await.unwrap_or_default()
+        // Fail clearly on Server-unavailable: do not silently render an
+        // empty catalogue or fabricate Server-owned fields from local state.
+        client.list_targets(c, None).await?
     } else {
         vec![]
     };
@@ -841,8 +863,8 @@ pub async fn build_target_display_items(
 
             display_items.push(TargetDisplayItem {
                 target_id: tid.clone(),
-                alias: st.alias,
-                kind: st.kind,
+                alias: Some(st.alias),
+                kind: Some(st.kind),
                 local_path: Some(lt.local_path.clone()),
                 status,
                 disabled: st.disabled,
@@ -854,6 +876,9 @@ pub async fn build_target_display_items(
                 model: lt.executor.as_ref().and_then(|e| e.model.clone()),
             });
         } else {
+            // Locally mapped but absent from the fetched Server catalogue.
+            // v3 local state carries no alias/kind and never fabricates
+            // Server-owned metadata: they are rendered as unknown.
             let status = if !path_exists {
                 "PATH_MISSING".into()
             } else {
@@ -862,8 +887,8 @@ pub async fn build_target_display_items(
 
             display_items.push(TargetDisplayItem {
                 target_id: tid.clone(),
-                alias: lt.alias.clone(),
-                kind: lt.kind.clone(),
+                alias: None,
+                kind: None,
                 local_path: Some(lt.local_path.clone()),
                 status,
                 disabled: false,
@@ -892,8 +917,8 @@ pub async fn build_target_display_items(
 
         display_items.push(TargetDisplayItem {
             target_id: tid,
-            alias: st.alias,
-            kind: st.kind,
+            alias: Some(st.alias),
+            kind: Some(st.kind),
             local_path: None,
             status,
             disabled: st.disabled,

@@ -60,9 +60,6 @@ fn setup_env(
     config.targets.insert(
         "tgt_v17".into(),
         LocalTarget {
-            workspace_id: "ws_v17".into(),
-            alias: "v17-target".into(),
-            kind: "general_automation".into(),
             local_path: target_path.to_string(),
             executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
@@ -103,9 +100,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "v17-target".into(),
-        kind: "general_automation".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -173,9 +167,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "v17-target".into(),
-        kind: "general_automation".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };

@@ -17,6 +17,15 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Shared one-time schema migration entrypoint (PROJECT-036 Slice 1B):
+    // every product code path starts here, so a legacy v1/v2 config is
+    // deterministically migrated to the schema v3 steady state (or fails
+    // closed with an actionable error) before any command executes.
+    if let Err(e) = ceo_connector::config::ensure_config_schema_current(&paths) {
+        eprintln!("Config schema migration failed: {}", e);
+        return ExitCode::FAILURE;
+    }
+
     match cli.command {
         Commands::Login {
             server,

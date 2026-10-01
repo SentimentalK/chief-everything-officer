@@ -2,12 +2,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
-use crate::local_state::atomic_write_json;
+use crate::local_state::{atomic_write_json, ExecutionLock};
+use crate::paths::ConnectorPaths;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+/// Steady-state durable config schema (PROJECT-036 Slice 1B).
+///
+/// v3 stores ONLY Device-owned state: `local_path` and the local executor
+/// configuration, keyed by the Server-owned immutable `target_id`. All
+/// Server-owned Target metadata (workspace membership, alias/name, kind,
+/// repository, disabled state, device binding, workspace default Agent
+/// Runtime) lives exclusively in the Server catalogue.
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+
+/// Legacy schema versions accepted ONLY as one-time migration inputs.
+const LEGACY_SCHEMA_VERSION_V1: u32 = 1;
+const LEGACY_SCHEMA_VERSION_V2: u32 = 2;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -23,6 +36,18 @@ pub enum ConfigError {
     UnsupportedSchemaVersion(u32),
     #[error("Invalid executor configuration: {0}")]
     InvalidExecutor(String),
+    #[error(
+        "Local config uses legacy schema v{0}; it must be migrated to schema v3 before use. Run any `ceo-connector` command to perform the automatic one-time migration (CONFIG_SCHEMA_MIGRATION_REQUIRED)."
+    )]
+    LegacySchemaRequiresMigration(u32),
+    #[error(
+        "Refusing to write legacy schema version {0} to disk; only schema v3 may be persisted (CONFIG_SCHEMA_WRITE_REJECTED)."
+    )]
+    LegacyWriteRejected(u32),
+    #[error(
+        "Config schema migration could not acquire the local state lock. Close other Connector operations and retry (CONFIG_MIGRATION_LOCK_BUSY)."
+    )]
+    MigrationLockBusy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,12 +208,15 @@ impl LocalExecutorConfig {
     }
 }
 
+/// Device-owned durable local Target state (schema v3 steady state).
+///
+/// Keyed by the Server-owned immutable `target_id` in `LocalConfig::targets`.
+/// Deliberately contains NO Server-owned Target metadata: workspace_id,
+/// alias/name, kind, repository, disabled state, bindings, and the workspace
+/// default Agent Runtime relation are all owned by the Server catalogue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalTarget {
-    pub workspace_id: String,
-    pub alias: String,
-    pub kind: String,
     pub local_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<LocalExecutorConfig>,
@@ -213,6 +241,12 @@ impl LocalConfig {
         })
     }
 
+    /// Strict schema-v3 parser. This is the ONLY steady-state on-disk format.
+    ///
+    /// - v3 is parsed with `deny_unknown_fields` (strictness/security policy).
+    /// - Legacy v1/v2 files are rejected with an actionable migration error;
+    ///   they are handled exclusively by [`ensure_config_schema_current`].
+    /// - Unknown future schema versions fail explicitly.
     pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         if !path.exists() {
             return Ok(None);
@@ -224,59 +258,35 @@ impl LocalConfig {
             .and_then(|v| v.as_u64())
             .ok_or(ConfigError::UnsupportedSchemaVersion(0))? as u32;
 
-        let config = match version {
-            1 => {
-                #[derive(Deserialize)]
-                struct LocalConfigV1 {
-                    server_url: String,
-                    #[serde(default)]
-                    targets: BTreeMap<String, LocalTargetV1>,
-                }
-                #[derive(Deserialize)]
-                struct LocalTargetV1 {
-                    workspace_id: String,
-                    alias: String,
-                    kind: String,
-                    local_path: String,
-                }
-                let v1: LocalConfigV1 = serde_json::from_value(val)?;
-                let mut targets = BTreeMap::new();
-                for (tid, t) in v1.targets {
-                    targets.insert(
-                        tid,
-                        LocalTarget {
-                            workspace_id: t.workspace_id,
-                            alias: t.alias,
-                            kind: t.kind,
-                            local_path: t.local_path,
-                            executor: None,
-                        },
-                    );
-                }
-                LocalConfig {
-                    schema_version: CONFIG_SCHEMA_VERSION,
-                    server_url: v1.server_url,
-                    targets,
-                }
-            }
-            CONFIG_SCHEMA_VERSION => {
-                let cfg: LocalConfig = serde_json::from_value(val)?;
-                for lt in cfg.targets.values() {
-                    if let Some(ref exec) = lt.executor {
-                        exec.validate()?;
-                    }
-                }
-                cfg
+        match version {
+            CONFIG_SCHEMA_VERSION => {}
+            LEGACY_SCHEMA_VERSION_V1 | LEGACY_SCHEMA_VERSION_V2 => {
+                return Err(ConfigError::LegacySchemaRequiresMigration(version));
             }
             other => return Err(ConfigError::UnsupportedSchemaVersion(other)),
-        };
+        }
+
+        let config: LocalConfig = serde_json::from_value(val)?;
+        if config.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(ConfigError::UnsupportedSchemaVersion(config.schema_version));
+        }
+        for lt in config.targets.values() {
+            if let Some(ref exec) = lt.executor {
+                exec.validate()?;
+            }
+        }
 
         // Ensure server_url in file is a valid normalized origin
         normalize_server_origin(&config.server_url)?;
         Ok(Some(config))
     }
 
+    /// Persists the config atomically. Only the steady-state schema v3 may be
+    /// written; legacy versions are rejected explicitly (fail closed).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(ConfigError::LegacyWriteRejected(self.schema_version));
+        }
         normalize_server_origin(&self.server_url)?;
         for lt in self.targets.values() {
             if let Some(ref exec) = lt.executor {
@@ -286,6 +296,195 @@ impl LocalConfig {
         atomic_write_json(path, self)?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy schema parsing (transient migration inputs only)
+// ---------------------------------------------------------------------------
+
+/// v2 local target shape. Server-owned fields (workspace_id/alias/kind) are
+/// parsed only so the old file can be read; they are dropped by the
+/// migration and are never treated as authoritative truth.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLocalTargetV2 {
+    #[allow(dead_code)]
+    workspace_id: String,
+    #[allow(dead_code)]
+    alias: String,
+    #[allow(dead_code)]
+    kind: String,
+    local_path: String,
+    executor: Option<LocalExecutorConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLocalConfigV2 {
+    #[allow(dead_code)]
+    schema_version: u32,
+    server_url: String,
+    #[serde(default)]
+    targets: BTreeMap<String, LegacyLocalTargetV2>,
+}
+
+/// v1 local target shape (pre-executor era; no deny_unknown_fields,
+/// matching the original v1 parser).
+#[derive(Deserialize)]
+struct LegacyLocalTargetV1 {
+    #[allow(dead_code)]
+    workspace_id: String,
+    #[allow(dead_code)]
+    alias: String,
+    #[allow(dead_code)]
+    kind: String,
+    local_path: String,
+}
+
+#[derive(Deserialize)]
+struct LegacyLocalConfigV1 {
+    #[allow(dead_code)]
+    schema_version: u32,
+    server_url: String,
+    #[serde(default)]
+    targets: BTreeMap<String, LegacyLocalTargetV1>,
+}
+
+fn peek_schema_version(content: &str) -> Result<u32, ConfigError> {
+    let val: serde_json::Value = serde_json::from_str(content)?;
+    val.get("schema_version")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .ok_or(ConfigError::UnsupportedSchemaVersion(0))
+}
+
+/// Converts a parsed legacy v2 config into the v3 steady-state shape.
+///
+/// Contract (PROJECT-036 Slice 1B):
+/// - target_id map keys, local_path, executor kind/agent_id/command/model are
+///   preserved exactly;
+/// - Server-owned workspace_id/alias/kind are dropped (never validated as
+///   present truth beyond what parsing the old shape requires);
+/// - Device-owned executor state is validated; malformed Device-owned fields
+///   fail closed BEFORE anything is written;
+/// - no Server contact is made and no Server state is mutated.
+fn migrate_legacy_v2(legacy: LegacyLocalConfigV2) -> Result<LocalConfig, ConfigError> {
+    let server_url = normalize_server_origin(&legacy.server_url)?;
+    let mut targets = BTreeMap::new();
+    for (target_id, t) in legacy.targets {
+        if let Some(ref exec) = t.executor {
+            exec.validate()?;
+        }
+        targets.insert(
+            target_id,
+            LocalTarget {
+                local_path: t.local_path,
+                executor: t.executor,
+            },
+        );
+    }
+    Ok(LocalConfig {
+        schema_version: CONFIG_SCHEMA_VERSION,
+        server_url,
+        targets,
+    })
+}
+
+/// Converts a parsed legacy v1 config into the v3 steady-state shape
+/// (v1 had no executor support; the migrated target has none configured).
+fn migrate_legacy_v1(legacy: LegacyLocalConfigV1) -> Result<LocalConfig, ConfigError> {
+    let server_url = normalize_server_origin(&legacy.server_url)?;
+    let mut targets = BTreeMap::new();
+    for (target_id, t) in legacy.targets {
+        targets.insert(
+            target_id,
+            LocalTarget {
+                local_path: t.local_path,
+                executor: None,
+            },
+        );
+    }
+    Ok(LocalConfig {
+        schema_version: CONFIG_SCHEMA_VERSION,
+        server_url,
+        targets,
+    })
+}
+
+/// One-time deterministic migration of a legacy schema v1/v2 config file to
+/// the schema v3 steady state. No-op when the file is absent or already v3.
+///
+/// Crash safety: the rewritten v3 file is published via the existing
+/// `atomic_write_json` durability primitive (temp file + fsync + rename +
+/// directory fsync). A crash at any point leaves either the original valid
+/// legacy file or a complete v3 file — never a partial/corrupt config.
+///
+/// Concurrency safety: migration runs under the shared Connector
+/// `state.lock` and RE-READS the file after acquiring the lock. If a
+/// concurrent process already migrated the file (or a newer local mutation
+/// landed), the on-disk version is no longer legacy and the migration is a
+/// no-op — a stale migrated snapshot can never overwrite newer local config.
+///
+/// No migration markers/progress state are persisted; after a successful
+/// rewrite the file on disk is plain schema v3 and future saves write v3 only.
+pub fn ensure_config_schema_current(paths: &ConnectorPaths) -> Result<(), ConfigError> {
+    let path = paths.config_file();
+    if !path.exists() {
+        return Ok(());
+    }
+    let version = peek_schema_version(&fs::read_to_string(&path)?)?;
+    if version == CONFIG_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if !matches!(version, LEGACY_SCHEMA_VERSION_V1 | LEGACY_SCHEMA_VERSION_V2) {
+        return Err(ConfigError::UnsupportedSchemaVersion(version));
+    }
+
+    // Only legacy files take the state lock (steady-state loads stay lock-free).
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(ConfigError::MigrationLockBusy);
+        }
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+
+    // Re-read under the lock: another process may have migrated the file or
+    // applied a newer local mutation in the meantime. Never clobber it.
+    let version = peek_schema_version(&fs::read_to_string(&path)?)?;
+    if version == CONFIG_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&path)?;
+    match version {
+        LEGACY_SCHEMA_VERSION_V2 => {
+            let legacy: LegacyLocalConfigV2 = serde_json::from_str(&content)?;
+            let migrated = migrate_legacy_v2(legacy)?;
+            atomic_write_json(&path, &migrated)?;
+        }
+        LEGACY_SCHEMA_VERSION_V1 => {
+            let legacy: LegacyLocalConfigV1 = serde_json::from_str(&content)?;
+            let migrated = migrate_legacy_v1(legacy)?;
+            atomic_write_json(&path, &migrated)?;
+        }
+        other => return Err(ConfigError::UnsupportedSchemaVersion(other)),
+    }
+    Ok(())
+}
+
+/// Migration-aware config load used by product code paths that are NOT
+/// already holding the state lock: ensures the on-disk config is the v3
+/// steady state, then parses it strictly. Paths executing under `state.lock`
+/// must use the strict [`LocalConfig::load`] instead (re-locking would
+/// self-deadlock).
+pub fn load_current_config(paths: &ConnectorPaths) -> Result<Option<LocalConfig>, ConfigError> {
+    ensure_config_schema_current(paths)?;
+    LocalConfig::load(&paths.config_file())
 }
 
 /// Normalizes and validates a server URL into an authoritative origin string.
@@ -358,7 +557,6 @@ pub fn normalize_server_origin(input: &str) -> Result<String, ConfigError> {
 }
 
 use crate::credential::{CredentialError, DeviceCredential};
-use crate::paths::ConnectorPaths;
 
 #[derive(Debug, Clone)]
 pub struct BoundProfile {
@@ -383,10 +581,13 @@ pub enum ProfileError {
 }
 
 /// Loads both config and credential, verifying that config.server_url matches credential.server_origin.
+///
+/// This is the shared migration-aware profile entrypoint for product code:
+/// any legacy v1/v2 config is first migrated to the schema v3 steady state.
 pub fn load_bound_profile(paths: &ConnectorPaths) -> Result<BoundProfile, ProfileError> {
     let credential =
         DeviceCredential::load(&paths.credential_file())?.ok_or(ProfileError::NotLoggedIn)?;
-    let config = match LocalConfig::load(&paths.config_file())? {
+    let config = match load_current_config(paths)? {
         Some(cfg) => cfg,
         None => LocalConfig::new(credential.server_origin.clone())?,
     };
@@ -442,7 +643,7 @@ mod tests {
     #[test]
     fn config_deny_unknown_fields() {
         let bad_json = r#"{
-            "schema_version": 2,
+            "schema_version": 3,
             "server_url": "https://ceo.example.com",
             "targets": {},
             "unknown_extra": true
@@ -625,9 +826,11 @@ mod tests {
     }
 
     #[test]
-    fn config_v2_without_model_field_loads_unchanged() {
+    fn v2_without_model_field_migrates_to_v3_unchanged() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("config.json");
+        let paths = ConnectorPaths::from_root(temp_dir.path());
+        paths.ensure_dirs().unwrap();
+        let path = paths.config_file();
         let v2_json = r#"{
             "schema_version": 2,
             "server_url": "https://ceo.example.com",
@@ -646,15 +849,24 @@ mod tests {
             }
         }"#;
         std::fs::write(&path, v2_json).unwrap();
+        ensure_config_schema_current(&paths).unwrap();
+        // On-disk file is now schema v3.
         let loaded = LocalConfig::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 3);
         let exec = loaded.targets.get("t1").unwrap().executor.as_ref().unwrap();
         assert_eq!(exec.model, None);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"schema_version\": 3"));
+        assert!(!on_disk.contains("workspace_id"));
+        assert!(!on_disk.contains("alias"));
     }
 
     #[test]
-    fn v1_to_v2_migration() {
+    fn v1_migrates_directly_to_v3() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("config.json");
+        let paths = ConnectorPaths::from_root(temp_dir.path());
+        paths.ensure_dirs().unwrap();
+        let path = paths.config_file();
         let v1_json = r#"{
             "schema_version": 1,
             "server_url": "https://ceo.example.com",
@@ -669,11 +881,15 @@ mod tests {
         }"#;
         std::fs::write(&path, v1_json).unwrap();
 
+        ensure_config_schema_current(&paths).unwrap();
         let loaded = LocalConfig::load(&path).unwrap().unwrap();
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, 3);
         assert_eq!(loaded.targets.len(), 1);
         let t1 = loaded.targets.get("t1").unwrap();
-        assert_eq!(t1.alias, "repo1");
+        assert_eq!(t1.local_path, "/tmp/repo1");
         assert!(t1.executor.is_none());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("workspace_id"));
+        assert!(!on_disk.contains("alias"));
     }
 }

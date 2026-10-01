@@ -422,9 +422,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "repo".into(),
-        kind: "repo".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -479,9 +476,6 @@ echo '{"ok":true}'
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "repo".into(),
-        kind: "repo".into(),
         local_path: repo_canon,
         executor: None,
     };
@@ -544,9 +538,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "repo".into(),
-        kind: "repo".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -1489,9 +1480,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "test-target".into(),
-        kind: "coding".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -1556,9 +1544,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "test-target".into(),
-        kind: "coding".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -1622,9 +1607,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "test-target".into(),
-        kind: "coding".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };
@@ -1689,9 +1671,6 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     let target = LocalTarget {
-        workspace_id: "ws_1".into(),
-        alias: "test-target".into(),
-        kind: "coding".into(),
         local_path: repo_canon,
         executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
     };

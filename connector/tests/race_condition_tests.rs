@@ -57,9 +57,6 @@ async fn setup_race_environment(server: &MockServer) -> (tempfile::TempDir, Conn
     config.targets.insert(
         "tgt_race".into(),
         LocalTarget {
-            workspace_id: "ws_race".into(),
-            alias: "race-tgt".into(),
-            kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },

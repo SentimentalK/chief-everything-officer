@@ -4,7 +4,7 @@
 //! Covers: exact alias resolution for bind/set-agent/set-model/
 //! set-default-runtime, raw target_id backward compatibility, unknown /
 //! fuzzy / case-folded selector rejection, fail-closed ID-vs-alias
-//! ambiguity, server-alias authority over stale local schema-v2 copies,
+//! ambiguity, schema-v3 local config carrying no alias at all (alias authority is Server-only),
 //! rename-by-selector driving an immutable-ID server rename (no
 //! delete/recreate), and stable name-oriented rendering contracts.
 
@@ -64,16 +64,11 @@ fn catalogue_json() -> serde_json::Value {
     })
 }
 
-fn seed_stale_local_config(paths: &ConnectorPaths, server_origin: &str) {
+fn seed_local_config(paths: &ConnectorPaths, server_origin: &str) {
     let mut config = LocalConfig::new(server_origin.to_string()).unwrap();
     config.targets.insert(
         TARGET_ID.to_string(),
         LocalTarget {
-            workspace_id: "ws_1".to_string(),
-            // Deliberately disagrees with the server alias: local alias is
-            // NOT authority.
-            alias: STALE_LOCAL_ALIAS.to_string(),
-            kind: "general_automation".to_string(),
             local_path: "/tmp/repo".to_string(),
             executor: Some(
                 LocalExecutorConfig::new("cursor".into(), "agent -f --trust".into()).unwrap(),
@@ -248,17 +243,19 @@ fn id_vs_alias_ambiguity_fails_closed() {
 }
 
 #[test]
-fn local_alias_copy_is_never_authority() {
+fn local_config_stores_no_alias_and_never_resolves_one() {
     let (_temp, paths) = temp_paths();
-    seed_stale_local_config(&paths, "http://127.0.0.1:4000");
-    // Server catalogue carries a different alias for the same target_id.
+    seed_local_config(&paths, "http://127.0.0.1:4000");
+    // Server catalogue carries the alias for this target_id.
     let catalogue = vec![projection(TARGET_ID, SERVER_ALIAS)];
 
     // Server alias resolves to the same immutable ID...
     let resolved = resolve_selector_from_catalogue(&paths, &catalogue, SERVER_ALIAS).unwrap();
     assert_eq!(resolved.target_id, TARGET_ID);
 
-    // ...while the stale local alias copy does not resolve at all.
+    // ...while any alias not in the Server catalogue (e.g. a stale alias an
+    // older local copy might have held) does not resolve at all: schema v3
+    // local config stores no alias and never supplies alias authority.
     let err = resolve_selector_from_catalogue(&paths, &catalogue, STALE_LOCAL_ALIAS).unwrap_err();
     assert!(matches!(err, TargetError::TargetNotFound(_)));
 }
@@ -294,7 +291,7 @@ async fn bind_accepts_exact_alias_and_drives_immutable_id() {
 
     let (temp, paths) = temp_paths();
     seed_credential(&paths, &server.origin());
-    seed_stale_local_config(&paths, &server.origin());
+    seed_local_config(&paths, &server.origin());
     let dir = make_dir_under(&temp, "bind_dir");
 
     // Exact alias (server authority), not the stale local alias.
@@ -338,7 +335,7 @@ async fn bind_rejects_unknown_alias_clearly() {
 
     let (temp, paths) = temp_paths();
     seed_credential(&paths, &server.origin());
-    seed_stale_local_config(&paths, &server.origin());
+    seed_local_config(&paths, &server.origin());
     let dir = make_dir_under(&temp, "bind_dir");
 
     let err = target_bind(&paths, "no-such-target", &dir, None, None)
@@ -374,7 +371,7 @@ async fn set_agent_and_set_model_accept_exact_alias() {
 
     let (_temp, paths) = temp_paths();
     seed_credential(&paths, &server.origin());
-    seed_stale_local_config(&paths, &server.origin());
+    seed_local_config(&paths, &server.origin());
 
     // Exact server alias resolves and drives the local executor config keyed
     // by the immutable target_id.
@@ -408,7 +405,7 @@ async fn set_agent_and_set_model_accept_exact_alias() {
 #[tokio::test]
 async fn set_agent_preserves_direct_id_behavior_without_credential() {
     let (_temp, paths) = temp_paths();
-    seed_stale_local_config(&paths, "http://127.0.0.1:4000");
+    seed_local_config(&paths, "http://127.0.0.1:4000");
     assert!(!paths.credential_file().exists());
 
     // No credential: legacy direct-ID behavior is preserved for the
@@ -478,7 +475,7 @@ async fn rename_resolves_selector_to_immutable_id_without_recreating() {
     let mock = rename_mock().await;
     let (_temp, paths) = temp_paths();
     seed_credential(&paths, &mock.origin);
-    seed_stale_local_config(&paths, &mock.origin);
+    seed_local_config(&paths, &mock.origin);
 
     // By exact alias...
     target_rename(&paths, SERVER_ALIAS, "bill-desk", false)
@@ -509,7 +506,7 @@ async fn rename_requires_server_known_target() {
     let mock = rename_mock().await;
     let (_temp, paths) = temp_paths();
     seed_credential(&paths, &mock.origin);
-    seed_stale_local_config(&paths, &mock.origin);
+    seed_local_config(&paths, &mock.origin);
 
     let err = target_rename(&paths, STALE_LOCAL_ALIAS, "bill-desk", false)
         .await
@@ -531,7 +528,7 @@ async fn rename_surfaces_server_conflict_and_replay() {
     .await;
     let (_temp, paths) = temp_paths();
     seed_credential(&paths, &conflict_mock.origin);
-    seed_stale_local_config(&paths, &conflict_mock.origin);
+    seed_local_config(&paths, &conflict_mock.origin);
 
     let err = target_rename(&paths, SERVER_ALIAS, "bill-desk", false)
         .await
@@ -558,7 +555,7 @@ async fn rename_surfaces_server_conflict_and_replay() {
     .await;
     let (_temp2, paths2) = temp_paths();
     seed_credential(&paths2, &replay_mock.origin);
-    seed_stale_local_config(&paths2, &replay_mock.origin);
+    seed_local_config(&paths2, &replay_mock.origin);
     target_rename(&paths2, SERVER_ALIAS, "bill-desk", true)
         .await
         .unwrap();

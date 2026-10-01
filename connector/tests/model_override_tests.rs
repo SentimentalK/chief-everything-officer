@@ -45,9 +45,6 @@ fn seed_target(paths: &ConnectorPaths, target_id: &str, agent_id: &str, command:
     config.targets.insert(
         target_id.to_string(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "model-target".into(),
-            kind: "coding".into(),
             local_path: "/tmp/repo".into(),
             executor: Some(LocalExecutorConfig::new(agent_id.into(), command.into()).unwrap()),
         },
@@ -68,11 +65,13 @@ fn seed_credential(paths: &ConnectorPaths, origin: &str) {
     cred.save(&paths.credential_file()).unwrap();
 }
 
-// 1. Old config without `model` loads successfully and means default behavior.
+// 1. Legacy v2 config without `model` migrates to v3 and means default behavior.
 #[test]
 fn old_config_without_model_loads_and_is_default() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("config.json");
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+    let path = paths.config_file();
     write_config(
         &path,
         r#"{
@@ -93,7 +92,10 @@ fn old_config_without_model_loads_and_is_default() {
             }
         }"#,
     );
+    // One-time migration via the shared entrypoint, then strict v3 load.
+    ceo_connector::config::ensure_config_schema_current(&paths).unwrap();
     let config = LocalConfig::load(&path).unwrap().unwrap();
+    assert_eq!(config.schema_version, 3);
     let exec = config
         .targets
         .get("tgt_1")
@@ -104,6 +106,11 @@ fn old_config_without_model_loads_and_is_default() {
     assert_eq!(exec.model, None);
     // Default behavior: effective command is unchanged
     assert_eq!(exec.effective_command().unwrap(), CURSOR_COMMAND);
+    // On-disk file is now schema v3 with legacy fields dropped.
+    let on_disk = fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("\"schema_version\": 3"));
+    assert!(!on_disk.contains("workspace_id"));
+    assert!(!on_disk.contains("\"alias\""));
 }
 
 // 2. Config with model round-trips through save/load.
@@ -214,9 +221,6 @@ async fn set_model_rejects_invalid_and_unsupported_explicitly() {
     config.targets.insert(
         "tgt_noexec".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "no-exec".into(),
-            kind: "coding".into(),
             local_path: "/tmp/repo".into(),
             executor: None,
         },
@@ -376,8 +380,8 @@ async fn set_model_refuses_active_target() {
 fn target_list_human_shows_model_override() {
     let mut with_model = TargetDisplayItem {
         target_id: "tgt_1".into(),
-        alias: "alpha".into(),
-        kind: "coding".into(),
+        alias: Some("alpha".into()),
+        kind: Some("coding".into()),
         local_path: Some("/tmp/repo".into()),
         status: "READY".into(),
         disabled: false,
@@ -402,8 +406,8 @@ fn target_list_human_shows_model_override() {
 fn target_json_model_field_is_additive_and_stable() {
     let with_model = TargetDisplayItem {
         target_id: "tgt_1".into(),
-        alias: "alpha".into(),
-        kind: "coding".into(),
+        alias: Some("alpha".into()),
+        kind: Some("coding".into()),
         local_path: Some("/tmp/repo".into()),
         status: "READY".into(),
         disabled: false,
@@ -504,9 +508,6 @@ async fn doctor_reports_model_override_when_set() {
     config.targets.insert(
         "tgt_model".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "model-target".into(),
-            kind: "coding".into(),
             local_path: repo_dir.to_string_lossy().to_string(),
             executor: Some(
                 LocalExecutorConfig::new_with_model(
@@ -525,7 +526,7 @@ async fn doctor_reports_model_override_when_set() {
     let exec_check = report
         .checks
         .iter()
-        .find(|c| c.name == "Target 'model-target' Executor Configuration")
+        .find(|c| c.name == "Target 'tgt_model' Executor Configuration")
         .expect("executor configuration check present");
     assert_eq!(exec_check.severity, DiagnosticSeverity::Pass);
     assert!(exec_check.message.contains("model override 'gpt-5'"));
@@ -570,7 +571,7 @@ async fn doctor_plain_executor_has_no_model_text() {
     let exec_check = report
         .checks
         .iter()
-        .find(|c| c.name == "Target 'model-target' Executor Configuration");
+        .find(|c| c.name == "Target 'tgt_plain' Executor Configuration");
     if let Some(c) = exec_check {
         assert!(!c.message.contains("model override"));
     }

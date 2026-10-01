@@ -259,12 +259,12 @@ pub async fn run_daemon_with_hooks(
                 None => continue,
             };
 
-            // 3. Match workspace and kind
-            if server_t.workspace_id != local_t.workspace_id || server_t.kind != local_t.kind {
-                continue;
-            }
+            // The Server snapshot is the sole authority for workspace
+            // membership/kind/binding/disabled state (schema v3 local config
+            // stores none of it); no local-vs-server metadata comparison is
+            // needed or possible.
 
-            // 4. Target enabled?
+            // 3. Target enabled?
             if server_t.disabled {
                 continue;
             }

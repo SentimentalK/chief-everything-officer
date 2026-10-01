@@ -131,9 +131,6 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "dev-target".into(),
-            kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
                 ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
@@ -296,9 +293,6 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "dev-target".into(),
-            kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
                 ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
@@ -533,9 +527,6 @@ async fn run_claim_mismatch_case(
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "dev-target".into(),
-            kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
                 ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
@@ -764,9 +755,6 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "dev-target".into(),
-            kind: "general_automation".into(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
                 ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())

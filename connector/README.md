@@ -5,11 +5,65 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **1.3.0**. Check with:
+Current baseline: **2.0.0**. Check with:
 
 ```
 ceo-connector --version
 ```
+
+## Local Config Schema v3 & Authority Split (2.0.0)
+
+`config.json` uses **schema version 3**. Local target state stores ONLY Device-owned
+durable state, keyed by the Server-owned immutable `target_id`:
+
+```json
+{
+  "schema_version": 3,
+  "server_url": "https://ceo.sentimentalk.com",
+  "targets": {
+    "tgt_...": {
+      "local_path": "/home/me/codes/project",
+      "executor": {
+        "kind": "orca_tui",
+        "agent_id": "opencode",
+        "command": "opencode",
+        "model": null
+      }
+    }
+  }
+}
+```
+
+The `model` field is optional and omitted when unset (existing serde convention).
+
+All Server-owned Target metadata — workspace membership, alias/name, kind, repository,
+disabled state, device bindings, and the workspace default Agent Runtime relation —
+lives exclusively in the Server catalogue. The Connector keeps exactly one authority
+per concept:
+
+- **Server catalogue**: alias/kind/repository/disabled/binding/default-runtime views
+  (`target list`, exact alias selector, rename). A logged-in Connector that cannot
+  obtain the Server catalogue fails clearly instead of fabricating Server-owned
+  metadata from local state. Locally-mapped targets absent from the catalogue render
+  honestly as `LOCAL_ONLY` with unknown alias/kind.
+- **Local schema v3 config**: `local_path`, executor (`agent_id`/`command`), and the
+  optional model override. Raw immutable target IDs keep working for local-only
+  executor operations without a Server connection.
+
+### One-time schema v2 -> v3 migration
+
+Legacy schema v1/v2 config files are migrated automatically, deterministically, and
+once on the first `ceo-connector` command run:
+
+- `target_id` keys, `local_path`, executor `agent_id`/`command`/`model` are preserved
+  exactly; legacy `workspace_id`/`alias`/`kind` are dropped from durable local state.
+- The rewrite is atomic and crash-safe; a failure leaves the original valid file
+  intact and fails with an actionable error. Device-owned fields that v3 still needs
+  (path/executor/model) are validated before the rewrite — malformed entries fail
+  closed instead of being silently dropped.
+- Migration is concurrency-safe under the shared `state.lock`; a stale migrated
+  snapshot can never overwrite a newer local mutation.
+- No Server contact or Target mutation is involved in the migration.
 
 ## Target Selectors & Rename (1.3.0)
 
@@ -20,9 +74,10 @@ Target-affecting commands (`target bind`, `target set-agent`, `target set-model`
   or case-insensitive matching), or
 - the exact immutable target ID (`tgt_...`, kept for scripts/backward compatibility).
 
-Aliases are resolved against the authenticated Server catalogue on every use; locally
-cached alias copies are never treated as authority. A selector that is simultaneously
-one target's ID and another target's alias fails closed rather than guessing.
+Aliases are resolved against the authenticated Server catalogue on every use; schema v3
+local config stores no alias at all, so aliases can never resolve from local state. A
+selector that is simultaneously one target's ID and another target's alias fails closed
+rather than guessing.
 
 ### Rename a target's alias
 

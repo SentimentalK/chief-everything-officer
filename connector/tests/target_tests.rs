@@ -147,18 +147,17 @@ async fn target_add_general_automation_and_repo_null_coding() {
 
     let config = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     assert_eq!(config.targets.len(), 2);
-    assert_eq!(
-        config.targets.get("tgt_auto-target").unwrap().alias,
-        "auto-target"
-    );
-    assert_eq!(
-        config.targets.get("tgt_coding-target").unwrap().alias,
-        "coding-target"
-    );
-    assert_eq!(
-        config.targets.get("tgt_auto-target").unwrap().local_path,
-        config.targets.get("tgt_coding-target").unwrap().local_path
-    );
+    // Schema v3 local state stores only Device-owned fields; the Server
+    // alias is not persisted locally (alias authority is Server-only).
+    let auto = config.targets.get("tgt_auto-target").unwrap();
+    let coding = config.targets.get("tgt_coding-target").unwrap();
+    assert!(serde_json::to_value(auto).unwrap().get("alias").is_none());
+    assert!(serde_json::to_value(auto)
+        .unwrap()
+        .get("workspace_id")
+        .is_none());
+    assert!(serde_json::to_value(auto).unwrap().get("kind").is_none());
+    assert_eq!(auto.local_path, coding.local_path);
 }
 
 #[tokio::test]
@@ -387,9 +386,6 @@ async fn active_target_mutation_rejected_with_target_in_use() {
     config.targets.insert(
         "tgt_in_use".into(),
         ceo_connector::config::LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "in-use".into(),
-            kind: "coding".into(),
             local_path: "/path/to/repo".into(),
             executor: None,
         },

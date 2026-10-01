@@ -26,8 +26,8 @@ const LONG_PATH: &str = "/home/sentimentalk/codes/chief-everything-officer-senti
 fn sample_item() -> ceo_connector::targets::TargetDisplayItem {
     ceo_connector::targets::TargetDisplayItem {
         target_id: LONG_TARGET_ID.into(),
-        alias: "chief-everything-officer".into(),
-        kind: "coding".into(),
+        alias: Some("chief-everything-officer".into()),
+        kind: Some("coding".into()),
         local_path: Some(LONG_PATH.into()),
         status: "READY".into(),
         disabled: false,
@@ -48,7 +48,7 @@ fn sample_item() -> ceo_connector::targets::TargetDisplayItem {
 fn target_list_human_is_vertical_block_oriented() {
     let mut unbound = sample_item();
     unbound.target_id = "tgt_ffffffffffffffffffffffffffffffff".into();
-    unbound.alias = "unbound-target".into();
+    unbound.alias = Some("unbound-target".into());
     unbound.local_path = None;
     unbound.status = "UNBOUND".into();
     unbound.is_default_agent_runtime = false;
@@ -146,9 +146,6 @@ async fn target_list_json_emits_valid_json_with_expected_fields() {
     config.targets.insert(
         "tgt_json".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "json-target".into(),
-            kind: "coding".into(),
             local_path: local_dir.display().to_string(),
             executor: Some(LocalExecutorConfig::new("cursor".into(), "/bin/agent".into()).unwrap()),
         },

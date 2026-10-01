@@ -151,9 +151,6 @@ async fn doctor_detects_missing_path_and_disabled_target() {
     config.targets.insert(
         "tgt_disabled".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "disabled-target".into(),
-            kind: "general_automation".into(),
             local_path: "/nonexistent/path/for/target".into(), // Missing!
             executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
@@ -249,9 +246,6 @@ async fn doctor_healthy_report_detects_git_and_targets() {
     config.targets.insert(
         "tgt_healthy".into(),
         LocalTarget {
-            workspace_id: "ws_1".into(),
-            alias: "healthy-target".into(),
-            kind: "coding".into(),
             local_path: repo_dir.to_string_lossy().to_string(),
             executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
@@ -271,5 +265,5 @@ async fn doctor_healthy_report_detects_git_and_targets() {
     assert!(report
         .checks
         .iter()
-        .any(|c| c.name == "Target 'healthy-target'" && c.severity == DiagnosticSeverity::Pass));
+        .any(|c| c.name == "Target 'tgt_healthy'" && c.severity == DiagnosticSeverity::Pass));
 }

@@ -3,7 +3,6 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
-use crate::config::LocalConfig;
 use crate::credential::DeviceCredential;
 use crate::local_state::ExecutionLock;
 use crate::paths::ConnectorPaths;
@@ -15,6 +14,8 @@ pub enum StatusError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Config error: {0}")]
+    Config(#[from] crate::config::ConfigError),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,7 +44,9 @@ struct ControlFile {
 }
 
 pub fn get_status(paths: &ConnectorPaths) -> Result<ConnectorStatus, StatusError> {
-    let config = LocalConfig::load(&paths.config_file()).unwrap_or(None);
+    // Migration-aware: a legacy config is migrated to v3 (or fails closed
+    // with an actionable error) instead of silently reporting zero targets.
+    let config = crate::config::load_current_config(paths)?;
     let cred = DeviceCredential::load(&paths.credential_file()).unwrap_or(None);
 
     let daemon_running = ExecutionLock::is_locked(&paths.daemon_lock_file());

@@ -64,9 +64,6 @@ fn setup_dogfood_env_with_cmd(
     config.targets.insert(
         "tgt_dogfood".into(),
         LocalTarget {
-            workspace_id: "ws_dogfood".into(),
-            alias: "dogfood-target".into(),
-            kind: "coding".into(),
             local_path: target_path.to_string(),
             executor: Some(LocalExecutorConfig::new(agent_id.into(), exec_cmd).unwrap()),
         },

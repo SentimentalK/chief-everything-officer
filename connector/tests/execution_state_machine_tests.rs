@@ -172,9 +172,6 @@ fn setup_test_env(
     config.targets.insert(
         "tgt_mock".to_string(),
         LocalTarget {
-            workspace_id: "ws_mock".to_string(),
-            alias: "mock-target".to_string(),
-            kind: "general_automation".to_string(),
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
         },
