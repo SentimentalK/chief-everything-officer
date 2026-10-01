@@ -33,7 +33,18 @@ async fn main() -> ExitCode {
             no_open,
             no_setup,
         } => {
-            match ceo_connector::enrollment::login_flow(&paths, &server, name, no_open).await {
+            // Omitted --server selects the official CEO Server; an explicit
+            // --server remains the override for self-hosted deployments.
+            let server_origin =
+                match ceo_connector::enrollment::resolve_login_origin(server.as_deref()) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("Invalid --server origin: {}", e);
+                        return ExitCode::FAILURE;
+                    }
+                };
+            match ceo_connector::enrollment::login_flow(&paths, &server_origin, name, no_open).await
+            {
                 Ok(_outcome) => {
                     // Post-login onboarding handoff (PROJECT-036 Slice 3).
                     // Never invalidates the successful authentication above.

@@ -7,7 +7,8 @@ use ceo_connector::client::{ClientError, ConnectorClient};
 use ceo_connector::config::LocalConfig;
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::enrollment::{
-    generate_secret_and_digest, login_flow, logout_flow, EnrollmentError, PendingEnrollmentSession,
+    generate_secret_and_digest, login_flow, logout_flow, resolve_login_origin, EnrollmentError,
+    PendingEnrollmentSession, OFFICIAL_SERVER_ORIGIN,
 };
 use ceo_connector::local_state::atomic_write_json;
 use ceo_connector::paths::ConnectorPaths;
@@ -36,6 +37,54 @@ async fn secret_digest_and_redacted_debug() {
     assert!(!debug_out.contains("devcode123"));
     assert!(debug_out.contains("USER-9999"));
     assert!(debug_out.contains("[REDACTED]"));
+}
+
+// ---------------------------------------------------------------------------
+// Login server default (PROJECT-036 Slice 4): official origin default,
+// explicit --server override, documented help text.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn login_without_server_resolves_official_origin() {
+    let origin = resolve_login_origin(None).unwrap();
+    assert_eq!(origin, "https://ceo.sentimentalk.com");
+    assert_eq!(OFFICIAL_SERVER_ORIGIN, "https://ceo.sentimentalk.com");
+}
+
+#[test]
+fn login_explicit_server_override_wins_and_is_normalized() {
+    // Explicit override replaces the official default (self-host support).
+    assert_eq!(
+        resolve_login_origin(Some("http://127.0.0.1:4000/")).unwrap(),
+        "http://127.0.0.1:4000"
+    );
+    assert_eq!(
+        resolve_login_origin(Some("https://ceo.example.com")).unwrap(),
+        "https://ceo.example.com"
+    );
+    // Existing origin security semantics still apply to overrides.
+    assert!(resolve_login_origin(Some("http://insecure.example.com")).is_err());
+    assert!(resolve_login_origin(Some("https://ceo.example.com/path")).is_err());
+}
+
+#[test]
+fn login_help_documents_official_default_and_override() {
+    use clap::CommandFactory;
+    let command = ceo_connector::cli::Cli::command();
+    let login = command.find_subcommand("login").expect("login subcommand");
+    let server_arg = login
+        .get_arguments()
+        .find(|a| a.get_id() == "server")
+        .expect("--server argument");
+    let help = server_arg.get_help().unwrap_or_default().to_string();
+    assert!(
+        help.contains("https://ceo.sentimentalk.com"),
+        "--server help must state the official default origin: {help}"
+    );
+    assert!(
+        help.to_lowercase().contains("omitted") || help.to_lowercase().contains("override"),
+        "--server help must explain the default/override semantics: {help}"
+    );
 }
 
 #[tokio::test]

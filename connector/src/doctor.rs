@@ -427,11 +427,23 @@ async fn check_server_integration(
             if let Some(lt_map) = local_targets {
                 let mut path_seen = std::collections::HashMap::new();
 
+                // Human-facing display name: prefer the Server-authoritative
+                // alias so no check name or next-step command ever requires a
+                // raw target ID. The raw target_id remains in --json/debug
+                // data (it is part of the stable advanced output).
+                let display_name = |tid: &str| -> String {
+                    server_map
+                        .get(tid)
+                        .map(|t| t.alias.clone())
+                        .unwrap_or_else(|| tid.to_string())
+                };
+
                 for (tid, lt) in lt_map {
+                    let display = display_name(tid);
                     let p = Path::new(&lt.local_path);
                     if !p.exists() || !p.is_dir() {
                         checks.push(DiagnosticCheck {
-                            name: format!("Target '{}' Path", tid),
+                            name: format!("Target '{}' Path", display),
                             severity: DiagnosticSeverity::Fail,
                             message: format!("Local path '{}' does not exist", lt.local_path),
                         });
@@ -441,11 +453,11 @@ async fn check_server_integration(
                             path_seen.insert(lt.local_path.clone(), tid.clone())
                         {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}' Duplicate Path", tid),
+                                name: format!("Target '{}' Duplicate Path", display),
                                 severity: DiagnosticSeverity::Warn,
                                 message: format!(
                                     "Shares path with target '{}' (permitted)",
-                                    other_tid
+                                    display_name(&other_tid)
                                 ),
                             });
                         }
@@ -454,7 +466,7 @@ async fn check_server_integration(
                     if let Some(st) = server_map.get(tid) {
                         if st.disabled {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}' Status", tid),
+                                name: format!("Target '{}' Status", display),
                                 severity: DiagnosticSeverity::Fail,
                                 message: "Target is disabled on server".into(),
                             });
@@ -465,7 +477,7 @@ async fn check_server_integration(
                             .unwrap_or(true)
                         {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}' Binding", tid),
+                                name: format!("Target '{}' Binding", display),
                                 severity: DiagnosticSeverity::Fail,
                                 message: "Device is not actively bound to this target on server"
                                     .into(),
@@ -474,13 +486,13 @@ async fn check_server_integration(
                             if p.is_dir() {
                                 if let Err(e) = verify_local_repository(p, repo) {
                                     checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}' Repo Match", tid),
+                                        name: format!("Target '{}' Repo Match", display),
                                         severity: DiagnosticSeverity::Fail,
                                         message: format!("{e}"),
                                     });
                                 } else {
                                     checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}'", tid),
+                                        name: format!("Target '{}'", display),
                                         severity: DiagnosticSeverity::Pass,
                                         message: format!(
                                             "Healthy, bound, and repository matches '{}'",
@@ -491,14 +503,14 @@ async fn check_server_integration(
                             }
                         } else {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}'", tid),
+                                name: format!("Target '{}'", display),
                                 severity: DiagnosticSeverity::Pass,
                                 message: "Healthy and bound on server".into(),
                             });
                         }
                     } else {
                         checks.push(DiagnosticCheck {
-                            name: format!("Target '{}' Server Sync", tid),
+                            name: format!("Target '{}' Server Sync", display),
                             severity: DiagnosticSeverity::Warn,
                             message: "Locally mapped target not found on server".into(),
                         });
@@ -508,13 +520,13 @@ async fn check_server_integration(
                         Some(exec) => {
                             if let Err(e) = exec.validate() {
                                 checks.push(DiagnosticCheck {
-                                    name: format!("Target '{}' Executor Configuration", tid),
+                                    name: format!("Target '{}' Executor Configuration", display),
                                     severity: DiagnosticSeverity::Fail,
                                     message: format!("Invalid executor configuration: {e}"),
                                 });
                             } else {
                                 checks.push(DiagnosticCheck {
-                                    name: format!("Target '{}' Executor Configuration", tid),
+                                    name: format!("Target '{}' Executor Configuration", display),
                                     severity: DiagnosticSeverity::Pass,
                                     message: match &exec.model {
                                         Some(m) => format!(
@@ -531,13 +543,13 @@ async fn check_server_integration(
                                 let agent_found = find_in_path(&exec.command);
                                 if agent_found {
                                     checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}' Agent Availability", tid),
+                                        name: format!("Target '{}' Agent Availability", display),
                                         severity: DiagnosticSeverity::Pass,
                                         message: "Agent executable found in PATH".to_string(),
                                     });
                                 } else {
                                     checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}' Agent Availability", tid),
+                                        name: format!("Target '{}' Agent Availability", display),
                                         severity: DiagnosticSeverity::Warn,
                                         message: "Agent executable not found in PATH".to_string(),
                                     });
@@ -546,11 +558,11 @@ async fn check_server_integration(
                         }
                         None => {
                             checks.push(DiagnosticCheck {
-                                name: format!("Target '{}' Executor Configuration", tid),
+                                name: format!("Target '{}' Executor Configuration", display),
                                 severity: DiagnosticSeverity::Fail,
                                 message: format!(
                                     "No agent executor configured. Configure one with `ceo-connector target set-agent --target-id {} --agent-id <id> --agent-command <command>`",
-                                    tid
+                                    display
                                 ),
                             });
                         }

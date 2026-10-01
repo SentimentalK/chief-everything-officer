@@ -103,6 +103,11 @@ pub struct SetupTargetOutcome {
     /// when it was already the default (no-op/replay). Always false for
     /// generic coding setup.
     pub default_changed: bool,
+    /// true when this run created the local directory itself (generic coding
+    /// setup with an explicit create confirmation); false when an existing
+    /// directory was reused. Always false for Agent Runtime setup (which
+    /// either reuses a verified checkout or reports `repo_cloned`).
+    pub directory_created: bool,
 }
 
 #[derive(Error, Debug)]
@@ -135,6 +140,10 @@ pub enum SetupError {
     TargetInUse(String),
     #[error("Local path '{0}' does not exist or is not a directory")]
     PathNotFound(String),
+    #[error("The canonical CEO Agent Runtime Target ('ceo-agent-runtime') does not exist in your workspace yet. Run setup and choose the runtime install/connect step first (SETUP_RUNTIME_TARGET_MISSING).")]
+    RuntimeTargetMissing,
+    #[error("This device has no local CEO Agent Runtime checkout connected yet. Connect the runtime on this computer first, then configure its execution agent (SETUP_RUNTIME_NOT_CONNECTED).")]
+    RuntimeNotConnected,
     #[error("Refusing to modify pre-existing path '{path}': {reason}. Setup never overwrites or deletes existing paths; correct or remove the path manually and rerun (SETUP_PATH_CONFLICT).")]
     PathConflict { path: String, reason: String },
     #[error("Destination path '{0}' is not usable as an install destination")]
@@ -494,6 +503,7 @@ pub async fn ensure_agent_runtime_with_repo(
         repo_cloned,
         binding_created,
         default_changed: false,
+        directory_created: false,
     };
 
     if ensured.is_default_agent_runtime {
@@ -568,7 +578,7 @@ fn ensure_local_repo(
 /// human Server alias exists, is bound to the current Device, and is mapped
 /// in the schema-v3 local config to `local_path`.
 ///
-/// Inputs are only the human alias and a concrete existing local path — no
+/// Inputs are only the human alias and a concrete local path — no
 /// workspace_id/target_id inputs. Generic coding setup never clones and never
 /// fabricates Server repository metadata.
 pub async fn ensure_coding_target(
@@ -576,11 +586,48 @@ pub async fn ensure_coding_target(
     alias: &str,
     local_path: &Path,
 ) -> Result<SetupTargetOutcome, SetupError> {
+    ensure_coding_target_with_policy(paths, alias, local_path, CodingPathPolicy::MustExist).await
+}
+
+/// Local directory policy for generic coding setup (PROJECT-036 Slice 4).
+///
+/// A missing local directory must be an explicit product decision BEFORE any
+/// new Server Target registration/binding mutation:
+/// - [`CodingPathPolicy::MustExist`]: the local path must already be an
+///   existing directory (previous behavior);
+/// - [`CodingPathPolicy::CreateIfMissing`]: an absent local directory is
+///   safely created first (no git init, no repo fabrication) after the user
+///   explicitly confirmed creation in the frontend; the frontend never
+///   performs filesystem/server mutation itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingPathPolicy {
+    MustExist,
+    CreateIfMissing,
+}
+
+/// Testable variant of [`ensure_coding_target`] with an explicit local
+/// directory policy. Production callers must only pass
+/// [`CodingPathPolicy::CreateIfMissing`] after the user explicitly confirmed
+/// creating the missing directory. The local path is validated (and with
+/// [`CodingPathPolicy::CreateIfMissing`] created) BEFORE any Server Target
+/// registration/binding mutation, so a missing path can never leave avoidable
+/// partial Server state.
+pub async fn ensure_coding_target_with_policy(
+    paths: &ConnectorPaths,
+    alias: &str,
+    local_path: &Path,
+    policy: CodingPathPolicy,
+) -> Result<SetupTargetOutcome, SetupError> {
     if alias.trim().is_empty() {
         return Err(SetupError::AmbiguousAlias(alias.to_string()));
     }
 
     paths.ensure_dirs()?;
+
+    // Local-path validation/creation happens FIRST: zero Server mutation
+    // happens before the local directory question is resolved.
+    let (canonical_path_str, directory_created) = ensure_local_directory(local_path, policy)?;
+
     let profile = load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
@@ -596,19 +643,11 @@ pub async fn ensure_coding_target(
     // local config mutation).
     check_target_in_use(paths, &ensured.target_id)?;
 
-    // Local path must already exist and be a directory; generic coding setup
-    // does not clone arbitrary projects.
-    if !local_path.exists() || !local_path.is_dir() {
-        return Err(SetupError::PathNotFound(local_path.display().to_string()));
-    }
-    let canonical_path = fs::canonicalize(local_path)?;
-    let canonical_path_str = canonical_path.to_string_lossy().to_string();
-
     // When the Server Target carries repository metadata, verify the local
     // repository with the existing shared semantics; when absent, invent
     // nothing.
     if let Some(ref repo_part) = ensured.repository {
-        verify_local_repository(&canonical_path, repo_part)?;
+        verify_local_repository(Path::new(&canonical_path_str), repo_part)?;
     }
 
     // Ensure the current Device binding is active.
@@ -631,7 +670,56 @@ pub async fn ensure_coding_target(
         repo_cloned: false,
         binding_created,
         default_changed: false,
+        directory_created,
     })
+}
+
+/// Validates (and optionally creates) the local coding directory BEFORE any
+/// Server mutation:
+/// - existing directory => reused (`directory_created = false`);
+/// - existing non-directory or symlink => fail closed, never overwritten;
+/// - absent path => with [`CodingPathPolicy::MustExist`] fail clearly; with
+///   [`CodingPathPolicy::CreateIfMissing`] safely create the directory
+///   (plain directory creation, no git init, no repo fabrication) and report
+///   `directory_created = true` so the frontend can render honestly.
+///
+/// If directory creation succeeds but a later Server mutation fails, the
+/// created directory is honest partial local progress; reruns converge and
+/// reuse it (`directory_created = false`).
+fn ensure_local_directory(
+    local_path: &Path,
+    policy: CodingPathPolicy,
+) -> Result<(String, bool), SetupError> {
+    match fs::symlink_metadata(local_path) {
+        Ok(meta) => {
+            let display = local_path.display().to_string();
+            if meta.is_symlink() {
+                return Err(SetupError::PathConflict {
+                    path: display,
+                    reason: "path exists and is a symlink".to_string(),
+                });
+            }
+            if !local_path.is_dir() {
+                return Err(SetupError::PathConflict {
+                    path: display,
+                    reason: "path exists and is not a directory".to_string(),
+                });
+            }
+            let canonical = fs::canonicalize(local_path)?;
+            Ok((canonical.to_string_lossy().to_string(), false))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match policy {
+            CodingPathPolicy::MustExist => {
+                Err(SetupError::PathNotFound(local_path.display().to_string()))
+            }
+            CodingPathPolicy::CreateIfMissing => {
+                fs::create_dir_all(local_path)?;
+                let canonical = fs::canonicalize(local_path)?;
+                Ok((canonical.to_string_lossy().to_string(), true))
+            }
+        },
+        Err(e) => Err(SetupError::Io(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -639,25 +727,40 @@ pub async fn ensure_coding_target(
 // ---------------------------------------------------------------------------
 
 /// Read-only view of how far the canonical Agent Runtime setup has converged
-/// for this device. Used ONLY to decide onboarding UX (configured markers in
+/// for this device. Used ONLY to decide onboarding UX (state-aware labels in
 /// the guided setup menu and the login handoff). Doctor remains the complete
 /// diagnostics/readiness authority for Git, Orca, executor availability,
 /// credentials, server health, etc.; this is NOT a second Doctor.
+///
+/// Server state and Device-local state are intentionally different (PROJECT-036
+/// Slice 4): a Server Target existing does NOT mean this Device is locally
+/// configured. The view model therefore distinguishes:
+/// - `server_target_exists`: the canonical Server Target exists (logical
+///   workspace identity, Server-owned);
+/// - `device_connected`: this Device is locally connected to it (active
+///   binding + workspace default + schema-v3 local mapping + verified
+///   official local checkout);
+/// - `executor_ready`: this Device has a valid local execution agent
+///   configured for it (Device-owned launch configuration only — never
+///   provider accounts, API keys, model routing/catalogues, or Orca
+///   internals);
+/// - `agent_runtime_configured`: this Device can actually reach daemon
+///   eligibility for the canonical runtime, i.e. local official repo +
+///   active binding/default + valid executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SetupReadiness {
-    /// True when, from authoritative/current state:
-    /// - the device is logged in;
-    /// - the single current workspace is resolvable (Slice-2 semantics);
-    /// - the canonical Server Target alias `ceo-agent-runtime` exists with
-    ///   kind=coding and is enabled;
-    /// - this Device has an active binding for it;
-    /// - it is the workspace default Agent Runtime;
-    /// - the schema-v3 local config maps its immutable target_id;
-    /// - the mapped local path exists and verifies as
-    ///   `SentimentalK/ceo-agent-runtime`.
-    ///
-    /// Executor/model overrides are intentionally NOT required: setup does
-    /// not manage Agent/provider/model configuration.
+    /// Canonical Server Target alias `ceo-agent-runtime` exists with
+    /// kind=coding and is enabled (Server-owned logical identity only).
+    pub server_target_exists: bool,
+    /// Server Target exists AND this Device is locally connected to it:
+    /// active binding, workspace default Agent Runtime, schema-v3 local
+    /// mapping, and the mapped local path verifies as the official repo.
+    pub device_connected: bool,
+    /// This Device has a valid local execution agent (executor) configured
+    /// for the canonical runtime Target.
+    pub executor_ready: bool,
+    /// Full daemon eligibility for the canonical runtime on this Device:
+    /// `device_connected && executor_ready`.
     pub agent_runtime_configured: bool,
 }
 
@@ -678,9 +781,7 @@ impl SetupReadiness {
 pub async fn assess_agent_runtime_readiness(
     paths: &ConnectorPaths,
 ) -> Result<SetupReadiness, SetupError> {
-    let not_ready = SetupReadiness {
-        agent_runtime_configured: false,
-    };
+    let not_ready = SetupReadiness::default();
 
     // Logged-in bound profile (migrates/validates the schema-v3 config and
     // reuses the shared origin-mismatch semantics). Not logged in is a
@@ -720,29 +821,203 @@ pub async fn assess_agent_runtime_readiness(
     if canonical.kind != TARGET_KIND_CODING || canonical.disabled {
         return Ok(not_ready);
     }
+
+    // Server logical identity exists from here on.
+    let server_target_exists = true;
+
     let binding_active = canonical
         .this_device_binding
         .as_ref()
         .map(|b| b.enabled)
         .unwrap_or(false);
     if !binding_active || !canonical.is_default_agent_runtime {
-        return Ok(not_ready);
+        return Ok(SetupReadiness {
+            server_target_exists,
+            ..not_ready
+        });
     }
 
     let local = match profile.config.targets.get(&canonical.target_id) {
         Some(lt) => lt,
-        None => return Ok(not_ready),
+        None => {
+            return Ok(SetupReadiness {
+                server_target_exists,
+                ..not_ready
+            })
+        }
     };
     let path = Path::new(&local.local_path);
     if !path.exists() || !path.is_dir() {
-        return Ok(not_ready);
+        return Ok(SetupReadiness {
+            server_target_exists,
+            ..not_ready
+        });
     }
     if verify_local_repo_full_name(path, AGENT_RUNTIME_REPO_FULL_NAME).is_err() {
-        return Ok(not_ready);
+        return Ok(SetupReadiness {
+            server_target_exists,
+            ..not_ready
+        });
     }
 
+    // Local checkout is connected (binding + default + mapping + verified
+    // official repo). Executor state is Device-owned launch configuration.
+    let device_connected = true;
+    let executor_ready = local.executor.is_some();
+
     Ok(SetupReadiness {
-        agent_runtime_configured: true,
+        server_target_exists,
+        device_connected,
+        executor_ready,
+        agent_runtime_configured: device_connected && executor_ready,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Device-local executor configuration (PROJECT-036 Slice 4)
+// ---------------------------------------------------------------------------
+
+/// Typed outcome of configuring the Device-local executor for the canonical
+/// Agent Runtime Target. Pure domain data: the caller owns presentation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigureExecutorOutcome {
+    /// Immutable Server Target ID of the canonical runtime Target.
+    pub target_id: String,
+    /// Server-authoritative alias (equals the canonical constant).
+    pub alias: String,
+    /// The effective executor agent_id after this operation (the reused
+    /// existing one when an executor already existed, never silently
+    /// overwritten).
+    pub agent_id: String,
+    /// The effective executor command after this operation.
+    pub command: String,
+    /// true when this run wrote a new executor; false when an existing valid
+    /// executor was reused (model preserved exactly).
+    pub executor_created: bool,
+    /// The model override in effect after this operation: None for a freshly
+    /// configured executor (no model/provider/account setup here), or the
+    /// existing preserved model when reusing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Reusable setup operation: configure the Device-local EXECUTOR (launch
+/// configuration only) for the canonical Agent Runtime Target.
+///
+/// Boundary (PROJECT-036 Slice 4): this configures ONLY the local execution
+/// agent needed by Connector/Orca — agent human name/id + command. It must
+/// never configure provider accounts, API keys, model routing/catalogues,
+/// Orca internals, or model overrides (a fresh executor is written with
+/// `model = None`).
+///
+/// Semantics:
+/// - resolves/reuses the canonical Target by Server authority (no Server
+///   mutation happens in this operation);
+/// - requires this Device's local mapping to already exist (the runtime
+///   connect step must have run first);
+/// - uses the same `state.lock` + under-lock config re-read + TARGET_IN_USE
+///   safety as other local mutations;
+/// - writes `LocalExecutorConfig(kind=orca_tui, agent_id, command, model=None)`;
+/// - never silently overwrites an existing valid executor: it is reused and
+///   reported with its existing model preserved exactly.
+pub async fn configure_agent_runtime_executor(
+    paths: &ConnectorPaths,
+    agent_id: &str,
+    command: &str,
+) -> Result<ConfigureExecutorOutcome, SetupError> {
+    paths.ensure_dirs()?;
+    let profile = load_bound_profile(paths)?;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+
+    // Resolve the canonical Target by Server authority (no mutation).
+    let workspaces = client.list_workspaces(&cred).await?;
+    let workspace = select_single_workspace(workspaces)?;
+    let catalogue = client.list_targets(&cred, Some(&workspace.id)).await?;
+    let canonical = catalogue
+        .iter()
+        .find(|t| t.alias == AGENT_RUNTIME_TARGET_ALIAS)
+        .ok_or(SetupError::RuntimeTargetMissing)?;
+    if canonical.kind != TARGET_KIND_CODING {
+        return Err(SetupError::TargetWrongKind {
+            alias: canonical.alias.clone(),
+            kind: canonical.kind.clone(),
+        });
+    }
+    if canonical.disabled {
+        return Err(SetupError::TargetDisabled(canonical.target_id.clone()));
+    }
+    let target_id = canonical.target_id.clone();
+
+    // The executor belongs to a Device-local mapping; the connect step must
+    // have created it first.
+    let existing_executor = profile
+        .config
+        .targets
+        .get(&target_id)
+        .ok_or(SetupError::RuntimeNotConnected)?
+        .executor
+        .clone();
+
+    if let Some(existing) = existing_executor {
+        // Never silently overwrite an existing valid executor: reuse and
+        // report it, preserving the existing model exactly.
+        return Ok(ConfigureExecutorOutcome {
+            target_id,
+            alias: canonical.alias.clone(),
+            agent_id: existing.agent_id,
+            command: existing.command,
+            executor_created: false,
+            model: existing.model,
+        });
+    }
+
+    // Validate through the existing LocalExecutorConfig validation policy.
+    let executor = crate::config::LocalExecutorConfig::new(
+        agent_id.trim().to_string(),
+        command.trim().to_string(),
+    )?;
+
+    let _lock = acquire_state_lock(paths)?;
+
+    // Re-checked under the lock: the active-attempt guard must never be
+    // bypassed by a concurrent attempt start.
+    check_target_in_use(paths, &target_id)?;
+
+    // Re-read under the lock so concurrent set-agent/set-model changes can
+    // never be overwritten by a stale snapshot.
+    let mut config = match LocalConfig::load(&paths.config_file())? {
+        Some(c) => c,
+        None => LocalConfig::new(cred.server_origin.clone())?,
+    };
+
+    let entry = config
+        .targets
+        .get_mut(&target_id)
+        .ok_or(SetupError::RuntimeNotConnected)?;
+
+    // Under-lock idempotency: if a concurrent writer configured an executor
+    // in the meantime, keep it (never silently overwrite).
+    if let Some(existing) = entry.executor.clone() {
+        return Ok(ConfigureExecutorOutcome {
+            target_id,
+            alias: canonical.alias.clone(),
+            agent_id: existing.agent_id,
+            command: existing.command,
+            executor_created: false,
+            model: existing.model,
+        });
+    }
+
+    entry.executor = Some(executor);
+    config.save(&paths.config_file())?;
+    Ok(ConfigureExecutorOutcome {
+        target_id,
+        alias: canonical.alias.clone(),
+        agent_id: agent_id.trim().to_string(),
+        command: command.trim().to_string(),
+        executor_created: true,
+        model: None,
     })
 }
 
@@ -844,6 +1119,7 @@ mod tests {
             repo_cloned: true,
             binding_created: false,
             default_changed: true,
+            directory_created: false,
         };
         let json = serde_json::to_value(&outcome).unwrap();
         assert_eq!(json["target_id"], "tgt_1");
@@ -851,5 +1127,69 @@ mod tests {
         assert_eq!(json["repo_cloned"], true);
         assert_eq!(json["binding_created"], false);
         assert_eq!(json["default_changed"], true);
+        // Typed outcome distinguishes local directory creation vs reuse so
+        // frontends can render honest partial progress.
+        assert_eq!(json["directory_created"], false);
+    }
+
+    #[test]
+    fn configure_executor_outcome_json_shape_is_stable() {
+        let created = ConfigureExecutorOutcome {
+            target_id: "tgt_1".into(),
+            alias: "ceo-agent-runtime".into(),
+            agent_id: "opencode".into(),
+            command: "opencode".into(),
+            executor_created: true,
+            model: None,
+        };
+        let json = serde_json::to_value(&created).unwrap();
+        assert_eq!(json["executor_created"], true);
+        // Fresh executor has no model field at all (no model/provider setup).
+        assert!(json.get("model").is_none());
+
+        let reused = ConfigureExecutorOutcome {
+            executor_created: false,
+            model: Some("gpt-5".into()),
+            ..created
+        };
+        let json = serde_json::to_value(&reused).unwrap();
+        assert_eq!(json["executor_created"], false);
+        assert_eq!(json["model"], "gpt-5");
+    }
+
+    #[test]
+    fn readiness_state_combinations_drive_onboarding_labels() {
+        // Server Target absent => install.
+        let absent = SetupReadiness::default();
+        assert!(!absent.server_target_exists);
+        assert!(absent.needs_setup());
+
+        // Server Target exists but Device not connected => connect.
+        let server_only = SetupReadiness {
+            server_target_exists: true,
+            ..Default::default()
+        };
+        assert!(server_only.server_target_exists);
+        assert!(!server_only.device_connected);
+        assert!(server_only.needs_setup());
+
+        // Connected checkout but executor missing => honest partial state.
+        let no_executor = SetupReadiness {
+            server_target_exists: true,
+            device_connected: true,
+            executor_ready: false,
+            agent_runtime_configured: false,
+        };
+        assert!(!no_executor.agent_runtime_configured);
+        assert!(no_executor.needs_setup());
+
+        // Fully runnable device => configured.
+        let ready = SetupReadiness {
+            server_target_exists: true,
+            device_connected: true,
+            executor_ready: true,
+            agent_runtime_configured: true,
+        };
+        assert!(!ready.needs_setup());
     }
 }

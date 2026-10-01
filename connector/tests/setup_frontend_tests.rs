@@ -26,8 +26,8 @@ use ceo_connector::setup::{
 use ceo_connector::setup_frontend::{
     complete_path, default_project_path_with_home, expand_tilde_with_home,
     is_safe_single_path_component, login_handoff_action, post_login_handoff, run_setup_wizard,
-    run_standalone_setup, HandoffAction, SetupCompletion, SetupUi, UiError,
-    CODING_PROJECT_MENU_LABEL, FINISH_MENU_LABEL, SETUP_MENU_PROMPT,
+    run_setup_wizard_with_probe, run_standalone_setup, HandoffAction, SetupCompletion, SetupUi,
+    UiError, CODING_PROJECT_MENU_LABEL, FINISH_MENU_LABEL, SETUP_MENU_PROMPT,
 };
 use common::mock_server::{MockResponse, MockServer};
 
@@ -324,6 +324,17 @@ fn seed_configured_runtime(env: &TestEnv) -> String {
 
 /// Writes the schema-v3 local mapping for `target_id` to a verified repo.
 fn write_local_mapping(env: &TestEnv, target_id: &str, local_path: &Path) {
+    write_local_mapping_with_executor(env, target_id, local_path, None);
+}
+
+/// Writes the schema-v3 local mapping with an explicit executor (Device-owned
+/// launch configuration) for fully-configured fixtures.
+fn write_local_mapping_with_executor(
+    env: &TestEnv,
+    target_id: &str,
+    local_path: &Path,
+    executor: Option<ceo_connector::config::LocalExecutorConfig>,
+) {
     let cred_text = fs::read_to_string(env.paths.credential_file()).unwrap();
     let cred: serde_json::Value = serde_json::from_str(&cred_text).unwrap();
     let mut config = LocalConfig::new(cred["server_origin"].as_str().unwrap().to_string()).unwrap();
@@ -334,10 +345,20 @@ fn write_local_mapping(env: &TestEnv, target_id: &str, local_path: &Path) {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            executor: None, // executor/model is intentionally NOT required
+            executor,
         },
     );
     config.save(&env.paths.config_file()).unwrap();
+}
+
+/// Deterministic agent-executable probe for tests (test 25: suggestion only
+/// when discovery says the executable exists; user can edit).
+fn probe_available(_: &str) -> bool {
+    true
+}
+
+fn probe_absent(_: &str) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +499,7 @@ fn interactive_terminal_detection_matches_libc_tty_state() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn readiness_configured_when_all_runtime_facts_present() {
+async fn readiness_connected_without_executor_is_explicit_partial_state() {
     let env = env_with_workspaces(one_workspace()).await;
     let target_id = seed_configured_runtime(&env);
     let repo = env._temp.path().join("ceo-agent-runtime");
@@ -486,13 +507,52 @@ async fn readiness_configured_when_all_runtime_facts_present() {
     write_local_mapping(&env, &target_id, &repo);
 
     let readiness = assess_agent_runtime_readiness(&env.paths).await.unwrap();
-    assert!(
-        !readiness.needs_setup(),
-        "fully configured runtime must report needs_setup=false"
-    );
-    // Executor/model absence does NOT by itself make needs_setup true.
+    // Slice-4 contract: a connected checkout without a local executor is NOT
+    // fully configured — the readiness model surfaces it honestly so setup
+    // can offer executor onboarding.
+    assert!(readiness.server_target_exists);
+    assert!(readiness.device_connected);
+    assert!(!readiness.executor_ready);
+    assert!(!readiness.agent_runtime_configured);
+    assert!(readiness.needs_setup());
     let config = env.config().unwrap();
     assert!(config.targets.get(&target_id).unwrap().executor.is_none());
+}
+
+#[tokio::test]
+async fn readiness_fully_configured_includes_executor() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping_with_executor(
+        &env,
+        &target_id,
+        &repo,
+        Some(
+            ceo_connector::config::LocalExecutorConfig::new("opencode".into(), "opencode".into())
+                .unwrap(),
+        ),
+    );
+
+    let readiness = assess_agent_runtime_readiness(&env.paths).await.unwrap();
+    // Full daemon eligibility: local official repo + active binding/default
+    // + valid executor.
+    assert!(readiness.server_target_exists);
+    assert!(readiness.device_connected);
+    assert!(readiness.executor_ready);
+    assert!(readiness.agent_runtime_configured);
+    assert!(!readiness.needs_setup());
+}
+
+#[tokio::test]
+async fn readiness_missing_target_reports_server_absent_only() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let readiness = assess_agent_runtime_readiness(&env.paths).await.unwrap();
+    assert!(!readiness.server_target_exists);
+    assert!(!readiness.device_connected);
+    assert!(!readiness.executor_ready);
+    assert!(readiness.needs_setup());
 }
 
 #[tokio::test]
@@ -712,10 +772,11 @@ async fn post_login_handoff_probe_failure_keeps_login_successful() {
 
 #[test]
 fn handoff_decision_pure_function_is_exhaustive() {
-    let unready = ceo_connector::setup::SetupReadiness {
-        agent_runtime_configured: false,
-    };
+    let unready = ceo_connector::setup::SetupReadiness::default();
     let ready = ceo_connector::setup::SetupReadiness {
+        server_target_exists: true,
+        device_connected: true,
+        executor_ready: true,
         agent_runtime_configured: true,
     };
     assert_eq!(
@@ -770,7 +831,7 @@ async fn top_menu_finish_runs_doctor_exactly_once_and_mirrors_verdict() {
         );
         assert!(ui
             .joined_messages()
-            .contains("Setup complete. Running doctor..."));
+            .contains("Setup steps finished. Running doctor..."));
         // No setup actions were performed.
         assert_eq!(env.register_calls(), 0);
         assert_eq!(env.default_calls(), 0);
@@ -816,12 +877,20 @@ async fn top_menu_cancel_exits_safely_without_mutation() {
 
 #[tokio::test]
 async fn configured_marker_comes_from_shared_readiness_view_model() {
-    // Configured: marker present on the runtime menu entry.
+    // Fully configured (incl. executor): marker present.
     let env = env_with_workspaces(one_workspace()).await;
     let target_id = seed_configured_runtime(&env);
     let repo = env._temp.path().join("ceo-agent-runtime");
     init_agent_runtime_repo(&repo);
-    write_local_mapping(&env, &target_id, &repo);
+    write_local_mapping_with_executor(
+        &env,
+        &target_id,
+        &repo,
+        Some(
+            ceo_connector::config::LocalExecutorConfig::new("opencode".into(), "opencode".into())
+                .unwrap(),
+        ),
+    );
 
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter, true);
@@ -832,11 +901,39 @@ async fn configured_marker_comes_from_shared_readiness_view_model() {
 
     let (prompt, options) = ui.select_calls[0].clone();
     assert_eq!(prompt, SETUP_MENU_PROMPT);
-    assert_eq!(options[0], "Enable CEO Agent Runtime [Configured]");
+    assert_eq!(options[0], "CEO Agent Runtime [Configured]");
     assert_eq!(options[1], CODING_PROJECT_MENU_LABEL);
     assert_eq!(options[2], FINISH_MENU_LABEL);
 
-    // Unconfigured: same menu, no marker.
+    // Server Target exists but Device not locally connected: explicit
+    // connect-this-computer wording (no ambiguous Enable wording).
+    let env = env_with_workspaces(one_workspace()).await;
+    seed_configured_runtime(&env);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([ScriptedAction::Select(2)]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+    let (_, options) = ui.select_calls[0].clone();
+    assert_eq!(options[0], "Connect CEO Agent Runtime to this computer");
+
+    // Connected checkout but executor missing: honest partial state.
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping(&env, &target_id, &repo);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([ScriptedAction::Select(2)]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+    let (_, options) = ui.select_calls[0].clone();
+    assert_eq!(options[0], "CEO Agent Runtime [Execution agent required]");
+
+    // Server runtime absent entirely: Install label.
     let env = env_with_workspaces(one_workspace()).await;
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter, true);
@@ -845,8 +942,7 @@ async fn configured_marker_comes_from_shared_readiness_view_model() {
         .await
         .unwrap();
     let (_, options) = ui.select_calls[0].clone();
-    assert_eq!(options[0], "Enable CEO Agent Runtime");
-    assert!(!options[0].contains("[Configured]"));
+    assert_eq!(options[0], "Install CEO Agent Runtime");
 }
 
 // ---------------------------------------------------------------------------
@@ -862,12 +958,15 @@ async fn agent_runtime_flow_delegates_to_ensure_agent_runtime_and_renders_facts(
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter, true);
     let mut ui = ScriptedUi::new([
-        ScriptedAction::Select(0), // Enable CEO Agent Runtime
+        ScriptedAction::Select(0), // Install CEO Agent Runtime
         ScriptedAction::Text(repo.to_string_lossy().into_owned()),
         ScriptedAction::Select(0), // Continue
+        // Fresh-device executor onboarding: agent name + command.
+        ScriptedAction::Text("opencode".into()),
+        ScriptedAction::Text("opencode".into()),
         ScriptedAction::Select(2), // Finish
     ]);
-    let completion = run_setup_wizard(&env.paths, &mut ui, &doctor)
+    let completion = run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_absent)
         .await
         .unwrap();
     assert_eq!(
@@ -883,6 +982,15 @@ async fn agent_runtime_flow_delegates_to_ensure_agent_runtime_and_renders_facts(
     let config = env.config().unwrap();
     assert_eq!(config.targets.len(), 1);
 
+    // The executor onboarding wrote the Device-local executor via the shared
+    // core (kind orca_tui, fresh model=None; no provider/model setup).
+    let target_id = config.targets.keys().next().unwrap().clone();
+    let exec = config.targets[&target_id].executor.as_ref().unwrap();
+    assert_eq!(exec.kind, "orca_tui");
+    assert_eq!(exec.agent_id, "opencode");
+    assert_eq!(exec.command, "opencode");
+    assert_eq!(exec.model, None);
+
     // Typed outcome rendered as human facts: name/path/action, no raw IDs.
     let messages = ui.joined_messages();
     assert!(messages.contains("ceo-agent-runtime"));
@@ -896,6 +1004,8 @@ async fn agent_runtime_flow_delegates_to_ensure_agent_runtime_and_renders_facts(
     assert!(messages.contains("cloned") || messages.contains("reused"));
     assert!(messages.contains("bound"));
     assert!(messages.contains("default"));
+    assert!(messages.contains("This computer still needs a local execution agent for CEO jobs."));
+    assert!(messages.contains("Execution agent configured for 'ceo-agent-runtime'"));
     for raw_prefix in ["tgt_", "ws_", "dev_", "bnd_"] {
         assert!(
             !messages.contains(raw_prefix),
@@ -904,8 +1014,14 @@ async fn agent_runtime_flow_delegates_to_ensure_agent_runtime_and_renders_facts(
     }
 
     // Only the expected prompts were ever requested from the user.
-    assert_eq!(ui.text_calls.len(), 1);
-    assert_eq!(ui.text_calls[0].0, "Path to install the CEO Agent Runtime:");
+    assert_eq!(ui.text_calls.len(), 3);
+    assert_eq!(ui.text_calls[0].0, "CEO Agent Runtime folder:");
+    assert_eq!(ui.text_calls[1].0, "Agent name:");
+    assert_eq!(ui.text_calls[2].0, "Agent command:");
+    // Agent name/command prompts never involve raw target IDs.
+    assert!(ui.text_calls[1..]
+        .iter()
+        .all(|(p, _, _)| !p.contains("tgt")));
 }
 
 #[tokio::test]
@@ -914,22 +1030,26 @@ async fn agent_runtime_flow_offers_home_default_and_edit_loop_without_mutation()
     let repo = env._temp.path().join("ceo-agent-runtime");
     init_agent_runtime_repo(&repo);
 
-    // A pre-existing non-repo path forces a recoverable core error on the
-    // first Continue attempt (no clone, no mutation, no network).
+    // A pre-existing non-repo path is detected BEFORE the confirm step and
+    // offers targeted recoverable options (no clone, no mutation, no
+    // network); the edit loop re-prompts and only the final accepted path
+    // was ensured once.
     let blocker = env._temp.path().join("blocker");
     fs::write(&blocker, "not a repo\n").unwrap();
 
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter, true);
     let mut ui = ScriptedUi::new([
-        ScriptedAction::Select(0), // Enable CEO Agent Runtime
+        ScriptedAction::Select(0), // Install CEO Agent Runtime
         ScriptedAction::Text(blocker.to_string_lossy().into_owned()),
-        ScriptedAction::Select(1), // Edit path (no mutation)
+        ScriptedAction::Select(0), // Edit path (no mutation)
         ScriptedAction::Text(repo.to_string_lossy().into_owned()),
-        ScriptedAction::Select(0), // Continue
-        ScriptedAction::Select(2), // Finish
+        ScriptedAction::Select(0),          // Continue
+        ScriptedAction::Text("agy".into()), // executor name
+        ScriptedAction::Text("agy".into()), // executor command
+        ScriptedAction::Select(2),          // Finish
     ]);
-    let completion = run_setup_wizard(&env.paths, &mut ui, &doctor)
+    let completion = run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_absent)
         .await
         .unwrap();
     assert_eq!(
@@ -949,7 +1069,8 @@ async fn agent_runtime_flow_offers_home_default_and_edit_loop_without_mutation()
         .into_owned();
     assert!(config.targets.values().all(|t| t.local_path == canonical));
 
-    // Default text was HOME/codes/ceo-agent-runtime when home is available.
+    // Default text was the FULL HOME/codes/ceo-agent-runtime path when home
+    // is available.
     if let Some(home) = dirs::home_dir() {
         let expected = home.join("codes").join("ceo-agent-runtime");
         assert_eq!(
@@ -958,7 +1079,12 @@ async fn agent_runtime_flow_offers_home_default_and_edit_loop_without_mutation()
         );
     }
     // Completion was enabled for path prompts.
-    assert!(ui.text_calls.iter().all(|(_, _, complete)| *complete));
+    assert!(ui.text_calls[..1].iter().all(|(_, _, complete)| *complete));
+    // The conflicting path produced the honest conflict error.
+    assert!(ui
+        .errors
+        .iter()
+        .any(|e| e.contains("already exists and is not a CEO Agent Runtime checkout")));
 }
 
 #[tokio::test]
@@ -1057,6 +1183,246 @@ async fn agent_runtime_confirm_prompt_offers_continue_edit_cancel() {
     assert!(ui.joined_messages().contains("Path:"));
 }
 
+#[tokio::test]
+async fn agent_runtime_flow_explains_connect_this_computer_when_server_target_exists() {
+    // Server Target already exists (from a previous run/device); this Device
+    // is not locally configured yet. The flow must explain that it connects
+    // THIS computer rather than implying server config is being recreated.
+    let env = env_with_workspaces(one_workspace()).await;
+    seed_configured_runtime(&env);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0), // Connect CEO Agent Runtime to this computer
+        ScriptedAction::Text("~/codes/ceo-agent-runtime".into()),
+        ScriptedAction::Select(2), // Cancel at confirm
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    let messages = ui.joined_messages();
+    assert!(messages.contains(
+        "CEO Agent Runtime already exists in your workspace. This step connects this computer by choosing/reusing a local checkout and local execution agent."
+    ));
+    // The path prompt asks for the exact checkout folder.
+    assert_eq!(ui.text_calls[0].0, "CEO Agent Runtime folder:");
+    // Zero mutations happened (cancel before Continue).
+    assert_eq!(env.register_calls(), 0);
+}
+
+#[tokio::test]
+async fn agent_runtime_flow_reuses_exact_existing_checkout_via_child_suggestion() {
+    // User enters the PARENT directory; the verified canonical child inside
+    // it is suggested and used after confirmation.
+    let env = env_with_workspaces(one_workspace()).await;
+    let parent = env._temp.path().join("codes");
+    let child = parent.join(AGENT_RUNTIME_TARGET_ALIAS);
+    init_agent_runtime_repo(&child);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0),
+        ScriptedAction::Text(parent.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0),               // Use this checkout
+        ScriptedAction::Select(0),               // Continue (with the child path)
+        ScriptedAction::Text("opencode".into()), // executor name
+        ScriptedAction::Text("opencode".into()), // executor command
+        ScriptedAction::Select(2),               // Finish
+    ]);
+    run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_absent)
+        .await
+        .unwrap();
+
+    // The targeted suggestion was offered (not a generic not-a-repo error).
+    assert!(ui
+        .select_calls
+        .iter()
+        .any(|(p, _)| p == "Found an existing CEO Agent Runtime checkout. Use it?"));
+    // The parent itself was never mutated or registered as the checkout.
+    assert_eq!(env.register_calls(), 1);
+    let config = env.config().unwrap();
+    let canonical_child = fs::canonicalize(&child)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(config
+        .targets
+        .values()
+        .all(|t| t.local_path == canonical_child));
+    // No clone: the existing verified checkout was reused.
+    assert!(!ui.errors.iter().any(|e| e.contains("not a git repository")));
+}
+
+#[tokio::test]
+async fn agent_runtime_flow_proposes_derived_child_for_parent_without_child() {
+    // Parent-like directory exists but the canonical child does not: the
+    // explicit derived child path is proposed; the parent is never
+    // overwritten. The user cancels at confirm, so nothing is cloned.
+    let env = env_with_workspaces(one_workspace()).await;
+    let parent = env._temp.path().join("codes");
+    fs::create_dir_all(&parent).unwrap();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0),
+        ScriptedAction::Text(parent.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Use the derived child path
+        ScriptedAction::Select(2), // Cancel at confirm
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    assert!(ui.select_calls.iter().any(|(p, _)| p
+        == "This folder is not a CEO Agent Runtime checkout. Use the runtime folder inside it?"));
+    assert!(ui
+        .joined_messages()
+        .contains("Setup can place the runtime at"));
+    // Parent untouched; nothing cloned (network-free cancel path).
+    assert!(parent.is_dir());
+    assert_eq!(env.register_calls(), 0);
+}
+
+#[tokio::test]
+async fn agent_runtime_executor_suggestion_appears_only_when_probe_finds_it() {
+    // probe_available: name/command prompts are prefilled with the editable
+    // `opencode` suggestion.
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping(&env, &target_id, &repo);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0), // CEO Agent Runtime [Execution agent required]
+        ScriptedAction::Text(repo.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Continue (idempotent reuse)
+        ScriptedAction::Text("opencode".into()),
+        ScriptedAction::Text("opencode".into()),
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_available)
+        .await
+        .unwrap();
+    assert_eq!(ui.text_calls[1].0, "Agent name:");
+    assert_eq!(ui.text_calls[1].1.as_deref(), Some("opencode"));
+    assert_eq!(ui.text_calls[2].0, "Agent command:");
+    assert_eq!(ui.text_calls[2].1.as_deref(), Some("opencode"));
+    // The executor was written through the shared core.
+    let config = env.config().unwrap();
+    assert!(config.targets[&target_id].executor.is_some());
+
+    // probe_absent: no invented agent — editable fields without defaults.
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping(&env, &target_id, &repo);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0),
+        ScriptedAction::Text(repo.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Continue (idempotent reuse)
+        ScriptedAction::Text("agy".into()),
+        ScriptedAction::Text("agy".into()),
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_absent)
+        .await
+        .unwrap();
+    assert_eq!(ui.text_calls[1].1, None);
+    assert_eq!(ui.text_calls[2].1, None);
+}
+
+#[tokio::test]
+async fn executor_cancel_leaves_runtime_incomplete_and_finish_reports_honestly() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping(&env, &target_id, &repo);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, false); // missing executor => doctor fails
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0), // runtime entry (partial state)
+        ScriptedAction::Text(repo.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0),  // Continue (idempotent reuse)
+        ScriptedAction::CancelText, // cancel at "Agent name:"
+        ScriptedAction::Select(2),  // Finish
+    ]);
+    let completion = run_setup_wizard_with_probe(&env.paths, &mut ui, &doctor, &probe_absent)
+        .await
+        .unwrap();
+
+    // Setup must NOT claim runnable success: the Doctor verdict mirrors.
+    assert_eq!(
+        completion,
+        SetupCompletion::Finished {
+            doctor_passed: false
+        }
+    );
+    assert!(ui
+        .joined_messages()
+        .contains("Execution agent configuration skipped. This computer is not fully set up yet; Finish will run doctor and show exactly what is missing."));
+    // No executor was written; the runtime stays explicitly incomplete.
+    let config = env.config().unwrap();
+    assert!(config.targets[&target_id].executor.is_none());
+}
+
+#[tokio::test]
+async fn executor_existing_is_reused_and_reported_not_overwritten() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let target_id = seed_configured_runtime(&env);
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_agent_runtime_repo(&repo);
+    write_local_mapping_with_executor(
+        &env,
+        &target_id,
+        &repo,
+        Some(
+            ceo_connector::config::LocalExecutorConfig::new_with_model(
+                "cursor".into(),
+                "/path/agent -f --trust".into(),
+                Some("gpt-5".into()),
+            )
+            .unwrap(),
+        ),
+    );
+
+    // Fully configured: selecting the runtime entry replays idempotently and
+    // never prompts for an executor.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(0), // CEO Agent Runtime [Configured]
+        ScriptedAction::Text(repo.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Continue (idempotent replay)
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    // No executor prompt appeared; the existing executor/model are intact.
+    assert!(!ui.text_calls.iter().any(|(p, _, _)| p == "Agent name:"));
+    let config = env.config().unwrap();
+    let exec = config.targets[&target_id].executor.as_ref().unwrap();
+    assert_eq!(exec.agent_id, "cursor");
+    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.model.as_deref(), Some("gpt-5"));
+}
+
 // ---------------------------------------------------------------------------
 // E. Coding project frontend flow
 // ---------------------------------------------------------------------------
@@ -1144,22 +1510,117 @@ async fn coding_flow_offers_safe_default_path_from_home() {
 }
 
 #[tokio::test]
+async fn coding_missing_directory_cancel_makes_no_server_mutation() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let missing = env._temp.path().join("does-not-exist");
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(1), // Add a coding project
+        ScriptedAction::Text("ghost-app".into()),
+        ScriptedAction::Text(missing.to_string_lossy().into_owned()),
+        ScriptedAction::Select(2), // Cancel at "Directory does not exist. Create it?"
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    // The missing-directory question was asked BEFORE any Server mutation,
+    // and cancelling it caused zero Server mutation and zero local writes.
+    assert!(ui
+        .select_calls
+        .iter()
+        .any(|(p, _)| p == "Directory does not exist. Create it?"));
+    assert_eq!(env.register_calls(), 0);
+    assert_eq!(env.default_calls(), 0);
+    assert!(env.config().is_none() || env.config().unwrap().targets.is_empty());
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn coding_missing_directory_create_confirmed_flows_through_shared_core() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let missing = env._temp.path().join("created-app");
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(1), // Add a coding project
+        ScriptedAction::Text("created-app".into()),
+        ScriptedAction::Text(missing.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Create
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    // The shared core created the directory, then registered/bound the
+    // Target — the frontend never mutated filesystem/server state itself.
+    assert!(missing.is_dir());
+    assert_eq!(env.register_calls(), 1);
+    let config = env.config().unwrap();
+    assert_eq!(config.targets.len(), 1);
+    // Honest rendering: local directory created vs reused.
+    assert!(ui.joined_messages().contains("Local directory created at"));
+}
+
+#[tokio::test]
+async fn coding_existing_non_directory_fails_without_core_call() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let file_path = env._temp.path().join("not-a-dir");
+    fs::write(&file_path, "irreplaceable user data\n").unwrap();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter, true);
+    let mut ui = ScriptedUi::new([
+        ScriptedAction::Select(1), // Add a coding project
+        ScriptedAction::Text("blocked-app".into()),
+        ScriptedAction::Text(file_path.to_string_lossy().into_owned()),
+        ScriptedAction::Select(1), // Cancel after the clear failure
+        ScriptedAction::Select(2), // Finish
+    ]);
+    run_setup_wizard(&env.paths, &mut ui, &doctor)
+        .await
+        .unwrap();
+
+    assert!(ui
+        .errors
+        .iter()
+        .any(|e| e.contains("exists but is not a directory")));
+    // User files untouched; no Server mutation; no local config write.
+    assert_eq!(
+        fs::read_to_string(&file_path).unwrap(),
+        "irreplaceable user data\n"
+    );
+    assert_eq!(env.register_calls(), 0);
+    assert!(env.config().is_none() || env.config().unwrap().targets.is_empty());
+}
+
+#[tokio::test]
 async fn coding_flow_recoverable_error_is_correctable_without_restarting_setup() {
     let env = env_with_workspaces(one_workspace()).await;
-    // Missing path first (recoverable), then a valid directory.
-    let missing = env._temp.path().join("does-not-exist");
+    // Existing directory + a Server Target whose alias matches the input but
+    // has the wrong kind => recoverable core error; the user fixes the name
+    // and the retry converges via the shared core.
     let dir = env._temp.path().join("fixed-app");
     fs::create_dir_all(&dir).unwrap();
+    env.state.lock().unwrap().targets.push(FakeTarget {
+        kind: "general_automation".to_string(),
+        ..fake_target("fixed-app", "coding")
+    });
 
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter, true);
     let mut ui = ScriptedUi::new([
         ScriptedAction::Select(1), // Add a coding project
         ScriptedAction::Text("fixed-app".into()),
-        ScriptedAction::Text(missing.to_string_lossy().into_owned()),
-        ScriptedAction::Select(0), // Create / Bind -> recoverable error
-        ScriptedAction::Select(1), // Edit path
         ScriptedAction::Text(dir.to_string_lossy().into_owned()),
+        ScriptedAction::Select(0), // Create / Bind -> recoverable wrong-kind error
+        ScriptedAction::Select(0), // Edit name
+        ScriptedAction::Text("renamed-app".into()),
         ScriptedAction::Select(0), // Create / Bind -> success
         ScriptedAction::Select(2), // Finish
     ]);
@@ -1178,7 +1639,7 @@ async fn coding_flow_recoverable_error_is_correctable_without_restarting_setup()
         .errors
         .iter()
         .any(|e| e.contains("Could not add the coding project")));
-    assert_eq!(env.register_calls(), 1); // reused, no duplicate target
+    assert_eq!(env.register_calls(), 1); // renamed-app registered once
     let config = env.config().unwrap();
     let canonical = fs::canonicalize(&dir)
         .unwrap()

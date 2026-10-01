@@ -15,9 +15,11 @@ pub struct Cli {
 pub enum Commands {
     /// Authenticate this device with the CEO Server
     Login {
-        /// Server origin URL (e.g. https://ceo.example.com or http://127.0.0.1:4000)
+        /// Server origin URL for self-hosted or custom deployments (e.g.
+        /// https://ceo.example.com or http://127.0.0.1:4000). When omitted,
+        /// the official CEO Server (https://ceo.sentimentalk.com) is used.
         #[arg(long)]
-        server: String,
+        server: Option<String>,
 
         /// Custom display name for this device
         #[arg(long)]

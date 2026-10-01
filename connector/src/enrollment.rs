@@ -16,6 +16,21 @@ use crate::paths::ConnectorPaths;
 
 pub const ENROLLMENT_SCHEMA_VERSION: u32 = 1;
 
+/// Official CEO Server origin used by `ceo-connector login` when `--server`
+/// is omitted. Normal users never need to pass `--server`; the flag remains
+/// an explicit override for self-hosted/custom deployments.
+pub const OFFICIAL_SERVER_ORIGIN: &str = "https://ceo.sentimentalk.com";
+
+/// Resolves the login server origin: an explicit `--server` override is
+/// normalized with the existing origin security semantics; `None` selects
+/// the official CEO Server. Pure/testable; used by the CLI login command.
+pub fn resolve_login_origin(server_override: Option<&str>) -> Result<String, ConfigError> {
+    match server_override {
+        Some(input) => normalize_server_origin(input),
+        None => Ok(OFFICIAL_SERVER_ORIGIN.to_string()),
+    }
+}
+
 /// Typed outcome of a completed login (PROJECT-036 Slice 3). Pure domain
 /// data: it tells the CLI whether authentication succeeded/reused without
 /// coupling enrollment business logic into setup semantics. The caller owns

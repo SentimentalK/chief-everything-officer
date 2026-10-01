@@ -16,8 +16,9 @@ use ceo_connector::config::{LocalConfig, LocalExecutorConfig, LocalTarget};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::setup::{
-    ensure_agent_runtime, ensure_agent_runtime_with_repo, ensure_coding_target,
-    AgentRuntimeRepoSpec, SetupError, AGENT_RUNTIME_REPO_CLONE_URL, AGENT_RUNTIME_TARGET_ALIAS,
+    configure_agent_runtime_executor, ensure_agent_runtime, ensure_agent_runtime_with_repo,
+    ensure_coding_target, ensure_coding_target_with_policy, AgentRuntimeRepoSpec, CodingPathPolicy,
+    SetupError, AGENT_RUNTIME_REPO_CLONE_URL, AGENT_RUNTIME_TARGET_ALIAS,
 };
 use common::mock_server::{MockResponse, MockServer};
 
@@ -1072,7 +1073,9 @@ async fn coding_disabled_target_fails() {
 }
 
 #[tokio::test]
-async fn coding_missing_local_path_fails_without_local_write() {
+async fn coding_missing_local_path_fails_before_any_server_mutation() {
+    // PROJECT-036 Slice 4 ordering contract: a missing local directory is
+    // detected BEFORE any new Server Target registration/binding mutation.
     let env = env_with_workspaces(one_workspace()).await;
     let missing = env._temp.path().join("does-not-exist");
 
@@ -1080,12 +1083,120 @@ async fn coding_missing_local_path_fails_without_local_write() {
         .await
         .unwrap_err();
     assert!(matches!(err, SetupError::PathNotFound(_)));
-    // Server mutation may remain (honest partial progress), but nothing is
-    // written locally and no default/binding churn happens.
-    assert_eq!(env.register_calls(), 1);
+    assert_eq!(env.register_calls(), 0);
     env.assert_no_local_targets();
     assert_eq!(env.bind_calls(), 0);
     assert_eq!(env.default_calls(), 0);
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn coding_existing_non_directory_fails_closed() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let file_path = env._temp.path().join("not-a-dir");
+    fs::write(&file_path, "irreplaceable user data\n").unwrap();
+
+    let err = ensure_coding_target(&env.paths, "blocked", &file_path)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::PathConflict { .. }));
+    assert!(err.to_string().contains("not a directory"));
+    // User file untouched; zero Server mutation; zero local writes.
+    assert_eq!(
+        fs::read_to_string(&file_path).unwrap(),
+        "irreplaceable user data\n"
+    );
+    assert_eq!(env.register_calls(), 0);
+    env.assert_no_local_targets();
+}
+
+#[tokio::test]
+async fn coding_create_policy_creates_directory_before_target_ensure() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let missing = env._temp.path().join("freshly-created");
+
+    let outcome = ensure_coding_target_with_policy(
+        &env.paths,
+        "freshly-created",
+        &missing,
+        CodingPathPolicy::CreateIfMissing,
+    )
+    .await
+    .unwrap();
+
+    // The directory was created by the core (no git init, no repo
+    // fabrication) BEFORE the Server Target registration.
+    assert!(missing.is_dir());
+    assert!(outcome.directory_created);
+    assert!(outcome.target_created);
+    assert_eq!(env.register_calls(), 1);
+    // The ensure/register endpoint creates the binding atomically, so no
+    // separate bind call is needed.
+    assert_eq!(env.bind_calls(), 0);
+    let config = env.config().unwrap();
+    assert_eq!(
+        config.targets.get(&outcome.target_id).unwrap().local_path,
+        fs::canonicalize(&missing)
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    );
+    // Plain directory, never fabricated into a repo.
+    assert!(!missing.join(".git").exists());
+}
+
+#[tokio::test]
+async fn coding_create_policy_rerun_reuses_directory_and_target() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let missing = env._temp.path().join("freshly-created");
+
+    let first = ensure_coding_target_with_policy(
+        &env.paths,
+        "freshly-created",
+        &missing,
+        CodingPathPolicy::CreateIfMissing,
+    )
+    .await
+    .unwrap();
+    assert!(first.directory_created);
+
+    // Rerun converges: the directory and Target are reused honestly.
+    let second = ensure_coding_target_with_policy(
+        &env.paths,
+        "freshly-created",
+        &missing,
+        CodingPathPolicy::CreateIfMissing,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.target_id, first.target_id);
+    assert!(!second.directory_created);
+    assert!(!second.target_created);
+    assert_eq!(env.register_calls(), 1);
+    assert_eq!(env.bind_calls(), 0);
+}
+
+#[tokio::test]
+async fn coding_directory_creation_local_failure_never_mutates_server() {
+    // A path whose parent is a FILE makes create_dir_all fail: the Server
+    // must stay untouched and the error honest.
+    let env = env_with_workspaces(one_workspace()).await;
+    let parent_file = env._temp.path().join("parent-is-a-file");
+    fs::write(&parent_file, "user data\n").unwrap();
+    let child = parent_file.join("child");
+
+    let err = ensure_coding_target_with_policy(
+        &env.paths,
+        "blocked-create",
+        &child,
+        CodingPathPolicy::CreateIfMissing,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SetupError::Io(_)));
+    assert_eq!(env.register_calls(), 0);
+    env.assert_no_local_targets();
+    assert_eq!(fs::read_to_string(&parent_file).unwrap(), "user data\n");
 }
 
 #[tokio::test]
@@ -1251,4 +1362,159 @@ async fn coding_active_attempt_guard_preserved() {
     assert!(err.to_string().contains("TARGET_IN_USE"));
     assert_eq!(env.bind_calls(), 0);
     env.assert_no_local_targets();
+}
+
+// ---------------------------------------------------------------------------
+// D. Device-local executor configuration (PROJECT-036 Slice 4)
+// ---------------------------------------------------------------------------
+
+/// Seeds the canonical runtime Target (Server-side) plus a Device-local
+/// verified checkout mapping without an executor — the exact fresh-device
+/// dogfood state that motivated Slice 4.
+async fn env_with_connected_runtime_without_executor() -> (TestEnv, String, std::path::PathBuf) {
+    let env = env_with_workspaces(one_workspace()).await;
+    env.state
+        .lock()
+        .unwrap()
+        .targets
+        .push(fake_target(AGENT_RUNTIME_TARGET_ALIAS, "coding"));
+    let repo = env._temp.path().join("ceo-agent-runtime");
+    init_git_repo_with_origin(&repo, AGENT_RUNTIME_REPO_CLONE_URL);
+
+    let outcome = ensure_agent_runtime(&env.paths, &repo).await.unwrap();
+    let config = env.config().unwrap();
+    assert!(config.targets[&outcome.target_id].executor.is_none());
+    (env, outcome.target_id, repo)
+}
+
+#[tokio::test]
+async fn executor_config_writes_device_owned_orca_tui_executor_without_model() {
+    let (env, target_id, _repo) = env_with_connected_runtime_without_executor().await;
+
+    // The connect step in the helper already consumed bind/default calls;
+    // capture baselines to prove the executor configure adds no mutation.
+    let before_bind = env.bind_calls();
+    let before_default = env.default_calls();
+    let before_register = env.register_calls();
+
+    let outcome = configure_agent_runtime_executor(&env.paths, "opencode", "opencode")
+        .await
+        .unwrap();
+
+    assert!(outcome.executor_created);
+    assert_eq!(outcome.target_id, target_id);
+    assert_eq!(outcome.alias, AGENT_RUNTIME_TARGET_ALIAS);
+    assert_eq!(outcome.agent_id, "opencode");
+    assert_eq!(outcome.command, "opencode");
+    assert_eq!(outcome.model, None, "fresh executor has no model");
+
+    // Only Device-owned schema-v3 executor state was written, under the
+    // shared local state contract.
+    let config = env.config().unwrap();
+    let exec = config.targets[&target_id].executor.as_ref().unwrap();
+    assert_eq!(exec.kind, "orca_tui");
+    assert_eq!(exec.agent_id, "opencode");
+    assert_eq!(exec.command, "opencode");
+    assert_eq!(exec.model, None);
+
+    // No Server mutation is needed for executor config.
+    assert_eq!(env.register_calls(), before_register);
+    assert_eq!(env.bind_calls(), before_bind);
+    assert_eq!(env.default_calls(), before_default);
+}
+
+#[tokio::test]
+async fn executor_config_never_silently_overwrites_existing_executor() {
+    let (env, target_id, _repo) = env_with_connected_runtime_without_executor().await;
+    write_config_with_executor(&env, &target_id, "/old/path");
+
+    // A configure call with DIFFERENT values must reuse, not overwrite.
+    let before_bind = env.bind_calls();
+    let before_default = env.default_calls();
+    let before_register = env.register_calls();
+    let outcome = configure_agent_runtime_executor(&env.paths, "opencode", "opencode")
+        .await
+        .unwrap();
+    assert!(!outcome.executor_created);
+    assert_eq!(outcome.agent_id, "cursor");
+    assert_eq!(outcome.command, "/path/agent -f --trust");
+    // The existing model override is preserved exactly when reusing.
+    assert_eq!(outcome.model.as_deref(), Some("gpt-5"));
+
+    let exec = {
+        let config = env.config().unwrap();
+        config.targets[&target_id].executor.clone().unwrap()
+    };
+    assert_eq!(exec.agent_id, "cursor");
+    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.model.as_deref(), Some("gpt-5"));
+    // Zero Server mutations either way.
+    assert_eq!(env.register_calls(), before_register);
+    assert_eq!(env.bind_calls(), before_bind);
+    assert_eq!(env.default_calls(), before_default);
+}
+
+#[tokio::test]
+async fn executor_config_validates_through_existing_executor_contract() {
+    let (env, _target_id, _repo) = env_with_connected_runtime_without_executor().await;
+
+    // Invalid agent_id characters are rejected by the existing validation.
+    let err = configure_agent_runtime_executor(&env.paths, "bad agent id", "opencode")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::Config(_)));
+    assert!(err.to_string().contains("invalid characters"));
+
+    // Empty command rejected.
+    let err = configure_agent_runtime_executor(&env.paths, "opencode", "   ")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::Config(_)));
+
+    // Nothing was written by the rejected attempts.
+    let config = env.config().unwrap();
+    let tid = config.targets.keys().next().unwrap().clone();
+    assert!(config.targets[&tid].executor.is_none());
+}
+
+#[tokio::test]
+async fn executor_config_active_attempt_guard_blocks_local_mutation() {
+    let (env, target_id, _repo) = env_with_connected_runtime_without_executor().await;
+    active_attempt(&env.paths, &target_id);
+
+    let err = configure_agent_runtime_executor(&env.paths, "opencode", "opencode")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::TargetInUse(ref id) if *id == target_id));
+    assert!(err.to_string().contains("TARGET_IN_USE"));
+    let config = env.config().unwrap();
+    assert!(config.targets[&target_id].executor.is_none());
+}
+
+#[tokio::test]
+async fn executor_config_requires_canonical_server_target() {
+    // No runtime Target on the Server at all.
+    let env = env_with_workspaces(one_workspace()).await;
+    let err = configure_agent_runtime_executor(&env.paths, "opencode", "opencode")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::RuntimeTargetMissing));
+    assert!(err.to_string().contains("SETUP_RUNTIME_TARGET_MISSING"));
+}
+
+#[tokio::test]
+async fn executor_config_requires_local_mapping_first() {
+    // Server Target exists but this Device has no local mapping yet.
+    let env = env_with_workspaces(one_workspace()).await;
+    env.state
+        .lock()
+        .unwrap()
+        .targets
+        .push(fake_target(AGENT_RUNTIME_TARGET_ALIAS, "coding"));
+
+    let err = configure_agent_runtime_executor(&env.paths, "opencode", "opencode")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SetupError::RuntimeNotConnected));
+    assert!(err.to_string().contains("SETUP_RUNTIME_NOT_CONNECTED"));
 }

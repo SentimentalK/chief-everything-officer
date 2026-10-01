@@ -27,8 +27,9 @@ use crate::config::load_bound_profile;
 use crate::doctor::DoctorReport;
 use crate::paths::ConnectorPaths;
 use crate::setup::{
-    assess_agent_runtime_readiness, ensure_agent_runtime, ensure_coding_target, SetupError,
-    SetupReadiness, SetupTargetOutcome, AGENT_RUNTIME_TARGET_ALIAS,
+    assess_agent_runtime_readiness, configure_agent_runtime_executor, ensure_agent_runtime,
+    ensure_coding_target, ensure_coding_target_with_policy, CodingPathPolicy, SetupError,
+    SetupReadiness, SetupTargetOutcome, AGENT_RUNTIME_REPO_FULL_NAME, AGENT_RUNTIME_TARGET_ALIAS,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,11 +37,43 @@ use crate::setup::{
 // ---------------------------------------------------------------------------
 
 pub const SETUP_MENU_PROMPT: &str = "Set up this computer";
-pub const AGENT_RUNTIME_MENU_LABEL: &str = "Enable CEO Agent Runtime";
+
+/// State-aware runtime menu labels (PROJECT-036 Slice 4). Server state and
+/// Device-local state are intentionally different: a Server Target existing
+/// does NOT mean this Device is locally configured, and the wording must say
+/// which one a step connects.
+pub const AGENT_RUNTIME_LABEL_INSTALL: &str = "Install CEO Agent Runtime";
+pub const AGENT_RUNTIME_LABEL_CONNECT: &str = "Connect CEO Agent Runtime to this computer";
+pub const AGENT_RUNTIME_LABEL_BASE: &str = "CEO Agent Runtime";
+pub const CONFIGURED_MARK: &str = " [Configured]";
+pub const AGENT_RUNTIME_LABEL_EXECUTOR_MARK: &str = " [Execution agent required]";
+/// Neutral fallback used only when the shared readiness probe itself failed
+/// (no state guess is made).
+pub const AGENT_RUNTIME_LABEL_UNKNOWN_STATE: &str = "Set up CEO Agent Runtime";
 pub const CODING_PROJECT_MENU_LABEL: &str = "Add a coding project";
 pub const FINISH_MENU_LABEL: &str = "Finish";
-pub const CONFIGURED_MARK: &str = " [Configured]";
-pub const SETUP_COMPLETE_LINE: &str = "Setup complete. Running doctor...";
+pub const SETUP_COMPLETE_LINE: &str = "Setup steps finished. Running doctor...";
+
+/// Explains the Server/Device distinction when the canonical runtime Target
+/// already exists Server-side: this step connects THIS computer (local
+/// checkout + local execution agent), it does not recreate Server config.
+pub const AGENT_RUNTIME_EXISTING_EXPLANATION: &str = "CEO Agent Runtime already exists in your workspace. This step connects this computer by choosing/reusing a local checkout and local execution agent.";
+/// Prompt for the exact runtime checkout folder (not an install parent).
+pub const AGENT_RUNTIME_PATH_PROMPT: &str = "CEO Agent Runtime folder:";
+pub const AGENT_RUNTIME_EXISTING_CHECKOUT_PROMPT: &str =
+    "Found an existing CEO Agent Runtime checkout. Use it?";
+pub const AGENT_RUNTIME_DERIVED_CHILD_PROMPT: &str =
+    "This folder is not a CEO Agent Runtime checkout. Use the runtime folder inside it?";
+pub const AGENT_RUNTIME_CONFLICT_ERROR: &str = "This path already exists and is not a CEO Agent Runtime checkout. Setup never overwrites or deletes existing files. Choose a different folder.";
+
+pub const EXECUTOR_EXPLAIN_LINE: &str =
+    "This computer still needs a local execution agent for CEO jobs.";
+pub const EXECUTOR_NAME_PROMPT: &str = "Agent name:";
+pub const EXECUTOR_COMMAND_PROMPT: &str = "Agent command:";
+pub const EXECUTOR_SKIPPED_LINE: &str = "Execution agent configuration skipped. This computer is not fully set up yet; Finish will run doctor and show exactly what is missing.";
+pub const AGENT_COMMAND_SUGGESTION: &str = "opencode";
+
+pub const CODING_DIR_MISSING_PROMPT: &str = "Directory does not exist. Create it?";
 
 // ---------------------------------------------------------------------------
 // UI abstraction (narrow, testable prompt boundary)
@@ -66,8 +99,11 @@ pub trait SetupUi {
     /// chosen index. Ctrl+C / Esc => [`UiError::Cancelled`]. No numeric
     /// fallback exists.
     fn select(&mut self, prompt: &str, options: &[String]) -> Result<usize, UiError>;
-    /// Editable single-line text with optional default and optional Tab
-    /// filesystem path completion. Ctrl+C / Esc => [`UiError::Cancelled`].
+    /// Editable single-line text. When `default` is provided it becomes the
+    /// ACTUAL initial editable buffer value (not a placeholder default), so
+    /// the visible text is the real input. `complete_paths` enables Tab
+    /// filesystem path completion over the current buffer. Ctrl+C / Esc =>
+    /// [`UiError::Cancelled`].
     fn text(
         &mut self,
         prompt: &str,
@@ -108,8 +144,12 @@ impl SetupUi for TerminalUi {
         complete_paths: bool,
     ) -> Result<String, UiError> {
         let mut input = inquire::Text::new(prompt);
+        // PROJECT-036 Slice 4: the default is placed into the ACTUAL editable
+        // buffer (`with_initial_value`), not a gray placeholder default. The
+        // visible text is the real input, so Tab completion operates on the
+        // same full intended path the user sees, and Enter accepts it as-is.
         if let Some(d) = default {
-            input = input.with_default(d);
+            input = input.with_initial_value(d);
         }
         if complete_paths {
             input = input.with_autocomplete(PathCompleter);
@@ -395,17 +435,52 @@ pub async fn run_setup_wizard(
     ui: &mut dyn SetupUi,
     doctor: &dyn DoctorRunner,
 ) -> Result<SetupCompletion, SetupFrontendError> {
+    run_setup_wizard_with_probe(paths, ui, doctor, &production_executable_probe).await
+}
+
+/// Injectable probe used to offer a convenient prefilled execution-agent
+/// suggestion ONLY when the executable actually exists on this machine
+/// (dogfood environment uses OpenCode; this is not a global allowlist — the
+/// suggestion stays fully editable).
+pub type ExecutableProbe = dyn Fn(&str) -> bool + Send + Sync;
+
+/// Production probe: checks the real PATH for the executable.
+pub fn production_executable_probe(command: &str) -> bool {
+    executable_in_path(command)
+}
+
+fn executable_in_path(cmd: &str) -> bool {
+    let bin = cmd.split_whitespace().next().unwrap_or(cmd);
+    if bin.contains('/') {
+        return Path::new(bin).is_file();
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&paths) {
+            let full = p.join(bin);
+            if full.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Like [`run_setup_wizard`] with an injectable executable probe (tests).
+pub async fn run_setup_wizard_with_probe(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    doctor: &dyn DoctorRunner,
+    probe: &ExecutableProbe,
+) -> Result<SetupCompletion, SetupFrontendError> {
     // Validate the logged-in profile up front (actionable; the wizard never
     // runs against a logged-out device).
     load_bound_profile(paths).map_err(SetupError::from)?;
 
     loop {
-        // Read-only readiness for the configured marker. A probe failure is
-        // reported honestly and the menu stays usable unmarked.
-        let configured = match assess_agent_runtime_readiness(paths).await {
-            Ok(SetupReadiness {
-                agent_runtime_configured,
-            }) => Some(agent_runtime_configured),
+        // Read-only readiness for the state-aware label. A probe failure is
+        // reported honestly and the menu stays usable with a neutral label.
+        let readiness = match assess_agent_runtime_readiness(paths).await {
+            Ok(r) => Some(r),
             Err(e) => {
                 ui.message(&format!("Could not determine current setup status: {e}"));
                 None
@@ -413,7 +488,7 @@ pub async fn run_setup_wizard(
         };
 
         let options = vec![
-            agent_runtime_menu_label(configured),
+            agent_runtime_menu_label(readiness.as_ref()),
             CODING_PROJECT_MENU_LABEL.to_string(),
             FINISH_MENU_LABEL.to_string(),
         ];
@@ -424,7 +499,7 @@ pub async fn run_setup_wizard(
         };
 
         match choice {
-            0 => run_agent_runtime_flow(paths, ui).await?,
+            0 => run_agent_runtime_flow(paths, ui, readiness.as_ref(), probe).await?,
             1 => run_coding_project_flow(paths, ui).await?,
             2 => {
                 ui.message(SETUP_COMPLETE_LINE);
@@ -438,17 +513,31 @@ pub async fn run_setup_wizard(
     }
 }
 
-/// Menu label for the Agent Runtime entry; the `[Configured]` marker comes
-/// exclusively from the shared read-only readiness view model.
-pub fn agent_runtime_menu_label(configured: Option<bool>) -> String {
-    match configured {
-        Some(true) => format!("{AGENT_RUNTIME_MENU_LABEL}{CONFIGURED_MARK}"),
-        _ => AGENT_RUNTIME_MENU_LABEL.to_string(),
+/// State-aware menu label for the Agent Runtime entry, driven exclusively by
+/// the shared read-only readiness view model (never CLI guesses):
+/// - canonical Server Target absent => `Install CEO Agent Runtime`;
+/// - Server Target exists but this Device is not locally connected =>
+///   `Connect CEO Agent Runtime to this computer`;
+/// - local checkout connected but executor missing => honest partial state
+///   `CEO Agent Runtime [Execution agent required]`;
+/// - local checkout + binding/default + executor ready =>
+///   `CEO Agent Runtime [Configured]`.
+pub fn agent_runtime_menu_label(readiness: Option<&SetupReadiness>) -> String {
+    match readiness {
+        None => AGENT_RUNTIME_LABEL_UNKNOWN_STATE.to_string(),
+        Some(r) => match (r.server_target_exists, r.device_connected, r.executor_ready) {
+            (false, _, _) => AGENT_RUNTIME_LABEL_INSTALL.to_string(),
+            (true, false, _) => AGENT_RUNTIME_LABEL_CONNECT.to_string(),
+            (true, true, false) => {
+                format!("{AGENT_RUNTIME_LABEL_BASE}{AGENT_RUNTIME_LABEL_EXECUTOR_MARK}")
+            }
+            (true, true, true) => format!("{AGENT_RUNTIME_LABEL_BASE}{CONFIGURED_MARK}"),
+        },
     }
 }
 
 // ---------------------------------------------------------------------------
-// Flow: Enable CEO Agent Runtime
+// Flow: Install / Connect the CEO Agent Runtime
 // ---------------------------------------------------------------------------
 
 /// Authentication/config corruption class failures where continuing setup is
@@ -464,22 +553,93 @@ fn is_fatal_setup_error(err: &SetupError) -> bool {
     )
 }
 
+/// Read-only classification of a resolved runtime path input (PROJECT-036
+/// Slice 4 path-UX contract). Pure filesystem/git inspection; never mutates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePathResolution {
+    /// Absent path: the official repository can be cloned there.
+    Missing,
+    /// Existing verified official checkout: reuse it directly.
+    VerifiedCheckout,
+    /// Existing directory that itself contains a verified official checkout
+    /// at the canonical child path (`<entered>/ceo-agent-runtime`): suggest
+    /// that child (targeted guidance, not a generic error).
+    ChildCheckout { child: PathBuf },
+    /// Existing directory without the canonical child: propose the explicit
+    /// derived child path for confirmation; the parent is never overwritten
+    /// or deleted.
+    ParentWithoutChild { child: PathBuf },
+    /// Existing path that is not a verified runtime checkout: fail closed
+    /// (setup never overwrites/deletes user files).
+    Conflict,
+}
+
+pub fn resolve_runtime_path_input(resolved: &Path) -> RuntimePathResolution {
+    match std::fs::symlink_metadata(resolved) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RuntimePathResolution::Missing,
+        Ok(meta) => {
+            if meta.is_symlink() || !resolved.is_dir() {
+                return RuntimePathResolution::Conflict;
+            }
+            if verify_runtime_repo(resolved) {
+                return RuntimePathResolution::VerifiedCheckout;
+            }
+            let child = resolved.join(AGENT_RUNTIME_TARGET_ALIAS);
+            let child_exists = std::fs::symlink_metadata(&child)
+                .map(|m| !m.is_symlink() && child.is_dir())
+                .unwrap_or(false);
+            if child_exists && verify_runtime_repo(&child) {
+                RuntimePathResolution::ChildCheckout { child }
+            } else if !child_exists && !is_inside_git_work_tree(resolved) {
+                // A plain parent-like directory (e.g. `~/codes/`) proposes the
+                // explicit derived child path; an existing unrelated git
+                // repository (or any directory inside one) stays fail-closed.
+                RuntimePathResolution::ParentWithoutChild { child }
+            } else {
+                RuntimePathResolution::Conflict
+            }
+        }
+        Err(_) => RuntimePathResolution::Conflict,
+    }
+}
+
+fn verify_runtime_repo(path: &Path) -> bool {
+    crate::targets::verify_local_repo_full_name(path, AGENT_RUNTIME_REPO_FULL_NAME).is_ok()
+}
+
+/// True when `dir` is inside any Git work tree (repo toplevel or deeper).
+/// Read-only probe used to keep existing unrelated repositories fail-closed
+/// instead of proposing a derived child path inside them.
+fn is_inside_git_work_tree(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 async fn run_agent_runtime_flow(
     paths: &ConnectorPaths,
     ui: &mut dyn SetupUi,
+    readiness: Option<&SetupReadiness>,
+    probe: &ExecutableProbe,
 ) -> Result<(), SetupFrontendError> {
-    ui.message("Enable the CEO Agent Runtime for this computer.");
+    // State-aware intro: a Server Target already existing does NOT mean this
+    // Device is locally configured. Explain the connect-this-computer step.
+    if readiness.map(|r| r.server_target_exists).unwrap_or(false) {
+        ui.message(AGENT_RUNTIME_EXISTING_EXPLANATION);
+    } else {
+        ui.message("Install the CEO Agent Runtime for this computer.");
+    }
     let mut current_raw: Option<String> = None;
 
     loop {
-        // 1. Path prompt with Tab completion; edit loop re-offers the last
-        // accepted input as the default.
+        // 1. Path prompt for the EXACT checkout folder, with the full
+        // intended default path as the actual editable buffer; Tab
+        // completion operates on that visible buffer.
         let default = current_raw.clone().or_else(default_agent_runtime_path);
-        let raw = match ui.text(
-            "Path to install the CEO Agent Runtime:",
-            default.as_deref(),
-            true,
-        ) {
+        let raw = match ui.text(AGENT_RUNTIME_PATH_PROMPT, default.as_deref(), true) {
             Ok(text) => text,
             Err(UiError::Cancelled) => return Ok(()),
             Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
@@ -499,9 +659,66 @@ async fn run_agent_runtime_flow(
         };
         current_raw = Some(raw);
 
-        // 3. Concise confirmation (arrow-select; Cancel returns to menu).
+        // 3. Targeted path resolution (exact reuse / child suggestion /
+        // derived child proposal / fail-closed conflict).
+        let target_path: PathBuf = match resolve_runtime_path_input(&resolved) {
+            RuntimePathResolution::Missing | RuntimePathResolution::VerifiedCheckout => resolved,
+            RuntimePathResolution::ChildCheckout { child } => {
+                ui.message(&format!(
+                    "Found an existing CEO Agent Runtime checkout at '{}'.",
+                    child.display()
+                ));
+                let options = vec![
+                    "Use this checkout".to_string(),
+                    "Edit path".to_string(),
+                    "Cancel".to_string(),
+                ];
+                match ui.select(AGENT_RUNTIME_EXISTING_CHECKOUT_PROMPT, &options) {
+                    Ok(0) => child,
+                    Ok(1) => continue,
+                    Ok(_) => return Ok(()),
+                    Err(UiError::Cancelled) => return Ok(()),
+                    Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                }
+            }
+            RuntimePathResolution::ParentWithoutChild { child } => {
+                ui.message(&format!(
+                    "'{}' is not a CEO Agent Runtime checkout; it was not modified.",
+                    resolved.display()
+                ));
+                ui.message(&format!(
+                    "Setup can place the runtime at '{}' by cloning the official repository there.",
+                    child.display()
+                ));
+                let options = vec![
+                    format!("Use {}", child.display()),
+                    "Edit path".to_string(),
+                    "Cancel".to_string(),
+                ];
+                match ui.select(AGENT_RUNTIME_DERIVED_CHILD_PROMPT, &options) {
+                    Ok(0) => child,
+                    Ok(1) => continue,
+                    Ok(_) => return Ok(()),
+                    Err(UiError::Cancelled) => return Ok(()),
+                    Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                }
+            }
+            RuntimePathResolution::Conflict => {
+                ui.error(AGENT_RUNTIME_CONFLICT_ERROR);
+                let options = vec!["Edit path".to_string(), "Cancel".to_string()];
+                match ui.select("How would you like to proceed?", &options) {
+                    Ok(0) => continue,
+                    Ok(_) => return Ok(()),
+                    Err(UiError::Cancelled) => return Ok(()),
+                    Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                }
+            }
+        };
+        current_raw = Some(target_path.to_string_lossy().into_owned());
+
+        // 4. Concise confirmation (arrow-select; Cancel returns to menu).
         ui.message("CEO Agent Runtime");
-        ui.message(&format!("Path: {}", resolved.display()));
+        ui.message(&format!("Path: {}", target_path.display()));
         let confirm = vec![
             "Continue".to_string(),
             "Edit path".to_string(),
@@ -514,10 +731,23 @@ async fn run_agent_runtime_flow(
         };
         match choice {
             0 => {
-                // 4. Delegate ONLY to the shared setup application service.
-                match ensure_agent_runtime(paths, &resolved).await {
+                // 5. Delegate ONLY to the shared setup application service.
+                match ensure_agent_runtime(paths, &target_path).await {
                     Ok(outcome) => {
                         render_outcome(ui, &outcome, true);
+                        // 6. Fresh-device executor onboarding: close the
+                        // Doctor/runnability gap with a minimal local launch
+                        // configuration (agent name + command only).
+                        let needs_executor = match assess_agent_runtime_readiness(paths).await {
+                            Ok(r) => r.device_connected && !r.executor_ready,
+                            Err(_) => false,
+                        };
+                        if needs_executor {
+                            let configured = run_executor_config_flow(paths, ui, probe).await?;
+                            if !configured {
+                                ui.message(EXECUTOR_SKIPPED_LINE);
+                            }
+                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -531,6 +761,64 @@ async fn run_agent_runtime_flow(
             }
             1 => continue,      // edit path: no mutation
             _ => return Ok(()), // cancel: back to top-level menu
+        }
+    }
+}
+
+/// Executor onboarding sub-flow (Device-local launch configuration ONLY):
+/// prompts for the human agent name and command (never a target UUID) and
+/// delegates to the shared `configure_agent_runtime_executor` core. Returns
+/// `Ok(false)` when the user cancels — the runtime stays explicitly
+/// incomplete and Finish/Doctor will report it honestly.
+async fn run_executor_config_flow(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    probe: &ExecutableProbe,
+) -> Result<bool, SetupFrontendError> {
+    ui.message(EXECUTOR_EXPLAIN_LINE);
+    // Convenient prefilled suggestion ONLY when the executable actually
+    // exists on this machine; always editable; never a global allowlist.
+    let suggestion = if probe(AGENT_COMMAND_SUGGESTION) {
+        Some(AGENT_COMMAND_SUGGESTION)
+    } else {
+        None
+    };
+
+    loop {
+        let name_raw = match ui.text(EXECUTOR_NAME_PROMPT, suggestion, false) {
+            Ok(text) => text,
+            Err(UiError::Cancelled) => return Ok(false),
+            Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+        };
+        let name = name_raw.trim().to_string();
+        if name.is_empty() {
+            ui.error("Agent name cannot be empty.");
+            continue;
+        }
+
+        let command_raw = match ui.text(EXECUTOR_COMMAND_PROMPT, suggestion, false) {
+            Ok(text) => text,
+            Err(UiError::Cancelled) => return Ok(false),
+            Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+        };
+        let command = command_raw.trim().to_string();
+        if command.is_empty() {
+            ui.error("Agent command cannot be empty.");
+            continue;
+        }
+
+        match configure_agent_runtime_executor(paths, &name, &command).await {
+            Ok(outcome) => {
+                render_executor_outcome(ui, &outcome);
+                return Ok(true);
+            }
+            Err(e) => {
+                if is_fatal_setup_error(&e) {
+                    return Err(e.into());
+                }
+                // Recoverable validation/domain error: re-prompt honestly.
+                ui.error(&format!("Could not configure the execution agent: {e}"));
+            }
         }
     }
 }
@@ -595,54 +883,128 @@ async fn run_coding_project_flow(
         }
         let path_value = resolved.clone().unwrap_or_default();
 
-        // 3. Confirmation (arrow-select; Cancel returns to menu).
-        ui.message("Coding project");
-        ui.message(&format!("Name: {name_value}"));
-        ui.message(&format!("Path: {}", path_value.display()));
-        let confirm = vec![
-            "Create / Bind".to_string(),
-            "Edit name".to_string(),
-            "Edit path".to_string(),
-            "Cancel".to_string(),
-        ];
-        let choice = match ui.select("Confirm the coding project", &confirm) {
-            Ok(i) => i,
-            Err(UiError::Cancelled) => return Ok(()),
-            Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
-        };
-        match choice {
-            0 => {
-                // 4. Delegate ONLY to the shared setup application service.
-                match ensure_coding_target(paths, &name_value, &path_value).await {
-                    Ok(outcome) => {
-                        render_outcome(ui, &outcome, false);
-                        return Ok(());
+        // 3. Missing directory is a PRODUCT FLOW, not a late error (PROJECT-036
+        // Slice 4): decide BEFORE any Server Target registration/binding
+        // mutation. The frontend performs read-only checks only; every
+        // filesystem/server mutation is delegated to the shared core.
+        let policy = match std::fs::symlink_metadata(&path_value) {
+            Ok(meta) if meta.is_symlink() || !path_value.is_dir() => {
+                ui.error(&format!(
+                    "Path '{}' exists but is not a directory. Setup never overwrites or deletes existing files.",
+                    path_value.display()
+                ));
+                let options = vec!["Edit path".to_string(), "Cancel".to_string()];
+                match ui.select("How would you like to proceed?", &options) {
+                    Ok(0) => {
+                        resolved = None;
+                        continue;
                     }
-                    Err(e) => {
-                        if is_fatal_setup_error(&e) {
-                            return Err(e.into());
+                    Ok(_) => return Ok(()),
+                    Err(UiError::Cancelled) => return Ok(()),
+                    Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                }
+            }
+            Ok(_) => CodingPathPolicy::MustExist,
+            Err(_) => CodingPathPolicy::CreateIfMissing,
+        };
+
+        if policy == CodingPathPolicy::CreateIfMissing {
+            ui.message(&format!("Path: {}", path_value.display()));
+            let options = vec![
+                "Create".to_string(),
+                "Edit path".to_string(),
+                "Cancel".to_string(),
+            ];
+            match ui.select(CODING_DIR_MISSING_PROMPT, &options) {
+                Ok(0) => {
+                    // Create confirmed: delegate to the shared setup
+                    // application core, which safely creates the directory
+                    // and then performs the exact-alias ensure/bind/mapping.
+                    match ensure_coding_target_with_policy(
+                        paths,
+                        &name_value,
+                        &path_value,
+                        CodingPathPolicy::CreateIfMissing,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            render_outcome(ui, &outcome, false);
+                            return Ok(());
                         }
-                        // Recoverable input/domain error: correct it without
-                        // restarting the whole setup process.
-                        ui.error(&format!("Could not add the coding project: {e}"));
-                        let options = vec![
-                            "Edit name".to_string(),
-                            "Edit path".to_string(),
-                            "Back to setup menu".to_string(),
-                        ];
-                        match ui.select("How would you like to proceed?", &options) {
-                            Ok(0) => name = None,
-                            Ok(1) => resolved = None,
-                            Err(UiError::Cancelled) => return Ok(()),
-                            Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
-                            _ => return Ok(()),
+                        Err(e) => {
+                            if is_fatal_setup_error(&e) {
+                                return Err(e.into());
+                            }
+                            ui.error(&format!("Could not add the coding project: {e}"));
+                            let options = vec![
+                                "Edit name".to_string(),
+                                "Edit path".to_string(),
+                                "Back to setup menu".to_string(),
+                            ];
+                            match ui.select("How would you like to proceed?", &options) {
+                                Ok(0) => name = None,
+                                Ok(1) => resolved = None,
+                                Err(UiError::Cancelled) => return Ok(()),
+                                Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                                _ => return Ok(()),
+                            }
                         }
                     }
                 }
+                Ok(_) | Err(UiError::Cancelled) => return Ok(()), // cancel/edit exit: zero Server mutation
+                Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
             }
-            1 => name = None,
-            2 => resolved = None,
-            _ => return Ok(()), // cancel: back to top-level menu
+        } else {
+            // 4. Existing directory: confirmation (arrow-select; Cancel
+            // returns to menu), then the shared core with MustExist policy.
+            ui.message("Coding project");
+            ui.message(&format!("Name: {name_value}"));
+            ui.message(&format!("Path: {}", path_value.display()));
+            let confirm = vec![
+                "Create / Bind".to_string(),
+                "Edit name".to_string(),
+                "Edit path".to_string(),
+                "Cancel".to_string(),
+            ];
+            let choice = match ui.select("Confirm the coding project", &confirm) {
+                Ok(i) => i,
+                Err(UiError::Cancelled) => return Ok(()),
+                Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+            };
+            match choice {
+                0 => {
+                    match ensure_coding_target(paths, &name_value, &path_value).await {
+                        Ok(outcome) => {
+                            render_outcome(ui, &outcome, false);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            if is_fatal_setup_error(&e) {
+                                return Err(e.into());
+                            }
+                            // Recoverable input/domain error: correct it without
+                            // restarting the whole setup process.
+                            ui.error(&format!("Could not add the coding project: {e}"));
+                            let options = vec![
+                                "Edit name".to_string(),
+                                "Edit path".to_string(),
+                                "Back to setup menu".to_string(),
+                            ];
+                            match ui.select("How would you like to proceed?", &options) {
+                                Ok(0) => name = None,
+                                Ok(1) => resolved = None,
+                                Err(UiError::Cancelled) => return Ok(()),
+                                Err(UiError::Failed(e)) => return Err(SetupFrontendError::Ui(e)),
+                                _ => return Ok(()),
+                            }
+                        }
+                    }
+                }
+                1 => name = None,
+                2 => resolved = None,
+                _ => return Ok(()), // cancel: back to top-level menu
+            }
         }
     }
 }
@@ -678,7 +1040,16 @@ fn render_outcome(ui: &mut dyn SetupUi, outcome: &SetupTargetOutcome, is_runtime
             outcome.local_path,
         ));
     } else {
-        ui.message(&format!("  Local path in use: '{}'.", outcome.local_path));
+        // Honest local-directory provenance: created vs reused.
+        ui.message(&format!(
+            "  Local directory {} at '{}'.",
+            if outcome.directory_created {
+                "created"
+            } else {
+                "reused (existing directory)"
+            },
+            outcome.local_path,
+        ));
     }
     ui.message(&format!(
         "  This device is {} it.",
@@ -697,6 +1068,24 @@ fn render_outcome(ui: &mut dyn SetupUi, outcome: &SetupTargetOutcome, is_runtime
                 "already set to this target"
             },
         ));
+    }
+}
+
+fn render_executor_outcome(ui: &mut dyn SetupUi, outcome: &crate::setup::ConfigureExecutorOutcome) {
+    if outcome.executor_created {
+        ui.message(&format!(
+            "Execution agent configured for '{}': agent '{}' (command '{}').",
+            outcome.alias, outcome.agent_id, outcome.command
+        ));
+    } else {
+        // Never silently overwritten: the existing executor was reused.
+        ui.message(&format!(
+            "Execution agent for '{}' was already configured: agent '{}' (command '{}'); it was reused unchanged.",
+            outcome.alias, outcome.agent_id, outcome.command
+        ));
+    }
+    if outcome.model.is_some() {
+        ui.message("  Existing model override preserved.");
     }
 }
 
@@ -784,6 +1173,7 @@ pub async fn post_login_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::AGENT_RUNTIME_REPO_CLONE_URL;
     use inquire::Autocomplete;
 
     #[test]
@@ -975,11 +1365,12 @@ mod tests {
     #[test]
     fn handoff_decision_covers_all_branches() {
         let ready = Ok(SetupReadiness {
+            server_target_exists: true,
+            device_connected: true,
+            executor_ready: true,
             agent_runtime_configured: true,
         });
-        let unready = Ok(SetupReadiness {
-            agent_runtime_configured: false,
-        });
+        let unready = Ok(SetupReadiness::default());
         let probe_failed = Err(SetupError::GitNotFound);
 
         assert_eq!(
@@ -1005,16 +1396,179 @@ mod tests {
     }
 
     #[test]
-    fn configured_marker_follows_readiness_only() {
+    fn runtime_menu_label_is_state_aware() {
+        // Probe failed: neutral label, no state guess.
         assert_eq!(
-            agent_runtime_menu_label(Some(true)),
-            format!("{AGENT_RUNTIME_MENU_LABEL}{CONFIGURED_MARK}")
+            agent_runtime_menu_label(None),
+            AGENT_RUNTIME_LABEL_UNKNOWN_STATE
+        );
+        // Server Target absent => Install.
+        assert_eq!(
+            agent_runtime_menu_label(Some(&SetupReadiness::default())),
+            AGENT_RUNTIME_LABEL_INSTALL
+        );
+        // Server Target exists but Device not connected => Connect this
+        // computer (no ambiguous Enable wording, no server recreation).
+        assert_eq!(
+            agent_runtime_menu_label(Some(&SetupReadiness {
+                server_target_exists: true,
+                ..Default::default()
+            })),
+            AGENT_RUNTIME_LABEL_CONNECT
+        );
+        // Connected checkout but executor missing => honest partial state.
+        assert_eq!(
+            agent_runtime_menu_label(Some(&SetupReadiness {
+                server_target_exists: true,
+                device_connected: true,
+                executor_ready: false,
+                agent_runtime_configured: false,
+            })),
+            format!("{AGENT_RUNTIME_LABEL_BASE}{AGENT_RUNTIME_LABEL_EXECUTOR_MARK}")
+        );
+        // Fully runnable device => [Configured].
+        assert_eq!(
+            agent_runtime_menu_label(Some(&SetupReadiness {
+                server_target_exists: true,
+                device_connected: true,
+                executor_ready: true,
+                agent_runtime_configured: true,
+            })),
+            format!("{AGENT_RUNTIME_LABEL_BASE}{CONFIGURED_MARK}")
+        );
+    }
+
+    #[test]
+    fn runtime_path_resolution_matches_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+
+        // Absent path => clone destination.
+        assert_eq!(
+            resolve_runtime_path_input(&base.join("absent")),
+            RuntimePathResolution::Missing
+        );
+
+        // Existing verified official checkout => reuse directly.
+        let repo = base.join("ceo-agent-runtime");
+        init_test_runtime_repo(&repo);
+        assert_eq!(
+            resolve_runtime_path_input(&repo),
+            RuntimePathResolution::VerifiedCheckout
+        );
+
+        // Parent-like directory containing the verified canonical child =>
+        // targeted child suggestion.
+        let parent = base.join("codes");
+        std::fs::create_dir_all(&parent).unwrap();
+        let child = parent.join(AGENT_RUNTIME_TARGET_ALIAS);
+        init_test_runtime_repo(&child);
+        assert_eq!(
+            resolve_runtime_path_input(&parent),
+            RuntimePathResolution::ChildCheckout {
+                child: child.clone()
+            }
+        );
+
+        // Parent-like directory without the canonical child => propose the
+        // derived child path (never silently overwrite the parent).
+        let empty_parent = base.join("elsewhere");
+        std::fs::create_dir_all(&empty_parent).unwrap();
+        assert_eq!(
+            resolve_runtime_path_input(&empty_parent),
+            RuntimePathResolution::ParentWithoutChild {
+                child: empty_parent.join(AGENT_RUNTIME_TARGET_ALIAS)
+            }
+        );
+
+        // Conflicting existing path (non-runtime file/repo) => fail closed.
+        let file = base.join("plain-file.txt");
+        std::fs::write(&file, "user data\n").unwrap();
+        assert_eq!(
+            resolve_runtime_path_input(&file),
+            RuntimePathResolution::Conflict
+        );
+        let wrong_repo = base.join("wrong-repo");
+        std::fs::create_dir_all(&wrong_repo).unwrap();
+        git_init(&wrong_repo);
+        git_remote(&wrong_repo, "https://github.com/other/wrong.git");
+        assert_eq!(
+            resolve_runtime_path_input(&wrong_repo),
+            RuntimePathResolution::Conflict
+        );
+
+        // Child exists but is NOT the official checkout => still fail closed.
+        let bad_child_parent = base.join("conflicting");
+        std::fs::create_dir_all(bad_child_parent.join(AGENT_RUNTIME_TARGET_ALIAS)).unwrap();
+        git_init(&bad_child_parent.join(AGENT_RUNTIME_TARGET_ALIAS));
+        git_remote(
+            &bad_child_parent.join(AGENT_RUNTIME_TARGET_ALIAS),
+            "https://github.com/other/wrong.git",
         );
         assert_eq!(
-            agent_runtime_menu_label(Some(false)),
-            AGENT_RUNTIME_MENU_LABEL
+            resolve_runtime_path_input(&bad_child_parent),
+            RuntimePathResolution::Conflict
         );
-        assert_eq!(agent_runtime_menu_label(None), AGENT_RUNTIME_MENU_LABEL);
+    }
+
+    fn git_init(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "master"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn git_remote(dir: &Path, url: &str) {
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", "origin", url])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn init_test_runtime_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        git_init(path);
+        git_remote(path, AGENT_RUNTIME_REPO_CLONE_URL);
+        std::fs::write(path.join("README.md"), "fixture\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "add",
+                ".",
+            ])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn executable_probe_checks_path_without_shell() {
+        // `git` is guaranteed present in the test environment; a nonsense
+        // binary is not.
+        assert!(executable_in_path("git"));
+        assert!(!executable_in_path("definitely-not-a-real-binary-xyz"));
     }
 
     #[test]
@@ -1032,5 +1586,6 @@ mod tests {
         assert!(!is_fatal_setup_error(&SetupError::AmbiguousAlias(
             "x".into()
         )));
+        assert!(!is_fatal_setup_error(&SetupError::RuntimeNotConnected));
     }
 }

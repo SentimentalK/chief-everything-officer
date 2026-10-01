@@ -526,7 +526,7 @@ async fn doctor_reports_model_override_when_set() {
     let exec_check = report
         .checks
         .iter()
-        .find(|c| c.name == "Target 'tgt_model' Executor Configuration")
+        .find(|c| c.name == "Target 'model-target' Executor Configuration")
         .expect("executor configuration check present");
     assert_eq!(exec_check.severity, DiagnosticSeverity::Pass);
     assert!(exec_check.message.contains("model override 'gpt-5'"));
