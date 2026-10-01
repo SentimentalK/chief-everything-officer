@@ -15,5 +15,6 @@ pub mod paths;
 pub mod redelivery;
 pub mod render;
 pub mod scheduler;
+pub mod setup;
 pub mod status;
 pub mod targets;

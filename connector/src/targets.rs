@@ -136,6 +136,19 @@ pub fn verify_local_repository(
     path: &Path,
     expected_repo: &TargetRepositoryPart,
 ) -> Result<(), TargetError> {
+    verify_local_repo_full_name(path, &expected_repo.full_name)
+}
+
+/// Verifies that `path` is an existing directory, that it is the top-level of a Git repository,
+/// and that its `origin` remote normalizes to `expected_full_name` (e.g. "owner/repo").
+///
+/// Shared by `verify_local_repository` and the setup application services
+/// (which verify a repository by full name without any Server repository
+/// metadata, e.g. the canonical CEO Agent Runtime repository).
+pub fn verify_local_repo_full_name(
+    path: &Path,
+    expected_full_name: &str,
+) -> Result<(), TargetError> {
     if !path.is_dir() {
         return Err(TargetError::PathNotFound(path.display().to_string()));
     }
@@ -187,12 +200,12 @@ pub fn verify_local_repository(
         .to_string();
     let normalized = normalize_github_remote(&remote_url).unwrap_or_else(|| remote_url.clone());
 
-    let expected_normalized = expected_repo.full_name.to_lowercase();
+    let expected_normalized = expected_full_name.to_lowercase();
     let actual_normalized = normalized.to_lowercase();
 
     if expected_normalized != actual_normalized {
         return Err(TargetError::RepositoryMismatch {
-            expected: expected_repo.full_name.clone(),
+            expected: expected_full_name.to_string(),
             actual: normalized,
         });
     }
@@ -200,7 +213,11 @@ pub fn verify_local_repository(
     Ok(())
 }
 
-fn check_active_attempt_target_in_use(
+/// Fail-fast local guard: refuses when `target_id` is currently in use by an
+/// active attempt (TARGET_IN_USE). Shared by target management commands and
+/// the setup application services (which re-check it under `state.lock`
+/// before any local config mutation).
+pub fn check_active_attempt_target_in_use(
     paths: &ConnectorPaths,
     target_id: &str,
 ) -> Result<(), TargetError> {

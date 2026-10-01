@@ -75,20 +75,23 @@ impl MockServer {
                     let mut buf = vec![0u8; 32768];
                     let mut total_read = 0;
 
-                    // Read initial headers
-                    let Ok(n) = socket.read(&mut buf[total_read..]).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    total_read += n;
-
-                    // Simple HTTP parser
-                    let header_end = buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n");
-
-                    let Some(end_idx) = header_end else {
-                        return;
+                    // Read until the end of headers. A single TCP read may
+                    // return a partial segment, so loop until the blank line
+                    // separating headers from the body has arrived.
+                    let end_idx = loop {
+                        if total_read >= buf.len() {
+                            return;
+                        }
+                        match socket.read(&mut buf[total_read..]).await {
+                            Ok(0) => return,
+                            Ok(n) => total_read += n,
+                            Err(_) => return,
+                        }
+                        if let Some(pos) =
+                            buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            break pos;
+                        }
                     };
 
                     let header_str = String::from_utf8_lossy(&buf[..end_idx]);
@@ -157,12 +160,17 @@ impl MockServer {
                     for (k, v) in resp.headers {
                         resp_bytes.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
                     }
+                    // Force the client to open a fresh connection per request:
+                    // this mock handles exactly one request per connection, so
+                    // keep-alive reuse must be disabled explicitly.
+                    resp_bytes.extend_from_slice(b"Connection: close\r\n");
                     resp_bytes.extend_from_slice(
                         format!("Content-Length: {}\r\n\r\n", resp.body.len()).as_bytes(),
                     );
                     resp_bytes.extend_from_slice(&resp.body);
 
                     let _ = socket.write_all(&resp_bytes).await;
+                    let _ = socket.shutdown().await;
                 });
             }
         });
