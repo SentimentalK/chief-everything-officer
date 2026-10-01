@@ -26,6 +26,11 @@ pub enum Commands {
         /// Do not automatically open the browser for approval
         #[arg(long, default_value_t = false)]
         no_open: bool,
+
+        /// Skip the guided setup handoff after successful authentication
+        /// (explicit escape hatch for scripts/automation)
+        #[arg(long, default_value_t = false)]
+        no_setup: bool,
     },
 
     /// Revoke this device's credential and logout locally
@@ -65,6 +70,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// Guided, interactive device setup (arrow-key menus)
+    Setup,
 
     /// Redeliver a managed result to the server
     Redeliver {

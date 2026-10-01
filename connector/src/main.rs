@@ -31,12 +31,45 @@ async fn main() -> ExitCode {
             server,
             name,
             no_open,
+            no_setup,
         } => {
-            if let Err(e) =
-                ceo_connector::enrollment::login_flow(&paths, &server, name, no_open).await
-            {
-                eprintln!("Login failed: {}", e);
-                return ExitCode::FAILURE;
+            match ceo_connector::enrollment::login_flow(&paths, &server, name, no_open).await {
+                Ok(_outcome) => {
+                    // Post-login onboarding handoff (PROJECT-036 Slice 3).
+                    // Never invalidates the successful authentication above.
+                    let interactive = ceo_connector::setup_frontend::is_interactive_terminal();
+                    let mut ui = ceo_connector::setup_frontend::TerminalUi;
+                    match ceo_connector::setup_frontend::post_login_handoff(
+                        &paths,
+                        no_setup,
+                        interactive,
+                        &mut ui,
+                    )
+                    .await
+                    {
+                        Ok(None) => {}
+                        Ok(Some(ceo_connector::setup_frontend::SetupCompletion::Finished {
+                            doctor_passed,
+                        })) => {
+                            if !doctor_passed {
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        Ok(Some(ceo_connector::setup_frontend::SetupCompletion::Cancelled)) => {
+                            println!(
+                                "Setup is incomplete. Resume anytime with `ceo-connector setup`."
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Setup failed: {}", e);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Login failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
             }
         }
         Commands::Logout => {
@@ -271,6 +304,30 @@ async fn main() -> ExitCode {
             let report = ceo_connector::doctor::run_doctor(&paths, json).await;
             if !report.overall_passed {
                 return ExitCode::FAILURE;
+            }
+        }
+        Commands::Setup => {
+            // Interactive-terminal contract: fail fast/actionably on a
+            // non-TTY; never hang, never fall back to numeric menus.
+            if !ceo_connector::setup_frontend::is_interactive_terminal() {
+                eprintln!(
+                    "Error: `ceo-connector setup` requires an interactive terminal (stdin and stdout attached to a TTY). Re-run it inside a normal terminal session. (SETUP_INTERACTIVE_TTY_REQUIRED)"
+                );
+                return ExitCode::FAILURE;
+            }
+            let mut ui = ceo_connector::setup_frontend::TerminalUi;
+            match ceo_connector::setup_frontend::run_standalone_setup(
+                &paths,
+                &mut ui,
+                &ceo_connector::setup_frontend::ProductionDoctor,
+            )
+            .await
+            {
+                Ok(exit) => return exit,
+                Err(e) => {
+                    eprintln!("Setup failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
             }
         }
         Commands::Redeliver { job_id, attempt } => {

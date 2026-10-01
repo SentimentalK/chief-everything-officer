@@ -1,6 +1,6 @@
 [package]
 name = "ceo-connector"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,10 @@ base64 = "0.22"
 async-trait = "0.1"
 serde_json_canonicalizer = "0.3.2"
 dirs = "5.0"
+# Guided-setup frontend: one small, mature, cross-platform terminal prompt
+# backend (crossterm) providing arrow-key Select + editable Text with Tab
+# completion. Unneeded features stay disabled to keep the footprint small.
+inquire = { version = "0.7", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
 tempfile = "3.12"

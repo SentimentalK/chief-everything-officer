@@ -16,6 +16,19 @@ use crate::paths::ConnectorPaths;
 
 pub const ENROLLMENT_SCHEMA_VERSION: u32 = 1;
 
+/// Typed outcome of a completed login (PROJECT-036 Slice 3). Pure domain
+/// data: it tells the CLI whether authentication succeeded/reused without
+/// coupling enrollment business logic into setup semantics. The caller owns
+/// any setup handoff decision.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoginOutcome {
+    /// Server-verified device identity of the authenticated credential.
+    pub device_id: String,
+    /// True when this login newly completed enrollment; false when an
+    /// existing valid credential was reused.
+    pub newly_enrolled: bool,
+}
+
 #[derive(Error, Debug)]
 pub enum EnrollmentError {
     #[error("IO error: {0}")]
@@ -147,12 +160,16 @@ pub fn default_platform() -> &'static str {
 }
 
 /// Executes the `ceo-connector login` flow with crash recovery and coexistence rules.
+///
+/// Returns the typed [`LoginOutcome`] so the CLI can decide whether to hand
+/// off to the guided setup frontend; enrollment itself never absorbs
+/// Target/clone/setup semantics.
 pub async fn login_flow(
     paths: &ConnectorPaths,
     server_input: &str,
     display_name_override: Option<String>,
     no_open: bool,
-) -> Result<(), EnrollmentError> {
+) -> Result<LoginOutcome, EnrollmentError> {
     paths.ensure_dirs()?;
     let server_origin = normalize_server_origin(server_input)?;
     let client = ConnectorClient::new(&server_origin)?;
@@ -204,7 +221,10 @@ pub async fn login_flow(
                         ));
                     }
                     println!("Already logged in as device '{}'.", cred.device_id);
-                    return Ok(());
+                    return Ok(LoginOutcome {
+                        device_id: cred.device_id.clone(),
+                        newly_enrolled: false,
+                    });
                 }
             }
             Err(ClientError::Unauthorized) => {
@@ -220,7 +240,10 @@ pub async fn login_flow(
                         && ident.credential.id == cred.credential_id
                     {
                         println!("Already logged in as device '{}'.", cred.device_id);
-                        return Ok(());
+                        return Ok(LoginOutcome {
+                            device_id: cred.device_id.clone(),
+                            newly_enrolled: false,
+                        });
                     }
                 }
                 Err(ClientError::Unauthorized) => {
@@ -376,7 +399,10 @@ pub async fn login_flow(
                     "Successfully authenticated as device '{}'!",
                     final_cred.device_id
                 );
-                return Ok(());
+                return Ok(LoginOutcome {
+                    device_id: final_cred.device_id.clone(),
+                    newly_enrolled: true,
+                });
             }
         }
     }

@@ -635,6 +635,118 @@ pub async fn ensure_coding_target(
 }
 
 // ---------------------------------------------------------------------------
+// Read-only setup readiness view model (PROJECT-036 Slice 3)
+// ---------------------------------------------------------------------------
+
+/// Read-only view of how far the canonical Agent Runtime setup has converged
+/// for this device. Used ONLY to decide onboarding UX (configured markers in
+/// the guided setup menu and the login handoff). Doctor remains the complete
+/// diagnostics/readiness authority for Git, Orca, executor availability,
+/// credentials, server health, etc.; this is NOT a second Doctor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SetupReadiness {
+    /// True when, from authoritative/current state:
+    /// - the device is logged in;
+    /// - the single current workspace is resolvable (Slice-2 semantics);
+    /// - the canonical Server Target alias `ceo-agent-runtime` exists with
+    ///   kind=coding and is enabled;
+    /// - this Device has an active binding for it;
+    /// - it is the workspace default Agent Runtime;
+    /// - the schema-v3 local config maps its immutable target_id;
+    /// - the mapped local path exists and verifies as
+    ///   `SentimentalK/ceo-agent-runtime`.
+    ///
+    /// Executor/model overrides are intentionally NOT required: setup does
+    /// not manage Agent/provider/model configuration.
+    pub agent_runtime_configured: bool,
+}
+
+impl SetupReadiness {
+    /// Conservative onboarding decision: any missing runtime-setup fact
+    /// means the device still needs guided setup.
+    pub fn needs_setup(&self) -> bool {
+        !self.agent_runtime_configured
+    }
+}
+
+/// Probes the current Agent Runtime setup readiness. Returns Err only when
+/// readiness cannot be determined (Server unreachable, invalid local state),
+/// so the login handoff can keep a completed authentication successful while
+/// reporting that the probe failed. Zero/multiple workspaces never invent a
+/// workspace here: they simply report "not configured", and the explicit
+/// setup errors surface when setup actually runs.
+pub async fn assess_agent_runtime_readiness(
+    paths: &ConnectorPaths,
+) -> Result<SetupReadiness, SetupError> {
+    let not_ready = SetupReadiness {
+        agent_runtime_configured: false,
+    };
+
+    // Logged-in bound profile (migrates/validates the schema-v3 config and
+    // reuses the shared origin-mismatch semantics). Not logged in is a
+    // missing fact (=> needs setup), not a probe failure.
+    let profile = match load_bound_profile(paths) {
+        Ok(p) => p,
+        Err(ProfileError::NotLoggedIn | ProfileError::ConfigNotFound) => return Ok(not_ready),
+        Err(e) => return Err(e.into()),
+    };
+    let cred = profile.credential;
+
+    let client = match ConnectorClient::new(&cred.server_origin) {
+        Ok(c) => c,
+        Err(e) => return Err(SetupError::Client(e)),
+    };
+
+    let workspaces = match client.list_workspaces(&cred).await {
+        Ok(w) => w,
+        Err(e) => return Err(SetupError::Client(e)),
+    };
+    let workspace = match workspaces.len() {
+        1 => &workspaces[0],
+        _ => return Ok(not_ready),
+    };
+
+    let catalogue = match client.list_targets(&cred, Some(&workspace.id)).await {
+        Ok(t) => t,
+        Err(e) => return Err(SetupError::Client(e)),
+    };
+    let canonical = match catalogue
+        .iter()
+        .find(|t| t.alias == AGENT_RUNTIME_TARGET_ALIAS)
+    {
+        Some(t) => t,
+        None => return Ok(not_ready),
+    };
+    if canonical.kind != TARGET_KIND_CODING || canonical.disabled {
+        return Ok(not_ready);
+    }
+    let binding_active = canonical
+        .this_device_binding
+        .as_ref()
+        .map(|b| b.enabled)
+        .unwrap_or(false);
+    if !binding_active || !canonical.is_default_agent_runtime {
+        return Ok(not_ready);
+    }
+
+    let local = match profile.config.targets.get(&canonical.target_id) {
+        Some(lt) => lt,
+        None => return Ok(not_ready),
+    };
+    let path = Path::new(&local.local_path);
+    if !path.exists() || !path.is_dir() {
+        return Ok(not_ready);
+    }
+    if verify_local_repo_full_name(path, AGENT_RUNTIME_REPO_FULL_NAME).is_err() {
+        return Ok(not_ready);
+    }
+
+    Ok(SetupReadiness {
+        agent_runtime_configured: true,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests (pure logic + git command construction)
 // ---------------------------------------------------------------------------
 

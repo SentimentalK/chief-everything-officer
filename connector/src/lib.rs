@@ -16,5 +16,6 @@ pub mod redelivery;
 pub mod render;
 pub mod scheduler;
 pub mod setup;
+pub mod setup_frontend;
 pub mod status;
 pub mod targets;
