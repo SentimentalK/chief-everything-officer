@@ -24,7 +24,7 @@ use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 use super::PrivacyStatus;
@@ -418,25 +418,6 @@ pub fn reject_reparse_target(path: &Path) -> io::Result<()> {
                 path.display()
             ),
         ));
-    }
-    Ok(())
-}
-
-/// Rejects if any existing component in `path` or its ancestors is a reparse
-/// point.
-pub fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        if is_reparse_point(&current)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "control ancestor is a reparse point (symlink/junction): {}",
-                    current.display()
-                ),
-            ));
-        }
     }
     Ok(())
 }

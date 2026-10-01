@@ -18,6 +18,7 @@
 //!   instead of POSIX rename, and a documented durability envelope.
 
 use std::fs::File;
+use std::path::Path;
 
 use fs2::FileExt;
 
@@ -77,6 +78,45 @@ pub enum PrivacyStatus {
         /// offending ACL fact (Windows).
         detail: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Reparse-point (symlink / junction / mount point) defense
+// ---------------------------------------------------------------------------
+
+/// Ancestor components that are part of OS-managed trusted prefixes are
+/// allowed to be reparse points: on macOS, `$TMPDIR` lives under the system
+/// symlink `/var -> /private/var`, and the user home chain is OS-managed.
+/// Planted symlinks INSIDE the trusted prefix (i.e. in the Connector-owned
+/// territory between home and connector root) are still rejected.
+fn is_trusted_prefix_component(current: &Path) -> bool {
+    let mut trusted: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        trusted.push(home);
+    }
+    trusted.push(std::env::temp_dir());
+    trusted.iter().any(|t| t.starts_with(current))
+}
+
+/// Rejects if any existing component in `path` or its ancestors is a reparse
+/// point (symlink/junction/mount point), except for components that belong
+/// to the OS-managed home/temp prefix chains (see
+/// [`is_trusted_prefix_component`]).
+pub fn reject_reparse_ancestors(path: &Path) -> std::io::Result<()> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if is_reparse_point(&current)? && !is_trusted_prefix_component(&current) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "control ancestor is a symlink or reparse point: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -140,5 +180,15 @@ mod tests {
             platform_name(),
             "linux" | "macos" | "windows" | "unknown"
         ));
+    }
+
+    /// Cross-platform regression: the OS-managed temp prefix chain (macOS
+    /// `/var -> /private/var` etc.) must be accepted; only planted reparse
+    /// points inside user-controlled territory are rejected.
+    #[test]
+    fn os_temp_prefix_ancestors_are_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let deep = temp.path().join("a/b/c");
+        assert!(reject_reparse_ancestors(&deep).is_ok());
     }
 }

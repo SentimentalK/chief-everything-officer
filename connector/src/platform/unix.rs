@@ -10,7 +10,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::PrivacyStatus;
 
@@ -111,27 +111,14 @@ pub fn reject_reparse_target(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Rejects if any existing component in `path` or its ancestors is a symlink.
-pub fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("control ancestor is a symlink: {}", current.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // If an intermediate directory does not exist yet, it will be created as a real dir.
-                break;
-            }
-            Err(e) => return Err(e),
-        }
+/// True when `path` exists and is a symlink. Missing paths are not reparse
+/// points (they will be created as real directories).
+pub fn is_reparse_point(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.file_type().is_symlink()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +210,7 @@ mod tests {
 
         assert!(reject_reparse_target(&link_dir).is_err());
         assert!(reject_reparse_target(&target_dir).is_ok());
+        use crate::platform::reject_reparse_ancestors;
         assert!(reject_reparse_ancestors(&link_dir.join("connector")).is_err());
         assert!(reject_reparse_ancestors(&target_dir.join("connector")).is_ok());
         // Non-existent paths stay acceptable (they will be created as real dirs).
