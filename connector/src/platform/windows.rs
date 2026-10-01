@@ -391,7 +391,9 @@ fn get_file_attributes(path: &Path) -> io::Result<u32> {
     }
 }
 
-fn is_reparse_point(path: &Path) -> io::Result<bool> {
+/// True when `path` exists and carries the reparse-point attribute
+/// (symlink/junction/mount point). Missing paths are not reparse points.
+pub fn is_reparse_point(path: &Path) -> io::Result<bool> {
     match get_file_attributes(path) {
         Ok(attrs) => Ok(attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0),
         Err(e) if is_not_found(&e) => Ok(false),
@@ -516,6 +518,7 @@ mod tests {
 
         assert!(reject_reparse_target(&link_dir).is_err());
         assert!(reject_reparse_target(&target_dir).is_ok());
+        use crate::platform::reject_reparse_ancestors;
         assert!(reject_reparse_ancestors(&link_dir.join("connector")).is_err());
         assert!(reject_reparse_ancestors(&target_dir.join("connector")).is_ok());
         assert!(reject_reparse_target(&temp.path().join("absent")).is_ok());
