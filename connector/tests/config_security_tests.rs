@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::fs;
 
 use ceo_connector::config::{normalize_server_origin, LocalConfig};
