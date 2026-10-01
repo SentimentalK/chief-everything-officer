@@ -293,8 +293,7 @@ unsafe fn current_user_sid() -> io::Result<Vec<u8>> {
 
     let mut len: u32 = 0;
     if GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut len) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "unexpected success querying TokenUser with a null buffer",
         ));
     }
