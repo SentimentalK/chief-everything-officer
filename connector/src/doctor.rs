@@ -589,18 +589,8 @@ async fn check_server_integration(
     }
 }
 
+/// Doctor's agent availability probe. Thin delegate to the shared
+/// cross-platform executable discovery (Windows PATHEXT-aware; no shell).
 fn find_in_path(cmd: &str) -> bool {
-    let bin = cmd.split_whitespace().next().unwrap_or(cmd);
-    if bin.contains('/') {
-        return Path::new(bin).is_file();
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for p in std::env::split_paths(&paths) {
-            let full = p.join(bin);
-            if full.is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::setup_frontend::executable_in_path(cmd)
 }

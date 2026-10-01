@@ -451,15 +451,41 @@ pub fn production_executable_probe(command: &str) -> bool {
     executable_in_path(command)
 }
 
-fn executable_in_path(cmd: &str) -> bool {
+/// Shared cross-platform executable discovery (no shell, pure filesystem
+/// checks). On Windows, bare names are resolved against `PATHEXT`
+/// (`.EXE`, `.BAT`, `.CMD`, ...) as the shell would, so `git` finds
+/// `git.exe`. Used by the setup wizard's agent suggestion probe AND by
+/// Doctor's agent availability check.
+pub fn executable_in_path(cmd: &str) -> bool {
     let bin = cmd.split_whitespace().next().unwrap_or(cmd);
-    if bin.contains('/') {
+    // Absolute/relative paths with separators are checked as-is.
+    if bin.contains('/') || bin.contains('\\') {
         return Path::new(bin).is_file();
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for p in std::env::split_paths(&paths) {
-            let full = p.join(bin);
-            if full.is_file() {
+            if executable_in_dir(&p, bin) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn executable_in_dir(dir: &Path, bin: &str) -> bool {
+    if dir.join(bin).is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        for ext in pathext.split(';') {
+            let ext = ext.trim();
+            if ext.is_empty() || !ext.starts_with('.') {
+                continue;
+            }
+            if dir.join(format!("{bin}{ext}")).is_file() {
                 return true;
             }
         }
@@ -1224,7 +1250,11 @@ mod tests {
     #[test]
     fn default_agent_runtime_path_uses_home_codes() {
         let p = default_agent_runtime_path_with_home(Some(Path::new("/home/u"))).unwrap();
-        assert_eq!(p, "/home/u/codes/ceo-agent-runtime");
+        // Compare as PathBuf so Windows-native separators are equivalent.
+        assert_eq!(
+            PathBuf::from(p),
+            PathBuf::from("/home/u/codes/ceo-agent-runtime")
+        );
         assert!(default_agent_runtime_path_with_home(None).is_none());
     }
 
@@ -1232,8 +1262,8 @@ mod tests {
     fn default_project_path_requires_safe_single_component() {
         let home = Path::new("/home/u");
         assert_eq!(
-            default_project_path_with_home("my-app", Some(home)).unwrap(),
-            "/home/u/codes/my-app"
+            PathBuf::from(default_project_path_with_home("my-app", Some(home)).unwrap()),
+            PathBuf::from("/home/u/codes/my-app")
         );
         // Unsafe names: no default rather than an invented path.
         for bad in ["", "  ", ".", "..", "a/b", "a\\b", "..\\x"] {
@@ -1244,8 +1274,8 @@ mod tests {
         }
         // Surrounding whitespace is trimmed before the safety check.
         assert_eq!(
-            default_project_path_with_home(" spaced ", Some(home)).unwrap(),
-            "/home/u/codes/spaced"
+            PathBuf::from(default_project_path_with_home(" spaced ", Some(home)).unwrap()),
+            PathBuf::from("/home/u/codes/spaced")
         );
         assert!(default_project_path_with_home("my-app", None).is_none());
     }

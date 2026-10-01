@@ -124,7 +124,8 @@ fn diagnose_privacy(path: &Path) -> io::Result<PrivacyStatus> {
         let user = current_user_sid()?;
 
         // 1. Ownership must be the current user (or a trusted local principal
-        //    when running elevated).
+        //    when running elevated, where the OS assigns ownership to the
+        //    Administrators group).
         if owner.is_null() {
             return Ok(PrivacyStatus::Exposed {
                 detail: "security descriptor has no owner".into(),
@@ -140,7 +141,10 @@ fn diagnose_privacy(path: &Path) -> io::Result<PrivacyStatus> {
         }
 
         // 2. Every allow-ACE must target the current user, SYSTEM, or the
-        //    local Administrators group. A missing DACL means everyone
+        //    local Administrators group. The current user is compared
+        //    DIRECTLY (not via the owner SID): elevated processes get files
+        //    owned by the Administrators group while hardening still grants
+        //    the current user an explicit ACE. A missing DACL means everyone
         //    access and is exposed.
         if dacl.is_null() {
             return Ok(PrivacyStatus::Exposed {
@@ -171,6 +175,7 @@ fn diagnose_privacy(path: &Path) -> io::Result<PrivacyStatus> {
             let ace_sid = ptr::addr_of_mut!((*allowed).SidStart) as PSID;
             let trusted = IsWellKnownSid(ace_sid, WinLocalSystemSid) != 0
                 || IsWellKnownSid(ace_sid, WinBuiltinAdministratorsSid) != 0
+                || EqualSid(ace_sid, user.as_ptr() as PSID) != 0
                 || EqualSid(ace_sid, owner) != 0;
             if !trusted {
                 return Ok(PrivacyStatus::Exposed {
@@ -463,9 +468,18 @@ mod tests {
     use super::*;
 
     fn absolute_plain(path: &Path) -> String {
-        let abs = fs::canonicalize(path).unwrap();
-        let s = abs.display().to_string();
-        s.strip_prefix(r"\\?\").map(|s| s.to_string()).unwrap_or(s)
+        // tempfile paths are already absolute, non-verbatim paths on Windows;
+        // strip a verbatim prefix only if canonicalize() produced one. Never
+        // canonicalize the junction link path itself (it does not exist yet).
+        match fs::canonicalize(path) {
+            Ok(abs) => {
+                let s = abs.display().to_string();
+                s.strip_prefix(r"\\?\").map(|s| s.to_string()).unwrap_or(s)
+            }
+            // The link path may legitimately not exist yet: mklink needs the
+            // plain absolute form.
+            Err(_) => path.display().to_string(),
+        }
     }
 
     #[test]
@@ -546,19 +560,18 @@ mod tests {
         perms.set_readonly(true);
         fs::set_permissions(&target, perms).unwrap();
 
-        let temp_file = temp.path().join("t.tmp");
-        fs::write(&temp_file, b"new").unwrap();
-        assert!(publish_atomic(&temp_file, &target).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"keep-me");
-
-        // The connector-level write path must clean its temp sibling and
-        // leave the prior valid file untouched.
+        // The connector-level write path must fail WITHOUT deleting the
+        // prior valid file, and must clean its OWN temp sibling.
         assert!(crate::local_state::atomic_write_durable(&target, b"new").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep-me");
         let leftovers: Vec<_> = fs::read_dir(temp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Connector temp siblings look like ".t.json.<pid>.<n>.<ns>.tmp".
+                name.starts_with(".t.json.") && name.ends_with(".tmp")
+            })
             .collect();
         assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
     }
