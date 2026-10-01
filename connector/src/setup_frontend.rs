@@ -112,14 +112,64 @@ impl SetupUi for TerminalUi {
             input = input.with_default(d);
         }
         if complete_paths {
-            input = input.with_autocomplete(move |current: &str| {
-                let suggestions: Vec<String> = complete_path(current);
-                Ok::<Vec<String>, inquire::CustomUserError>(suggestions)
-            });
+            input = input.with_autocomplete(PathCompleter);
         }
         let answer = input.prompt().map_err(map_inquire_error)?;
         Ok(answer)
     }
+}
+
+/// Tab-completion autocompleter for path prompts (real `Autocomplete`
+/// implementation, unlike a bare suggestions closure whose `get_completion`
+/// default is a no-op). On Tab:
+/// - a highlighted suggestion replaces the input verbatim;
+/// - otherwise the longest common prefix of the current suggestions replaces
+///   the input when it extends the typed text (terminal-like unambiguous
+///   completion); otherwise the input is left unchanged.
+#[derive(Clone)]
+struct PathCompleter;
+
+impl inquire::Autocomplete for PathCompleter {
+    fn get_suggestions(&mut self, input: &str) -> Result<Vec<String>, inquire::CustomUserError> {
+        Ok(complete_path(input))
+    }
+
+    fn get_completion(
+        &mut self,
+        input: &str,
+        highlighted_suggestion: Option<String>,
+    ) -> Result<Option<String>, inquire::CustomUserError> {
+        if let Some(suggestion) = highlighted_suggestion {
+            return Ok(Some(suggestion));
+        }
+        let suggestions = complete_path(input);
+        match longest_common_prefix(&suggestions) {
+            Some(prefix) if prefix.chars().count() > input.chars().count() => Ok(Some(prefix)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Longest common prefix of `suggestions`, compared per `char` so Unicode
+/// path components are never split mid-codepoint.
+fn longest_common_prefix(suggestions: &[String]) -> Option<String> {
+    let mut iter = suggestions.iter();
+    let first = iter.next()?;
+    let mut prefix: Vec<char> = first.chars().collect();
+    for suggestion in iter {
+        let mut common = 0;
+        for (a, b) in prefix.iter().zip(suggestion.chars()) {
+            if a != &b {
+                break;
+            }
+            common += 1;
+        }
+        prefix.truncate(common);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    Some(prefix.into_iter().collect())
 }
 
 fn map_inquire_error(err: inquire::InquireError) -> UiError {
@@ -734,6 +784,7 @@ pub async fn post_login_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inquire::Autocomplete;
 
     #[test]
     fn expand_tilde_supports_home_and_tilde_slash_forms() {
@@ -857,6 +908,68 @@ mod tests {
         assert!(complete_path(&format!("{base_str}/file")).is_empty());
         // Nonexistent base yields no suggestions and never executes anything.
         assert!(complete_path("/definitely/not/here/x").is_empty());
+    }
+
+    #[test]
+    fn path_completer_tab_applies_highlighted_suggestion() {
+        let mut completer = PathCompleter;
+        // A highlighted suggestion is applied verbatim, even when a longer
+        // unambiguous prefix would also be possible.
+        let completion = completer
+            .get_completion("~/co", Some("~/codes/".into()))
+            .unwrap();
+        assert_eq!(completion, Some("~/codes/".to_string()));
+    }
+
+    #[test]
+    fn path_completer_tab_extends_unambiguous_prefix_without_highlight() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_str = temp.path().display().to_string();
+        for name in ["alpha", "alphabet"] {
+            std::fs::create_dir_all(temp.path().join(name)).unwrap();
+        }
+        let mut completer = PathCompleter;
+
+        // No highlight: Tab extends the input to the longest common prefix.
+        let input = format!("{base_str}/al");
+        let completion = completer.get_completion(&input, None).unwrap();
+        assert_eq!(completion, Some(format!("{base_str}/alpha")));
+
+        // A single suggestion is applied fully (it extends the input).
+        let input = format!("{base_str}/alphabet");
+        let completion = completer.get_completion(&input, None).unwrap();
+        assert_eq!(completion, Some(format!("{base_str}/alphabet/")));
+
+        // Input already equals the common prefix: no replacement.
+        let input = format!("{base_str}/alpha");
+        let completion = completer.get_completion(&input, None).unwrap();
+        assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn path_completer_tab_without_suggestions_is_noop() {
+        let mut completer = PathCompleter;
+        assert_eq!(
+            completer
+                .get_completion("/definitely/not/here/x", None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn longest_common_prefix_is_char_safe_for_unicode() {
+        let a = "uni\u{301}code-dir/".to_string();
+        let b = "uni\u{301}x/".to_string();
+        assert_eq!(
+            longest_common_prefix(&[a, b]).unwrap(),
+            "uni\u{301}".to_string()
+        );
+        assert_eq!(longest_common_prefix(&[]), None);
+        assert_eq!(
+            longest_common_prefix(&["only/".to_string()]).unwrap(),
+            "only/"
+        );
     }
 
     #[test]
