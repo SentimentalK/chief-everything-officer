@@ -1715,9 +1715,10 @@ fn tilde_expansion_semantics() {
 #[test]
 fn default_project_path_is_none_for_unsafe_names() {
     let home = Path::new("/home/u");
+    // Compare as PathBuf so Windows-native separators are equivalent.
     assert_eq!(
-        default_project_path_with_home("app", Some(home)).unwrap(),
-        "/home/u/codes/app"
+        PathBuf::from(default_project_path_with_home("app", Some(home)).unwrap()),
+        PathBuf::from("/home/u/codes/app")
     );
     for bad in ["", "  ", ".", "..", "a/b", "a\\b", "..\\x"] {
         assert!(
@@ -1728,8 +1729,8 @@ fn default_project_path_is_none_for_unsafe_names() {
     // Surrounding whitespace is trimmed before the safety check, matching
     // how the wizard normalizes the name.
     assert_eq!(
-        default_project_path_with_home(" spaced ", Some(home)).unwrap(),
-        "/home/u/codes/spaced"
+        PathBuf::from(default_project_path_with_home(" spaced ", Some(home)).unwrap()),
+        PathBuf::from("/home/u/codes/spaced")
     );
     assert!(!is_safe_single_path_component("  "));
     assert!(is_safe_single_path_component("my-app"));
