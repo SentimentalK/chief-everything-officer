@@ -5,11 +5,86 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **2.0.0**. Check with:
+Current baseline: **2.4.0**. Check with:
 
-```
+```bash
 ceo-connector --version
 ```
+
+## Installation, Update & Uninstall
+
+Deterministic binary packages are provided for five supported platforms:
+- **Linux x86_64**: `ceo-connector-linux-x64.tar.gz`
+- **Linux aarch64**: `ceo-connector-linux-arm64.tar.gz`
+- **macOS x86_64 (Intel)**: `ceo-connector-macos-x64.zip`
+- **macOS arm64 (Apple Silicon)**: `ceo-connector-macos-arm64.zip`
+- **Windows x86_64**: `ceo-connector-windows-x64.zip`
+
+### Prerequisites
+- **Git**: Installed and available on PATH (for repository worktrees and state tracking).
+- **Orca runtime / CLI**: For managing agent runs and session lifecycle.
+- **Local execution Agent**: Configured agent executor (e.g. `opencode`, Claude Code, Codex, or custom agent).
+
+### Manual Installation
+
+#### Linux and macOS
+1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.4.0`).
+2. Verify the archive against `SHA256SUMS`:
+   ```bash
+   sha256sum -c SHA256SUMS --ignore-missing
+   # or on macOS:
+   shasum -a 256 -c SHA256SUMS --ignore-missing
+   ```
+3. Extract the archive:
+   ```bash
+   # Linux x86_64:
+   tar -xzf ceo-connector-linux-x64.tar.gz
+   # or macOS Apple Silicon:
+   unzip ceo-connector-macos-arm64.zip
+   ```
+4. Place `ceo-connector` in a directory on your `PATH` (such as `~/.local/bin`) and ensure executable permissions:
+   ```bash
+   mkdir -p ~/.local/bin
+   cp ceo-connector-2.4.0/ceo-connector ~/.local/bin/ceo-connector
+   chmod +x ~/.local/bin/ceo-connector
+   ```
+5. Verify the installation:
+   ```bash
+   ceo-connector --version
+   ```
+
+#### Windows (x86_64)
+1. Download `ceo-connector-windows-x64.zip` and `SHA256SUMS`.
+2. Verify SHA256 using built-in PowerShell:
+   ```powershell
+   Get-FileHash ceo-connector-windows-x64.zip -Algorithm SHA256
+   ```
+   Confirm the hash matches the entry in `SHA256SUMS`.
+3. Extract the ZIP archive:
+   ```powershell
+   Expand-Archive -Path ceo-connector-windows-x64.zip -DestinationPath .
+   ```
+4. Place `ceo-connector-2.4.0\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
+5. Verify the installation:
+   ```cmd
+   ceo-connector.exe --version
+   ```
+
+### Updating
+1. Stop any currently running connector daemon:
+   - If running in foreground, terminate with `Ctrl+C`.
+   - If running as a background service, stop the service.
+2. Replace the existing `ceo-connector` (or `ceo-connector.exe`) executable with the newly verified release binary.
+3. Durable user state under `~/.ceo/connector` (credentials, target mappings, history) is preserved and compatible across minor versions.
+
+### Uninstalling
+1. Delete the `ceo-connector` (or `ceo-connector.exe`) executable from your PATH directory.
+2. *(Optional)* If you wish to erase local device state completely, delete the `~/.ceo/connector` directory:
+   ```bash
+   rm -rf ~/.ceo/connector
+   ```
+   *Note: Removing local files never deletes Server-side workspaces, Targets, or job history.*
+
 
 ## Local Config Schema v3 & Authority Split (2.0.0)
 

@@ -1,0 +1,237 @@
+name: CEO Connector — Multi-Platform Packaging & Release
+
+on:
+  push:
+    tags:
+      - "connector-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: "Validate Tag & Release Contract"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Validate Tag and Cargo Version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/connector-v* ]]; then
+            TAG="${{ github.ref_name }}"
+            echo "Validating push tag: $TAG"
+            python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+            echo "Validating workflow_dispatch tag: $TAG"
+            python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
+          else
+            echo "Workflow dispatched on non-tag ref '${{ github.ref }}'."
+            echo "Running in preflight mode (packaging & verification only, will NOT publish)."
+            python3 -c "import scripts.release.package_connector as p; print('Validated Cargo.toml version:', p.parse_cargo_version('connector/Cargo.toml'))"
+          fi
+
+      - name: Run Packaging Unit Tests
+        run: python3 scripts/release/test_package_connector.py
+
+  build-and-package:
+    name: "Build & Package (${{ matrix.name }})"
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            platform: linux-x64
+            asset: ceo-connector-linux-x64.tar.gz
+            binary-path: connector/target/release/ceo-connector
+            is-cross: false
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            platform: linux-arm64
+            asset: ceo-connector-linux-arm64.tar.gz
+            binary-path: connector/target/aarch64-unknown-linux-gnu/release/ceo-connector
+            target: aarch64-unknown-linux-gnu
+            is-cross: true
+
+          - name: macos-x64
+            os: macos-15-intel
+            platform: macos-x64
+            asset: ceo-connector-macos-x64.zip
+            binary-path: connector/target/release/ceo-connector
+            is-cross: false
+
+          - name: macos-arm64
+            os: macos-15
+            platform: macos-arm64
+            asset: ceo-connector-macos-arm64.zip
+            binary-path: connector/target/release/ceo-connector
+            is-cross: false
+
+          - name: windows-x64
+            os: windows-latest
+            platform: windows-x64
+            asset: ceo-connector-windows-x64.zip
+            binary-path: connector/target/release/ceo-connector.exe
+            is-cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
+
+      - name: Install aarch64 cross linker (Linux arm64)
+        if: matrix.is-cross
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary (Cross-compilation)
+        if: matrix.is-cross
+        run: cargo build --locked --release --target ${{ matrix.target }}
+        working-directory: connector
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Honest labeling (Linux arm64)
+        if: matrix.is-cross
+        run: |
+          echo "Linux aarch64 was CROSS-BUILT (compile-only)."
+          echo "No runtime tests or version smoke checks were executed on aarch64 hardware."
+
+      - name: Build release binary (Native)
+        if: "!matrix.is-cross"
+        run: cargo build --locked --release
+        working-directory: connector
+
+      - name: Native Smoke Check (--version)
+        if: "!matrix.is-cross"
+        run: ${{ matrix.binary-path }} --version
+
+      - name: Create Deterministic Package
+        run: python3 scripts/release/package_connector.py package --platform ${{ matrix.platform }} --binary-path ${{ matrix.binary-path }} --output-dir dist
+
+      - name: Verify Package Contents and Layout
+        run: python3 scripts/release/package_connector.py verify-archive --archive-path dist/${{ matrix.asset }} --platform ${{ matrix.platform }}
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish-release:
+    name: "Aggregate Checksums & Publish Release"
+    needs: [validate, build-and-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Download all package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded release assets
+        run: ls -la dist
+
+      - name: Verify all five archives
+        run: |
+          python3 scripts/release/package_connector.py verify-archive --archive-path dist/ceo-connector-linux-x64.tar.gz --platform linux-x64
+          python3 scripts/release/package_connector.py verify-archive --archive-path dist/ceo-connector-linux-arm64.tar.gz --platform linux-arm64
+          python3 scripts/release/package_connector.py verify-archive --archive-path dist/ceo-connector-macos-x64.zip --platform macos-x64
+          python3 scripts/release/package_connector.py verify-archive --archive-path dist/ceo-connector-macos-arm64.zip --platform macos-arm64
+          python3 scripts/release/package_connector.py verify-archive --archive-path dist/ceo-connector-windows-x64.zip --platform windows-x64
+
+      - name: Generate SHA256SUMS
+        run: python3 scripts/release/package_connector.py generate-checksums --dist-dir dist
+
+      - name: Verify SHA256SUMS
+        run: |
+          python3 scripts/release/package_connector.py verify-checksums --dist-dir dist
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Generate Release Notes
+        run: python3 scripts/release/package_connector.py generate-release-notes --output dist/RELEASE_NOTES.md
+
+      - name: Publish or Report Preflight
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/connector-v* ]]; then
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#connector-v}"
+            echo "Publishing GitHub Release for tag: $TAG (version: $VERSION)"
+
+            # Validate tag again before publish
+            python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
+
+            # Idempotency and rerun safety check
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG already exists. Inspecting target commit..."
+              TARGET_COMMIT=$(gh release view "$TAG" --json targetCommitish -q .targetCommitish)
+              if [[ "$TARGET_COMMIT" != "${{ github.sha }}" && "$TARGET_COMMIT" != "$TAG" ]]; then
+                echo "ERROR: Existing release $TAG points to $TARGET_COMMIT, expected ${{ github.sha }}. Failing closed."
+                exit 1
+              fi
+              echo "Release exists for matching tag/commit. Updating assets idempotently..."
+              gh release upload "$TAG" \
+                dist/ceo-connector-linux-arm64.tar.gz \
+                dist/ceo-connector-linux-x64.tar.gz \
+                dist/ceo-connector-macos-arm64.zip \
+                dist/ceo-connector-macos-x64.zip \
+                dist/ceo-connector-windows-x64.zip \
+                dist/SHA256SUMS \
+                --clobber
+            else
+              echo "Creating GitHub Release $TAG..."
+              gh release create "$TAG" \
+                dist/ceo-connector-linux-arm64.tar.gz \
+                dist/ceo-connector-linux-x64.tar.gz \
+                dist/ceo-connector-macos-arm64.zip \
+                dist/ceo-connector-macos-x64.zip \
+                dist/ceo-connector-windows-x64.zip \
+                dist/SHA256SUMS \
+                --title "CEO Connector $VERSION" \
+                --notes-file dist/RELEASE_NOTES.md \
+                --draft=false \
+                --prerelease=false
+            fi
+
+            echo "Release $TAG successfully published."
+          else
+            echo "Workflow run completed in preflight mode (event=${{ github.event_name }}, ref=${{ github.ref }})."
+            echo "All 5 platform packages and SHA256SUMS were verified successfully."
+            echo "No GitHub Release was published because this was not a tag push."
+          fi
