@@ -30,10 +30,12 @@ jobs:
             TAG="${{ github.ref_name }}"
             echo "Validating push tag: $TAG"
             python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
+            python3 scripts/release/package_connector.py verify-rerun-identity --tag "$TAG" --expected-commit "${{ github.sha }}"
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.ref_type }}" == "tag" ]]; then
             TAG="${{ github.ref_name }}"
             echo "Validating workflow_dispatch tag: $TAG"
             python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
+            python3 scripts/release/package_connector.py verify-rerun-identity --tag "$TAG" --expected-commit "${{ github.sha }}"
           else
             echo "Workflow dispatched on non-tag ref '${{ github.ref }}'."
             echo "Running in preflight mode (packaging & verification only, will NOT publish)."
@@ -192,20 +194,21 @@ jobs:
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/connector-v* ]]; then
             TAG="${{ github.ref_name }}"
             VERSION="${TAG#connector-v}"
-            echo "Publishing GitHub Release for tag: $TAG (version: $VERSION)"
+            SOURCE_COMMIT="${{ github.sha }}"
+            echo "Publishing GitHub Release for tag: $TAG (version: $VERSION, source commit: $SOURCE_COMMIT)"
 
             # Validate tag again before publish
             python3 scripts/release/package_connector.py validate-tag --tag "$TAG" --cargo-toml connector/Cargo.toml
 
-            # Idempotency and rerun safety check
+            # Resolve tag to commit and verify rerun identity against source commit
+            python3 scripts/release/package_connector.py verify-rerun-identity --tag "$TAG" --expected-commit "$SOURCE_COMMIT"
+
+            # Check if release already exists on GitHub
             if gh release view "$TAG" >/dev/null 2>&1; then
-              echo "Release $TAG already exists. Inspecting target commit..."
-              TARGET_COMMIT=$(gh release view "$TAG" --json targetCommitish -q .targetCommitish)
-              if [[ "$TARGET_COMMIT" != "${{ github.sha }}" && "$TARGET_COMMIT" != "$TAG" ]]; then
-                echo "ERROR: Existing release $TAG points to $TARGET_COMMIT, expected ${{ github.sha }}. Failing closed."
-                exit 1
-              fi
-              echo "Release exists for matching tag/commit. Updating assets idempotently..."
+              echo "Release $TAG already exists on GitHub."
+              TARGET_COMMITISH=$(gh release view "$TAG" --json targetCommitish -q .targetCommitish 2>/dev/null || echo "unknown")
+              echo "Existing release targetCommitish: '$TARGET_COMMITISH' (ignored for identity; immutable git tag commit verified)."
+              echo "Updating release assets idempotently with --clobber..."
               gh release upload "$TAG" \
                 dist/ceo-connector-linux-arm64.tar.gz \
                 dist/ceo-connector-linux-x64.tar.gz \

@@ -100,7 +100,7 @@ Getting Started
 3. Inspect status:
    ceo-connector status
 4. Run daemon:
-   ceo-connector daemon run
+   ceo-connector run
 
 Updating
 --------
@@ -163,6 +163,77 @@ def validate_tag(tag: str, cargo_toml_path: str) -> str:
     return tag_version
 
 
+def resolve_tag_commit(tag: str, repo_root: str = None) -> str:
+    """
+    Resolves/dereferences a git tag to its 40-character commit SHA.
+    Works for annotated tags, lightweight tags, and detached-HEAD tag checkouts.
+    """
+    cwd = repo_root or os.getcwd()
+    candidates = [
+        ["git", "rev-parse", f"{tag}^{{commit}}"],
+        ["git", "rev-list", "-n", "1", tag],
+        ["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"],
+    ]
+    for cmd in candidates:
+        try:
+            res = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True, check=True
+            )
+            sha = res.stdout.strip()
+            if len(sha) == 40 and all(c in "0123456789abcdefABCDEF" for c in sha):
+                return sha.lower()
+        except Exception:
+            continue
+
+    # Fallback: check if HEAD is at this tag
+    try:
+        tag_desc = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if tag_desc == tag:
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if len(head_sha) == 40:
+                return head_sha.lower()
+    except Exception:
+        pass
+
+    raise ValueError(f"Could not resolve tag '{tag}' to a commit SHA in '{cwd}'.")
+
+
+def verify_rerun_identity(
+    tag: str,
+    expected_commit: str,
+    release_target_commitish: str = None,
+    repo_root: str = None,
+) -> str:
+    """
+    Verifies that the immutable git tag resolves exactly to expected_commit.
+    Does NOT depend on GitHub Release.targetCommitish (which may be 'main' or a branch name).
+    """
+    resolved_commit = resolve_tag_commit(tag, repo_root=repo_root)
+    expected = expected_commit.strip().lower()
+    if resolved_commit != expected:
+        raise ValueError(
+            f"Release rerun identity mismatch: tag '{tag}' resolves to commit '{resolved_commit}', "
+            f"but workflow expected source commit '{expected}'."
+        )
+
+    # Note: release_target_commitish is intentionally decoupled from identity matching.
+    # GitHub Release API often returns target_commitish as 'main' or default branch,
+    # even when the immutable tag points directly to the release commit SHA.
+    return resolved_commit
+
+
 def get_deterministic_timestamp(repo_root: str = None) -> int:
     """
     Determines timestamp from:
@@ -212,7 +283,7 @@ def create_tar_gz_archive(output_path: str, entries: list, timestamp: int):
     """
     Creates a bit-for-bit deterministic .tar.gz archive.
     - entries: list of dicts with keys:
-      'name': archive path (e.g. 'ceo-connector-2.4.0/README.txt')
+      'name': archive path (e.g. 'ceo-connector-2.4.1/README.txt')
       'type': 'dir' or 'file'
       'mode': octal permission (0o755 or 0o644)
       'data': bytes (if file)
@@ -594,7 +665,7 @@ def main():
 
     # validate-tag
     p_tag = subparsers.add_parser("validate-tag", help="Validate release tag against Cargo.toml")
-    p_tag.add_argument("--tag", required=True, help="Tag name (e.g. connector-v2.4.0)")
+    p_tag.add_argument("--tag", required=True, help="Tag name (e.g. connector-v2.4.1)")
     p_tag.add_argument(
         "--cargo-toml",
         default="connector/Cargo.toml",
@@ -671,12 +742,49 @@ def main():
     )
     p_notes.add_argument("--output", help="Output file path")
 
+    # resolve-tag-commit
+    p_res = subparsers.add_parser(
+        "resolve-tag-commit", help="Resolve git tag to commit SHA"
+    )
+    p_res.add_argument("--tag", required=True, help="Tag name (e.g. connector-v2.4.1)")
+    p_res.add_argument("--repo-root", help="Path to repository root")
+
+    # verify-rerun-identity
+    p_rerun = subparsers.add_parser(
+        "verify-rerun-identity",
+        help="Verify tag resolves to expected source commit for rerun safety",
+    )
+    p_rerun.add_argument("--tag", required=True, help="Tag name (e.g. connector-v2.4.1)")
+    p_rerun.add_argument(
+        "--expected-commit", required=True, help="Expected source commit SHA"
+    )
+    p_rerun.add_argument(
+        "--target-commitish",
+        help="GitHub release targetCommitish (recorded for diagnostics)",
+    )
+    p_rerun.add_argument("--repo-root", help="Path to repository root")
+
     args = parser.parse_args()
 
     try:
         if args.command == "validate-tag":
             ver = validate_tag(args.tag, args.cargo_toml)
             print(f"PASS: Release tag '{args.tag}' matches Cargo.toml version '{ver}'.")
+
+        elif args.command == "resolve-tag-commit":
+            sha = resolve_tag_commit(args.tag, repo_root=args.repo_root)
+            print(sha)
+
+        elif args.command == "verify-rerun-identity":
+            sha = verify_rerun_identity(
+                args.tag,
+                args.expected_commit,
+                release_target_commitish=args.target_commitish,
+                repo_root=args.repo_root,
+            )
+            print(
+                f"PASS: Release rerun identity verified for tag '{args.tag}' -> {sha}."
+            )
 
         elif args.command == "package":
             ver = args.version or parse_cargo_version(args.cargo_toml)
