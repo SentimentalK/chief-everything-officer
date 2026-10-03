@@ -33,17 +33,18 @@ export function git(cwd: string, ...args: string[]): string {
   }).trim();
 }
 
-export async function fixture(options: { tempRoot?: string } = {}): Promise<{ root: string; remote: string; config: TestConfig }> {
+export async function fixture(options: { tempRoot?: string; branch?: string } = {}): Promise<{ root: string; remote: string; config: TestConfig }> {
   const base = options.tempRoot ?? os.tmpdir();
+  const branch = options.branch ?? "main";
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(path.join(base, "ceo-mcp-test-"));
   const remote = path.join(root, "remote.git");
   const seed = path.join(root, "seed");
   const dataRoot = path.join(root, "data");
   await mkdir(remote);
-  git(remote, "init", "--bare", "--initial-branch=main");
+  git(remote, "init", "--bare", `--initial-branch=${branch}`);
   await mkdir(seed);
-  git(seed, "init", "--initial-branch=main");
+  git(seed, "init", `--initial-branch=${branch}`);
   await mkdir(path.join(seed, "tasks"));
   await mkdir(path.join(seed, "inbox"));
   await writeFile(path.join(seed, "TODO.md"), "# TODO\n\n- Original\n");
@@ -54,13 +55,13 @@ export async function fixture(options: { tempRoot?: string } = {}): Promise<{ ro
   git(seed, "add", "-A");
   git(seed, "commit", "-m", "seed");
   git(seed, "remote", "add", "origin", remote);
-  git(seed, "push", "-u", "origin", "main");
+  git(seed, "push", "-u", "origin", branch);
   const config: TestConfig = {
     dataRoot,
     repoDir: path.join(dataRoot, "repo"),
     txnDir: path.join(dataRoot, "txns"),
     stateDir: path.join(dataRoot, "state"),
-    branch: "main",
+    branch,
     remoteUrl: remote,
     port: 3000,
     bindHost: "127.0.0.1",

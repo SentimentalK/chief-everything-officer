@@ -65,8 +65,12 @@ interface CompletedTransaction {
   worktree?: string;
   changed_files: string[];
   diff_stat: string;
-  pushed_at: string;
+  pushed_at?: string;
   pushed?: boolean;
+  outcome?: "COMMITTED" | "NOOP" | "STALE_REVISION";
+  reason?: string;
+  remote_head?: string;
+  archived_at?: string;
   operation_result?: Record<string, unknown>;
 }
 
@@ -224,7 +228,6 @@ export class CeoWorkspace {
   async workspaceStatus(): Promise<Record<string, unknown>> {
     return await this.withExclusiveWorkspaceMutation(async () => {
       await this.recoverPending();
-      if (this.state === "BLOCKED") throw new CeoError("WORKSPACE_DIVERGED", "Pending commit diverged from origin/main.");
       await this.syncCleanWorkspace();
       const local = await resolveRef(this.config, this.config.repoDir, "HEAD");
       const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
@@ -586,6 +589,9 @@ export class CeoWorkspace {
   async isRequestCompleted(requestId: string): Promise<Record<string, unknown> | null> {
     const completed = await this.readCompleted(requestId);
     if (completed) {
+      if (completed.outcome === "STALE_REVISION" || (completed.pushed === false && completed.reason === "REMOTE_HISTORY_REWRITTEN")) {
+        return null;
+      }
       return this.completedResult(completed);
     }
     return null;
@@ -613,13 +619,25 @@ export class CeoWorkspace {
     } = input;
     return await this.withExclusiveWorkspaceMutation(async () => {
       const completed = await this.readCompleted(requestId);
-      if (completed) return this.completedResult(completed);
+      if (completed) {
+        if (completed.outcome === "STALE_REVISION" || (completed.pushed === false && completed.reason === "REMOTE_HISTORY_REWRITTEN")) {
+          throw new CeoError("STALE_REVISION", `Transaction ${requestId} was superseded by a remote history rewrite; retry required.`, {
+            request_id: completed.request_id,
+            base_commit: completed.base_commit,
+            pending_commit: completed.commit,
+            remote_head: completed.remote_head,
+            outcome: completed.outcome,
+            reason: completed.reason,
+          });
+        }
+        return this.completedResult(completed);
+      }
       await this.recoverPending();
       if (await this.readPending()) throw new CeoError("PUSH_PENDING", "A previous commit is awaiting push verification.");
       await this.syncCleanWorkspace();
       const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
       if (remote !== baseCommit) {
-        throw new CeoError("STALE_REVISION", "origin/main changed since the files were read.", {
+        throw new CeoError("STALE_REVISION", `origin/${this.config.branch} changed since the files were read.`, {
           expected: baseCommit,
           remote_head: remote,
         });
@@ -653,6 +671,7 @@ export class CeoWorkspace {
             diff_stat: "",
             pushed: false,
             pushed_at: new Date().toISOString(),
+            outcome: "NOOP",
             ...(opRes ? { operation_result: opRes } : {}),
           };
           await this.writeJson(path.join(this.completedDir, `${requestId}.json`), completedNoop);
@@ -686,8 +705,9 @@ export class CeoWorkspace {
         await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
         const latest = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
         if (latest !== baseCommit) {
-          this.state = "BLOCKED";
-          throw new CeoError("STALE_REVISION", "origin/main moved during the transaction; the local commit was not pushed.", {
+          await this.archiveStalePending(pending, latest, "REMOTE_HISTORY_REWRITTEN");
+          await this.syncCleanWorkspace();
+          throw new CeoError("STALE_REVISION", `origin/${this.config.branch} moved during the transaction; the local commit was not pushed.`, {
             remote_head: latest,
             pending_commit: commit,
           });
@@ -699,7 +719,7 @@ export class CeoWorkspace {
           throw new CeoError("PUSH_PENDING", "Commit created locally, but push could not be verified.", { commit });
         }
         await this.finalizePending(pending);
-        return this.completedResult({ ...pending, pushed_at: this.lastPushAt! });
+        return this.completedResult({ ...pending, pushed_at: this.lastPushAt!, pushed: true, outcome: "COMMITTED" });
       } catch (error) {
         if (!committed) await this.discardWorktree(worktree);
         throw error;
@@ -739,7 +759,6 @@ export class CeoWorkspace {
   async withReadyWorkspace<T>(operation: (base: string) => Promise<T>): Promise<T> {
     return await this.withExclusiveWorkspaceMutation(async () => {
       await this.recoverPending();
-      if (this.state === "BLOCKED") throw new CeoError("WORKSPACE_DIVERGED", "Workspace requires operator repair.");
       await this.syncCleanWorkspace();
       const base = await resolveRef(this.config, this.config.repoDir, "HEAD");
       this.state = "READY";
@@ -768,13 +787,18 @@ export class CeoWorkspace {
     await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
     const local = await resolveRef(this.config, this.config.repoDir, "HEAD");
     const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
-    if (local === remote) return;
-    try {
-      await runGit(this.config, this.config.repoDir, ["merge", "--ff-only", remote]);
-    } catch {
-      this.state = "BLOCKED";
-      throw new CeoError("WORKSPACE_DIVERGED", "Local and remote CEO history diverged.", { local, remote });
+    if (local === remote) {
+      this.state = "READY";
+      return;
     }
+    const currentBranch = (await runGit(this.config, this.config.repoDir, ["branch", "--show-current"])).stdout.trim();
+    if (currentBranch !== this.config.branch) {
+      await runGit(this.config, this.config.repoDir, ["checkout", "-B", this.config.branch, remote]);
+    } else {
+      await runGit(this.config, this.config.repoDir, ["reset", "--hard", remote]);
+    }
+    await runGit(this.config, this.config.repoDir, ["worktree", "prune"], true);
+    this.state = "READY";
   }
 
   validateOperations(operations: ChangeOperation[], matcher: CeoIgnoreMatcher): void {
@@ -952,33 +976,80 @@ export class CeoWorkspace {
         throw new CeoError("PUSH_PENDING", "Pending commit still cannot be pushed.", { commit: pending.commit });
       }
     }
-    this.state = "BLOCKED";
-    throw new CeoError("WORKSPACE_DIVERGED", "Remote history moved away from the pending transaction.", {
-      pending_commit: pending.commit,
-      remote_head: remote,
-    });
+    await this.archiveStalePending(pending, remote, "REMOTE_HISTORY_REWRITTEN");
+    await this.syncCleanWorkspace();
+    this.state = "READY";
   }
 
   private async finalizePending(pending: PendingTransaction, remoteOverride?: string): Promise<void> {
     await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
     const remote = remoteOverride ?? await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
-    try {
-      await runGit(this.config, this.config.repoDir, ["merge", "--ff-only", remote]);
-    } catch {
-      this.state = "NOT_READY";
-      throw new CeoError("PUSHED_LOCAL_REPAIR_NEEDED", "GitHub accepted the commit, but the local cache could not fast-forward.", {
-        commit: pending.commit,
-      });
+    const dirty = (await runGit(this.config, this.config.repoDir, ["status", "--porcelain"])).stdout;
+    if (dirty) throw new CeoError("WORKSPACE_DIRTY", "Main working copy contains uncommitted changes.");
+    const currentBranch = (await runGit(this.config, this.config.repoDir, ["branch", "--show-current"])).stdout.trim();
+    if (currentBranch !== this.config.branch) {
+      await runGit(this.config, this.config.repoDir, ["checkout", "-B", this.config.branch, remote]);
+    } else {
+      await runGit(this.config, this.config.repoDir, ["reset", "--hard", remote]);
     }
     this.lastPushAt = new Date().toISOString();
-    const completed: CompletedTransaction = { ...pending, pushed_at: this.lastPushAt, pushed: true };
+    const completed: CompletedTransaction = {
+      ...pending,
+      pushed_at: this.lastPushAt,
+      pushed: true,
+      outcome: "COMMITTED",
+    };
     await this.writeJson(path.join(this.completedDir, `${pending.request_id}.json`), completed);
     await rm(this.pendingPath, { force: true });
     await this.discardWorktree(pending.worktree);
     this.state = "READY";
   }
 
+  private async archiveStalePending(
+    pending: PendingTransaction,
+    remoteHead: string,
+    reason: string = "REMOTE_HISTORY_REWRITTEN",
+  ): Promise<void> {
+    const terminal: CompletedTransaction = {
+      request_id: pending.request_id,
+      base_commit: pending.base_commit,
+      commit: pending.commit,
+      changed_files: pending.changed_files,
+      diff_stat: pending.diff_stat,
+      pushed: false,
+      outcome: "STALE_REVISION",
+      reason,
+      remote_head: remoteHead,
+      archived_at: new Date().toISOString(),
+      ...(pending.operation_result ? { operation_result: pending.operation_result } : {}),
+    };
+    await this.writeJson(path.join(this.completedDir, `${pending.request_id}.json`), terminal);
+    await rm(this.pendingPath, { force: true });
+    await this.discardWorktree(pending.worktree);
+  }
+
   private completedResult(completed: CompletedTransaction): Record<string, unknown> {
+    if (completed.outcome === "STALE_REVISION" || (completed.pushed === false && completed.reason === "REMOTE_HISTORY_REWRITTEN")) {
+      return {
+        ok: false,
+        error: {
+          code: "STALE_REVISION",
+          message: "Transaction was superseded by a remote history rewrite; retry required.",
+        },
+        request_id: completed.request_id,
+        workspace_state: "READY",
+        base_commit: completed.base_commit,
+        commit: completed.commit,
+        pushed: false,
+        outcome: completed.outcome ?? "STALE_REVISION",
+        reason: completed.reason ?? "REMOTE_HISTORY_REWRITTEN",
+        remote_head: completed.remote_head,
+        changed_files: completed.changed_files,
+        diff_stat: completed.diff_stat,
+        ...(completed.archived_at ? { archived_at: completed.archived_at } : {}),
+        ...(completed.operation_result ? { operation_result: completed.operation_result } : {}),
+      };
+    }
     return {
       ok: true,
       request_id: completed.request_id,
@@ -989,6 +1060,7 @@ export class CeoWorkspace {
       changed_files: completed.changed_files,
       diff_stat: completed.diff_stat,
       pushed_at: completed.pushed_at,
+      ...(completed.outcome ? { outcome: completed.outcome } : {}),
       ...(completed.operation_result ? completed.operation_result : {}),
     };
   }
