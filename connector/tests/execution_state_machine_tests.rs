@@ -2465,6 +2465,10 @@ async fn test_agent_done_resource_job_with_missing_result_fails_and_retains_term
     executor.dispatch_started_at_ms = Some(now - 1000);
     executor.execution_deadline_ms = Some(now + 10_000);
     executor.dispatch_turn_started = true;
+    // Durable positive turn-start evidence from a prior process run is a
+    // precondition for authoritative AgentDone completion (restart scenario F).
+    executor.turn_started_observed = true;
+    executor.structured_lifecycle_observed = true;
 
     let active = make_test_attempt_with_resource(
         &cred,
@@ -3043,8 +3047,10 @@ async fn test_non_resource_job_does_not_persist_redelivery_meta() {
 // lack of observability, NOT proof that the dispatched turn started. A
 // pre-turn tui-idle must therefore never terminalize an attempt (never
 // RESULT_MISSING), and completion must only occur via positive turn-start
-// evidence (explicit turn_started stage, WorkingObserved, new-generation
-// AgentDone) or the managed-result barrier.
+// evidence (explicit turn_started stage for the bounded unstructured
+// fallback, WorkingObserved) or the managed-result barrier. A structured
+// new-generation AgentDone additionally requires durable positive turn-start
+// evidence (turn_started_observed=true) before it may complete.
 // ---------------------------------------------------------------------------
 
 fn write_valid_managed_result_file(
@@ -3266,7 +3272,7 @@ async fn test_resource_job_managed_result_after_pre_turn_idle_completes_via_barr
 }
 
 #[tokio::test]
-async fn test_resource_job_agent_done_after_pre_turn_idle_with_valid_result_completes() {
+async fn test_resource_job_pre_turn_agent_done_keeps_waiting_and_barrier_completes() {
     let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
     let attempt_id = format!("att-{}", Uuid::new_v4());
     let resource_id = "res_done_idle".to_string();
@@ -3305,15 +3311,15 @@ async fn test_resource_job_agent_done_after_pre_turn_idle_with_valid_result_comp
         ready: true,
         on_wait: Some(Arc::new(move || {
             // Write the managed-result only when the AgentDone tick runs, so
-            // the AgentDone resource-capture path is exercised (not the
-            // earlier barrier check).
+            // the AgentDone tick itself is exercised (and rejected as
+            // pre-turn evidence), then the barrier check completes.
             if wc_clone.fetch_add(1, Ordering::SeqCst) == 1 {
                 write_valid_managed_result_file(&rf_clone, &j_clone, &a_clone, &r_clone);
             }
         })),
         wait_seq: Arc::new(std::sync::Mutex::new(vec![
             Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored
-            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // Later OpenCode-style done: completes
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // Pre-turn done: NOT completion evidence
         ])),
         ..Default::default()
     });
@@ -3334,14 +3340,27 @@ async fn test_resource_job_agent_done_after_pre_turn_idle_with_valid_result_comp
         .unwrap();
     assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
     let exec = cur.executor.as_ref().unwrap();
-    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+    // Pre-turn AgentDone is NOT completion evidence: the attempt keeps
+    // waiting, and completion happens via the independent managed-result
+    // barrier (which is checked every tick).
+    assert_eq!(
+        exec.runtime_completion_kind.as_deref(),
+        Some("managed_result")
+    );
     assert!(exec.runtime_error.is_none());
+    assert!(!exec.turn_started_observed);
+    assert!(exec.structured_lifecycle_observed);
     let pres_res = paths.preserved_managed_result_file(&cur.job_id, &attempt_id);
     assert!(pres_res.exists());
 }
 
+/// Regression for the false-completion bug: after repeated pre-turn tui-idle
+/// observations, a new-generation AgentDone (state=done, interrupted=false)
+/// WITHOUT any prior WorkingObserved must NOT terminalize the attempt. It is
+/// pre-turn evidence only: keep waiting inside the durable deadline, never
+/// close the terminal, and never report COMPLETED.
 #[tokio::test]
-async fn test_non_resource_agent_done_completes_without_explicit_turn_started() {
+async fn test_pre_turn_agent_done_without_working_observed_keeps_waiting_never_completes() {
     let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
     let attempt_id = format!("att-{}", Uuid::new_v4());
     let now = chrono::Utc::now().timestamp_millis();
@@ -3351,9 +3370,11 @@ async fn test_non_resource_agent_done_completes_without_explicit_turn_started() 
     executor.terminal_id = Some("term_test".into());
     executor.dispatch_request_id = Some("req_123".into());
     executor.dispatch_started_at_ms = Some(now - 1000);
-    executor.execution_deadline_ms = Some(now + 10_000);
+    // Short deadline so the waiting loop terminates quickly on timeout.
+    executor.execution_deadline_ms = Some(now + 2_000);
     executor.dispatch_turn_started = false;
     executor.turn_started_observed = false;
+    executor.structured_lifecycle_observed = false;
 
     let active = make_test_attempt(
         &cred,
@@ -3368,8 +3389,10 @@ async fn test_non_resource_agent_done_completes_without_explicit_turn_started() 
         ready: true,
         wait_seq: Arc::new(std::sync::Mutex::new(vec![
             Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored
-            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // New-generation done: completes
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // Pre-turn done: NOT completion evidence
         ])),
+        // Keep reporting pre-turn done until the durable deadline.
+        wait_result: Some(Ok(WaitOutcome::AgentDone { elapsed_ms: 50 })),
         ..Default::default()
     });
     let client = ConnectorClient::new(&cred.server_origin).unwrap();
@@ -3389,8 +3412,253 @@ async fn test_non_resource_agent_done_completes_without_explicit_turn_started() 
         .unwrap();
     assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
     let exec = cur.executor.as_ref().unwrap();
-    // AgentDone for a new generation completes even when explicit
-    // turn_started evidence was unavailable (OpenCode-style dispatch).
+    // Pre-turn AgentDone without positive turn-start evidence must never
+    // complete: the attempt converges to the durable timeout instead.
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+    assert!(!exec.turn_started_observed);
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Pre-turn AgentDone must never close the terminal"
+    );
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_ne!(record.report.execution_status, ExecutionStatus::COMPLETED);
+}
+
+/// A structured AgentSeen observation (structured lifecycle observation is
+/// available) followed by a new-generation AgentDone WITHOUT any prior
+/// WorkingObserved must still NOT terminalize the attempt: AgentSeen proves
+/// observability, not turn start.
+#[tokio::test]
+async fn test_agent_seen_then_agent_done_without_working_observed_keeps_waiting() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+    executor.structured_lifecycle_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::AgentSeen { elapsed_ms: 50 }), // Baseline/baseline-state observation
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // New-generation done: still NOT completion evidence
+        ])),
+        wait_result: Some(Ok(WaitOutcome::AgentDone { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+    assert!(!exec.turn_started_observed);
+    assert!(exec.structured_lifecycle_observed);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Pre-turn AgentDone must never close the terminal"
+    );
+}
+
+/// Restart/recovery: durable state persisted by a prior process run with
+/// structured lifecycle observation but NO positive turn-start evidence must
+/// still prevent AgentDone from completing.
+#[tokio::test]
+async fn test_restart_with_structured_observation_but_no_turn_start_rejects_agent_done() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = false;
+    // Durable state as persisted by the previous process run: structured
+    // observation available, but no positive turn-start evidence.
+    executor.turn_started_observed = false;
+    executor.structured_lifecycle_observed = true;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_result: Some(Ok(WaitOutcome::AgentDone { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+    assert!(!exec.turn_started_observed);
+    assert!(exec.structured_lifecycle_observed);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Restarted pre-turn AgentDone must never close the terminal"
+    );
+}
+
+/// Restart/recovery: once positive turn-start evidence
+/// (turn_started_observed=true) was durably persisted by a prior process run,
+/// a subsequent authoritative AgentDone may complete normally.
+#[tokio::test]
+async fn test_restart_with_turn_started_observed_agent_done_completes() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.dispatch_turn_started = false;
+    // Durable state as persisted by the previous process run right after the
+    // structured working observation.
+    executor.turn_started_observed = true;
+    executor.structured_lifecycle_observed = true;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_result: Some(Ok(WaitOutcome::AgentDone { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
     assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
     assert!(exec.runtime_error.is_none());
+    assert!(exec.turn_started_observed);
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        1,
+        "Successful AgentDone after restart closes the terminal exactly once"
+    );
 }

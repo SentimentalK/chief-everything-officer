@@ -1371,6 +1371,42 @@ pub async fn drive_active_attempt(
                         tokio::time::sleep(Duration::from_millis(300)).await;
                     }
                     crate::scheduler::WaitOutcome::AgentDone { .. } => {
+                        // Correctness rule: a structured Agent done observation
+                        // with a new generation but NO prior durable positive
+                        // turn-start evidence for the dispatched turn
+                        // (turn_started_observed=false) is NOT sufficient proof
+                        // that the dispatched task ran. Treat it as pre-turn
+                        // /non-terminal evidence: record that structured
+                        // lifecycle observation is available and keep waiting
+                        // inside the durable execution deadline (never close
+                        // the terminal here). Only after WorkingObserved has
+                        // been durably recorded may an authoritative
+                        // new-generation done + interrupted=false complete.
+                        if !turn_started_observed {
+                            if !structured_lifecycle_observed {
+                                structured_lifecycle_observed = true;
+                                let _lock = ExecutionLock::acquire_with_retry(
+                                    &paths.state_lock_file(),
+                                    Duration::from_secs(5),
+                                    Duration::from_millis(50),
+                                )?;
+                                let mut current =
+                                    match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                        Some(c) if c.attempt_id == active.attempt_id => c,
+                                        _ => return Ok(true),
+                                    };
+                                if let Some(ref mut exec) = current.executor {
+                                    exec.structured_lifecycle_observed = true;
+                                }
+                                current.save(&paths.active_attempt_file())?;
+                            }
+                            println!(
+                                "Pre-turn AgentDone observed for attempt '{}' without positive turn-start evidence; waiting for turn start.",
+                                active.attempt_id
+                            );
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            continue;
+                        }
                         if active.result_target.as_deref() == Some("resource") {
                             match crate::managed_result::durable_capture_managed_result(
                                 paths, cred, &active,
