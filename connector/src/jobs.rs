@@ -20,6 +20,8 @@ pub enum JobError {
     Client(#[from] ClientError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Target error: {0}")]
+    Target(#[from] crate::targets::TargetError),
     #[error("Not logged in. Please run `ceo-connector login` first.")]
     NotLoggedIn,
 }
@@ -62,6 +64,7 @@ pub fn parse_state_filter(raw: &str) -> Result<String, String> {
 pub struct JobListFilters {
     pub state: Option<String>,
     pub target_id: Option<String>,
+    pub project: Option<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }
@@ -85,7 +88,18 @@ pub async fn job_list(
     let profile = crate::config::load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
-    let res = client.list_jobs(&cred, &filters.to_query()).await?;
+
+    let target_id = if let Some(ref proj) = filters.project {
+        let resolved = crate::targets::resolve_target_selector(paths, &client, &cred, proj).await?;
+        Some(resolved.target_id)
+    } else {
+        filters.target_id.clone()
+    };
+
+    let mut query = filters.to_query();
+    query.target_id = target_id;
+
+    let res = client.list_jobs(&cred, &query).await?;
 
     if json_format {
         println!("{}", serde_json::to_string_pretty(&res)?);

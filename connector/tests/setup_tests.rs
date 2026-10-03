@@ -815,7 +815,7 @@ async fn agent_runtime_preserves_existing_executor_and_model_exactly() {
     assert_eq!(lt.local_path, outcome.local_path);
     let exec = lt.executor.as_ref().unwrap();
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.command.as_deref(), Some("/path/agent -f --trust"));
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
 }
 
@@ -1344,7 +1344,7 @@ async fn coding_local_mapping_preserves_executor_and_model() {
     assert_eq!(lt.local_path, outcome.local_path);
     let exec = lt.executor.as_ref().unwrap();
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.command.as_deref(), Some("/path/agent -f --trust"));
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
 }
 
@@ -1420,7 +1420,7 @@ async fn executor_config_writes_device_owned_orca_tui_executor_without_model() {
     let exec = config.targets[&target_id].executor.as_ref().unwrap();
     assert_eq!(exec.kind, "orca_tui");
     assert_eq!(exec.agent_id, "opencode");
-    assert_eq!(exec.command, "opencode");
+    assert_eq!(exec.command.as_deref(), Some("opencode"));
     assert_eq!(exec.model, None);
 
     // No Server mutation is needed for executor config.
@@ -1452,7 +1452,7 @@ async fn executor_config_never_silently_overwrites_existing_executor() {
         config.targets[&target_id].executor.clone().unwrap()
     };
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.command.as_deref(), Some("/path/agent -f --trust"));
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
     // Zero Server mutations either way.
     assert_eq!(env.register_calls(), before_register);

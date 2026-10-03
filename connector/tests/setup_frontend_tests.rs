@@ -988,7 +988,7 @@ async fn agent_runtime_flow_delegates_to_ensure_agent_runtime_and_renders_facts(
     let exec = config.targets[&target_id].executor.as_ref().unwrap();
     assert_eq!(exec.kind, "orca_tui");
     assert_eq!(exec.agent_id, "opencode");
-    assert_eq!(exec.command, "opencode");
+    assert_eq!(exec.command.as_deref(), Some("opencode"));
     assert_eq!(exec.model, None);
 
     // Typed outcome rendered as human facts: name/path/action, no raw IDs.
@@ -1419,7 +1419,7 @@ async fn executor_existing_is_reused_and_reported_not_overwritten() {
     let config = env.config().unwrap();
     let exec = config.targets[&target_id].executor.as_ref().unwrap();
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, "/path/agent -f --trust");
+    assert_eq!(exec.command.as_deref(), Some("/path/agent -f --trust"));
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
 }
 

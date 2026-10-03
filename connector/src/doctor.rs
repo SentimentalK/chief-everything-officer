@@ -537,19 +537,26 @@ async fn check_server_integration(
                                 checks.push(DiagnosticCheck {
                                     name: format!("Target '{}' Executor Configuration", display),
                                     severity: DiagnosticSeverity::Pass,
-                                    message: match &exec.model {
-                                        Some(m) => format!(
-                                            "Configured for agent '{}' ({}) with model override '{}'",
-                                            exec.agent_id, exec.command, m
-                                        ),
-                                        None => format!(
-                                            "Configured for agent '{}' ({})",
-                                            exec.agent_id, exec.command
-                                        ),
+                                    message: {
+                                        let cmd_suffix = match &exec.command {
+                                            Some(c) => format!(" ({c})"),
+                                            None => String::new(),
+                                        };
+                                        match &exec.model {
+                                            Some(m) => format!(
+                                                "Configured for agent '{}'{cmd_suffix} with model override '{}'",
+                                                exec.agent_id, m
+                                            ),
+                                            None => format!(
+                                                "Configured for agent '{}'{cmd_suffix}",
+                                                exec.agent_id
+                                            ),
+                                        }
                                     },
                                 });
 
-                                let agent_found = find_in_path(&exec.command);
+                                let probe_cmd = exec.command.as_deref().unwrap_or(&exec.agent_id);
+                                let agent_found = find_in_path(probe_cmd);
                                 if agent_found {
                                     checks.push(DiagnosticCheck {
                                         name: format!("Target '{}' Agent Availability", display),

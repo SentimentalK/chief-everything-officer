@@ -27,6 +27,7 @@ fn sample_item() -> ceo_connector::targets::TargetDisplayItem {
     ceo_connector::targets::TargetDisplayItem {
         target_id: LONG_TARGET_ID.into(),
         alias: Some("chief-everything-officer".into()),
+        display_name: Some("Chief Everything Officer".into()),
         kind: Some("coding".into()),
         local_path: Some(LONG_PATH.into()),
         status: "READY".into(),
@@ -639,6 +640,7 @@ fn clap_parses_job_list_and_show() {
                 JobSubcommands::List {
                     json,
                     state,
+                    project: _,
                     target_id,
                     limit,
                     cursor,

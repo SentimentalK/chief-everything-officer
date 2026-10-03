@@ -22,7 +22,7 @@
 pub mod gitops;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -213,7 +213,7 @@ pub fn select_single_workspace(
     }
 }
 
-async fn resolve_current_workspace(
+pub(crate) async fn resolve_current_workspace(
     client: &ConnectorClient,
     cred: &DeviceCredential,
 ) -> Result<crate::client::WorkspaceItem, SetupError> {
@@ -236,22 +236,22 @@ async fn resolve_current_workspace(
 /// The Device binding is intentionally NOT ensured here; it is ensured after
 /// the local repository/path steps succeed.
 #[derive(Debug, Clone)]
-struct EnsuredTarget {
-    target_id: String,
-    alias: String,
-    kind: String,
-    target_created: bool,
+pub(crate) struct EnsuredTarget {
+    pub(crate) target_id: String,
+    pub(crate) alias: String,
+    pub(crate) kind: String,
+    pub(crate) target_created: bool,
     /// Server-reported state of this device's binding at ensure time.
-    this_device_binding_active: bool,
+    pub(crate) this_device_binding_active: bool,
     /// True when the Server reports that this ensure run itself created the
     /// Device binding (register auto-binds the current device).
-    binding_created_by_register: bool,
-    is_default_agent_runtime: bool,
+    pub(crate) binding_created_by_register: bool,
+    pub(crate) is_default_agent_runtime: bool,
     /// Server repository metadata when present (coding flows verify it).
-    repository: Option<crate::client::TargetRepositoryPart>,
+    pub(crate) repository: Option<crate::client::TargetRepositoryPart>,
 }
 
-async fn ensure_server_target(
+pub(crate) async fn ensure_server_target(
     client: &ConnectorClient,
     cred: &DeviceCredential,
     workspace_id: &str,
@@ -338,7 +338,7 @@ async fn ensure_device_binding(
 /// Ensures the current Device binding is enabled. Active => replay/no-op;
 /// missing/disabled => existing bind API. A binding created by the register
 /// call itself counts as newly created.
-async fn ensure_binding_step(
+pub(crate) async fn ensure_binding_step(
     client: &ConnectorClient,
     cred: &DeviceCredential,
     ensured: &EnsuredTarget,
@@ -965,8 +965,11 @@ pub async fn configure_agent_runtime_executor(
         return Ok(ConfigureExecutorOutcome {
             target_id,
             alias: canonical.alias.clone(),
-            agent_id: existing.agent_id,
-            command: existing.command,
+            agent_id: existing.agent_id.clone(),
+            command: existing
+                .command
+                .clone()
+                .unwrap_or_else(|| existing.agent_id.clone()),
             executor_created: false,
             model: existing.model,
         });
@@ -1002,8 +1005,11 @@ pub async fn configure_agent_runtime_executor(
         return Ok(ConfigureExecutorOutcome {
             target_id,
             alias: canonical.alias.clone(),
-            agent_id: existing.agent_id,
-            command: existing.command,
+            agent_id: existing.agent_id.clone(),
+            command: existing
+                .command
+                .clone()
+                .unwrap_or_else(|| existing.agent_id.clone()),
             executor_created: false,
             model: existing.model,
         });
@@ -1019,6 +1025,156 @@ pub async fn configure_agent_runtime_executor(
         executor_created: true,
         model: None,
     })
+}
+
+/// Configures the default agent runtime executor using logical agent ID and optional model,
+/// without requiring a user-authored raw command.
+pub async fn configure_agent_runtime_executor_logical(
+    paths: &ConnectorPaths,
+    agent_id: &str,
+    model: Option<String>,
+) -> Result<ConfigureExecutorOutcome, SetupError> {
+    paths.ensure_dirs()?;
+    let profile = load_bound_profile(paths)?;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+
+    let workspaces = client.list_workspaces(&cred).await?;
+    let workspace = select_single_workspace(workspaces)?;
+    let catalogue = client.list_targets(&cred, Some(&workspace.id)).await?;
+    let canonical = catalogue
+        .iter()
+        .find(|t| t.alias == AGENT_RUNTIME_TARGET_ALIAS)
+        .ok_or(SetupError::RuntimeTargetMissing)?;
+    if canonical.kind != TARGET_KIND_CODING {
+        return Err(SetupError::TargetWrongKind {
+            alias: canonical.alias.clone(),
+            kind: canonical.kind.clone(),
+        });
+    }
+    if canonical.disabled {
+        return Err(SetupError::TargetDisabled(canonical.target_id.clone()));
+    }
+    let target_id = canonical.target_id.clone();
+
+    let existing_executor = profile
+        .config
+        .targets
+        .get(&target_id)
+        .ok_or(SetupError::RuntimeNotConnected)?
+        .executor
+        .clone();
+
+    if let Some(existing) = existing_executor {
+        return Ok(ConfigureExecutorOutcome {
+            target_id,
+            alias: canonical.alias.clone(),
+            agent_id: existing.agent_id.clone(),
+            command: existing
+                .command
+                .clone()
+                .unwrap_or_else(|| existing.agent_id.clone()),
+            executor_created: false,
+            model: existing.model,
+        });
+    }
+
+    let executor = crate::config::LocalExecutorConfig::new_logical(
+        agent_id.trim().to_string(),
+        model.clone(),
+    )?;
+
+    let _lock = acquire_state_lock(paths)?;
+    check_target_in_use(paths, &target_id)?;
+
+    let mut config = match LocalConfig::load(&paths.config_file())? {
+        Some(c) => c,
+        None => LocalConfig::new(cred.server_origin.clone())?,
+    };
+
+    let entry = config
+        .targets
+        .get_mut(&target_id)
+        .ok_or(SetupError::RuntimeNotConnected)?;
+
+    if let Some(existing) = entry.executor.clone() {
+        return Ok(ConfigureExecutorOutcome {
+            target_id,
+            alias: canonical.alias.clone(),
+            agent_id: existing.agent_id.clone(),
+            command: existing
+                .command
+                .clone()
+                .unwrap_or_else(|| existing.agent_id.clone()),
+            executor_created: false,
+            model: existing.model,
+        });
+    }
+
+    entry.executor = Some(executor);
+    config.save(&paths.config_file())?;
+    Ok(ConfigureExecutorOutcome {
+        target_id,
+        alias: canonical.alias.clone(),
+        agent_id: agent_id.trim().to_string(),
+        command: agent_id.trim().to_string(),
+        executor_created: true,
+        model,
+    })
+}
+
+/// Bounded search for existing CEO Agent Runtime checkouts in sensible user home
+/// and common code roots. Checks if the official normalized Git remote matches
+/// AGENT_RUNTIME_REPO_FULL_NAME.
+pub fn discover_agent_runtime_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut to_check = Vec::new();
+
+    // 1. Direct locations
+    to_check.push(home.join(".ceo").join(AGENT_RUNTIME_TARGET_ALIAS));
+    to_check.push(home.join(AGENT_RUNTIME_TARGET_ALIAS));
+
+    // 2. Common code roots at depth 1
+    let common_roots = [
+        "codes",
+        "code",
+        "src",
+        "Projects",
+        "projects",
+        "workspace",
+        "workspaces",
+        "dev",
+        "git",
+        "github",
+        "repos",
+    ];
+    for root_name in &common_roots {
+        let root = home.join(root_name);
+        to_check.push(root.join(AGENT_RUNTIME_TARGET_ALIAS));
+        if root.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    if entry.file_name() == AGENT_RUNTIME_TARGET_ALIAS {
+                        to_check.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    for path in to_check {
+        if path.is_dir() {
+            if let Ok(canonical) = std::fs::canonicalize(&path) {
+                if verify_local_repo_full_name(&canonical, AGENT_RUNTIME_REPO_FULL_NAME).is_ok()
+                    && !candidates.contains(&canonical)
+                {
+                    candidates.push(canonical);
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 // ---------------------------------------------------------------------------

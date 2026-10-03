@@ -409,4 +409,19 @@ impl OrcaCliClient {
             .await?;
         parse_orca_json(output)
     }
+
+    pub async fn agent_context_raw(&self) -> Result<String, OrcaError> {
+        let output = self
+            .execute_command(&["agent-context", "--json"], None, self.default_timeout)
+            .await?;
+        if let Some(code) = output.exit_code {
+            if code != 0 {
+                return Err(OrcaError::CommandFailed {
+                    code: Some(code),
+                    stderr: output.stderr,
+                });
+            }
+        }
+        Ok(output.stdout)
+    }
 }

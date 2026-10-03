@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use ceo_connector::cli::{Cli, Commands, JobSubcommands, TargetSubcommands};
+use ceo_connector::cli::{Cli, Commands, JobSubcommands, ProjectSubcommands, TargetSubcommands};
 use ceo_connector::jobs::JobListFilters;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::status::{get_status, print_status};
@@ -50,32 +50,14 @@ async fn main() -> ExitCode {
                     // Never invalidates the successful authentication above.
                     let interactive = ceo_connector::setup_frontend::is_interactive_terminal();
                     let mut ui = ceo_connector::setup_frontend::TerminalUi;
-                    match ceo_connector::setup_frontend::post_login_handoff(
+                    let _ = ceo_connector::setup_frontend::post_login_handoff(
                         &paths,
                         no_setup,
                         interactive,
                         &mut ui,
                     )
-                    .await
-                    {
-                        Ok(None) => {}
-                        Ok(Some(ceo_connector::setup_frontend::SetupCompletion::Finished {
-                            doctor_passed,
-                        })) => {
-                            if !doctor_passed {
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                        Ok(Some(ceo_connector::setup_frontend::SetupCompletion::Cancelled)) => {
-                            println!(
-                                "Setup is incomplete. Resume anytime with `ceo-connector setup`."
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("Setup failed: {}", e);
-                            return ExitCode::FAILURE;
-                        }
-                    }
+                    .await;
+                    println!("Login completed successfully.");
                 }
                 Err(e) => {
                     eprintln!("Login failed: {}", e);
@@ -147,6 +129,86 @@ async fn main() -> ExitCode {
             }
             println!("Connector job acquisition resumed.");
         }
+        Commands::Project { sub } => match sub {
+            ProjectSubcommands::Add {
+                path,
+                name,
+                agent,
+                model,
+            } => {
+                if let Err(e) = ceo_connector::projects::project_add(
+                    &paths,
+                    path.as_deref(),
+                    name.as_deref(),
+                    agent.as_deref(),
+                    model.as_deref(),
+                )
+                .await
+                {
+                    eprintln!("Project add failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::List { json } => {
+                if let Err(e) = ceo_connector::projects::project_list(&paths, json).await {
+                    eprintln!("Project list failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Show { project, json } => {
+                if let Err(e) = ceo_connector::projects::project_show(&paths, &project, json).await
+                {
+                    eprintln!("Project show failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Set {
+                project,
+                path,
+                agent,
+                model,
+            } => {
+                if let Err(e) = ceo_connector::projects::project_set(
+                    &paths,
+                    &project,
+                    path.as_deref(),
+                    agent.as_deref(),
+                    model.as_deref(),
+                )
+                .await
+                {
+                    eprintln!("Project set failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Rename {
+                project,
+                new_name,
+                json,
+            } => {
+                if let Err(e) =
+                    ceo_connector::projects::project_rename(&paths, &project, &new_name, json).await
+                {
+                    eprintln!("Project rename failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Remove { project } => {
+                if let Err(e) = ceo_connector::projects::project_remove(&paths, &project).await {
+                    eprintln!("Project remove failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::DefaultRuntime { project } => {
+                if let Err(e) =
+                    ceo_connector::projects::project_default_runtime(&paths, project.as_deref())
+                        .await
+                {
+                    eprintln!("Project default-runtime failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        },
         Commands::Target { sub } => match sub {
             TargetSubcommands::List { json } => {
                 if let Err(e) = ceo_connector::targets::target_list(&paths, json).await {
@@ -277,6 +339,7 @@ async fn main() -> ExitCode {
             JobSubcommands::List {
                 json,
                 state,
+                project,
                 target_id,
                 limit,
                 cursor,
@@ -284,6 +347,7 @@ async fn main() -> ExitCode {
                 let filters = JobListFilters {
                     state,
                     target_id,
+                    project,
                     limit,
                     cursor,
                 };
@@ -342,8 +406,12 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Redeliver { job_id, attempt } => {
-            if let Err(e) =
-                ceo_connector::redelivery::run_redeliver(&paths, &job_id, attempt.as_deref()).await
+            if let Err(e) = ceo_connector::redelivery::run_redeliver(
+                &paths,
+                job_id.as_deref(),
+                attempt.as_deref(),
+            )
+            .await
             {
                 eprintln!("Redelivery failed: {}", e);
                 return ExitCode::FAILURE;

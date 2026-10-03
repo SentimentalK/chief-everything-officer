@@ -134,7 +134,7 @@ async fn config_with_model_round_trips() {
         .unwrap();
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, CURSOR_COMMAND);
+    assert_eq!(exec.command.as_deref(), Some(CURSOR_COMMAND));
 }
 
 // 3. Model validation rejects empty / NUL / newline / control / whitespace / overlong.
@@ -253,7 +253,7 @@ async fn set_model_set_and_clear_preserve_other_executor_fields() {
         .unwrap();
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, CURSOR_COMMAND);
+    assert_eq!(exec.command.as_deref(), Some(CURSOR_COMMAND));
 
     // Overwrite with another model
     target_set_model(&paths, "tgt_1", Some("sonnet-4-thinking"))
@@ -283,7 +283,7 @@ async fn set_model_set_and_clear_preserve_other_executor_fields() {
         .unwrap();
     assert_eq!(exec.model, None);
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, CURSOR_COMMAND);
+    assert_eq!(exec.command.as_deref(), Some(CURSOR_COMMAND));
     assert_eq!(exec.effective_command().unwrap(), CURSOR_COMMAND);
 }
 
@@ -309,7 +309,7 @@ async fn set_agent_preserves_existing_model_override() {
         .clone()
         .unwrap();
     assert_eq!(exec.agent_id, "cursor");
-    assert_eq!(exec.command, "/path/new-agent --force");
+    assert_eq!(exec.command.as_deref(), Some("/path/new-agent --force"));
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
 }
 
@@ -338,7 +338,7 @@ async fn set_agent_with_unsupported_agent_and_model_fails_explicitly() {
         .clone()
         .unwrap();
     assert_eq!(exec.model.as_deref(), Some("gpt-5"));
-    assert_eq!(exec.command, CURSOR_COMMAND);
+    assert_eq!(exec.command.as_deref(), Some(CURSOR_COMMAND));
 }
 
 // 6. Active-target mutation guard applies to set-model (TARGET_IN_USE).
@@ -381,6 +381,7 @@ fn target_list_human_shows_model_override() {
     let mut with_model = TargetDisplayItem {
         target_id: "tgt_1".into(),
         alias: Some("alpha".into()),
+        display_name: None,
         kind: Some("coding".into()),
         local_path: Some("/tmp/repo".into()),
         status: "READY".into(),
@@ -407,6 +408,7 @@ fn target_json_model_field_is_additive_and_stable() {
     let with_model = TargetDisplayItem {
         target_id: "tgt_1".into(),
         alias: Some("alpha".into()),
+        display_name: None,
         kind: Some("coding".into()),
         local_path: Some("/tmp/repo".into()),
         status: "READY".into(),
@@ -602,7 +604,7 @@ fn unsupported_agent_model_has_no_silent_fallback() {
     let cfg = LocalExecutorConfig {
         kind: "orca_tui".into(),
         agent_id: "agy".into(),
-        command: "agy".into(),
+        command: Some("agy".into()),
         model: Some("gpt-5".into()),
     };
     assert!(cfg.validate().is_err());

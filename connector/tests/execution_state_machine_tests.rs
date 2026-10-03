@@ -1703,7 +1703,8 @@ async fn test_explicit_redelivery_flow() {
         MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
 
-    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, Some(&attempt_id)).await;
+    let res =
+        ceo_connector::redelivery::run_redeliver(&paths, Some(job_id), Some(&attempt_id)).await;
     assert!(res.is_ok(), "redelivery failed: {:?}", res);
 }
 
@@ -2385,7 +2386,8 @@ async fn test_redelivery_authority_decoupled_from_active_attempt_and_late_runtim
     });
 
     // Run redelivery on Job A while Job B is active!
-    let redeliver_res = ceo_connector::redelivery::run_redeliver(&paths, job_a_id, None).await;
+    let redeliver_res =
+        ceo_connector::redelivery::run_redeliver(&paths, Some(job_a_id), None).await;
     assert!(
         redeliver_res.is_ok(),
         "Redelivery failed: {:?}",
@@ -2487,7 +2489,7 @@ async fn test_redelivery_runtime_candidate_precedence_and_snapshot_replacement()
         MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
     });
 
-    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, None).await;
+    let res = ceo_connector::redelivery::run_redeliver(&paths, Some(job_id), None).await;
     assert!(res.is_ok(), "Redelivery failed: {:?}", res);
     assert!(server_saw_corrected.load(Ordering::SeqCst));
 
@@ -2547,7 +2549,7 @@ async fn test_redelivery_invalid_runtime_result_strict_failure_no_silent_fallbac
         MockResponse::json(500, &serde_json::json!({ "error": "should not be called" }))
     });
 
-    let res = ceo_connector::redelivery::run_redeliver(&paths, job_id, None).await;
+    let res = ceo_connector::redelivery::run_redeliver(&paths, Some(job_id), None).await;
     assert!(res.is_err(), "Must fail when runtime result is invalid");
     let err_msg = res.unwrap_err();
     assert!(

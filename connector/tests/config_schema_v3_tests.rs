@@ -343,8 +343,13 @@ fn migration_never_clobbers_a_concurrent_newer_v3_mutation() {
     );
     let cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     assert_eq!(
-        cfg.targets["tgt_alpha"].executor.as_ref().unwrap().command,
-        "/newer/command"
+        cfg.targets["tgt_alpha"]
+            .executor
+            .as_ref()
+            .unwrap()
+            .command
+            .as_deref(),
+        Some("/newer/command")
     );
 }
 

@@ -54,7 +54,14 @@ pub enum Commands {
     /// Resume job acquisition
     Resume,
 
-    /// Target management commands
+    /// Project management commands
+    Project {
+        #[command(subcommand)]
+        sub: ProjectSubcommands,
+    },
+
+    /// Target management commands (low-level / compatibility)
+    #[command(hide = true)]
     Target {
         #[command(subcommand)]
         sub: TargetSubcommands,
@@ -76,14 +83,92 @@ pub enum Commands {
     /// Guided, interactive device setup (arrow-key menus)
     Setup,
 
-    /// Redeliver a managed result to the server
+    /// Redeliver managed results to the server
     Redeliver {
-        /// Job ID to redeliver
-        job_id: String,
+        /// Optional job ID to redeliver (omitted = smart redelivery scanning this device)
+        job_id: Option<String>,
 
         /// Specific attempt ID to redeliver (optional if only one attempt exists)
         #[arg(long)]
         attempt: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectSubcommands {
+    /// Add an existing Git project to this device and workspace
+    Add {
+        /// Local filesystem path to the project Git repository (defaults to current directory)
+        path: Option<String>,
+
+        /// Optional project name / alias override (defaults to Git remote or directory name)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Execution agent ID (interactive selection if flag is given without a value)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        agent: Option<String>,
+
+        /// Optional model override (e.g. gpt-5, or 'auto' to clear)
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// List configured projects
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Show project details
+    Show {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Update project configuration (path, agent, or model)
+    Set {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+
+        /// Update local filesystem path
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Execution agent ID (interactive selection if flag is given without a value; 'auto' to follow Orca default)
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        agent: Option<String>,
+
+        /// Model override for this project ('auto' to clear)
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Rename a project (server-authoritative alias)
+    Rename {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+
+        /// New project name / alias
+        new_name: String,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Remove a project binding from this device
+    Remove {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+    },
+
+    /// Get or set the workspace default Agent Runtime project
+    DefaultRuntime {
+        /// Project selector to set as default (if omitted, shows current workspace default)
+        project: Option<String>,
     },
 }
 
@@ -187,7 +272,11 @@ pub enum JobSubcommands {
         #[arg(long, value_parser = parse_state_filter)]
         state: Option<String>,
 
-        /// Filter by execution target ID (tgt_...)
+        /// Filter by project alias, display name, or target ID
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Filter by execution target ID (tgt_...) [compatibility]
         #[arg(long)]
         target_id: Option<String>,
 

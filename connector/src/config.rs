@@ -55,7 +55,8 @@ pub enum ConfigError {
 pub struct LocalExecutorConfig {
     pub kind: String,
     pub agent_id: String,
-    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// Optional per-target model override applied by the shared core launch
     /// policy when creating a new agent terminal/session. Absent (None)
     /// preserves the agent's normal default/Auto model selection.
@@ -71,9 +72,21 @@ impl LocalExecutorConfig {
         Self::new_with_model(agent_id, command, None)
     }
 
+    pub fn new_logical(agent_id: String, model: Option<String>) -> Result<Self, ConfigError> {
+        Self::new_internal(agent_id, None, model)
+    }
+
     pub fn new_with_model(
         agent_id: String,
         command: String,
+        model: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        Self::new_internal(agent_id, Some(command), model)
+    }
+
+    pub fn new_internal(
+        agent_id: String,
+        command: Option<String>,
         model: Option<String>,
     ) -> Result<Self, ConfigError> {
         let cfg = Self {
@@ -87,13 +100,13 @@ impl LocalExecutorConfig {
     }
 
     /// Explicit executor capability mapping for per-target model overrides.
-    /// Intentionally minimal: only the Cursor Agent CLI has a verified launch
-    /// contract (`--model <model>`). Future agents add their own entry after
-    /// their CLI contract is verified. This shared-core mapping is the single
-    /// place model-capable agents are declared; platform modules and Orca
-    /// never own model routing.
+    /// Orca 1.4.219 worker-start contract documents model support for:
+    /// Claude, Codex, Cursor, Antigravity, and Muse opaque provider model ids.
     pub fn agent_supports_model_override(agent_id: &str) -> bool {
-        agent_id == "cursor"
+        matches!(
+            agent_id.to_lowercase().as_str(),
+            "cursor" | "claude" | "codex" | "antigravity" | "muse"
+        )
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -127,36 +140,38 @@ impl LocalExecutorConfig {
                 "agent_id contains invalid characters (allowed: alphanumeric, -, _, .)".into(),
             ));
         }
-        let command = self.command.trim();
-        if command.is_empty() {
-            return Err(ConfigError::InvalidExecutor(
-                "command cannot be empty".into(),
-            ));
-        }
-        if command.len() > 1024 {
-            return Err(ConfigError::InvalidExecutor(
-                "command exceeds maximum length of 1024 bytes".into(),
-            ));
-        }
-        if command.contains('\0') {
-            return Err(ConfigError::InvalidExecutor(
-                "command cannot contain NUL byte".into(),
-            ));
+        if let Some(cmd) = &self.command {
+            let command = cmd.trim();
+            if command.is_empty() {
+                return Err(ConfigError::InvalidExecutor(
+                    "command cannot be empty".into(),
+                ));
+            }
+            if command.len() > 1024 {
+                return Err(ConfigError::InvalidExecutor(
+                    "command exceeds maximum length of 1024 bytes".into(),
+                ));
+            }
+            if command.contains('\0') {
+                return Err(ConfigError::InvalidExecutor(
+                    "command cannot contain NUL byte".into(),
+                ));
+            }
         }
         if let Some(model) = &self.model {
-            Self::validate_model_override(&self.agent_id, command, model)?;
+            Self::validate_model_override(&self.agent_id, self.command.as_deref(), model)?;
         }
         Ok(())
     }
 
     fn validate_model_override(
         agent_id: &str,
-        command: &str,
+        command: Option<&str>,
         model: &str,
     ) -> Result<(), ConfigError> {
         if !Self::agent_supports_model_override(agent_id) {
             return Err(ConfigError::InvalidExecutor(format!(
-                "model override is not supported for agent '{agent_id}' (only 'cursor' has a verified model launch contract)"
+                "model override is not supported for agent '{agent_id}' (Orca documented model contract supports claude, codex, cursor, antigravity, and muse)"
             )));
         }
         let model = model.trim();
@@ -182,10 +197,12 @@ impl LocalExecutorConfig {
         }
         // The model flag is appended to the existing command; a command that
         // already carries `--model` would result in the flag appearing twice.
-        if command.split_whitespace().any(|t| t == "--model") {
-            return Err(ConfigError::InvalidExecutor(
-                "command already contains '--model'; remove it from the command before setting a model override".into(),
-            ));
+        if let Some(cmd) = command {
+            if cmd.split_whitespace().any(|t| t == "--model") {
+                return Err(ConfigError::InvalidExecutor(
+                    "command already contains '--model'; remove it from the command before setting a model override".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -193,17 +210,26 @@ impl LocalExecutorConfig {
     /// Returns the effective agent launch command used when creating a *new*
     /// agent terminal/session for this Target (shared core launch policy).
     ///
-    /// - No model override: the configured command is returned unchanged.
-    /// - Model override set: the verified Cursor CLI `--model <model>` option
-    ///   is appended exactly once to the configured command.
+    /// - No model override: configured command or logical agent_id is returned.
+    /// - Model override set: `--model <model>` option is appended.
     ///
     /// Recovery/reconciliation of an existing recorded terminal must not use
     /// this to restart a terminal; the override only applies at creation time.
     pub fn effective_command(&self) -> Result<String, ConfigError> {
         self.validate()?;
+        let base_cmd = match &self.command {
+            Some(cmd) => cmd.clone(),
+            None => {
+                if self.agent_id == "auto" {
+                    "auto".to_string()
+                } else {
+                    self.agent_id.clone()
+                }
+            }
+        };
         match &self.model {
-            None => Ok(self.command.clone()),
-            Some(model) => Ok(format!("{} --model {}", self.command, model)),
+            None => Ok(base_cmd),
+            Some(model) => Ok(format!("{} --model {}", base_cmd, model)),
         }
     }
 }
@@ -660,7 +686,7 @@ mod tests {
         let invalid_kind = LocalExecutorConfig {
             kind: "other".into(),
             agent_id: "agy".into(),
-            command: "agy".into(),
+            command: Some("agy".into()),
             model: None,
         };
         assert!(invalid_kind.validate().is_err());

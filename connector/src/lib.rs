@@ -13,6 +13,7 @@ pub mod orca;
 pub mod outbox;
 pub mod paths;
 pub mod platform;
+pub mod projects;
 pub mod redelivery;
 pub mod render;
 pub mod scheduler;

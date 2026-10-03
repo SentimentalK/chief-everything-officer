@@ -166,12 +166,16 @@ impl SetupUi for TerminalUi {
 /// - otherwise the longest common prefix of the current suggestions replaces
 ///   the input when it extends the typed text (terminal-like unambiguous
 ///   completion); otherwise the input is left unchanged.
+///
+/// get_suggestions returns an empty list so no passive directory list is
+/// rendered below the prompt while typing.
 #[derive(Clone)]
-struct PathCompleter;
+pub struct PathCompleter;
 
 impl inquire::Autocomplete for PathCompleter {
-    fn get_suggestions(&mut self, input: &str) -> Result<Vec<String>, inquire::CustomUserError> {
-        Ok(complete_path(input))
+    fn get_suggestions(&mut self, _input: &str) -> Result<Vec<String>, inquire::CustomUserError> {
+        // Do NOT render passive directory-entry lists below the prompt while typing.
+        Ok(Vec::new())
     }
 
     fn get_completion(

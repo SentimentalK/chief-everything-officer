@@ -76,6 +76,8 @@ pub struct TargetDisplayItem {
     /// local state never fabricates Server-owned names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Server-authoritative Target kind; `None` when unknown locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -328,10 +330,10 @@ pub fn resolve_selector_from_catalogue(
 ) -> Result<ResolvedTarget, TargetError> {
     // 1. Exact immutable target_id match wins.
     if let Some(by_id) = targets.iter().find(|t| t.target_id == selector) {
-        // Fail closed if the same string is also another target's exact alias.
-        let ambiguous = targets
-            .iter()
-            .any(|t| t.target_id != by_id.target_id && t.alias == selector);
+        // Fail closed if the same string is also another target's exact alias or display_name.
+        let ambiguous = targets.iter().any(|t| {
+            t.target_id != by_id.target_id && (t.alias == selector || t.display_name == selector)
+        });
         if ambiguous {
             return Err(TargetError::AmbiguousSelector(selector.to_string()));
         }
@@ -344,27 +346,50 @@ pub fn resolve_selector_from_catalogue(
     // 2. Exact server-authoritative alias match (case-sensitive, whole string).
     let alias_matches: Vec<&crate::client::ConnectorTargetProjection> =
         targets.iter().filter(|t| t.alias == selector).collect();
-    match alias_matches.len() {
-        1 => {
-            let t = alias_matches[0];
-            Ok(ResolvedTarget {
-                target_id: t.target_id.clone(),
-                projection: Some(t.clone()),
-            })
-        }
-        0 => {
-            // Direct-ID fallback for local-only targets known to this device
-            // (e.g. server catalogue does not include this device's mapping).
-            if local_config_has_target(paths, selector)? {
-                return Ok(ResolvedTarget {
-                    target_id: selector.to_string(),
-                    projection: None,
-                });
-            }
-            Err(TargetError::TargetNotFound(selector.to_string()))
-        }
-        _ => Err(TargetError::AmbiguousSelector(selector.to_string())),
+    if alias_matches.len() > 1 {
+        return Err(TargetError::AmbiguousSelector(selector.to_string()));
     }
+    if alias_matches.len() == 1 {
+        let t = alias_matches[0];
+        // Check if there is another target with exact display_name == selector
+        let display_matches: Vec<&crate::client::ConnectorTargetProjection> = targets
+            .iter()
+            .filter(|o| o.target_id != t.target_id && o.display_name == selector)
+            .collect();
+        if !display_matches.is_empty() {
+            return Err(TargetError::AmbiguousSelector(selector.to_string()));
+        }
+        return Ok(ResolvedTarget {
+            target_id: t.target_id.clone(),
+            projection: Some(t.clone()),
+        });
+    }
+
+    // 3. Exact server-authoritative display_name match (case-sensitive, whole string).
+    let display_matches: Vec<&crate::client::ConnectorTargetProjection> = targets
+        .iter()
+        .filter(|t| t.display_name == selector)
+        .collect();
+    if display_matches.len() > 1 {
+        return Err(TargetError::AmbiguousSelector(selector.to_string()));
+    }
+    if display_matches.len() == 1 {
+        let t = display_matches[0];
+        return Ok(ResolvedTarget {
+            target_id: t.target_id.clone(),
+            projection: Some(t.clone()),
+        });
+    }
+
+    // Direct-ID fallback for local-only targets known to this device
+    // (e.g. server catalogue does not include this device's mapping).
+    if local_config_has_target(paths, selector)? {
+        return Ok(ResolvedTarget {
+            target_id: selector.to_string(),
+            projection: None,
+        });
+    }
+    Err(TargetError::TargetNotFound(selector.to_string()))
 }
 
 /// Builds a client + credential when the device is logged in; `None` when no
@@ -881,6 +906,7 @@ pub async fn build_target_display_items(
             display_items.push(TargetDisplayItem {
                 target_id: tid.clone(),
                 alias: Some(st.alias),
+                display_name: Some(st.display_name),
                 kind: Some(st.kind),
                 local_path: Some(lt.local_path.clone()),
                 status,
@@ -889,7 +915,7 @@ pub async fn build_target_display_items(
                 active_binding_count: st.active_binding_count,
                 repository: st.repository.map(|r| r.full_name),
                 agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
-                agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
+                agent_command: lt.executor.as_ref().and_then(|e| e.command.clone()),
                 model: lt.executor.as_ref().and_then(|e| e.model.clone()),
             });
         } else {
@@ -905,6 +931,7 @@ pub async fn build_target_display_items(
             display_items.push(TargetDisplayItem {
                 target_id: tid.clone(),
                 alias: None,
+                display_name: None,
                 kind: None,
                 local_path: Some(lt.local_path.clone()),
                 status,
@@ -913,7 +940,7 @@ pub async fn build_target_display_items(
                 active_binding_count: 0,
                 repository: None,
                 agent_id: lt.executor.as_ref().map(|e| e.agent_id.clone()),
-                agent_command: lt.executor.as_ref().map(|e| e.command.clone()),
+                agent_command: lt.executor.as_ref().and_then(|e| e.command.clone()),
                 model: lt.executor.as_ref().and_then(|e| e.model.clone()),
             });
         }
@@ -935,6 +962,7 @@ pub async fn build_target_display_items(
         display_items.push(TargetDisplayItem {
             target_id: tid,
             alias: Some(st.alias),
+            display_name: Some(st.display_name),
             kind: Some(st.kind),
             local_path: None,
             status,

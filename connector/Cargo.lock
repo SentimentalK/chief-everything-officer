@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "ceo-connector"
-version = "2.4.1"
+version = "2.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
