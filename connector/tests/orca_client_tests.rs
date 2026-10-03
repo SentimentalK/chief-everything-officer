@@ -465,7 +465,7 @@ fi
 }
 
 #[tokio::test]
-async fn test_real_orca_agent_aware_launch_antigravity_not_literal_command() {
+async fn test_logical_agent_launch_never_invokes_orchestration_worker_start_and_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
@@ -484,12 +484,99 @@ elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
     echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
-elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
-    echo '{{"ok":true,"result":{{"runId":"run_1","taskId":"task_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_agy"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ] && [ "$3" = "--help" ]; then
+    echo 'Options: --command, --worktree, --title, --json'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    // Logical agent launch fails closed with ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE
+    // when pure agent launch surface is unavailable in Orca CLI
+    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    match outcome {
+        PrepareOutcome::RecoveryRequired { reason, .. } => {
+            assert!(
+                reason.contains("ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE"),
+                "must report ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE, got: {reason}"
+            );
+        }
+        other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
+    }
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    // PROVEN: NEVER invokes orchestration worker-start
+    assert!(
+        !recorded.contains("worker-start"),
+        "must NEVER call orchestration worker-start, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration"),
+        "must NEVER invoke orchestration commands, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_pure_agent_aware_cli_path_when_available_invokes_terminal_create_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ] && [ "$3" = "--help" ]; then
+    echo 'Options: --command, --worktree, --title, --agent, --json'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_agent_pure","title":"ceo:att_123:antigravity","worktreeId":"wt_123"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
-    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_agy","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_agent_pure","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
-    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_agy","title":"ceo:att_123:antigravity","worktreeId":"wt_123"}}}}}}'
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_agent_pure","title":"ceo:att_123:antigravity","worktreeId":"wt_123"}}}}}}'
 else
     echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
 fi
@@ -533,32 +620,28 @@ fi
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
     assert_eq!(prep.worktree_id, "wt_123");
-    assert_eq!(prep.terminal_id, "term_worker_agy");
+    assert_eq!(prep.terminal_id, "term_agent_pure");
     assert_eq!(prep.agent_id, "antigravity");
 
     let recorded = fs::read_to_string(&args_log).unwrap();
-    // Proven: worker-start called with logical agent antigravity
+    // Proven: terminal create called with --agent antigravity
     assert!(
-        recorded.contains("orchestration worker-start"),
-        "must call orchestration worker-start, log:\n{recorded}"
+        recorded.contains("terminal create"),
+        "must call terminal create, log:\n{recorded}"
     );
     assert!(
         recorded.contains("--agent antigravity"),
         "must pass --agent antigravity, log:\n{recorded}"
     );
-    // Proven: NEVER executed literal "antigravity" command or terminal create --command antigravity
+    // Proven: NEVER invokes orchestration worker-start
     assert!(
-        !recorded.contains("terminal create --command antigravity"),
-        "must NOT create terminal with literal command 'antigravity'"
-    );
-    assert!(
-        !recorded.contains("--command"),
-        "normal path must not pass --command"
+        !recorded.contains("orchestration"),
+        "must NEVER invoke orchestration, log:\n{recorded}"
     );
 }
 
 #[tokio::test]
-async fn test_real_orca_agent_aware_launch_auto_omits_agent_and_never_literal_command() {
+async fn test_legacy_safe_launch_bridge_with_command_works_without_orchestration() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");
     fs::create_dir_all(&repo_dir).unwrap();
@@ -577,12 +660,12 @@ elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
     echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
     echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
-elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
-    echo '{{"ok":true,"result":{{"runId":"run_1","taskId":"task_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_auto"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_legacy_cmd","title":"ceo:att_123:custom","worktreeId":"wt_123"}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
-    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_auto","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_legacy_cmd","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
-    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_auto","title":"ceo:att_123:auto","worktreeId":"wt_123"}}}}}}'
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_legacy_cmd","title":"ceo:att_123:custom","worktreeId":"wt_123"}}}}}}'
 else
     echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
 fi
@@ -597,7 +680,9 @@ fi
 
     let target = LocalTarget {
         local_path: repo_canon,
-        executor: Some(LocalExecutorConfig::new_logical("auto".into(), None).unwrap()),
+        executor: Some(
+            LocalExecutorConfig::new("custom".into(), "run-custom-agent".into()).unwrap(),
+        ),
     };
 
     let attempt = ActiveAttempt {
@@ -626,28 +711,22 @@ fi
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
     assert_eq!(prep.worktree_id, "wt_123");
-    assert_eq!(prep.terminal_id, "term_worker_auto");
-    assert_eq!(prep.agent_id, "auto");
+    assert_eq!(prep.terminal_id, "term_legacy_cmd");
+    assert_eq!(prep.agent_id, "custom");
 
     let recorded = fs::read_to_string(&args_log).unwrap();
-    // Proven: worker-start called
+    // Proven: legacy path uses terminal create --command without worker-start
     assert!(
-        recorded.contains("orchestration worker-start"),
-        "must call orchestration worker-start, log:\n{recorded}"
-    );
-    // Proven: --agent is completely omitted for auto
-    assert!(
-        !recorded.contains("--agent"),
-        "must omit --agent for auto, log:\n{recorded}"
-    );
-    // Proven: NEVER executed literal "auto" command or terminal create --command auto
-    assert!(
-        !recorded.contains("terminal create --command auto"),
-        "must NOT create terminal with literal command 'auto'"
+        recorded.contains("terminal create"),
+        "must call terminal create, log:\n{recorded}"
     );
     assert!(
-        !recorded.contains("--command"),
-        "normal path must not pass --command"
+        recorded.contains("--command run-custom-agent"),
+        "must pass --command run-custom-agent, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration"),
+        "must NEVER invoke orchestration, log:\n{recorded}"
     );
 }
 

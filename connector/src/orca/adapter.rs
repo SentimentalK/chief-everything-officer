@@ -401,39 +401,30 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                             .await
                             .map_err(|e| format!("failed to create terminal for attempt: {e}"))?;
                         term.handle
-                    } else {
-                        // Agent-aware Orca launch: normal path passes logical agent_id and optional model.
-                        // Orca owns binary / launch command / flags / trust / prompt injection.
-                        let spec = format!("ceo:{}", attempt.attempt_id);
-                        let worktree_selector = format!("id:{}", worktree.id);
-                        let agent_opt = if executor.agent_id == "auto" {
-                            None
-                        } else {
-                            Some(executor.agent_id.as_str())
-                        };
+                    } else if self.client.supports_agent_session_launch().await {
+                        // Pure Agent-aware Orca launch: normal path passes logical agent_id and optional model.
+                        // Non-orchestrating, existing-worktree pure launch primitive.
+                        let agent_id = &executor.agent_id;
                         let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
-
-                        let start_res = self
+                        let term = self
                             .client
-                            .worker_start(
-                                &worktree_selector,
-                                &spec,
-                                Some(&expected_title),
-                                agent_opt,
+                            .create_agent_terminal(
+                                &worktree.id,
+                                &expected_title,
+                                agent_id,
                                 model_opt,
-                                None,
+                                Some(&canonical_target_path),
                             )
                             .await
                             .map_err(|e| {
-                                format!("failed to start agent worker for attempt: {e}")
+                                format!("failed to create agent terminal for attempt: {e}")
                             })?;
-
-                        start_res.terminal_handle().ok_or_else(|| {
-                            format!(
-                                "RECOVERY_REQUIRED: worker-start succeeded but did not return a terminal handle for attempt '{}'",
-                                attempt.attempt_id
-                            )
-                        })?
+                        term.handle
+                    } else {
+                        return Ok(PrepareOutcome::RecoveryRequired {
+                            execution: None,
+                            reason: "ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector".to_string(),
+                        });
                     };
 
                     let identity = PreparedExecutionIdentity {

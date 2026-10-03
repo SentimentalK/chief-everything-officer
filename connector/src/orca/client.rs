@@ -425,108 +425,61 @@ impl OrcaCliClient {
         Ok(output.stdout)
     }
 
-    pub async fn run_create(&self, objective: &str) -> Result<OrcaRunItem, OrcaError> {
-        let args = vec![
-            "orchestration",
-            "run-create",
-            "--objective",
-            objective,
-            "--json",
-        ];
-        let output = self
-            .execute_command(&args, None, self.default_timeout)
-            .await?;
-        let resp: OrcaRunCreateResponse = parse_orca_json(output)?;
-        resp.result.and_then(|r| r.run).ok_or_else(|| {
-            OrcaError::Protocol(
-                "run create returned missing run object".into(),
-                String::new(),
+    pub async fn supports_agent_session_launch(&self) -> bool {
+        if std::env::var("CEO_FORCE_ORCA_AGENT_LAUNCH")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let output = match self
+            .execute_command(
+                &["terminal", "create", "--help"],
+                None,
+                Duration::from_secs(3),
             )
-        })
+            .await
+        {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        output.stdout.contains("--agent") || output.stderr.contains("--agent")
     }
 
-    async fn worker_start_inner(
+    pub async fn create_agent_terminal(
         &self,
         worktree_selector: &str,
-        spec: &str,
-        task_title: Option<&str>,
-        agent: Option<&str>,
+        title: &str,
+        agent: &str,
         model: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Result<OrcaWorkerStartResult, OrcaError> {
+        cwd: Option<&Path>,
+    ) -> Result<OrcaTerminalItem, OrcaError> {
         let mut args = vec![
-            "orchestration",
-            "worker-start",
+            "terminal",
+            "create",
             "--worktree",
             worktree_selector,
-            "--spec",
-            spec,
+            "--title",
+            title,
+            "--agent",
+            agent,
             "--json",
         ];
-        if let Some(title) = task_title {
-            args.push("--task-title");
-            args.push(title);
-        }
-        if let Some(ag) = agent {
-            if ag != "auto" {
-                args.push("--agent");
-                args.push(ag);
-            }
-        }
         if let Some(m) = model {
             if m != "auto" {
                 args.push("--model");
                 args.push(m);
             }
         }
-        if let Some(r) = run_id {
-            args.push("--run");
-            args.push(r);
-        }
-
         let output = self
-            .execute_command(&args, None, self.default_timeout)
+            .execute_command(&args, cwd, self.default_timeout)
             .await?;
-        let resp: OrcaWorkerStartResponse = parse_orca_json(output)?;
-        resp.result.ok_or_else(|| {
+        let resp: OrcaTerminalCreateResponse = parse_orca_json(output)?;
+        resp.result.map(|r| r.terminal).ok_or_else(|| {
             OrcaError::Protocol(
-                "worker start returned missing result object".into(),
+                "terminal create returned missing terminal object".into(),
                 String::new(),
             )
         })
-    }
-
-    pub async fn worker_start(
-        &self,
-        worktree_selector: &str,
-        spec: &str,
-        task_title: Option<&str>,
-        agent: Option<&str>,
-        model: Option<&str>,
-        run_id: Option<&str>,
-    ) -> Result<OrcaWorkerStartResult, OrcaError> {
-        let res = self
-            .worker_start_inner(worktree_selector, spec, task_title, agent, model, run_id)
-            .await;
-        match res {
-            Err(OrcaError::Orca { ref code, .. })
-                if run_id.is_none()
-                    && (code == "run_required"
-                        || code == "no_active_run"
-                        || code == "consumer_fenced") =>
-            {
-                let run = self.run_create(&format!("ceo-run-{spec}")).await?;
-                self.worker_start_inner(
-                    worktree_selector,
-                    spec,
-                    task_title,
-                    agent,
-                    model,
-                    Some(&run.id),
-                )
-                .await
-            }
-            other => other,
-        }
     }
 }

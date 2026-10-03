@@ -963,3 +963,74 @@ async fn convergence_explicit_runtime_path_links_directly() {
     assert_eq!(exec.agent_id, "auto");
     assert_eq!(exec.command, None);
 }
+
+#[tokio::test]
+async fn setup_stops_before_mutation_when_orca_missing() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let custom_target = env._temp.path().join("explicit_runtime");
+    init_agent_runtime_repo(&custom_target);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let doctor = make_doctor(counter.clone(), true);
+    let mut ui = ScriptedUi::new([]);
+
+    let missing_orca_client = ceo_connector::orca::client::OrcaCliClient::new(
+        env._temp.path().join("nonexistent_orca_bin"),
+    );
+
+    let result = ceo_connector::setup_frontend::run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        Some(custom_target.to_str().unwrap()),
+        None,
+        Some(missing_orca_client),
+    )
+    .await;
+
+    // Must return an error
+    let err = result.expect_err("setup must fail when Orca is missing");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("Orca is missing or unresponsive"),
+        "error must explain Orca is missing/unresponsive, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("rerun `ceo-connector setup`"),
+        "error must provide actionable guidance to rerun setup, got: {err_str}"
+    );
+
+    // PROVEN: stops before mutation - no server target registration or binding
+    let st = env.state.lock().unwrap();
+    assert_eq!(st.register_calls, 0, "must NOT register server targets");
+    assert_eq!(st.bind_calls, 0, "must NOT bind device to target");
+
+    // PROVEN: no local config target mutation (config file was not even created, or has no targets)
+    if let Some(config) = env.config() {
+        assert!(
+            config.targets.is_empty(),
+            "local config must NOT have targets added"
+        );
+    }
+}
+
+#[tokio::test]
+async fn login_remains_successful_when_setup_readiness_fails() {
+    let env = env_with_workspaces(one_workspace()).await;
+    let mut ui = ScriptedUi::new([]);
+
+    // When post_login_handoff runs, even if guided setup fails,
+    // post_login_handoff returns Ok(None) and does NOT invalidate authentication.
+    let outcome = post_login_handoff(&env.paths, false, true, &mut ui).await;
+    assert!(
+        outcome.is_ok(),
+        "post_login_handoff must return Ok even when setup readiness fails"
+    );
+
+    // Credential is still valid and untouched
+    let cred = DeviceCredential::load(&env.paths.credential_file())
+        .unwrap()
+        .expect("credential must remain present");
+    assert_eq!(cred.user_id, "usr_1");
+    assert_eq!(cred.device_id, "dev_1");
+}

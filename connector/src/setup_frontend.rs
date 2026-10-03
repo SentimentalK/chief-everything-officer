@@ -475,6 +475,25 @@ pub async fn run_setup_convergence_with_home(
     explicit_runtime_path: Option<&str>,
     home_override: Option<&Path>,
 ) -> Result<SetupCompletion, SetupFrontendError> {
+    run_setup_convergence_with_home_and_orca(
+        paths,
+        ui,
+        doctor,
+        explicit_runtime_path,
+        home_override,
+        None,
+    )
+    .await
+}
+
+pub async fn run_setup_convergence_with_home_and_orca(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    doctor: &dyn DoctorRunner,
+    explicit_runtime_path: Option<&str>,
+    home_override: Option<&Path>,
+    orca_client: Option<crate::orca::client::OrcaCliClient>,
+) -> Result<SetupCompletion, SetupFrontendError> {
     // 1. Check login
     load_bound_profile(paths).map_err(|e| {
         ui.error("Not logged in. Please run `ceo-connector login` first.");
@@ -490,9 +509,19 @@ pub async fn run_setup_convergence_with_home(
     }
 
     // 3. Check Orca
-    let orca_client = crate::orca::client::OrcaCliClient::default();
-    match orca_client.status().await {
-        Ok(st) => {
+    let orca = orca_client.unwrap_or_default();
+    match orca.status().await {
+        Ok(st) if st.ok => {
+            let ready = st
+                .result
+                .as_ref()
+                .map(|r| r.app.running && r.runtime.state == "ready")
+                .unwrap_or(false);
+            if !ready {
+                let msg = "Orca desktop app is not running or runtime is not ready. Start Orca, then rerun `ceo-connector setup`.";
+                ui.error(msg);
+                return Err(SetupFrontendError::Ui(msg.into()));
+            }
             if let Some(res) = &st.result {
                 if let Some(pid) = res.app.pid {
                     ui.message(&format!("Orca CLI check: ready (pid: {pid})"));
@@ -503,8 +532,15 @@ pub async fn run_setup_convergence_with_home(
                 ui.message("Orca CLI check: ready");
             }
         }
+        Ok(_) => {
+            let msg = "Orca status check reported an error. Ensure Orca is running, then rerun `ceo-connector setup`.";
+            ui.error(msg);
+            return Err(SetupFrontendError::Ui(msg.into()));
+        }
         Err(e) => {
-            ui.message(&format!("Notice: Orca CLI check: {e}"));
+            let msg = format!("Orca is missing or unresponsive: {e}. Install Orca, ensure it is running, and rerun `ceo-connector setup`.");
+            ui.error(&msg);
+            return Err(SetupFrontendError::Ui(msg));
         }
     }
 

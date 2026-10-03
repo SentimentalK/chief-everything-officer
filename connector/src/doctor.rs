@@ -41,6 +41,19 @@ pub struct DoctorReport {
 }
 
 pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorReport {
+    run_doctor_with_orca(
+        paths,
+        json_format,
+        crate::orca::client::OrcaCliClient::default(),
+    )
+    .await
+}
+
+pub async fn run_doctor_with_orca(
+    paths: &ConnectorPaths,
+    json_format: bool,
+    orca_client: crate::orca::client::OrcaCliClient,
+) -> DoctorReport {
     let mut checks = Vec::new();
 
     // 1. Filesystem directories and permissions
@@ -76,11 +89,11 @@ pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorRepo
     check_git_tooling(&mut checks);
 
     // 4. Orca discovery and runtime status
-    check_orca_cli(&mut checks).await;
+    check_orca_cli(&orca_client, &mut checks).await;
 
     // 5. Server reachability, identity, workspaces, targets
     if let Some(ref c) = cred {
-        check_server_integration(paths, c, &mut checks).await;
+        check_server_integration(paths, c, &orca_client, &mut checks).await;
     } else {
         checks.push(DiagnosticCheck {
             name: "Server Auth Probe".into(),
@@ -288,8 +301,10 @@ fn check_git_tooling(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
-    let client = crate::orca::client::OrcaCliClient::default();
+async fn check_orca_cli(
+    client: &crate::orca::client::OrcaCliClient,
+    checks: &mut Vec<DiagnosticCheck>,
+) {
     match client.status().await {
         Ok(status) if status.ok => {
             if let Some(res) = status.result {
@@ -305,15 +320,15 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
                 } else if app_running {
                     checks.push(DiagnosticCheck {
                         name: "Orca CLI & Runtime".into(),
-                        severity: DiagnosticSeverity::Warn,
+                        severity: DiagnosticSeverity::Fail,
                         message: format!(
-                            "Version {ver}, desktop app running, runtime state: {runtime_state}"
+                            "Version {ver}, desktop app running, runtime state: {runtime_state} (expected 'ready')"
                         ),
                     });
                 } else {
                     checks.push(DiagnosticCheck {
                         name: "Orca CLI & Runtime".into(),
-                        severity: DiagnosticSeverity::Warn,
+                        severity: DiagnosticSeverity::Fail,
                         message: format!(
                             "Version {ver}, desktop app not running (start Orca before running daemon)"
                         ),
@@ -330,7 +345,7 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
         Ok(_) => {
             checks.push(DiagnosticCheck {
                 name: "Orca CLI & Runtime".into(),
-                severity: DiagnosticSeverity::Warn,
+                severity: DiagnosticSeverity::Fail,
                 message: "Orca status reported ok=false".into(),
             });
         }
@@ -339,8 +354,8 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
         {
             checks.push(DiagnosticCheck {
                 name: "Orca CLI & Runtime".into(),
-                severity: DiagnosticSeverity::Warn,
-                message: "Orca CLI not found in PATH (required for V1.7 execution)".into(),
+                severity: DiagnosticSeverity::Fail,
+                message: "Orca CLI not found in PATH (required for execution)".into(),
             });
         }
         Err(e) => {
@@ -350,7 +365,7 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
                     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     checks.push(DiagnosticCheck {
                         name: "Orca CLI & Runtime".into(),
-                        severity: DiagnosticSeverity::Warn,
+                        severity: DiagnosticSeverity::Fail,
                         message: format!("Detected {v}, but status probe failed: {e}"),
                     });
                     return;
@@ -358,7 +373,7 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
             }
             checks.push(DiagnosticCheck {
                 name: "Orca CLI & Runtime".into(),
-                severity: DiagnosticSeverity::Warn,
+                severity: DiagnosticSeverity::Fail,
                 message: format!("Orca CLI probe failed: {e}"),
             });
         }
@@ -368,6 +383,7 @@ async fn check_orca_cli(checks: &mut Vec<DiagnosticCheck>) {
 async fn check_server_integration(
     paths: &ConnectorPaths,
     cred: &DeviceCredential,
+    orca_client: &crate::orca::client::OrcaCliClient,
     checks: &mut Vec<DiagnosticCheck>,
 ) {
     let client = match ConnectorClient::new(&cred.server_origin) {
@@ -555,20 +571,44 @@ async fn check_server_integration(
                                     },
                                 });
 
-                                let probe_cmd = exec.command.as_deref().unwrap_or(&exec.agent_id);
-                                let agent_found = find_in_path(probe_cmd);
-                                if agent_found {
-                                    checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}' Agent Availability", display),
-                                        severity: DiagnosticSeverity::Pass,
-                                        message: "Agent executable found in PATH".to_string(),
-                                    });
+                                if let Some(cmd) = &exec.command {
+                                    let agent_found = find_in_path(cmd);
+                                    if agent_found {
+                                        checks.push(DiagnosticCheck {
+                                            name: format!(
+                                                "Target '{}' Agent Availability",
+                                                display
+                                            ),
+                                            severity: DiagnosticSeverity::Pass,
+                                            message: "Agent executable found in PATH".to_string(),
+                                        });
+                                    } else {
+                                        checks.push(DiagnosticCheck {
+                                            name: format!(
+                                                "Target '{}' Agent Availability",
+                                                display
+                                            ),
+                                            severity: DiagnosticSeverity::Warn,
+                                            message: "Agent executable not found in PATH"
+                                                .to_string(),
+                                        });
+                                    }
                                 } else {
-                                    checks.push(DiagnosticCheck {
-                                        name: format!("Target '{}' Agent Availability", display),
-                                        severity: DiagnosticSeverity::Warn,
-                                        message: "Agent executable not found in PATH".to_string(),
-                                    });
+                                    let supports_launch =
+                                        orca_client.supports_agent_session_launch().await;
+                                    if supports_launch {
+                                        checks.push(DiagnosticCheck {
+                                            name: format!("Target '{}' Agent Launch Surface", display),
+                                            severity: DiagnosticSeverity::Pass,
+                                            message: format!("Orca supports non-orchestrating Agent launch for '{}'", exec.agent_id),
+                                        });
+                                    } else {
+                                        checks.push(DiagnosticCheck {
+                                            name: format!("Target '{}' Agent Launch Compatibility", display),
+                                            severity: DiagnosticSeverity::Fail,
+                                            message: "ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector".to_string(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -577,7 +617,7 @@ async fn check_server_integration(
                                 name: format!("Target '{}' Executor Configuration", display),
                                 severity: DiagnosticSeverity::Fail,
                                 message: format!(
-                                    "No agent executor configured. Configure one with `ceo-connector target set-agent --target-id {} --agent-id <id> --agent-command <command>`",
+                                    "No agent executor configured. Configure one with `ceo-connector target set-agent --target-id {} --agent-id <id>`",
                                     display
                                 ),
                             });

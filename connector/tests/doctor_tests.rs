@@ -459,3 +459,142 @@ async fn doctor_fully_configured_fixture_passes_with_executor() {
         == "Target 'healthy-target' Executor Configuration"
         && c.severity == DiagnosticSeverity::Pass));
 }
+
+#[tokio::test]
+async fn doctor_missing_orca_reports_fail_and_overall_passed_false() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+
+    let missing_orca_client =
+        ceo_connector::orca::client::OrcaCliClient::new(temp.path().join("nonexistent_orca_bin"));
+
+    let report =
+        ceo_connector::doctor::run_doctor_with_orca(&paths, true, missing_orca_client).await;
+    assert!(
+        !report.overall_passed,
+        "overall_passed must be false when Orca is missing"
+    );
+    let orca_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Orca CLI & Runtime")
+        .expect("must contain Orca check");
+    assert_eq!(
+        orca_check.severity,
+        DiagnosticSeverity::Fail,
+        "missing Orca must be FAIL, not WARN"
+    );
+    assert!(
+        orca_check.message.contains("not found in PATH") || orca_check.message.contains("failed")
+    );
+}
+
+#[tokio::test]
+async fn doctor_logical_agent_target_fails_when_pure_launch_unavailable() {
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_1",
+                    "device": { "id": "dev_1", "display_name": "Dev", "platform": "linux-x86_64" },
+                    "credential": { "id": "dcr_1", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path == "/api/connector/workspaces" && req.method == "GET" {
+            return MockResponse::json(200, &serde_json::json!({ "workspaces": [] }));
+        }
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": "tgt_logical",
+                            "workspace_id": "ws_1",
+                            "alias": "logical-target",
+                            "display_name": "Logical Target",
+                            "kind": "coding",
+                            "repository": null,
+                            "disabled": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let repo_dir = temp.path().join("logical_repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_logical".into(),
+        LocalTarget {
+            local_path: repo_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("auto".into(), None).unwrap()),
+        },
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    let report = run_doctor(&paths, true).await;
+    assert!(
+        !report.overall_passed,
+        "Doctor must FAIL when Orca lacks pure agent launch surface for logical config"
+    );
+
+    let compat_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Target 'logical-target' Agent Launch Compatibility")
+        .expect("must contain compatibility check");
+    assert_eq!(compat_check.severity, DiagnosticSeverity::Fail);
+    assert!(compat_check
+        .message
+        .contains("ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE"));
+}
+
+#[tokio::test]
+async fn doctor_diagnostics_human_and_json_remain_ansi_free() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+
+    let report = run_doctor(&paths, false).await;
+    let human = ceo_connector::doctor::render_doctor_human(&report);
+    assert!(
+        !human.contains('\x1b'),
+        "human output must not contain ANSI escape sequences"
+    );
+
+    let json_str = serde_json::to_string_pretty(&report).unwrap();
+    assert!(
+        !json_str.contains('\x1b'),
+        "JSON output must not contain ANSI escape sequences"
+    );
+}
