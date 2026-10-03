@@ -9,6 +9,7 @@ export const TARGET_ERROR_CODES = {
   TARGET_DISABLED: "TARGET_DISABLED",
   TARGET_ALIAS_CONFLICT: "TARGET_ALIAS_CONFLICT",
   TARGET_REPOSITORY_NOT_FOUND: "TARGET_REPOSITORY_NOT_FOUND",
+  TARGET_REPOSITORY_CONFLICT: "TARGET_REPOSITORY_CONFLICT",
   DEVICE_NOT_ELIGIBLE: "DEVICE_NOT_ELIGIBLE",
   IDENTITY_UNAVAILABLE: "IDENTITY_UNAVAILABLE",
 } as const;
@@ -188,6 +189,89 @@ export function parseRegisterTargetInput(raw: unknown): ParsedRegisterTargetInpu
     repositoryProvider,
     repositoryFullName,
   };
+}
+
+export interface ParsedAttachTargetRepositoryInput {
+  workspaceId: string;
+  targetId: string;
+  provider: string;
+  fullName: string;
+}
+
+/**
+ * Validates and strictly parses an attach-repository request body:
+ * `{ workspace_id, repository: { source: "remote_url", provider, full_name } }`.
+ * The `remote_url` form is the ONLY accepted source: legacy backfill is
+ * always driven by a device-observed, locally verified Git origin — never by
+ * human names or server-derived workspace bindings.
+ */
+export function parseAttachTargetRepositoryInput(
+  targetId: string,
+  raw: unknown,
+): ParsedAttachTargetRepositoryInput {
+  if (!targetId || typeof targetId !== "string" || targetId.trim().length === 0) {
+    throw new TargetValidationError("target_id path parameter must be a non-empty string.", TARGET_ERROR_CODES.INVALID_REQUEST);
+  }
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TargetValidationError("Request body must be a JSON object.", TARGET_ERROR_CODES.INVALID_REQUEST);
+  }
+
+  const record = raw as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 2 || !keys.includes("workspace_id") || !keys.includes("repository")) {
+    throw new TargetValidationError(
+      "Attach-repository request must contain exactly the fields: 'workspace_id' and 'repository'.",
+      TARGET_ERROR_CODES.INVALID_REQUEST,
+    );
+  }
+
+  const workspaceIdRaw = record.workspace_id;
+  if (typeof workspaceIdRaw !== "string" || workspaceIdRaw.trim().length === 0) {
+    throw new TargetValidationError("workspace_id must be a non-empty string.", TARGET_ERROR_CODES.INVALID_REQUEST);
+  }
+  const workspaceId = workspaceIdRaw.trim();
+
+  const repoRaw = record.repository;
+  if (!repoRaw || typeof repoRaw !== "object" || Array.isArray(repoRaw)) {
+    throw new TargetValidationError("repository must be an object.", TARGET_ERROR_CODES.INVALID_REQUEST);
+  }
+  const repoRecord = repoRaw as Record<string, unknown>;
+  for (const key of Object.keys(repoRecord)) {
+    if (!ALLOWED_REPOSITORY_KEYS.has(key)) {
+      throw new TargetValidationError(`Unexpected field '${key}' in repository object.`, TARGET_ERROR_CODES.INVALID_REQUEST);
+    }
+  }
+
+  if (repoRecord.source !== "remote_url") {
+    throw new TargetValidationError(
+      "repository.source must be 'remote_url': legacy backfill only accepts a device-observed Git origin.",
+      TARGET_ERROR_CODES.INVALID_REQUEST,
+    );
+  }
+
+  if (typeof repoRecord.provider !== "string" || repoRecord.provider.trim().length === 0 || repoRecord.provider.trim().length > 64) {
+    throw new TargetValidationError(
+      "repository.provider must be a non-empty string (max 64 characters).",
+      TARGET_ERROR_CODES.INVALID_REQUEST,
+    );
+  }
+  if (typeof repoRecord.full_name !== "string" || repoRecord.full_name.trim().length === 0 || repoRecord.full_name.trim().length > 256) {
+    throw new TargetValidationError(
+      "repository.full_name must be a non-empty string (max 256 characters).",
+      TARGET_ERROR_CODES.INVALID_REQUEST,
+    );
+  }
+  const provider = repoRecord.provider.trim().toLowerCase();
+  const fullName = normalizeRemoteFullName(provider, repoRecord.full_name.trim());
+  if (!provider || fullName === null) {
+    throw new TargetValidationError(
+      "repository.full_name is not a valid normalized repository name.",
+      TARGET_ERROR_CODES.INVALID_REQUEST,
+    );
+  }
+
+  return { workspaceId, targetId: targetId.trim(), provider, fullName };
 }
 
 export interface ConnectorTargetProjection {

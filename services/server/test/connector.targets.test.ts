@@ -886,3 +886,300 @@ describe("POST /api/connector/targets/:target_id/default-runtime (workspace defa
     expect(listData.targets.every((i: any) => i.target.is_default_agent_runtime === false)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bounded legacy repository-identity backfill: POST /api/connector/targets/:target_id/attach-repository
+// ---------------------------------------------------------------------------
+
+describe("POST /api/connector/targets/:target_id/attach-repository (legacy backfill)", () => {
+  let legacyTargetId: string;
+
+  const attach = (token: string, targetId: string, fullName: string, provider = "github") =>
+    fetch(`${baseUrl}/api/connector/targets/${targetId}/attach-repository`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        repository: {
+          source: "remote_url",
+          provider,
+          full_name: fullName,
+        },
+      }),
+    });
+
+  beforeEach(async () => {
+    // Legacy production shape: an active coding Target with NULL repository
+    // metadata, created via the repository-less register path.
+    const regRes = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "legacy-app",
+        display_name: "Legacy App",
+        kind: "coding",
+        repository: null,
+      }),
+    });
+    expect(regRes.status).toBe(201);
+    const data = await regRes.json();
+    legacyTargetId = data.target.id;
+    expect(data.target.repository).toBeNull();
+  });
+
+  it("rejects unauthenticated requests", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/${legacyTargetId}/attach-repository`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        repository: { source: "remote_url", provider: "github", full_name: "acme/main-repo" },
+      }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("attaches normalized repository identity to the exact legacy target_id without renaming", async () => {
+    const res = await attach(ownerDevToken, legacyTargetId, "Acme/Main-Repo.git");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.replayed).toBe(false);
+    expect(data.target.id).toBe(legacyTargetId);
+    // No implicit rename: the legacy alias/display_name are untouched.
+    expect(data.target.alias).toBe("legacy-app");
+    expect(data.target.display_name).toBe("Legacy App");
+    expect(data.target.kind).toBe("coding");
+    expect(data.target.disabled).toBe(false);
+    // Workspace binding full_name matches => external_id enriched to the
+    // numeric binding id, exactly like the remote_url register path.
+    expect(data.target.repository).toEqual({
+      provider: "github",
+      external_id: "987654",
+      full_name: "acme/main-repo",
+    });
+
+    const stored = controlStore.getExecutionTarget(legacyTargetId);
+    expect(stored!.repository_provider).toBe("github");
+    expect(stored!.repository_external_id).toBe("987654");
+    expect(stored!.repository_full_name).toBe("acme/main-repo");
+  });
+
+  it("falls back to the normalized full_name as external_id when the workspace binding does not match", async () => {
+    const res = await attach(ownerDevToken, legacyTargetId, "acme/other-repo");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.target.repository).toEqual({
+      provider: "github",
+      external_id: "acme/other-repo",
+      full_name: "acme/other-repo",
+    });
+  });
+
+  it("is idempotent when the exact same identity is attached again", async () => {
+    const first = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(first.status).toBe(200);
+
+    const second = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(second.status).toBe(200);
+    const data = await second.json();
+    expect(data.replayed).toBe(true);
+    expect(data.target.id).toBe(legacyTargetId);
+    expect(data.target.repository).toEqual({
+      provider: "github",
+      external_id: "987654",
+      full_name: "acme/main-repo",
+    });
+  });
+
+  it("fails closed when the target already owns a DIFFERENT repository identity (never overwrites)", async () => {
+    const first = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(first.status).toBe(200);
+
+    const second = await attach(ownerDevToken, legacyTargetId, "acme/other-repo");
+    expect(second.status).toBe(409);
+    const data = await second.json();
+    expect(data.error).toBe("TARGET_REPOSITORY_CONFLICT");
+
+    // The original identity is preserved untouched.
+    const stored = controlStore.getExecutionTarget(legacyTargetId);
+    expect(stored!.repository_full_name).toBe("acme/main-repo");
+  });
+
+  it("fails closed when another active target already owns the same repository identity", async () => {
+    // A different active target owns the identity first.
+    const ownerRes = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "identity-owner",
+        display_name: "Identity Owner",
+        kind: "coding",
+        repository: { source: "remote_url", provider: "github", full_name: "acme/main-repo" },
+      }),
+    });
+    expect(ownerRes.status).toBe(201);
+
+    const res = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_REPOSITORY_CONFLICT");
+
+    // The legacy target stays repository-null (never auto-merged).
+    const stored = controlStore.getExecutionTarget(legacyTargetId);
+    expect(stored!.repository_provider).toBeNull();
+  });
+
+  it("rejects a disabled target with 409 TARGET_DISABLED", async () => {
+    const disRes = await fetch(`${baseUrl}/api/user/targets/${legacyTargetId}/disable`, {
+      method: "POST",
+      headers: { Cookie: `ceo_user_session=${sessionManager.createSession({ userId: userOwnerId, provider: "github", providerSubject: "sub_owner_disable" }).sessionId}` },
+    });
+    expect(disRes.status).toBe(200);
+
+    const res = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_DISABLED");
+  });
+
+  it("rejects a non-coding target", async () => {
+    const regRes = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "automation-target",
+        display_name: "Automation Target",
+        kind: "general_automation",
+        repository: null,
+      }),
+    });
+    expect(regRes.status).toBe(201);
+    const regData = await regRes.json();
+
+    const res = await attach(ownerDevToken, regData.target.id, "acme/main-repo");
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_REPOSITORY_CONFLICT");
+  });
+
+  it("masks targets of another workspace as 404", async () => {
+    const foreignRes = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${foreignDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: foreignWorkspaceId,
+        alias: "foreign-legacy",
+        display_name: "Foreign Legacy",
+        kind: "coding",
+        repository: null,
+      }),
+    });
+    expect(foreignRes.status).toBe(201);
+    const foreignData = await foreignRes.json();
+
+    // Owner device claims its own workspace, but the target belongs to the
+    // foreign workspace => masked as not-found.
+    const res = await attach(ownerDevToken, foreignData.target.id, "acme/main-repo");
+    expect(res.status).toBe(404);
+    const data = await res.json();
+    expect(data.error).toBe("TARGET_NOT_FOUND");
+  });
+
+  it("rejects callers outside the workspace with 403", async () => {
+    const res = await attach(foreignDevToken, legacyTargetId, "acme/main-repo");
+    expect(res.status).toBe(403);
+    const data = await res.json();
+    expect(data.error).toBe("DEVICE_NOT_ELIGIBLE");
+  });
+
+  it("rejects invalid full_name forms with 400", async () => {
+    for (const badName of [
+      "https://github.com/acme/main-repo",
+      "not-a-repo-name",
+      "",
+    ]) {
+      const res = await attach(ownerDevToken, legacyTargetId, badName);
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.error).toBe("INVALID_REQUEST");
+    }
+  });
+
+  it("rejects workspace_repository source and unexpected fields with 400", async () => {
+    const res1 = await fetch(`${baseUrl}/api/connector/targets/${legacyTargetId}/attach-repository`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        repository: { source: "workspace_repository" },
+      }),
+    });
+    expect(res1.status).toBe(400);
+    expect((await res1.json()).error).toBe("INVALID_REQUEST");
+
+    const res2 = await fetch(`${baseUrl}/api/connector/targets/${legacyTargetId}/attach-repository`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        repository: { source: "remote_url", provider: "github", full_name: "acme/main-repo" },
+        alias: "sneaky-rename",
+      }),
+    });
+    expect(res2.status).toBe(400);
+    expect((await res2.json()).error).toBe("INVALID_REQUEST");
+  });
+
+  it("after backfill, a fresh device register with a different human name resolves the same target (repository-first)", async () => {
+    const backfill = await attach(ownerDevToken, legacyTargetId, "acme/main-repo");
+    expect(backfill.status).toBe(200);
+
+    // Fresh device (member), different requested alias/display_name, same
+    // normalized Git repository identity.
+    const fresh = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${memberDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "fresh-name-after-backfill",
+        display_name: "Fresh Name After Backfill",
+        kind: "coding",
+        repository: { source: "remote_url", provider: "github", full_name: "acme/main-repo" },
+      }),
+    });
+    expect(fresh.status).toBe(200);
+    const freshData = await fresh.json();
+    expect(freshData.target_created).toBe(false);
+    expect(freshData.target.id).toBe(legacyTargetId);
+    // No implicit rename.
+    expect(freshData.target.alias).toBe("legacy-app");
+  });
+});

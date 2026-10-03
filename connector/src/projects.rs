@@ -12,7 +12,8 @@ use crate::local_state::ExecutionLock;
 use crate::orca::discovery::{AgentDiscovery, OrcaCliAgentDiscovery};
 use crate::paths::ConnectorPaths;
 use crate::setup::{
-    ensure_binding_step, ensure_server_target_with_repository, resolve_current_workspace,
+    ensure_binding_step, ensure_server_target_with_repository,
+    maybe_backfill_legacy_repository_identity, resolve_current_workspace, LegacyBackfillCheckout,
     SetupError,
 };
 use crate::targets::{
@@ -505,6 +506,31 @@ pub async fn project_add(
 
     let ws = resolve_current_workspace(&client, &cred).await?;
     let catalogue = client.list_targets(&cred, Some(&ws.id)).await?;
+
+    // 2b. Bounded legacy repository-identity backfill: when the repository
+    // identity has no repository match in the workspace catalogue but THIS
+    // Device's local config already maps the verified checkout to an
+    // existing exact target_id whose Server repository is null, attach the
+    // identity to that exact target (the Server attaches atomically and
+    // fails closed). A fresh/unbound Device is never backfilled by alias.
+    let backfill = maybe_backfill_legacy_repository_identity(
+        &client,
+        &cred,
+        paths,
+        &ws.id,
+        &catalogue,
+        LegacyBackfillCheckout {
+            canonical_path: &canonical_str,
+            provider: &repo_identity.provider,
+            full_name: &repo_identity.full_name,
+        },
+    )
+    .await?;
+    let catalogue = if backfill.is_some() {
+        client.list_targets(&cred, Some(&ws.id)).await?
+    } else {
+        catalogue
+    };
 
     let ensured = ensure_server_target_with_repository(
         &client,

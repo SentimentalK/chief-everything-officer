@@ -26,6 +26,7 @@ import {
 import type { UserSessionManager } from "../auth/user-session.js";
 import {
   parseRegisterTargetInput,
+  parseAttachTargetRepositoryInput,
   toConnectorTargetProjection,
   TargetValidationError,
   TARGET_ERROR_CODES,
@@ -550,6 +551,96 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
         }
         if (err instanceof ConnectorNotFoundError) {
           res.status(404).json({ error: TARGET_ERROR_CODES.WORKSPACE_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorValidationError) {
+          res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 7b. Native API: Attach Repository Identity To Exact Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  // Bounded legacy backfill capability (one-time migration). The exact
+  // target_id in the path is the ONLY addressing mechanism; human
+  // alias/display names are deliberately not accepted inputs. The Server
+  // store fails closed unless the target is active coding, belongs to the
+  // caller's workspace, has NULL repository metadata, and no other active
+  // target already owns the same normalized repository identity.
+  router.post(
+    "/api/connector/targets/:target_id/attach-repository",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const rawTargetId = req.params.target_id;
+      let input;
+      try {
+        input = parseAttachTargetRepositoryInput(typeof rawTargetId === "string" ? rawTargetId : "", req.body);
+      } catch (err) {
+        if (err instanceof TargetValidationError) {
+          res.status(400).json({ error: err.code, message: err.message });
+          return;
+        }
+        res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: "Invalid JSON input." });
+        return;
+      }
+
+      try {
+        const result = controlStore.attachRepositoryIdentityToTarget({
+          deviceId: auth.device_id,
+          workspaceId: input.workspaceId,
+          targetId: input.targetId,
+          provider: input.provider,
+          fullName: input.fullName,
+        });
+
+        res.status(200).json({
+          ok: true,
+          target: {
+            id: result.target.id,
+            workspace_id: result.target.workspace_id,
+            alias: result.target.alias,
+            display_name: result.target.display_name,
+            kind: result.target.kind,
+            repository: result.target.repository_provider
+              ? {
+                  provider: result.target.repository_provider,
+                  external_id: result.target.repository_external_id!,
+                  full_name: result.target.repository_full_name!,
+                }
+              : null,
+            disabled: result.target.disabled_at_ms !== null,
+          },
+          replayed: result.replayed,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetConflictError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_REPOSITORY_CONFLICT, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorTargetDisabledError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_DISABLED, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
           return;
         }
         if (err instanceof ConnectorValidationError) {

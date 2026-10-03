@@ -219,6 +219,18 @@ pub struct RegisterTargetResponse {
     pub replayed: bool,
 }
 
+/// Server response for the bounded legacy repository-identity backfill
+/// (`POST /targets/:target_id/attach-repository`). The exact target_id is the
+/// only addressing mechanism; `replayed` reports an idempotent same-identity
+/// replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachRepositoryResponse {
+    pub ok: bool,
+    pub target: ConnectorTargetWire,
+    #[serde(default)]
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindTargetResponse {
     pub target_id: String,
@@ -721,6 +733,69 @@ impl ConnectorClient {
 
         if status.is_success() {
             let res: RegisterTargetResponse = serde_json::from_str(&text)?;
+            Ok(res)
+        } else if status.as_u16() == 401 {
+            Err(ClientError::Unauthorized)
+        } else if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let code = err_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let msg = err_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(ClientError::TargetError { code, message: msg })
+        } else {
+            Err(ClientError::UnexpectedResponse {
+                status: status.as_u16(),
+                body: text,
+            })
+        }
+    }
+
+    // 7b. Bounded legacy backfill: attach repository identity to an exact
+    // target_id. Only called when this Device's local config already maps
+    // the verified checkout to that exact target_id and the Server Target's
+    // repository metadata is null; the Server fails closed otherwise.
+    pub async fn attach_repository(
+        &self,
+        credential: &DeviceCredential,
+        target_id: &str,
+        workspace_id: &str,
+        provider: &str,
+        full_name: &str,
+    ) -> Result<AttachRepositoryResponse, ClientError> {
+        let headers = self.auth_headers(credential)?;
+        let url = format!(
+            "{}/api/connector/targets/{}/attach-repository",
+            self.server_origin, target_id
+        );
+        let body = serde_json::json!({
+            "workspace_id": workspace_id,
+            "repository": {
+                "source": "remote_url",
+                "provider": provider,
+                "full_name": full_name,
+            }
+        });
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status.is_success() {
+            let res: AttachRepositoryResponse = serde_json::from_str(&text)?;
             Ok(res)
         } else if status.as_u16() == 401 {
             Err(ClientError::Unauthorized)

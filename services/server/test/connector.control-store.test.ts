@@ -1276,3 +1276,272 @@ describe("ConnectorControlStore - repository-first fresh-device Project identity
     expect(forRepo.filter((t) => t.target.disabled_at_ms !== null)).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bounded legacy repository-identity backfill (exact target_id attach)
+// ---------------------------------------------------------------------------
+
+describe("ConnectorControlStore - bounded legacy repository-identity backfill", () => {
+  let dev1: { id: string };
+  let dev2: { id: string };
+
+  beforeEach(() => {
+    dev1 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Device A",
+      platform: "linux",
+    });
+    dev2 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Device B",
+      platform: "windows",
+    });
+  });
+
+  function legacyNullTarget(alias: string, kind: "coding" | "general_automation" = "coding") {
+    return connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias,
+      displayName: alias,
+      kind,
+      repositorySource: null,
+    });
+  }
+
+  function remoteRepo(fullName: string) {
+    return {
+      repositorySource: "remote_url" as const,
+      repositoryProvider: "github",
+      repositoryFullName: fullName,
+    };
+  }
+
+  it("attaches repository identity to the exact legacy null-repo target_id (no rename)", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    const now = Date.now();
+
+    const res = connectorStore.attachRepositoryIdentityToTarget({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      targetId: legacy.target.id,
+      provider: "github",
+      fullName: "org/legacy-repo",
+      nowMs: now,
+    });
+
+    expect(res.replayed).toBe(false);
+    expect(res.target.id).toBe(legacy.target.id);
+    expect(res.target.alias).toBe("legacy-app");
+    expect(res.target.kind).toBe("coding");
+    expect(res.target.repository_provider).toBe("github");
+    expect(res.target.repository_external_id).toBe("org/legacy-repo");
+    expect(res.target.repository_full_name).toBe("org/legacy-repo");
+    expect(res.target.updated_at_ms).toBe(now);
+  });
+
+  it("is idempotent when the exact same identity is already attached", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    connectorStore.attachRepositoryIdentityToTarget({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      targetId: legacy.target.id,
+      provider: "github",
+      fullName: "org/legacy-repo",
+    });
+
+    const replay = connectorStore.attachRepositoryIdentityToTarget({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      targetId: legacy.target.id,
+      provider: "github",
+      fullName: "org/legacy-repo",
+    });
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.target.id).toBe(legacy.target.id);
+    expect(replay.target.repository_full_name).toBe("org/legacy-repo");
+  });
+
+  it("fails closed when the target already owns a different repository identity", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    connectorStore.attachRepositoryIdentityToTarget({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      targetId: legacy.target.id,
+      provider: "github",
+      fullName: "org/repo-a",
+    });
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/repo-b",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    const stored = connectorStore.getExecutionTarget(legacy.target.id)!;
+    expect(stored.repository_full_name).toBe("org/repo-a");
+  });
+
+  it("fails closed when another active target already owns the same repository identity", () => {
+    const owner = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "identity-owner",
+      displayName: "Identity Owner",
+      kind: "coding",
+      ...remoteRepo("org/owned-repo"),
+    });
+    const legacy = legacyNullTarget("legacy-app");
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/owned-repo",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    // The legacy target stays repository-null; the owner keeps the identity.
+    const stored = connectorStore.getExecutionTarget(legacy.target.id)!;
+    expect(stored.repository_provider).toBeNull();
+    expect(owner.target.repository_full_name).toBe("org/owned-repo");
+  });
+
+  it("fails closed for a disabled target", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    connectorStore.disableExecutionTarget(legacy.target.id);
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorTargetDisabledError);
+  });
+
+  it("fails closed for a non-coding target", () => {
+    const legacy = legacyNullTarget("automation-target", "general_automation");
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+  });
+
+  it("masks a cross-workspace target as not-found", () => {
+    const foreignWs = "ws_foreign_b";
+    store.withDb((db) => {
+      db.prepare("INSERT INTO workspaces VALUES (?, ?, 'https://github.com/foreign/b.git', 'main', 1000);").run(
+        foreignWs,
+        testUserId,
+      );
+      db.prepare("INSERT INTO workspace_memberships VALUES ('wsm_foreign_b', ?, ?, 'owner', 1000);").run(
+        foreignWs,
+        testUserId,
+      );
+    });
+    const foreign = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: foreignWs,
+      alias: "foreign-legacy",
+      displayName: "Foreign Legacy",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: foreign.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorNotFoundError);
+  });
+
+  it("fails closed for a caller outside the workspace", () => {
+    const foreignUser = "usr_foreign_b";
+    store.withDb((db) => {
+      db.prepare("INSERT INTO users VALUES (?, 1000, NULL, 0);").run(foreignUser);
+    });
+    const foreignDev = connectorStore.createDevice({
+      userId: foreignUser,
+      displayName: "Foreign Device",
+      platform: "linux",
+    });
+    const legacy = legacyNullTarget("legacy-app");
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: foreignDev.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorPermissionError);
+  });
+
+  it("rejects invalid provider/full_name input", () => {
+    const legacy = legacyNullTarget("legacy-app");
+
+    for (const bad of [
+      { provider: "  ", fullName: "org/repo" },
+      { provider: "github", fullName: "https://github.com/org/repo" },
+      { provider: "github", fullName: "not-a-repo-name" },
+    ]) {
+      expect(() =>
+        connectorStore.attachRepositoryIdentityToTarget({
+          deviceId: dev1.id,
+          workspaceId: testWorkspaceId,
+          targetId: legacy.target.id,
+          provider: bad.provider,
+          fullName: bad.fullName,
+        }),
+      ).toThrow(ConnectorValidationError);
+    }
+
+    expect(connectorStore.getExecutionTarget(legacy.target.id)!.repository_provider).toBeNull();
+  });
+
+  it("after backfill, a fresh device register with a different name resolves the same target_id", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    connectorStore.attachRepositoryIdentityToTarget({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      targetId: legacy.target.id,
+      provider: "github",
+      fullName: "org/backfilled-repo",
+    });
+
+    const fresh = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "totally-different-name",
+      displayName: "Totally Different Name",
+      kind: "coding",
+      ...remoteRepo("org/backfilled-repo"),
+    });
+
+    expect(fresh.targetCreated).toBe(false);
+    expect(fresh.target.id).toBe(legacy.target.id);
+    expect(fresh.target.alias).toBe("legacy-app");
+    expect(fresh.bindingCreated).toBe(true);
+  });
+});

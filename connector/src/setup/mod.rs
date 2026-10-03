@@ -136,6 +136,10 @@ pub enum SetupError {
     #[error("Alias '{0}' matched multiple Server Targets in the workspace; refusing to choose one (SETUP_ALIAS_AMBIGUOUS).")]
     AmbiguousAlias(String),
     #[error(
+        "Local config maps the checked-out path '{0}' to multiple Server Targets; refusing to pick one for legacy repository backfill (SETUP_BACKFILL_LOCAL_AMBIGUOUS)."
+    )]
+    AmbiguousLocalBackfill(String),
+    #[error(
         "Git repository '{0}' identity matched multiple active coding Server Targets in the workspace; refusing to choose one (SETUP_REPOSITORY_AMBIGUOUS)."
     )]
     AmbiguousRepository(String),
@@ -448,6 +452,115 @@ async fn ensure_device_binding(
     }
     let res = client.bind_target(cred, target_id).await?;
     Ok(!res.replayed)
+}
+
+// ---------------------------------------------------------------------------
+// Bounded legacy repository-identity backfill (one-time migration)
+// ---------------------------------------------------------------------------
+
+/// Bounded legacy repository-identity backfill for `project add`.
+///
+/// Bounded case (design rule 12): the resolved repository identity has NO
+/// repository match in the workspace catalogue, but THIS Device's schema-v3
+/// local config ALREADY maps the exact immutable target_id to the verified
+/// local Git checkout being added, and the Server Target is an active coding
+/// Target whose repository metadata is null. Only then is the explicit
+/// Server attach capability called; it independently fails closed on
+/// disabled targets, wrong kinds, cross-workspace targets, non-null
+/// mismatches, and identity conflicts.
+///
+/// A fresh/unbound Device (no local mapping for the checkout) returns None
+/// here: an alias match is never authority to backfill a legacy
+/// repository-null Target.
+///
+/// Returns `Some(target_id)` when the bounded attach path ran (attached or
+/// idempotently replayed) so the caller can refresh its catalogue snapshot;
+/// `None` when the ordinary repository-first ensure flow should proceed
+/// unchanged.
+/// The verified local Git checkout context driving a bounded backfill:
+/// canonical checkout path plus the normalized repository identity derived
+/// from that same checkout's origin.
+pub(crate) struct LegacyBackfillCheckout<'a> {
+    pub(crate) canonical_path: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) full_name: &'a str,
+}
+
+pub(crate) async fn maybe_backfill_legacy_repository_identity(
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    paths: &ConnectorPaths,
+    workspace_id: &str,
+    catalogue: &[ConnectorTargetProjection],
+    checkout: LegacyBackfillCheckout<'_>,
+) -> Result<Option<String>, SetupError> {
+    let canonical_path = checkout.canonical_path;
+    let provider = checkout.provider;
+    let full_name = checkout.full_name;
+    // 1. Repository identity already present in the workspace catalogue =>
+    //    nothing to backfill; ensure_server_target_with_repository owns the
+    //    reuse/ambiguity semantics.
+    let wanted = full_name.to_lowercase();
+    let repo_match_count = catalogue
+        .iter()
+        .filter(|t| {
+            !t.disabled
+                && t.kind == TARGET_KIND_CODING
+                && t.repository
+                    .as_ref()
+                    .map(|r| r.provider == provider && r.full_name.to_lowercase() == wanted)
+                    .unwrap_or(false)
+        })
+        .count();
+    if repo_match_count > 0 {
+        return Ok(None);
+    }
+
+    // 2. Local-config authority: the Device must ALREADY map the exact
+    //    target_id to this verified checkout (schema-v3 config is keyed by
+    //    the immutable target_id). A fresh/unbound Device has no such
+    //    mapping and must never claim a legacy repository-null Target by
+    //    human alias alone.
+    let config = match LocalConfig::load(&paths.config_file())? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let mut mapped_target_ids: Vec<String> = config
+        .targets
+        .iter()
+        .filter(|(_, lt)| lt.local_path == canonical_path)
+        .map(|(tid, _)| tid.clone())
+        .collect();
+    mapped_target_ids.sort();
+    mapped_target_ids.dedup();
+    let target_id = match mapped_target_ids.len() {
+        0 => return Ok(None),
+        1 => mapped_target_ids.remove(0),
+        _ => {
+            return Err(SetupError::AmbiguousLocalBackfill(
+                canonical_path.to_string(),
+            ))
+        }
+    };
+
+    // 3. The mapped target must be THIS workspace's active coding Target
+    //    with NULL repository metadata. Anything else is not the bounded
+    //    case: no backfill, and the ordinary repository-first/alias
+    //    semantics of ensure_server_target_with_repository handle rejection
+    //    downstream (fail closed).
+    let Some(target) = catalogue.iter().find(|t| t.target_id == target_id) else {
+        return Ok(None);
+    };
+    if target.disabled || target.kind != TARGET_KIND_CODING || target.repository.is_some() {
+        return Ok(None);
+    }
+
+    // 4. Call the bounded Server attach capability; the Server performs the
+    //    attach atomically and only under its own fail-closed guards.
+    let res = client
+        .attach_repository(cred, &target_id, workspace_id, provider, full_name)
+        .await?;
+    Ok(Some(res.target.id))
 }
 
 /// Ensures the current Device binding is enabled. Active => replay/no-op;
