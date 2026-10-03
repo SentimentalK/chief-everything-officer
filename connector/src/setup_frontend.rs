@@ -436,7 +436,26 @@ pub async fn run_standalone_setup(
     doctor: &dyn DoctorRunner,
     explicit_runtime_path: Option<&str>,
 ) -> Result<std::process::ExitCode, SetupFrontendError> {
-    match run_setup_convergence(paths, ui, doctor, explicit_runtime_path).await? {
+    run_standalone_setup_with_orca(paths, ui, doctor, explicit_runtime_path, None).await
+}
+
+pub async fn run_standalone_setup_with_orca(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    doctor: &dyn DoctorRunner,
+    explicit_runtime_path: Option<&str>,
+    orca_client: Option<crate::orca::client::OrcaCliClient>,
+) -> Result<std::process::ExitCode, SetupFrontendError> {
+    match run_setup_convergence_with_home_and_orca(
+        paths,
+        ui,
+        doctor,
+        explicit_runtime_path,
+        None,
+        orca_client,
+    )
+    .await?
+    {
         SetupCompletion::Finished { doctor_passed } => {
             if doctor_passed {
                 Ok(std::process::ExitCode::SUCCESS)
@@ -456,7 +475,16 @@ pub async fn run_setup_wizard(
     ui: &mut dyn SetupUi,
     doctor: &dyn DoctorRunner,
 ) -> Result<SetupCompletion, SetupFrontendError> {
-    run_setup_convergence(paths, ui, doctor, None).await
+    run_setup_wizard_with_orca(paths, ui, doctor, None).await
+}
+
+pub async fn run_setup_wizard_with_orca(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    doctor: &dyn DoctorRunner,
+    orca_client: Option<crate::orca::client::OrcaCliClient>,
+) -> Result<SetupCompletion, SetupFrontendError> {
+    run_setup_convergence_with_home_and_orca(paths, ui, doctor, None, None, orca_client).await
 }
 
 pub async fn run_setup_convergence(
@@ -465,7 +493,25 @@ pub async fn run_setup_convergence(
     doctor: &dyn DoctorRunner,
     explicit_runtime_path: Option<&str>,
 ) -> Result<SetupCompletion, SetupFrontendError> {
-    run_setup_convergence_with_home(paths, ui, doctor, explicit_runtime_path, None).await
+    run_setup_convergence_with_orca(paths, ui, doctor, explicit_runtime_path, None).await
+}
+
+pub async fn run_setup_convergence_with_orca(
+    paths: &ConnectorPaths,
+    ui: &mut dyn SetupUi,
+    doctor: &dyn DoctorRunner,
+    explicit_runtime_path: Option<&str>,
+    orca_client: Option<crate::orca::client::OrcaCliClient>,
+) -> Result<SetupCompletion, SetupFrontendError> {
+    run_setup_convergence_with_home_and_orca(
+        paths,
+        ui,
+        doctor,
+        explicit_runtime_path,
+        None,
+        orca_client,
+    )
+    .await
 }
 
 pub async fn run_setup_convergence_with_home(

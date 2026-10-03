@@ -18,14 +18,15 @@ use ceo_connector::cli::Cli;
 use ceo_connector::config::LocalConfig;
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::doctor::DoctorReport;
+use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::setup::{
     assess_agent_runtime_readiness, AGENT_RUNTIME_REPO_CLONE_URL, AGENT_RUNTIME_TARGET_ALIAS,
 };
 use ceo_connector::setup_frontend::{
-    login_handoff_action, post_login_handoff, run_setup_convergence,
-    run_setup_convergence_with_home, run_setup_wizard, run_standalone_setup, HandoffAction,
-    SetupCompletion, SetupUi, UiError,
+    login_handoff_action, post_login_handoff, run_setup_convergence_with_home_and_orca,
+    run_setup_convergence_with_orca, run_setup_wizard_with_orca, run_standalone_setup_with_orca,
+    HandoffAction, SetupCompletion, SetupUi, UiError,
 };
 use common::mock_server::{MockResponse, MockServer};
 
@@ -238,6 +239,33 @@ struct TestEnv {
     state: Arc<Mutex<ServerState>>,
 }
 
+fn healthy_mock_orca(temp: &tempfile::TempDir) -> OrcaCliClient {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = temp.path().join("mock-orca");
+        let script = r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+    echo '{"ok":true,"result":{"app":{"running":true},"runtime":{"state":"ready","reachable":true,"appVersion":"1.4.209"}}}'
+    exit 0
+fi
+echo '{"ok":true}'
+"#;
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+    #[cfg(windows)]
+    {
+        let script_path = temp.path().join("mock-orca.cmd");
+        let script = "@echo off\r\nif \"%~1\"==\"status\" (\r\necho {\"ok\":true,\"result\":{\"app\":{\"running\":true},\"runtime\":{\"state\":\"ready\",\"reachable\":true,\"appVersion\":\"1.4.209\"}}}\r\nexit /b 0\r\n)\r\necho {\"ok\":true}\r\n";
+        fs::write(&script_path, script).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+}
+
 impl TestEnv {
     fn register_calls(&self) -> usize {
         self.state.lock().unwrap().register_calls
@@ -247,6 +275,9 @@ impl TestEnv {
     }
     fn config(&self) -> Option<LocalConfig> {
         LocalConfig::load(&self.paths.config_file()).unwrap()
+    }
+    fn orca(&self) -> OrcaCliClient {
+        healthy_mock_orca(&self._temp)
     }
 }
 
@@ -651,7 +682,7 @@ async fn convergence_runs_doctor_at_completion_and_mirrors_verdict() {
         let counter = Arc::new(AtomicUsize::new(0));
         let doctor = make_doctor(counter.clone(), doctor_passed);
         let mut ui = ScriptedUi::new([]);
-        let completion = run_setup_wizard(&env.paths, &mut ui, &doctor)
+        let completion = run_setup_wizard_with_orca(&env.paths, &mut ui, &doctor, Some(env.orca()))
             .await
             .unwrap();
         assert_eq!(
@@ -686,7 +717,7 @@ async fn standalone_setup_maps_doctor_verdict_to_exit_code() {
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter.clone(), true);
     let mut ui = ScriptedUi::new([]);
-    let code = run_standalone_setup(&env.paths, &mut ui, &doctor, None)
+    let code = run_standalone_setup_with_orca(&env.paths, &mut ui, &doctor, None, Some(env.orca()))
         .await
         .unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
@@ -695,7 +726,7 @@ async fn standalone_setup_maps_doctor_verdict_to_exit_code() {
     let counter = Arc::new(AtomicUsize::new(0));
     let doctor = make_doctor(counter.clone(), false);
     let mut ui = ScriptedUi::new([]);
-    let code = run_standalone_setup(&env.paths, &mut ui, &doctor, None)
+    let code = run_standalone_setup_with_orca(&env.paths, &mut ui, &doctor, None, Some(env.orca()))
         .await
         .unwrap();
     assert_eq!(code, ExitCode::FAILURE);
@@ -719,9 +750,10 @@ async fn convergence_reuses_existing_valid_runtime_mapping() {
     let doctor = make_doctor(counter.clone(), true);
     let mut ui = ScriptedUi::new([]);
 
-    let completion = run_setup_convergence(&env.paths, &mut ui, &doctor, None)
-        .await
-        .unwrap();
+    let completion =
+        run_setup_convergence_with_orca(&env.paths, &mut ui, &doctor, None, Some(env.orca()))
+            .await
+            .unwrap();
     assert_eq!(
         completion,
         SetupCompletion::Finished {
@@ -756,10 +788,16 @@ async fn convergence_discovery_single_candidate_auto_links_without_prompt() {
     let doctor = make_doctor(counter.clone(), true);
     let mut ui = ScriptedUi::new([]);
 
-    let completion =
-        run_setup_convergence_with_home(&env.paths, &mut ui, &doctor, None, Some(&home))
-            .await
-            .unwrap();
+    let completion = run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        None,
+        Some(&home),
+        Some(env.orca()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         completion,
@@ -805,9 +843,16 @@ async fn convergence_discovery_multiple_candidates_fails_requiring_explicit_flag
     let doctor = make_doctor(counter.clone(), true);
     let mut ui = ScriptedUi::new([]);
 
-    let err = run_setup_convergence_with_home(&env.paths, &mut ui, &doctor, None, Some(&home))
-        .await
-        .unwrap_err();
+    let err = run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        None,
+        Some(&home),
+        Some(env.orca()),
+    )
+    .await
+    .unwrap_err();
 
     match err {
         ceo_connector::setup_frontend::SetupFrontendError::Ui(msg) => {
@@ -837,10 +882,16 @@ async fn convergence_discovery_zero_candidates_proposes_dot_ceo_and_accepts() {
     // Option 0 is "Use proposed path (~/.ceo/ceo-agent-runtime)"
     let mut ui = ScriptedUi::new([ScriptedAction::Select(0)]);
 
-    let completion =
-        run_setup_convergence_with_home(&env.paths, &mut ui, &doctor, None, Some(&home))
-            .await
-            .unwrap();
+    let completion = run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        None,
+        Some(&home),
+        Some(env.orca()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         completion,
@@ -878,10 +929,16 @@ async fn convergence_discovery_zero_candidates_change_path_accepts_custom_path()
         ScriptedAction::Text(custom_target.to_string_lossy().into_owned()),
     ]);
 
-    let completion =
-        run_setup_convergence_with_home(&env.paths, &mut ui, &doctor, None, Some(&home))
-            .await
-            .unwrap();
+    let completion = run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        None,
+        Some(&home),
+        Some(env.orca()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         completion,
@@ -912,10 +969,16 @@ async fn convergence_discovery_zero_candidates_cancel_exits_without_mutation() {
     // Option 2 is "Cancel"
     let mut ui = ScriptedUi::new([ScriptedAction::Select(2)]);
 
-    let completion =
-        run_setup_convergence_with_home(&env.paths, &mut ui, &doctor, None, Some(&home))
-            .await
-            .unwrap();
+    let completion = run_setup_convergence_with_home_and_orca(
+        &env.paths,
+        &mut ui,
+        &doctor,
+        None,
+        Some(&home),
+        Some(env.orca()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(completion, SetupCompletion::Cancelled);
     assert_eq!(env.register_calls(), 0);
@@ -935,11 +998,12 @@ async fn convergence_explicit_runtime_path_links_directly() {
     let doctor = make_doctor(counter.clone(), true);
     let mut ui = ScriptedUi::new([]);
 
-    let completion = run_setup_convergence(
+    let completion = run_setup_convergence_with_orca(
         &env.paths,
         &mut ui,
         &doctor,
         Some(custom_target.to_str().unwrap()),
+        Some(env.orca()),
     )
     .await
     .unwrap();
