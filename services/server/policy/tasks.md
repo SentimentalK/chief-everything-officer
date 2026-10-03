@@ -128,6 +128,10 @@ Type 是辅助索引。Task 同时具有多种性质时，选择最有助于理�
 - 可复用 decision evidence → Decision
 - 当前工作范围、状态、执行与验证 → Task
 
+判断一条信息是否属于 Task，问：**这个 Task 明天关闭，这条信息还成立、还有用吗？** 是，则写入对应长期 owner（偏好、约束、长期事实 → Personal；一次权衡 → Decision），Task 只保留引用和它对当前 scope 的影响。讨论围绕某个 Task 展开，不改变信息本身的 owner。
+
+Task 的推理确实需要某个长期事实的值时（例如按薪资计算资格分），可以写出该值，但必须同时写 owner 引用，使该事实变化时能通过引用找回所有依赖它的结论；不维护脱离引用的副本。
+
 Task 保留这些信息对当前 scope 的影响和必要引用。MONITORING / treatment / habit Task 可以维护趋势结论、阈值、策略和下一动作，但不应继续堆积每次 daily observation；原始纵向记录由 Well-being 等对应 owner 保存。
 
 一旦拆 child，详细 ownership 下沉：
@@ -189,6 +193,14 @@ rename / move / archive 不改变 Task identity。
 
 保留仍影响未来工作的决定、阻塞、结论和必要历史；合并或移除已经被替代且不再帮助当前推进的重复 checkpoint。
 
+### 就地更新
+
+Task 是状态文档，不是 changelog。新信息改写它所替代的那一处（字段、current state、next action 或对应章节），不在文件末尾追加 `Update` / 日期节，让新旧事实并存。
+
+- 被替代的旧值仅在仍能解释当前决定时保留，压缩为一行历史（日期 + 变化 + 原因），并放在不会被误读为现状的位置；
+- 修正错误直接改正原处，不追加“修正”“修正的修正”；
+- 只有确实承载 evidence 价值的 checkpoint 才按时间保留，且 current state 必须独立成立，不要求读者读完历史才能知道现状。
+
 ## 9. 结束与归档
 
 Task 达到目标、明确停止或不再需要作为独立工作存在时，应退出 `tasks/`：
@@ -202,7 +214,7 @@ Task 达到目标、明确停止或不再需要作为独立工作存在时，应
 
 归档前检查：
 
-- 长期事实 / preference / option / decision 是否已有正确 owner；
+- 长期事实 / preference / option / decision 是否已写入正确 owner，Task 内只剩引用；归档 Task 不在默认检索范围，留在其中的长期信息视为对未来不可见；
 - parent 是否只保留必要 routing / roll-up；
 - 新 owner / child 的稳定 ID 是否明确；
 - dependency / relation 是否仍正确；
