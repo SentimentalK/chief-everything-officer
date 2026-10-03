@@ -194,8 +194,20 @@ pub struct RegisterTargetInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterTargetRepoSource {
-    pub source: String,
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum RegisterTargetRepoSource {
+    /// Server derives provider/external_id/full_name from the workspace's
+    /// own GitHub repository binding.
+    WorkspaceRepository,
+    /// Device-observed Git origin (explicit raw target_id compatibility for
+    /// automation/debugging also flows through the register API contract,
+    /// but repository identity always comes from provider/full_name here).
+    RemoteUrl {
+        /// Normalized provider (currently "github").
+        provider: String,
+        /// Owner/repo full name, matching supported SSH/HTTPS forms.
+        full_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

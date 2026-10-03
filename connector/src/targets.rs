@@ -104,32 +104,7 @@ pub struct TargetDisplayItem {
 /// - git@github.com:owner/repo.git -> owner/repo
 /// - ssh://git@github.com/owner/repo.git -> owner/repo
 pub fn normalize_github_remote(remote: &str) -> Option<String> {
-    let trimmed = remote.trim();
-    let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-
-    if let Some(rest) = without_git.strip_prefix("https://github.com/") {
-        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() == 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
-    } else if let Some(rest) = without_git.strip_prefix("http://github.com/") {
-        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() == 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
-    } else if let Some(rest) = without_git.strip_prefix("git@github.com:") {
-        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() == 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
-    } else if let Some(rest) = without_git.strip_prefix("ssh://git@github.com/") {
-        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() == 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
-    }
-
-    None
+    crate::repo_identity::normalize_github_url_to_full_name(remote)
 }
 
 /// Verifies that `path` is an existing directory, that it is the top-level of a Git repository,
@@ -452,9 +427,7 @@ pub async fn target_add(
         };
         verify_local_repository(&canonical_path, &repo_part)?;
 
-        Some(RegisterTargetRepoSource {
-            source: "workspace_repository".into(),
-        })
+        Some(RegisterTargetRepoSource::WorkspaceRepository)
     } else {
         None
     };

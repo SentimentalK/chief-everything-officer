@@ -16,6 +16,7 @@ pub mod platform;
 pub mod projects;
 pub mod redelivery;
 pub mod render;
+pub mod repo_identity;
 pub mod scheduler;
 pub mod setup;
 pub mod setup_frontend;

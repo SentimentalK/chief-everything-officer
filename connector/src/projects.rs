@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
-use crate::client::{ClientError, ConnectorClient};
+use crate::client::{ClientError, ConnectorClient, RegisterTargetRepoSource};
 use crate::config::{ConfigError, LocalConfig, LocalExecutorConfig, LocalTarget};
 use crate::credential::CredentialError;
 use crate::local_state::ExecutionLock;
 use crate::orca::discovery::{AgentDiscovery, OrcaCliAgentDiscovery};
 use crate::paths::ConnectorPaths;
 use crate::setup::{
-    ensure_binding_step, ensure_server_target, resolve_current_workspace, SetupError,
+    ensure_binding_step, ensure_server_target_with_repository, resolve_current_workspace,
+    SetupError,
 };
 use crate::targets::{
     build_target_display_items, check_active_attempt_target_in_use, resolve_target_selector,
@@ -45,6 +46,18 @@ pub enum ProjectError {
     GitError(String),
     #[error("Could not infer project name from Git remote or directory. Please specify --name.")]
     CannotInferName,
+    #[error(
+        "Repository '{path}' has no 'origin' remote configured. Repository-first project identity requires a Git 'origin' remote; add one (git remote add origin ...) and rerun (REPOSITORY_ORIGIN_MISSING)."
+    )]
+    OriginMissing { path: String },
+    #[error(
+        "Unsupported Git remote URL '{url}': work/svn/local helpers are not valid project origins (REPOSITORY_UNSAFE_ORIGIN)."
+    )]
+    UnsafeOrigin { url: String },
+    #[error(
+        "Cannot resolve repository identity from remote URL '{url}': unsupported provider form. Supported forms are github.com HTTPS and SSH remotes (REPOSITORY_IDENTITY_UNRESOLVED)."
+    )]
+    Unresolved { url: String },
     #[error("Project '{0}' not found. Use an exact project alias, display name, or target ID.")]
     ProjectNotFound(String),
     #[error("Project selector '{0}' is ambiguous: matches multiple projects. Use the full target ID or distinct alias.")]
@@ -64,6 +77,21 @@ pub(crate) fn map_target_error_for_project(err: TargetError) -> ProjectError {
         TargetError::TargetNotFound(s) => ProjectError::ProjectNotFound(s),
         TargetError::AmbiguousSelector(s) => ProjectError::AmbiguousSelector(s),
         other => ProjectError::Target(other),
+    }
+}
+
+fn map_repo_identity_error(err: crate::repo_identity::RepoIdentityError) -> ProjectError {
+    match err {
+        crate::repo_identity::RepoIdentityError::Git(msg) => ProjectError::GitError(msg),
+        crate::repo_identity::RepoIdentityError::OriginMissing { path } => {
+            ProjectError::OriginMissing { path }
+        }
+        crate::repo_identity::RepoIdentityError::UnsafeOrigin { url } => {
+            ProjectError::UnsafeOrigin { url }
+        }
+        crate::repo_identity::RepoIdentityError::Unresolved { url } => {
+            ProjectError::Unresolved { url }
+        }
     }
 }
 
@@ -444,7 +472,20 @@ pub async fn project_add(
     let canonical_path = validate_git_repository(Path::new(raw_path))?;
     let canonical_str = canonical_path.to_string_lossy().to_string();
 
-    // 2. Infer or take name override
+    // 1b. Resolve the Git repository identity BEFORE any server mutation.
+    // A fresh Device ordinarily does not know the immutable target_id; the
+    // normalized origin (provider + owner/repo) is the identity key sent to
+    // the Server. Human names are presentation only and never decide
+    // identity; a local checkout without a resolvable origin fails clearly
+    // here instead of silently registering by human name.
+    let repo_identity = crate::repo_identity::resolve_repository_identity(&canonical_path)
+        .map_err(map_repo_identity_error)?;
+    let repo_source = RegisterTargetRepoSource::RemoteUrl {
+        provider: repo_identity.provider.clone(),
+        full_name: repo_identity.full_name.clone(),
+    };
+
+    // 2. Infer or take name override (presentation only)
     let project_name = match name_override {
         Some(name) => {
             let s = sanitize_name(name);
@@ -465,13 +506,14 @@ pub async fn project_add(
     let ws = resolve_current_workspace(&client, &cred).await?;
     let catalogue = client.list_targets(&cred, Some(&ws.id)).await?;
 
-    let ensured = ensure_server_target(
+    let ensured = ensure_server_target_with_repository(
         &client,
         &cred,
         &ws.id,
         &catalogue,
         &project_name,
         &project_name,
+        Some(repo_source),
     )
     .await?;
 

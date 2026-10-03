@@ -498,6 +498,8 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
           displayName: input.displayName,
           kind: input.kind,
           repositorySource: input.repositorySource,
+          repositoryProvider: input.repositoryProvider,
+          repositoryFullName: input.repositoryFullName,
         });
 
         const status = result.targetCreated ? 201 : 200;

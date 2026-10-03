@@ -281,6 +281,123 @@ describe("POST /api/connector/targets/register", () => {
     });
   });
 
+  it("registers target with remote_url source and persists normalized repository metadata", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "fresh-add",
+        display_name: "Fresh Add",
+        kind: "coding",
+        repository: {
+          source: "remote_url",
+          provider: "github",
+          full_name: "Acme/Other-Repo.git",
+        },
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const data = await res.json();
+    expect(data.target_created).toBe(true);
+    expect(data.target.repository).toEqual({
+      provider: "github",
+      // Binding full_name does not match: normalized full_name is persisted
+      // as the deterministic external identifier.
+      external_id: "acme/other-repo",
+      full_name: "acme/other-repo",
+    });
+  });
+
+  it("rejects remote_url full_name that is not a normalized repository name with 400", async () => {
+    const res = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "bad-repo-name",
+        display_name: "Bad Repo Name",
+        kind: "coding",
+        repository: {
+          source: "remote_url",
+          provider: "github",
+          full_name: "https://github.com/acme/main-repo",
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("INVALID_REQUEST");
+  });
+
+  it("remote_url register is repository-first: fresh device with different human name reuses the target without rename", async () => {
+    const first = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ownerDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "device-a-custom-name",
+        display_name: "Device A Custom Name",
+        kind: "coding",
+        repository: {
+          source: "remote_url",
+          provider: "github",
+          full_name: "acme/identity-repo",
+        },
+      }),
+    });
+    expect(first.status).toBe(201);
+    const firstData = await first.json();
+
+    // Fresh device (different device token), default repo-derived human
+    // name, same Git repository identity.
+    const second = await fetch(`${baseUrl}/api/connector/targets/register`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${memberDevToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        alias: "identity-repo",
+        display_name: "Identity Repo",
+        kind: "coding",
+        repository: {
+          source: "remote_url",
+          provider: "github",
+          full_name: "acme/identity-repo",
+        },
+      }),
+    });
+
+    expect(second.status).toBe(200);
+    const secondData = await second.json();
+    expect(secondData.target_created).toBe(false);
+    expect(secondData.target.id).toBe(firstData.target.id);
+    // Names never decide identity: the existing Server Target keeps its
+    // original alias/display_name (no implicit rename).
+    expect(secondData.target.alias).toBe("device-a-custom-name");
+    expect(secondData.target.display_name).toBe("Device A Custom Name");
+    // The fresh device got its own binding to the reused target.
+    expect(secondData.binding_created).toBe(true);
+    expect(secondData.target.repository).toEqual({
+      provider: "github",
+      external_id: "acme/identity-repo",
+      full_name: "acme/identity-repo",
+    });
+  });
+
   it("strictly rejects unknown fields with 400 INVALID_REQUEST", async () => {
     // 1. Extraneous local_path
     const res1 = await fetch(`${baseUrl}/api/connector/targets/register`, {

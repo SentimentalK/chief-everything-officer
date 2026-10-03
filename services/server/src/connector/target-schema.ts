@@ -1,4 +1,4 @@
-import { normalizeTargetAlias, V1_VALID_TARGET_KINDS, type V1ExecutionTargetKind, type ExecutionTargetRecord, type DeviceTargetBindingRecord } from "./control-store.js";
+import { normalizeRemoteFullName, normalizeTargetAlias, V1_VALID_TARGET_KINDS, type V1ExecutionTargetKind, type ExecutionTargetRecord, type DeviceTargetBindingRecord } from "./control-store.js";
 
 export const TARGET_ERROR_CODES = {
   INVALID_REQUEST: "INVALID_REQUEST",
@@ -27,17 +27,32 @@ export interface RegisterTargetInput {
   alias: string;
   display_name: string;
   kind: V1ExecutionTargetKind;
-  repository?: {
-    source: "workspace_repository";
-  } | null;
+  repository?: RegisterTargetRepository | null;
 }
+
+/**
+ * Repository provenance sent by devices:
+ * - `workspace_repository`: server derives identity from the workspace's own
+ *   GitHub repository binding (legacy flow).
+ * - `remote_url`: device-observed Git origin for repository-first
+ *   fresh-device Project identity (normalized provider + owner/repo).
+ */
+export type RegisterTargetRepository = {
+  source: "workspace_repository";
+} | {
+  source: "remote_url";
+  provider: string;
+  full_name: string;
+} | null;
 
 export interface ParsedRegisterTargetInput {
   workspaceId: string;
   alias: string;
   displayName: string;
   kind: V1ExecutionTargetKind;
-  repositorySource: "workspace_repository" | null;
+  repositorySource: "workspace_repository" | "remote_url" | null;
+  repositoryProvider: string | null;
+  repositoryFullName: string | null;
 }
 
 const ALLOWED_REGISTER_TARGET_KEYS = new Set([
@@ -48,7 +63,7 @@ const ALLOWED_REGISTER_TARGET_KEYS = new Set([
   "repository",
 ]);
 
-const ALLOWED_REPOSITORY_KEYS = new Set(["source"]);
+const ALLOWED_REPOSITORY_KEYS = new Set(["source", "provider", "full_name"]);
 
 /**
  * Validates and strictly parses a register target request.
@@ -109,7 +124,9 @@ export function parseRegisterTargetInput(raw: unknown): ParsedRegisterTargetInpu
     );
   }
 
-  let repositorySource: "workspace_repository" | null = null;
+  let repositorySource: "workspace_repository" | "remote_url" | null = null;
+  let repositoryProvider: string | null = null;
+  let repositoryFullName: string | null = null;
   const repoRaw = record.repository;
   if (repoRaw !== undefined && repoRaw !== null) {
     if (typeof repoRaw !== "object" || Array.isArray(repoRaw)) {
@@ -122,9 +139,9 @@ export function parseRegisterTargetInput(raw: unknown): ParsedRegisterTargetInpu
       }
     }
 
-    if (repoRecord.source !== "workspace_repository") {
+    if (repoRecord.source !== "workspace_repository" && repoRecord.source !== "remote_url") {
       throw new TargetValidationError(
-        "repository.source must be 'workspace_repository'.",
+        "repository.source must be 'workspace_repository' or 'remote_url'.",
         TARGET_ERROR_CODES.INVALID_REQUEST,
       );
     }
@@ -136,7 +153,30 @@ export function parseRegisterTargetInput(raw: unknown): ParsedRegisterTargetInpu
       );
     }
 
-    repositorySource = "workspace_repository";
+    if (repoRecord.source === "remote_url") {
+      if (typeof repoRecord.provider !== "string" || repoRecord.provider.trim().length === 0 || repoRecord.provider.trim().length > 64) {
+        throw new TargetValidationError(
+          "repository.provider must be a non-empty string (max 64 characters).",
+          TARGET_ERROR_CODES.INVALID_REQUEST,
+        );
+      }
+      if (typeof repoRecord.full_name !== "string" || repoRecord.full_name.trim().length === 0 || repoRecord.full_name.trim().length > 256) {
+        throw new TargetValidationError(
+          "repository.full_name must be a non-empty string (max 256 characters).",
+          TARGET_ERROR_CODES.INVALID_REQUEST,
+        );
+      }
+      repositoryProvider = repoRecord.provider.trim().toLowerCase();
+      repositoryFullName = normalizeRemoteFullName(repoRecord.provider.trim().toLowerCase(), repoRecord.full_name.trim());
+      if (repositoryFullName === null) {
+        throw new TargetValidationError(
+          "repository.full_name is not a valid normalized repository name.",
+          TARGET_ERROR_CODES.INVALID_REQUEST,
+        );
+      }
+    }
+
+    repositorySource = repoRecord.source as "workspace_repository" | "remote_url";
   }
 
   return {
@@ -145,6 +185,8 @@ export function parseRegisterTargetInput(raw: unknown): ParsedRegisterTargetInpu
     displayName,
     kind,
     repositorySource,
+    repositoryProvider,
+    repositoryFullName,
   };
 }
 

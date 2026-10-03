@@ -977,3 +977,302 @@ describe("ConnectorControlStore - Execution Target Registry & Device Bindings", 
     expect(dItemRestored!.activeBindingCount).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Repository-first fresh-device Project identity (remote_url register source)
+// ---------------------------------------------------------------------------
+
+describe("ConnectorControlStore - repository-first fresh-device Project identity", () => {
+  let dev1: { id: string };
+  let dev2: { id: string };
+
+  beforeEach(() => {
+    dev1 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Device A",
+      platform: "linux",
+    });
+    dev2 = connectorStore.createDevice({
+      userId: testUserId,
+      displayName: "Device B",
+      platform: "windows",
+    });
+
+    // Workspace GitHub binding (numeric external id authority), matching the
+    // shape seeded for the legacy register describe block above.
+    store.withDb((db) => {
+      db.prepare(`
+        INSERT INTO github_installations (
+          id, github_installation_id, github_app_id, account_id, account_login, account_type,
+          repository_selection, suspended_at_ms, created_at_ms, updated_at_ms
+        ) VALUES ('inst_row_rfi', 'inst_1', 'app_1', 'acc_1', 'alice', 'User', 'selected', NULL, 1000, 1000);
+      `).run();
+      db.prepare(`
+        INSERT INTO github_repository_bindings (
+          id, workspace_id, github_repository_id, github_installation_row_id,
+          owner_account_id, owner_login, repository_name, full_name, branch, created_at_ms, updated_at_ms
+        ) VALUES ('grb_rfi', ?, '123456', 'inst_row_rfi', 'acc_1', 'alice', 'test-repo', 'alice/test-repo', 'main', 1000, 1000);
+      `).run(testWorkspaceId);
+    });
+  });
+
+  function remoteRepo(fullName: string) {
+    return {
+      repositorySource: "remote_url" as const,
+      repositoryProvider: "github",
+      repositoryFullName: fullName,
+    };
+  }
+
+  it("persists repository metadata on remote_url register (external_id falls back to normalized full_name)", () => {
+    const res = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "custom-name",
+      displayName: "Custom Name",
+      kind: "coding",
+      ...remoteRepo("org/my-repo"),
+    });
+
+    expect(res.targetCreated).toBe(true);
+    expect(res.target.repository_provider).toBe("github");
+    expect(res.target.repository_full_name).toBe("org/my-repo");
+    // Workspace binding is 'alice/test-repo' and does NOT match: the normalized
+    // full_name is persisted as the deterministic external identifier.
+    expect(res.target.repository_external_id).toBe("org/my-repo");
+  });
+
+  it("enriches external_id from the workspace GitHub binding when full_name matches", () => {
+    const res = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "alice-repo",
+      displayName: "Alice Repo",
+      kind: "coding",
+      ...remoteRepo("alice/test-repo"),
+    });
+
+    expect(res.target.repository_external_id).toBe("123456");
+    expect(res.target.repository_full_name).toBe("alice/test-repo");
+  });
+
+  it("fresh Device B add with default name reuses Device A custom-named target (no rename)", () => {
+    const deviceA = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "my-custom-typo-name",
+      displayName: "My Custom Typo Name",
+      kind: "coding",
+      ...remoteRepo("org/shared-repo"),
+    });
+    expect(deviceA.targetCreated).toBe(true);
+
+    // Fresh Device B: different clone folder/name context, default
+    // repo-derived human name, same Git repository identity.
+    const deviceB = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "shared-repo",
+      displayName: "Shared Repo",
+      kind: "coding",
+      ...remoteRepo("org/shared-repo"),
+    });
+
+    expect(deviceB.targetCreated).toBe(false);
+    expect(deviceB.target.id).toBe(deviceA.target.id);
+    // Human alias/display name never decides identity; the existing
+    // Server Target is reused under its original alias (no implicit rename).
+    expect(deviceB.target.alias).toBe("my-custom-typo-name");
+    expect(deviceB.target.display_name).toBe("My Custom Typo Name");
+    // Device B got its own binding to the reused target.
+    expect(deviceB.bindingCreated).toBe(true);
+    expect(deviceB.binding.device_id).toBe(dev2.id);
+    expect(deviceB.binding.target_id).toBe(deviceA.target.id);
+  });
+
+  it("idempotent re-register (same or different alias) never duplicates the repository Target", () => {
+    const first = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "repo-alpha",
+      displayName: "Repo Alpha",
+      kind: "coding",
+      ...remoteRepo("org/dup-repo"),
+    });
+
+    // Exact replay on the same device
+    const replay = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "repo-alpha",
+      displayName: "Repo Alpha",
+      kind: "coding",
+      ...remoteRepo("org/dup-repo"),
+    });
+    expect(replay.targetCreated).toBe(false);
+    expect(replay.target.id).toBe(first.target.id);
+    expect(replay.replayed).toBe(true);
+
+    // Different alias (concurrent create race equivalent), same device
+    const otherAlias = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "repo-beta",
+      displayName: "Repo Beta",
+      kind: "coding",
+      ...remoteRepo("org/dup-repo"),
+    });
+    expect(otherAlias.targetCreated).toBe(false);
+    expect(otherAlias.target.id).toBe(first.target.id);
+
+    // Same repo, other device
+    const otherDevice = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "repo-gamma",
+      displayName: "Repo Gamma",
+      kind: "coding",
+      ...remoteRepo("org/dup-repo"),
+    });
+    expect(otherDevice.targetCreated).toBe(false);
+    expect(otherDevice.target.id).toBe(first.target.id);
+  });
+
+  it("equivalent SSH/HTTPS origins resolve consistently via case-insensitive full_name", () => {
+    const httpsAdd = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "case-one",
+      displayName: "Case One",
+      kind: "coding",
+      ...remoteRepo("org/case-repo"),
+    });
+
+    // Device B's checkout uses the same repository under a different
+    // origin form; the device normalizes to owner/repo and case only
+    // differs in the human-typed layer.
+    const sshAdd = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "case-two",
+      displayName: "Case Two",
+      kind: "coding",
+      ...remoteRepo("ORG/CASE-REPO"),
+    });
+
+    expect(sshAdd.targetCreated).toBe(false);
+    expect(sshAdd.target.id).toBe(httpsAdd.target.id);
+  });
+
+  it("same human name on different repositories is not treated as identity (alias conflict, no duplicate creation)", () => {
+    connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "same-project",
+      displayName: "Same Project",
+      kind: "coding",
+      ...remoteRepo("org/repo-a"),
+    });
+
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "same-project",
+        displayName: "Same Project",
+        kind: "coding",
+        ...remoteRepo("org/repo-b"),
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    // Only one active target for alias 'same-project'; repo-b never created.
+    const visible = connectorStore.listTargetsForUser(testUserId, { workspaceId: testWorkspaceId });
+    const sameProject = visible.filter((t) => t.target.alias === "same-project");
+    expect(sameProject).toHaveLength(1);
+    expect(sameProject[0]!.target.repository_full_name).toBe("org/repo-a");
+    expect(visible.filter((t) => t.target.repository_full_name === "org/repo-b")).toHaveLength(0);
+  });
+
+  it("refuses to resolve when multiple active targets share the repository identity", () => {
+    connectorStore.createExecutionTarget({
+      workspaceId: testWorkspaceId,
+      alias: "dup-one",
+      displayName: "Dup One",
+      kind: "coding",
+      repositoryProvider: "github",
+      repositoryExternalId: "org/multi-repo",
+      repositoryFullName: "org/multi-repo",
+    });
+    connectorStore.createExecutionTarget({
+      workspaceId: testWorkspaceId,
+      alias: "dup-two",
+      displayName: "Dup Two",
+      kind: "coding",
+      repositoryProvider: "github",
+      repositoryExternalId: "org/multi-repo",
+      repositoryFullName: "org/multi-repo",
+    });
+
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "fresh",
+        displayName: "Fresh",
+        kind: "coding",
+        ...remoteRepo("org/multi-repo"),
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+  });
+
+  it("repository identity match with different kind conflicts instead of reusing", () => {
+    connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "kind-guard",
+      displayName: "Kind Guard",
+      kind: "coding",
+      ...remoteRepo("org/kind-repo"),
+    });
+
+    expect(() =>
+      connectorStore.registerExecutionTargetForDevice({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        alias: "kind-guard-two",
+        displayName: "Kind Guard Two",
+        kind: "general_automation",
+        ...remoteRepo("org/kind-repo"),
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+  });
+
+  it("disabled targets are not reused for repository identity; a new active Target is created", () => {
+    const first = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev1.id,
+      workspaceId: testWorkspaceId,
+      alias: "disabled-repo",
+      displayName: "Disabled Repo",
+      kind: "coding",
+      ...remoteRepo("org/disabled-repo"),
+    });
+    connectorStore.disableExecutionTarget(first.target.id);
+
+    const second = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "disabled-repo-new",
+      displayName: "Disabled Repo New",
+      kind: "coding",
+      ...remoteRepo("org/disabled-repo"),
+    });
+
+    expect(second.targetCreated).toBe(true);
+    expect(second.target.id).not.toBe(first.target.id);
+
+    const all = connectorStore.listTargetsForUser(testUserId, { workspaceId: testWorkspaceId });
+    const forRepo = all.filter((t) => t.target.repository_full_name === "org/disabled-repo");
+    expect(forRepo).toHaveLength(2);
+    expect(forRepo.filter((t) => t.target.disabled_at_ms !== null)).toHaveLength(1);
+  });
+});

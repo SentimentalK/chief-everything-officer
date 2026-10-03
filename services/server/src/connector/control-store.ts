@@ -1,4 +1,5 @@
 import { IdentityStore, IdentityError, newId } from "../identity/store.js";
+import type { DatabaseSync } from "node:sqlite";
 
 export class ConnectorControlError extends IdentityError {
   constructor(message: string, public readonly code?: string) {
@@ -90,6 +91,30 @@ export function normalizeTargetAlias(alias: string): string {
     );
   }
   return normalized;
+}
+
+/**
+ * Normalizes a device-reported repository full_name (owner/repo from a Git
+ * origin) into the canonical persisted form used for repository-first
+ * fresh-device identity resolution: lowercase `owner/repo` (or deeper
+ * subgroup paths), no `.git` suffix, no surrounding slashes, and no
+ * whitespace. Returns null for anything that is not a normalized repository
+ * name (paths, URLs, helper names) — callers reject those with
+ * INVALID_REQUEST instead of silently deriving a weaker identity.
+ */
+export function normalizeRemoteFullName(provider: string, raw: string): string | null {
+  if (provider.trim().length === 0) {
+    return null;
+  }
+  let name = raw.trim();
+  if (name.includes("://") || name.includes("@") || /\s/.test(name)) {
+    return null;
+  }
+  name = name.replace(/\.git$/i, "").replace(/\/+$/, "").replace(/^\/+/, "");
+  if (!/^[a-z0-9._-]+(?:\/[a-z0-9._-]+)+$/.test(name.toLowerCase())) {
+    return null;
+  }
+  return name.toLowerCase();
 }
 
 export class ConnectorControlStore {
@@ -1001,7 +1026,9 @@ export class ConnectorControlStore {
     alias: string;
     displayName: string;
     kind: string;
-    repositorySource?: "workspace_repository" | null;
+    repositorySource?: "workspace_repository" | "remote_url" | null;
+    repositoryProvider?: string | null;
+    repositoryFullName?: string | null;
     nowMs?: number;
   }): {
     target: ExecutionTargetRecord;
@@ -1073,6 +1100,80 @@ export class ConnectorControlStore {
           provider = "github";
           externalId = repoBinding.github_repository_id;
           fullName = repoBinding.full_name;
+        } else if (input.repositorySource === "remote_url") {
+          if (input.repositoryProvider == null || input.repositoryFullName == null) {
+            throw new ConnectorValidationError(
+              "remote_url repository source requires repository_provider and repository_full_name.",
+            );
+          }
+          const normalizedProvider = input.repositoryProvider.trim().toLowerCase();
+          const normalizedFullName = normalizeRemoteFullName(normalizedProvider, input.repositoryFullName);
+          if (!normalizedProvider || normalizedFullName === null) {
+            throw new ConnectorValidationError(
+              "remote_url repository source requires a valid provider and normalized full_name.",
+            );
+          }
+          provider = normalizedProvider;
+          fullName = normalizedFullName;
+
+          // Enrich the persisted external_id with the workspace's GitHub
+          // binding numeric id when the binding resolves the same repository;
+          // otherwise persist the normalized full_name so repository-first
+          // resolution stays deterministic across devices.
+          const repoBinding = db.prepare(
+            "SELECT github_repository_id, full_name FROM github_repository_bindings WHERE workspace_id = ? LIMIT 1;",
+          ).get(input.workspaceId) as { github_repository_id: string; full_name: string } | undefined;
+          if (repoBinding && repoBinding.full_name.toLowerCase() === fullName) {
+            externalId = repoBinding.github_repository_id;
+          } else {
+            externalId = fullName;
+          }
+        }
+
+        // Repository-first fresh-device identity resolution (remote_url
+        // sources only): an existing ACTIVE coding Target with the same
+        // repository identity is REUSED regardless of its alias/display_name
+        // (names never decide identity; no implicit rename). The lookup runs
+        // inside BEGIN IMMEDIATE so concurrent create paths serialize and
+        // duplicate active Targets for the same repository identity are
+        // prevented.
+        if (provider !== null && externalId !== null && input.repositorySource === "remote_url") {
+          const repoRows = db.prepare(`
+            SELECT id, workspace_id, alias, display_name, kind,
+                   repository_provider, repository_external_id, repository_full_name,
+                   created_at_ms, updated_at_ms, disabled_at_ms
+            FROM execution_targets
+            WHERE workspace_id = ?
+              AND repository_provider = ?
+              AND repository_external_id = ?
+              AND disabled_at_ms IS NULL
+            ORDER BY created_at_ms ASC, id ASC;
+          `).all(input.workspaceId, provider, externalId) as unknown as ExecutionTargetRecord[];
+
+          if (repoRows.length > 1) {
+            throw new ConnectorTargetConflictError(
+              `Multiple active execution targets in workspace '${input.workspaceId}' resolve to the same repository identity '${fullName}'; refusing to choose one.`,
+            );
+          }
+          if (repoRows.length === 1) {
+            const repoTarget = repoRows[0];
+            if (!repoTarget) {
+              throw new ConnectorTargetConflictError(
+                `Repository identity '${fullName}' resolution failed unexpectedly.`,
+              );
+            }
+            if (repoTarget.kind !== trimmedKind) {
+              throw new ConnectorTargetConflictError(
+                `Execution target '${repoTarget.alias}' matches repository identity '${fullName}' but has kind '${repoTarget.kind}' instead of '${trimmedKind}'.`,
+              );
+            }
+            return this.ensureDeviceBindingAndReturn(db, {
+              target: repoTarget,
+              deviceId: input.deviceId,
+              now,
+              targetCreated: false,
+            });
+          }
         }
 
         const existingTarget = db.prepare(`
@@ -1161,56 +1262,12 @@ export class ConnectorControlStore {
           };
         }
 
-        const existingBinding = db.prepare(`
-          SELECT id, device_id, target_id, created_at_ms, updated_at_ms, disabled_at_ms
-          FROM device_target_bindings
-          WHERE device_id = ? AND target_id = ?
-          LIMIT 1;
-        `).get(input.deviceId, target.id) as DeviceTargetBindingRecord | undefined;
-
-        let binding: DeviceTargetBindingRecord;
-        let bindingCreated = false;
-        let replayed = false;
-
-        if (existingBinding) {
-          if (existingBinding.disabled_at_ms !== null) {
-            db.prepare(`
-              UPDATE device_target_bindings
-              SET disabled_at_ms = NULL, updated_at_ms = ?
-              WHERE id = ?;
-            `).run(now, existingBinding.id);
-            binding = {
-              ...existingBinding,
-              disabled_at_ms: null,
-              updated_at_ms: now,
-            };
-            bindingCreated = false;
-            replayed = false;
-          } else {
-            binding = existingBinding;
-            bindingCreated = false;
-            replayed = true;
-          }
-        } else {
-          const bindingId = newId("dtb");
-          db.prepare(`
-            INSERT INTO device_target_bindings (id, device_id, target_id, created_at_ms, updated_at_ms, disabled_at_ms)
-            VALUES (?, ?, ?, ?, ?, NULL);
-          `).run(bindingId, input.deviceId, target.id, now, now);
-          binding = {
-            id: bindingId,
-            device_id: input.deviceId,
-            target_id: target.id,
-            created_at_ms: now,
-            updated_at_ms: now,
-            disabled_at_ms: null,
-          };
-          bindingCreated = true;
-          replayed = false;
-        }
-
-        db.exec("COMMIT;");
-        return { target, binding, targetCreated: false, bindingCreated, replayed };
+        return this.ensureDeviceBindingAndReturn(db, {
+          target,
+          deviceId: input.deviceId,
+          now,
+          targetCreated: false,
+        });
       } catch (err) {
         try {
           db.exec("ROLLBACK;");
@@ -1220,6 +1277,80 @@ export class ConnectorControlStore {
         throw err;
       }
     });
+  }
+
+  /**
+   * Ensures the calling device's binding to `target` is enabled (create,
+   * re-enable, or idempotent replay) and commits the surrounding
+   * `BEGIN IMMEDIATE` transaction.
+   */
+  private ensureDeviceBindingAndReturn(
+    db: DatabaseSync,
+    input: {
+      target: ExecutionTargetRecord;
+      deviceId: string;
+      now: number;
+      targetCreated: boolean;
+    },
+  ): {
+    target: ExecutionTargetRecord;
+    binding: DeviceTargetBindingRecord;
+    targetCreated: boolean;
+    bindingCreated: boolean;
+    replayed: boolean;
+  } {
+    const { target, deviceId, now, targetCreated } = input;
+
+    const existingBinding = db.prepare(`
+      SELECT id, device_id, target_id, created_at_ms, updated_at_ms, disabled_at_ms
+      FROM device_target_bindings
+      WHERE device_id = ? AND target_id = ?
+      LIMIT 1;
+    `).get(deviceId, target.id) as DeviceTargetBindingRecord | undefined;
+
+    let binding: DeviceTargetBindingRecord;
+    let bindingCreated = false;
+    let replayed = false;
+
+    if (existingBinding) {
+      if (existingBinding.disabled_at_ms !== null) {
+        db.prepare(`
+          UPDATE device_target_bindings
+          SET disabled_at_ms = NULL, updated_at_ms = ?
+          WHERE id = ?;
+        `).run(now, existingBinding.id);
+        binding = {
+          ...existingBinding,
+          disabled_at_ms: null,
+          updated_at_ms: now,
+        };
+        bindingCreated = false;
+        replayed = false;
+      } else {
+        binding = existingBinding;
+        bindingCreated = false;
+        replayed = true;
+      }
+    } else {
+      const bindingId = newId("dtb");
+      db.prepare(`
+        INSERT INTO device_target_bindings (id, device_id, target_id, created_at_ms, updated_at_ms, disabled_at_ms)
+        VALUES (?, ?, ?, ?, ?, NULL);
+      `).run(bindingId, deviceId, target.id, now, now);
+      binding = {
+        id: bindingId,
+        device_id: deviceId,
+        target_id: target.id,
+        created_at_ms: now,
+        updated_at_ms: now,
+        disabled_at_ms: null,
+      };
+      bindingCreated = true;
+      replayed = false;
+    }
+
+    db.exec("COMMIT;");
+    return { target, binding, targetCreated, bindingCreated, replayed };
   }
 
   bindTargetForDevice(input: {

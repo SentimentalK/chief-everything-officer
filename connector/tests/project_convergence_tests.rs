@@ -804,12 +804,7 @@ async fn test_project_add_idempotency_preserves_existing_executor_and_model() {
 
     let temp_repo = tempfile::tempdir().unwrap();
     let repo_dir = temp_repo.path().join("my-repo-idem");
-    fs::create_dir_all(&repo_dir).unwrap();
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&repo_dir)
-        .output()
-        .unwrap();
+    init_git_repo(&repo_dir, Some("https://github.com/org/my-repo-idem.git"));
 
     // 1. Initial add with --agent codex --model gpt-5
     let res = ceo_connector::projects::project_add(
@@ -901,12 +896,7 @@ async fn test_project_add_model_without_agent_on_fresh_project_fails_clearly() {
 
     let temp_repo = tempfile::tempdir().unwrap();
     let repo_dir = temp_repo.path().join("my-repo-model");
-    fs::create_dir_all(&repo_dir).unwrap();
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&repo_dir)
-        .output()
-        .unwrap();
+    init_git_repo(&repo_dir, Some("https://github.com/org/my-repo-model.git"));
 
     let res = ceo_connector::projects::project_add(
         &paths,
@@ -1267,7 +1257,10 @@ async fn test_project_detach_then_add_reuses_existing_server_target() {
 
     let temp_repo = tempfile::tempdir().unwrap();
     let repo_dir = temp_repo.path().join(alias);
-    init_git_repo(&repo_dir, None);
+    init_git_repo(
+        &repo_dir,
+        Some(&format!("https://github.com/org/{alias}.git")),
+    );
 
     let register_count = Arc::new(AtomicU32::new(0));
     let bind_count = Arc::new(AtomicU32::new(0));

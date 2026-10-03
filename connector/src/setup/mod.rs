@@ -26,7 +26,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::client::{ClientError, ConnectorClient, ConnectorTargetProjection, RegisterTargetInput};
+use crate::client::{
+    ClientError, ConnectorClient, ConnectorTargetProjection, RegisterTargetInput,
+    RegisterTargetRepoSource,
+};
 use crate::config::{load_bound_profile, ConfigError, LocalConfig, LocalTarget, ProfileError};
 use crate::credential::{CredentialError, DeviceCredential};
 use crate::local_state::ExecutionLock;
@@ -132,6 +135,18 @@ pub enum SetupError {
     MultiWorkspaceUnsupported(usize),
     #[error("Alias '{0}' matched multiple Server Targets in the workspace; refusing to choose one (SETUP_ALIAS_AMBIGUOUS).")]
     AmbiguousAlias(String),
+    #[error(
+        "Git repository '{0}' identity matched multiple active coding Server Targets in the workspace; refusing to choose one (SETUP_REPOSITORY_AMBIGUOUS)."
+    )]
+    AmbiguousRepository(String),
+    #[error(
+        "Local checkout origin resolves to repository '{actual}', but the Server Target '{alias}' matched by name belongs to repository '{expected}'. Human names never decide Project identity; this add fails instead of binding a different repository (SETUP_REPOSITORY_IDENTITY_CONFLICT)."
+    )]
+    RepositoryIdentityConflict {
+        alias: String,
+        expected: String,
+        actual: String,
+    },
     #[error("Target '{alias}' exists on the Server with kind '{kind}', but setup requires kind 'coding' (SETUP_TARGET_WRONG_KIND).")]
     TargetWrongKind { alias: String, kind: String },
     #[error("Target '{0}' is disabled on server (TARGET_DISABLED)")]
@@ -225,8 +240,8 @@ pub(crate) async fn resolve_current_workspace(
 // Shared orchestration steps
 // ---------------------------------------------------------------------------
 
-/// Server-side Target ensure shared by both setup flows. Resolves the exact
-/// alias within the freshly fetched workspace catalogue:
+/// Server-side Target ensure shared by the legacy setup flows. Resolves the
+/// exact alias within the freshly fetched workspace catalogue:
 /// - existing => require kind=coding, not disabled, reuse the immutable
 ///   target_id (no rename, no delete/recreate, no duplicate);
 /// - absent => register exactly one coding Target (repository metadata stays
@@ -259,9 +274,93 @@ pub(crate) async fn ensure_server_target(
     alias: &str,
     display_name: &str,
 ) -> Result<EnsuredTarget, SetupError> {
-    // Exact, case-sensitive whole-string alias match within the workspace.
-    // No fuzzy/prefix/case-folding semantics are defined locally; the Server
-    // alias contract is the only authority.
+    ensure_server_target_with_repository(
+        client,
+        cred,
+        workspace_id,
+        catalogue,
+        alias,
+        display_name,
+        None,
+    )
+    .await
+}
+
+/// Repository-first Server Target ensure shared by the project add flow.
+///
+/// Resolution order (fresh-device Project identity):
+/// 1. When `repo_source` is `Some(RegisterTargetRepoSource::RemoteUrl { .. })`,
+///    resolve by normalized Git repository identity FIRST: the catalogue is
+///    scanned for an existing active coding Target with the same provider and
+///    canonical full_name (case-insensitive; the persisted external_id is the
+///    lowercase form). A human alias/display name never decides dedupe; if the
+///    repository-identity match has a different alias, the Server Target is
+///    REUSED under its existing alias — no implicit rename.
+/// 2. Otherwise fall back to the exact alias match within the workspace
+///    catalogue (the authoritative contract for workspace_repository and
+///    repository-less setup flows).
+/// 3. No existing match: register at most ONE coding Target. With a remote_url
+///    source the repository metadata is persisted for future fresh-device
+///    resolution; the Server rejects a duplicate registration inside a
+///    transaction (idempotent create race).
+pub(crate) async fn ensure_server_target_with_repository(
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    workspace_id: &str,
+    catalogue: &[ConnectorTargetProjection],
+    alias: &str,
+    display_name: &str,
+    repo_source: Option<RegisterTargetRepoSource>,
+) -> Result<EnsuredTarget, SetupError> {
+    // Step 1: repository-identity resolution (remote_url sources only).
+    if let Some(RegisterTargetRepoSource::RemoteUrl {
+        provider,
+        full_name,
+    }) = &repo_source
+    {
+        let wanted = full_name.to_lowercase();
+        let repo_matches: Vec<&ConnectorTargetProjection> = catalogue
+            .iter()
+            .filter(|t| {
+                !t.disabled
+                    && t.kind == TARGET_KIND_CODING
+                    && t.repository
+                        .as_ref()
+                        .map(|r| r.provider == *provider && r.full_name.to_lowercase() == wanted)
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        match repo_matches.len() {
+            1 => {
+                let t = repo_matches[0];
+                return Ok(EnsuredTarget {
+                    target_id: t.target_id.clone(),
+                    alias: t.alias.clone(),
+                    kind: t.kind.clone(),
+                    target_created: false,
+                    this_device_binding_active: t
+                        .this_device_binding
+                        .as_ref()
+                        .map(|b| b.enabled)
+                        .unwrap_or(false),
+                    binding_created_by_register: false,
+                    is_default_agent_runtime: t.is_default_agent_runtime,
+                    repository: t.repository.clone(),
+                });
+            }
+            0 => {
+                // Fall through to register (step 3) below.
+            }
+            _ => {
+                return Err(SetupError::AmbiguousRepository(full_name.clone()));
+            }
+        }
+    }
+
+    // Step 2: exact, case-sensitive whole-string alias match within the
+    // workspace. No fuzzy/prefix/case-folding semantics are defined locally;
+    // the Server alias contract is the only authority.
     let matches: Vec<&ConnectorTargetProjection> =
         catalogue.iter().filter(|t| t.alias == alias).collect();
 
@@ -276,6 +375,25 @@ pub(crate) async fn ensure_server_target(
             }
             if t.disabled {
                 return Err(SetupError::TargetDisabled(t.target_id.clone()));
+            }
+            // A name-matched Target whose repository metadata belongs to a
+            // DIFFERENT Git repository must never silently absorb this
+            // checkout: names are presentation only.
+            if let Some(RegisterTargetRepoSource::RemoteUrl {
+                provider,
+                full_name,
+            }) = &repo_source
+            {
+                if let Some(repo) = &t.repository {
+                    let wanted = full_name.to_lowercase();
+                    if repo.provider != *provider || repo.full_name.to_lowercase() != wanted {
+                        return Err(SetupError::RepositoryIdentityConflict {
+                            alias: t.alias.clone(),
+                            expected: repo.full_name.clone(),
+                            actual: full_name.clone(),
+                        });
+                    }
+                }
             }
             Ok(EnsuredTarget {
                 target_id: t.target_id.clone(),
@@ -298,10 +416,7 @@ pub(crate) async fn ensure_server_target(
                 alias: alias.to_string(),
                 display_name: display_name.to_string(),
                 kind: TARGET_KIND_CODING.to_string(),
-                // No fabricated workspace/repository metadata: the existing
-                // register API cannot truthfully express these flows' external
-                // repository truth, so repository stays absent.
-                repository: None,
+                repository: repo_source,
             };
             let res = client.register_target(cred, &input).await?;
             Ok(EnsuredTarget {
