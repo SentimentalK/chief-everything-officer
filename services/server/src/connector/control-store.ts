@@ -679,6 +679,10 @@ export class ConnectorControlStore {
    *   access is masked as not-found, matching bind/unbind);
    * - the Target is active (not disabled);
    * - the Target kind is "coding";
+   * - the calling Device has an ACTIVE device_target_bindings row for exactly
+   *   this (deviceId, targetId) — stale local state after detach/unbind (or a
+   *   binding owned by another device) never authorizes the attach, and a
+   *   missing/disabled binding fails closed without any auto-bind;
    * - the Target's current repository metadata is NULL — an exact same
    *   identity is an idempotent replay; a DIFFERENT existing identity fails
    *   closed and is never overwritten;
@@ -753,6 +757,23 @@ export class ConnectorControlStore {
         if (target.kind !== "coding") {
           throw new ConnectorTargetConflictError(
             `ExecutionTarget '${input.targetId}' has kind '${target.kind}'; repository identity can only be attached to coding targets.`,
+          );
+        }
+
+        // The legacy backfill authority is an ALREADY-BOUND legacy Device on
+        // THIS machine: an ACTIVE device_target_bindings row for exactly
+        // (this deviceId, this targetId) is independently required. Stale
+        // local state after detach/unbind (or another device being bound)
+        // can never authorize this attach, and missing/disabled bindings
+        // fail closed — the backfill never auto-binds.
+        const thisDeviceBinding = db
+          .prepare(
+            "SELECT id FROM device_target_bindings WHERE device_id = ? AND target_id = ? AND disabled_at_ms IS NULL LIMIT 1;",
+          )
+          .get(input.deviceId, input.targetId);
+        if (!thisDeviceBinding) {
+          throw new ConnectorTargetConflictError(
+            `Device '${input.deviceId}' has no active binding for ExecutionTarget '${input.targetId}'; legacy repository backfill requires an active this-device binding and never auto-binds.`,
           );
         }
 

@@ -1363,6 +1363,75 @@ describe("ConnectorControlStore - bounded legacy repository-identity backfill", 
     expect(replay.target.repository_full_name).toBe("org/legacy-repo");
   });
 
+  it("fails closed when this device has no active binding for the exact target", () => {
+    // Legacy target inserted directly: NO device_target_bindings row exists
+    // for any device, so no device may authorize the attach.
+    store.withDb((db) => {
+      db.prepare(
+        `INSERT INTO execution_targets (id, workspace_id, alias, display_name, kind,
+           repository_provider, repository_external_id, repository_full_name,
+           created_at_ms, updated_at_ms, disabled_at_ms)
+         VALUES ('tgt_unbound_b', ?, 'unbound-legacy', 'Unbound Legacy', 'coding', NULL, NULL, NULL, 1000, 1000, NULL);`,
+      ).run(testWorkspaceId);
+    });
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: "tgt_unbound_b",
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    const stored = connectorStore.getExecutionTarget("tgt_unbound_b")!;
+    expect(stored.repository_provider).toBeNull();
+  });
+
+  it("fails closed when the binding row exists but is disabled (detached device)", () => {
+    const legacy = legacyNullTarget("legacy-app");
+    connectorStore.disableDeviceTargetBinding(dev1.id, legacy.target.id);
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    // Stays repository-null; the attach never happened.
+    const stored = connectorStore.getExecutionTarget(legacy.target.id)!;
+    expect(stored.repository_provider).toBeNull();
+  });
+
+  it("fails closed when only ANOTHER device is bound to the target", () => {
+    const legacy = connectorStore.registerExecutionTargetForDevice({
+      deviceId: dev2.id,
+      workspaceId: testWorkspaceId,
+      alias: "other-bound",
+      displayName: "Other Bound",
+      kind: "coding",
+      repositorySource: null,
+    });
+
+    expect(() =>
+      connectorStore.attachRepositoryIdentityToTarget({
+        deviceId: dev1.id,
+        workspaceId: testWorkspaceId,
+        targetId: legacy.target.id,
+        provider: "github",
+        fullName: "org/legacy-repo",
+      }),
+    ).toThrow(ConnectorTargetConflictError);
+
+    const stored = connectorStore.getExecutionTarget(legacy.target.id)!;
+    expect(stored.repository_provider).toBeNull();
+  });
+
   it("fails closed when the target already owns a different repository identity", () => {
     const legacy = legacyNullTarget("legacy-app");
     connectorStore.attachRepositoryIdentityToTarget({

@@ -464,10 +464,11 @@ async fn ensure_device_binding(
 /// repository match in the workspace catalogue, but THIS Device's schema-v3
 /// local config ALREADY maps the exact immutable target_id to the verified
 /// local Git checkout being added, and the Server Target is an active coding
-/// Target whose repository metadata is null. Only then is the explicit
-/// Server attach capability called; it independently fails closed on
-/// disabled targets, wrong kinds, cross-workspace targets, non-null
-/// mismatches, and identity conflicts.
+/// Target whose repository metadata is null AND whose this-device binding for
+/// the exact target_id is active. Only then is the explicit Server attach
+/// capability called; it independently fails closed on disabled targets,
+/// wrong kinds, cross-workspace targets, missing/disabled this-device
+/// bindings, non-null mismatches, and identity conflicts.
 ///
 /// A fresh/unbound Device (no local mapping for the checkout) returns None
 /// here: an alias match is never authority to backfill a legacy
@@ -555,8 +556,24 @@ pub(crate) async fn maybe_backfill_legacy_repository_identity(
         return Ok(None);
     }
 
-    // 4. Call the bounded Server attach capability; the Server performs the
-    //    attach atomically and only under its own fail-closed guards.
+    // 4. Server-side binding authority for THIS device: the catalogue
+    //    projection must show an ACTIVE this-device binding for the exact
+    //    mapped target_id. A stale local mapping after detach/unbind is
+    //    never authority to backfill; a binding owned by another device
+    //    never authorizes this device; and the backfill never auto-binds
+    //    (missing/disabled binding => no attach, fail closed).
+    let binding_active = target
+        .this_device_binding
+        .as_ref()
+        .map(|b| b.enabled)
+        .unwrap_or(false);
+    if !binding_active {
+        return Ok(None);
+    }
+
+    // 5. Call the bounded Server attach capability; the Server performs the
+    //    attach atomically and only under its own fail-closed guards
+    //    (including its independent active this-device binding check).
     let res = client
         .attach_repository(cred, &target_id, workspace_id, provider, full_name)
         .await?;

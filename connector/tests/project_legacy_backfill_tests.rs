@@ -17,6 +17,10 @@
 //!   alias alone (no attach call, fail closed);
 //! - another active target already owning the identity fails closed;
 //! - the config-mapped disabled target is rejected, not backfilled;
+//! - a stale local mapping WITHOUT an active this-device Server binding
+//!   never triggers an attach (no auto-bind, fail closed);
+//! - a disabled this-device binding never triggers an attach;
+//! - only another device being bound does not authorize this device;
 //! - local config remains keyed by the immutable target_id throughout.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -120,6 +124,14 @@ fn map_target_in_config(paths: &ConnectorPaths, target_id: &str, local_path: &st
     cfg.save(&paths.config_file()).unwrap();
 }
 
+fn seed_binding(state: &SimServerState, credential_id: &str, target_id: &str, enabled: bool) {
+    state.bindings.lock().unwrap().push(SimBinding {
+        credential_id: credential_id.to_string(),
+        target_id: target_id.to_string(),
+        enabled,
+    });
+}
+
 /// Minimal simulated Server state implementing both authoritative contracts:
 /// repository-first register and the bounded attach-repository backfill.
 #[derive(Default)]
@@ -128,13 +140,23 @@ struct SimServerState {
     register_count: AtomicU32,
     attach_count: AtomicU32,
     attach_last_target_id: Mutex<String>,
-    bindings: Mutex<Vec<(String, String)>>, // (credential_id, target_id)
+    /// DeviceTargetBinding rows: (credential_id, target_id, enabled).
+    /// Missing rows and enabled=false rows are distinct states, matching the
+    /// Server's device_target_bindings (row presence + disabled_at_ms).
+    bindings: Mutex<Vec<SimBinding>>,
     next_id: AtomicU32,
     rename_count: AtomicU32,
     /// When set, the simulated attach endpoint rejects with
     /// TARGET_REPOSITORY_CONFLICT (simulates another device winning the
     /// identity between this device's catalogue snapshot and the attach).
     attach_conflict_inject: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone)]
+struct SimBinding {
+    credential_id: String,
+    target_id: String,
+    enabled: bool,
 }
 
 #[derive(Clone)]
@@ -204,13 +226,25 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
             let items: Vec<serde_json::Value> = targets
                 .iter()
                 .map(|t| {
-                    let bound = bindings
+                    // Mirror the Server contract: this_device_binding is null
+                    // when no row exists for this device, and enabled mirrors
+                    // disabled_at_ms IS NULL.
+                    let this_binding = bindings
                         .iter()
-                        .any(|(cid, tid)| cid == &cred_id && tid == &t.id);
+                        .find(|b| b.credential_id == cred_id && b.target_id == t.id)
+                        .map(|b| {
+                            serde_json::json!({
+                                "id": format!("bnd_{}", b.credential_id),
+                                "enabled": b.enabled
+                            })
+                        });
                     serde_json::json!({
                         "target": target_wire_json(t),
-                        "this_device_binding": { "id": format!("bnd_{cred_id}"), "enabled": bound },
-                        "active_binding_count": bindings.iter().filter(|(_, tid)| tid == &t.id).count()
+                        "this_device_binding": this_binding,
+                        "active_binding_count": bindings
+                            .iter()
+                            .filter(|b| b.target_id == t.id && b.enabled)
+                            .count()
                     })
                 })
                 .collect();
@@ -265,6 +299,21 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
                 return MockResponse::json(
                     409,
                     &serde_json::json!({ "error": "TARGET_REPOSITORY_CONFLICT", "message": "repository identity can only be attached to coding targets." }),
+                );
+            }
+            // Mirror the Server's independent active-binding requirement: an
+            // attach is only authorized for the EXACT calling device holding
+            // an ACTIVE binding row for this exact target_id.
+            let cred_id = bearer_credential_id(req);
+            let bindings = state.bindings.lock().unwrap();
+            let binding_active = bindings
+                .iter()
+                .any(|b| b.credential_id == cred_id && b.target_id == t.id && b.enabled);
+            drop(bindings);
+            if !binding_active {
+                return MockResponse::json(
+                    409,
+                    &serde_json::json!({ "error": "TARGET_REPOSITORY_CONFLICT", "message": "device has no active binding for this target; never auto-binds." }),
                 );
             }
             if let Some(existing) = &t.full_name {
@@ -340,9 +389,13 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
                 if let Some(existing) = matches.into_iter().next() {
                     let already = bindings
                         .iter()
-                        .any(|(cid, tid)| cid == &cred_id && tid == &existing.id);
+                        .any(|b| b.credential_id == cred_id && b.target_id == existing.id);
                     if !already {
-                        bindings.push((cred_id.clone(), existing.id.clone()));
+                        bindings.push(SimBinding {
+                            credential_id: cred_id.clone(),
+                            target_id: existing.id.clone(),
+                            enabled: true,
+                        });
                     }
                     return MockResponse::json(
                         200,
@@ -385,9 +438,13 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
                 }
                 let already = bindings
                     .iter()
-                    .any(|(cid, tid)| cid == &cred_id && tid == &existing.id);
+                    .any(|b| b.credential_id == cred_id && b.target_id == existing.id);
                 if !already {
-                    bindings.push((cred_id.clone(), existing.id.clone()));
+                    bindings.push(SimBinding {
+                        credential_id: cred_id.clone(),
+                        target_id: existing.id.clone(),
+                        enabled: true,
+                    });
                 }
                 return MockResponse::json(
                     200,
@@ -412,7 +469,11 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
                 disabled: false,
             };
             targets.push(target.clone());
-            bindings.push((cred_id.clone(), target.id.clone()));
+            bindings.push(SimBinding {
+                credential_id: cred_id.clone(),
+                target_id: target.id.clone(),
+                enabled: true,
+            });
             return MockResponse::json(
                 201,
                 &serde_json::json!({
@@ -427,20 +488,31 @@ fn attach_simulated_server(server: &MockServer, state: Arc<SimServerState>) {
         if req.method == "POST" && req.path.contains("/bind") {
             let cred_id = bearer_credential_id(req);
             let target_id = req.path.rsplit('/').nth(1).unwrap_or("").to_string();
-            let mut bindings = state.bindings.lock().unwrap();
-            let already = bindings
-                .iter()
-                .any(|(cid, tid)| cid == &cred_id && tid == &target_id);
-            if !already {
-                bindings.push((cred_id.clone(), target_id.clone()));
-            }
+            let replayed = {
+                let mut bindings = state.bindings.lock().unwrap();
+                if let Some(existing) = bindings
+                    .iter_mut()
+                    .find(|b| b.credential_id == cred_id && b.target_id == target_id)
+                {
+                    let was_enabled = existing.enabled;
+                    existing.enabled = true;
+                    was_enabled
+                } else {
+                    bindings.push(SimBinding {
+                        credential_id: cred_id.clone(),
+                        target_id: target_id.clone(),
+                        enabled: true,
+                    });
+                    false
+                }
+            };
             return MockResponse::json(
                 200,
                 &serde_json::json!({
                     "target_id": target_id,
                     "binding_id": format!("bnd_{cred_id}"),
                     "enabled": true,
-                    "replayed": already
+                    "replayed": replayed
                 }),
             );
         }
@@ -500,10 +572,12 @@ async fn bound_legacy_null_target_backfills_onto_exact_target_id() {
     let (_temp, paths) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
 
     // The bound legacy Device's local config already maps the exact
-    // target_id to the verified checkout being added.
+    // target_id to the verified checkout being added, and the Server still
+    // has an ACTIVE binding row for this exact device + target.
     let repo_dir = _temp.path().join("clone-folder");
     init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
     map_target_in_config(&paths, "tgt_1cf2ba3e", &canonical(&repo_dir));
+    seed_binding(&state, "crd_devA", "tgt_1cf2ba3e", true);
 
     // A DIFFERENT requested human name: backfill must not rename anything.
     project_add(
@@ -551,10 +625,11 @@ async fn fresh_device_after_backfill_resolves_same_target_id_despite_name_and_fo
     let (_temp_a, paths_a) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
     let (_temp_b, paths_b) = setup_device_profile(&server.origin(), "crd_devB", "dev_B");
 
-    // Device A: bound legacy device backfills.
+    // Device A: bound legacy device backfills (active this-device binding).
     let repo_dir_a = _temp_a.path().join("clone-a");
     init_git_repo(&repo_dir_a, Some("git@github.com:org/legacy-repo.git"));
     map_target_in_config(&paths_a, "tgt_1cf2ba3e", &canonical(&repo_dir_a));
+    seed_binding(&state, "crd_devA", "tgt_1cf2ba3e", true);
     project_add(
         &paths_a,
         Some(repo_dir_a.to_str().unwrap()),
@@ -664,10 +739,12 @@ async fn attach_conflict_race_fails_closed_without_registering() {
         .push(SimTarget::legacy("tgt_legacy", "legacy-app"));
 
     let (_temp, paths) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
+    // Device A: stale local mapping, active this-device binding, but a
+    // catalogue/attach race injects a conflict...
     let repo_dir = _temp.path().join("clone-folder");
     init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
     map_target_in_config(&paths, "tgt_legacy", &canonical(&repo_dir));
-
+    seed_binding(&state, "crd_devA", "tgt_legacy", true);
     // Simulate a catalogue/attach race: between this device's catalogue
     // snapshot and the attach call, another device registered an active
     // target owning the same repository identity. The Server's atomic
@@ -708,6 +785,7 @@ async fn rerun_after_backfill_is_idempotent_and_folder_changes_stay_irrelevant()
     let repo_dir_a = _temp.path().join("first-folder");
     init_git_repo(&repo_dir_a, Some("https://github.com/org/legacy-repo.git"));
     map_target_in_config(&paths, "tgt_1cf2ba3e", &canonical(&repo_dir_a));
+    seed_binding(&state, "crd_devA", "tgt_1cf2ba3e", true);
 
     project_add(&paths, Some(repo_dir_a.to_str().unwrap()), None, None, None)
         .await
@@ -757,6 +835,7 @@ async fn config_mapped_disabled_target_is_not_backfilled() {
     let repo_dir = _temp.path().join("clone-folder");
     init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
     map_target_in_config(&paths, "tgt_disabled", &canonical(&repo_dir));
+    seed_binding(&state, "crd_devA", "tgt_disabled", true);
 
     let err = project_add(
         &paths,
@@ -781,4 +860,133 @@ async fn config_mapped_disabled_target_is_not_backfilled() {
     let targets = state.targets.lock().unwrap();
     assert!(targets[0].full_name.is_none());
     assert!(targets[0].disabled);
+}
+
+#[tokio::test]
+async fn stale_local_mapping_without_server_binding_never_backfills() {
+    let server = MockServer::start().await;
+    let state = Arc::new(SimServerState::default());
+    attach_simulated_server(&server, state.clone());
+
+    state
+        .targets
+        .lock()
+        .unwrap()
+        .push(SimTarget::legacy("tgt_1cf2ba3e", "legacy-app"));
+
+    let (_temp, paths) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
+    let repo_dir = _temp.path().join("clone-folder");
+    init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
+    map_target_in_config(&paths, "tgt_1cf2ba3e", &canonical(&repo_dir));
+    // NO device_target_bindings row exists for this device + target: the
+    // local mapping is stale state after detach/unbind and must never
+    // authorize a legacy backfill attach.
+
+    project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("legacy-app"),
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("unexpected failure: {e}"));
+
+    // The attach capability was NEVER called: without an active this-device
+    // Server binding the local mapping cannot authorize backfill, and the
+    // backfill never auto-binds.
+    assert_eq!(state.attach_count.load(Ordering::SeqCst), 0);
+    assert_eq!(state.register_count.load(Ordering::SeqCst), 0);
+
+    // The legacy target stays repository-null and keeps its alias; no
+    // duplicate target was registered.
+    let targets = state.targets.lock().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].id, "tgt_1cf2ba3e");
+    assert_eq!(targets[0].alias, "legacy-app");
+    assert!(targets[0].full_name.is_none());
+    drop(targets);
+
+    // Local config remains keyed by the immutable target_id.
+    let cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(cfg.targets.contains_key("tgt_1cf2ba3e"));
+}
+
+#[tokio::test]
+async fn disabled_this_device_binding_never_authorizes_backfill() {
+    let server = MockServer::start().await;
+    let state = Arc::new(SimServerState::default());
+    attach_simulated_server(&server, state.clone());
+
+    state
+        .targets
+        .lock()
+        .unwrap()
+        .push(SimTarget::legacy("tgt_1cf2ba3e", "legacy-app"));
+
+    let (_temp, paths) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
+    let repo_dir = _temp.path().join("clone-folder");
+    init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
+    map_target_in_config(&paths, "tgt_1cf2ba3e", &canonical(&repo_dir));
+    // The binding row exists but is DISABLED (unbound/detached): this is not
+    // backfill authority.
+    seed_binding(&state, "crd_devA", "tgt_1cf2ba3e", false);
+
+    project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("legacy-app"),
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("unexpected failure: {e}"));
+
+    assert_eq!(state.attach_count.load(Ordering::SeqCst), 0);
+    assert_eq!(state.register_count.load(Ordering::SeqCst), 0);
+
+    let targets = state.targets.lock().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert!(targets[0].full_name.is_none());
+    drop(targets);
+}
+
+#[tokio::test]
+async fn another_device_binding_does_not_authorize_this_device_backfill() {
+    let server = MockServer::start().await;
+    let state = Arc::new(SimServerState::default());
+    attach_simulated_server(&server, state.clone());
+
+    state
+        .targets
+        .lock()
+        .unwrap()
+        .push(SimTarget::legacy("tgt_1cf2ba3e", "legacy-app"));
+
+    let (_temp, paths) = setup_device_profile(&server.origin(), "crd_devA", "dev_A");
+    let repo_dir = _temp.path().join("clone-folder");
+    init_git_repo(&repo_dir, Some("https://github.com/org/legacy-repo.git"));
+    map_target_in_config(&paths, "tgt_1cf2ba3e", &canonical(&repo_dir));
+    // Only ANOTHER device holds an active binding for this target; that
+    // never authorizes THIS device's backfill attach.
+    seed_binding(&state, "crd_devB", "tgt_1cf2ba3e", true);
+
+    project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("legacy-app"),
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("unexpected failure: {e}"));
+
+    assert_eq!(state.attach_count.load(Ordering::SeqCst), 0);
+    assert_eq!(state.register_count.load(Ordering::SeqCst), 0);
+
+    let targets = state.targets.lock().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].alias, "legacy-app");
+    assert!(targets[0].full_name.is_none());
+    drop(targets);
 }
