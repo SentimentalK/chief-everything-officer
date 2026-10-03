@@ -192,7 +192,7 @@ pub async fn run_smart_redeliver(paths: &ConnectorPaths) -> Result<(), String> {
                 &meta.claim_token,
                 &envelope,
                 &sha256,
-                Some("smart_redelivery"),
+                Some("automatic"),
             )
             .await
         {

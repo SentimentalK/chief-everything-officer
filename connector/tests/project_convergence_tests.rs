@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use ceo_connector::cli::{Cli, Commands, JobSubcommands, ProjectSubcommands};
-use ceo_connector::config::{LocalConfig, CONFIG_SCHEMA_VERSION};
+use ceo_connector::config::{LocalConfig, LocalTarget, CONFIG_SCHEMA_VERSION};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::orca::discovery::extract_known_agents_from_agent_context_json;
 use ceo_connector::paths::ConnectorPaths;
@@ -560,6 +560,13 @@ async fn test_smart_redelivery_candidate_delivered_and_receipt_persisted() {
         }
         if req.method == "POST" && req.path.contains("/result") {
             sc.fetch_add(1, Ordering::SeqCst);
+            let body_val: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let delivery_mode = body_val.get("delivery_mode").and_then(|v| v.as_str());
+            assert_eq!(
+                delivery_mode,
+                Some("automatic"),
+                "smart redelivery must send delivery_mode='automatic' to satisfy server jobResultRequestSchema"
+            );
             return MockResponse::json(
                 200,
                 &serde_json::json!({
@@ -686,4 +693,261 @@ async fn test_smart_redelivery_server_digest_match_skips_submission() {
     // Local receipt must now exist
     let receipt_path = receipt_file_path(&paths.results_dir(), job_id, attempt_id);
     assert!(receipt_path.exists());
+}
+
+#[tokio::test]
+async fn test_project_add_idempotency_preserves_existing_executor_and_model() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    server.add_handler(|req| {
+        if req.method == "GET" && req.path.contains("/api/connector/workspaces") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "workspaces": [{ "id": "ws_1", "role": "owner", "created_at": "2026-10-01T00:00:00Z" }]
+                }),
+            );
+        }
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(200, &serde_json::json!({ "targets": [] }));
+        }
+        if req.method == "POST" && req.path.contains("/api/connector/targets/register") {
+            return MockResponse::json(
+                201,
+                &serde_json::json!({
+                    "target": {
+                        "id": "tgt_proj_1",
+                        "workspace_id": "ws_1",
+                        "alias": "my-repo-idem",
+                        "display_name": "my-repo-idem",
+                        "kind": "coding",
+                        "repository": null,
+                        "disabled": false,
+                        "is_default_agent_runtime": false
+                    },
+                    "binding": { "id": "bnd_1", "enabled": true },
+                    "target_created": true,
+                    "binding_created": true,
+                    "replayed": false
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.contains("/bind") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "binding": { "id": "bnd_1", "target_id": "tgt_proj_1", "device_id": "dev_1", "enabled": true }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let temp_repo = tempfile::tempdir().unwrap();
+    let repo_dir = temp_repo.path().join("my-repo-idem");
+    fs::create_dir_all(&repo_dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // 1. Initial add with --agent codex --model gpt-5
+    let res = ceo_connector::projects::project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("my-repo-idem"),
+        Some("codex"),
+        Some("gpt-5"),
+    )
+    .await;
+    assert!(res.is_ok(), "initial project add failed: {:?}", res);
+
+    let cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    let t = cfg.targets.get("tgt_proj_1").unwrap();
+    let exec = t.executor.as_ref().unwrap();
+    assert_eq!(exec.agent_id, "codex");
+    assert_eq!(exec.model.as_deref(), Some("gpt-5"));
+
+    // 2. Repeat add with NO agent or model specified: must preserve existing executor and model!
+    let res2 = ceo_connector::projects::project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("my-repo-idem"),
+        None,
+        None,
+    )
+    .await;
+    assert!(res2.is_ok(), "repeat project add failed: {:?}", res2);
+
+    let cfg2 = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    let t2 = cfg2.targets.get("tgt_proj_1").unwrap();
+    let exec2 = t2.executor.as_ref().unwrap();
+    assert_eq!(exec2.agent_id, "codex", "must preserve existing agent_id");
+    assert_eq!(
+        exec2.model.as_deref(),
+        Some("gpt-5"),
+        "must preserve existing model"
+    );
+}
+
+#[tokio::test]
+async fn test_project_add_model_without_agent_on_fresh_project_fails_clearly() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    server.add_handler(|req| {
+        if req.method == "GET" && req.path.contains("/api/connector/workspaces") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "workspaces": [{ "id": "ws_1", "role": "owner", "created_at": "2026-10-01T00:00:00Z" }]
+                }),
+            );
+        }
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(200, &serde_json::json!({ "targets": [] }));
+        }
+        if req.method == "POST" && req.path.contains("/api/connector/targets/register") {
+            return MockResponse::json(
+                201,
+                &serde_json::json!({
+                    "target": {
+                        "id": "tgt_proj_model",
+                        "workspace_id": "ws_1",
+                        "alias": "my-repo-model",
+                        "display_name": "my-repo-model",
+                        "kind": "coding",
+                        "repository": null,
+                        "disabled": false,
+                        "is_default_agent_runtime": false
+                    },
+                    "binding": { "id": "bnd_1", "enabled": true },
+                    "target_created": true,
+                    "binding_created": true,
+                    "replayed": false
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.contains("/bind") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "binding": { "id": "bnd_1", "target_id": "tgt_proj_model", "device_id": "dev_1", "enabled": true }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let temp_repo = tempfile::tempdir().unwrap();
+    let repo_dir = temp_repo.path().join("my-repo-model");
+    fs::create_dir_all(&repo_dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    let res = ceo_connector::projects::project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some("my-repo-model"),
+        None,
+        Some("gpt-5"),
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "must fail when model is provided without agent on a fresh project"
+    );
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("--model requires an execution agent"),
+        "error must explain that --model requires an agent: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_project_set_agent_auto_model_auto_clears_both_without_transient_conflict() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let target_id = "tgt_clear_test";
+    let temp_repo = tempfile::tempdir().unwrap();
+    let repo_dir = temp_repo.path().join("my-repo-clear");
+    fs::create_dir_all(&repo_dir).unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
+    // Initial config has agent=codex, model=gpt-5
+    let mut cfg = LocalConfig::new(server.origin()).unwrap();
+    let exec = ceo_connector::config::LocalExecutorConfig::new_logical(
+        "codex".into(),
+        Some("gpt-5".into()),
+    )
+    .unwrap();
+    cfg.targets.insert(
+        target_id.to_string(),
+        LocalTarget {
+            local_path: fs::canonicalize(&repo_dir)
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            executor: Some(exec),
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    // Mock server for resolve_target_selector
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": target_id,
+                            "workspace_id": "ws_1",
+                            "alias": "my-repo-clear",
+                            "display_name": "my-repo-clear",
+                            "kind": "coding",
+                            "repository": null,
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Run: project set my-repo-clear --agent auto --model auto
+    let res = ceo_connector::projects::project_set(
+        &paths,
+        "my-repo-clear",
+        None,
+        Some("auto"),
+        Some("auto"),
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "project set --agent auto --model auto must succeed: {:?}",
+        res
+    );
+
+    let updated_cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    let updated_t = updated_cfg.targets.get(target_id).unwrap();
+    let updated_exec = updated_t.executor.as_ref().unwrap();
+    assert_eq!(updated_exec.agent_id, "auto");
+    assert_eq!(updated_exec.model, None, "model must be cleared to None");
 }

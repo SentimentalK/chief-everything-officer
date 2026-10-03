@@ -465,6 +465,193 @@ fi
 }
 
 #[tokio::test]
+async fn test_real_orca_agent_aware_launch_antigravity_not_literal_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":true,"result":{{"runId":"run_1","taskId":"task_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_agy"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_agy","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_agy","title":"ceo:att_123:antigravity","worktreeId":"wt_123"}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.worktree_id, "wt_123");
+    assert_eq!(prep.terminal_id, "term_worker_agy");
+    assert_eq!(prep.agent_id, "antigravity");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    // Proven: worker-start called with logical agent antigravity
+    assert!(
+        recorded.contains("orchestration worker-start"),
+        "must call orchestration worker-start, log:\n{recorded}"
+    );
+    assert!(
+        recorded.contains("--agent antigravity"),
+        "must pass --agent antigravity, log:\n{recorded}"
+    );
+    // Proven: NEVER executed literal "antigravity" command or terminal create --command antigravity
+    assert!(
+        !recorded.contains("terminal create --command antigravity"),
+        "must NOT create terminal with literal command 'antigravity'"
+    );
+    assert!(
+        !recorded.contains("--command"),
+        "normal path must not pass --command"
+    );
+}
+
+#[tokio::test]
+async fn test_real_orca_agent_aware_launch_auto_omits_agent_and_never_literal_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":true,"result":{{"runId":"run_1","taskId":"task_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_auto"}}]}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_auto","condition":"tui-idle","satisfied":true,"elapsedMs":50}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_auto","title":"ceo:att_123:auto","worktreeId":"wt_123"}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("auto".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_123".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.worktree_id, "wt_123");
+    assert_eq!(prep.terminal_id, "term_worker_auto");
+    assert_eq!(prep.agent_id, "auto");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    // Proven: worker-start called
+    assert!(
+        recorded.contains("orchestration worker-start"),
+        "must call orchestration worker-start, log:\n{recorded}"
+    );
+    // Proven: --agent is completely omitted for auto
+    assert!(
+        !recorded.contains("--agent"),
+        "must omit --agent for auto, log:\n{recorded}"
+    );
+    // Proven: NEVER executed literal "auto" command or terminal create --command auto
+    assert!(
+        !recorded.contains("terminal create --command auto"),
+        "must NOT create terminal with literal command 'auto'"
+    );
+    assert!(
+        !recorded.contains("--command"),
+        "normal path must not pass --command"
+    );
+}
+
+#[tokio::test]
 async fn test_fake_orca_missing_executor_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let repo_dir = temp.path().join("repo");

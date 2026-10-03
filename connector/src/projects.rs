@@ -391,7 +391,28 @@ pub async fn resolve_agent_choice(
             }
         }
         Some("auto") => Ok(Some("auto".to_string())),
-        Some(explicit) => Ok(Some(explicit.trim().to_string())),
+        Some(explicit) => {
+            let clean = explicit.trim().to_lowercase();
+            // Validate explicit agent against Orca discovery when available
+            let client = crate::orca::client::OrcaCliClient::default();
+            let discovery = OrcaCliAgentDiscovery::new(&client);
+            match discovery.discover_agents().await {
+                Ok(known) => {
+                    if !known.iter().any(|k| k.to_lowercase() == clean) {
+                        return Err(ProjectError::Config(ConfigError::InvalidExecutor(format!(
+                            "unknown or unsupported agent '{explicit}'. Orca known agents: {}",
+                            known.join(", ")
+                        ))));
+                    }
+                    Ok(Some(clean))
+                }
+                Err(e) => {
+                    // Escape hatch when Orca discovery is unavailable
+                    eprintln!("Warning: Orca agent discovery unavailable ({e}); proceeding with explicit agent '{explicit}'.");
+                    Ok(Some(clean))
+                }
+            }
+        }
     }
 }
 
@@ -425,26 +446,8 @@ pub async fn project_add(
         None => infer_project_name(&canonical_path)?,
     };
 
-    // 3. Resolve agent and model
+    // 3. Server mutation: ensure Server Target exists and bind to device
     let interactive = is_tty();
-    let agent_id = resolve_agent_choice(agent_arg, interactive).await?;
-
-    let model = match model_arg {
-        Some("auto") | None => None,
-        Some(m) => {
-            let m_clean = m.trim().to_string();
-            if let Some(ref aid) = agent_id {
-                if !LocalExecutorConfig::agent_supports_model_override(aid) {
-                    return Err(ProjectError::Config(ConfigError::InvalidExecutor(format!(
-                        "model override is not supported for agent '{aid}'"
-                    ))));
-                }
-            }
-            Some(m_clean)
-        }
-    };
-
-    // 4. Server mutation: ensure Server Target exists and bind to device
     let profile = crate::config::load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
@@ -468,7 +471,7 @@ pub async fn project_add(
     // Ensure device binding
     let _ = ensure_binding_step(&client, &cred, &ensured).await?;
 
-    // 5. Update local config
+    // 4. Update local config
     let _lock = match ExecutionLock::acquire_with_retry(
         &paths.state_lock_file(),
         std::time::Duration::from_secs(3),
@@ -487,15 +490,65 @@ pub async fn project_add(
         targets: std::collections::BTreeMap::new(),
     });
 
-    let executor = agent_id
-        .map(|aid| LocalExecutorConfig::new_logical(aid, model))
-        .transpose()?;
+    let existing_target = config.targets.get(&ensured.target_id);
+    let existing_executor = existing_target.and_then(|t| t.executor.clone());
+
+    let final_executor = match (agent_arg, model_arg) {
+        (None, None) => {
+            // Idempotency: re-running project add with no --agent/--model preserves
+            // existing executor/model exactly!
+            existing_executor
+        }
+        _ => {
+            let requested_agent = resolve_agent_choice(agent_arg, interactive).await?;
+            let current_agent = existing_executor.as_ref().map(|e| e.agent_id.clone());
+            let current_model = existing_executor.as_ref().and_then(|e| e.model.clone());
+
+            let effective_agent = match requested_agent {
+                Some(a) => Some(a),
+                None => current_agent,
+            };
+
+            let effective_agent = match effective_agent {
+                Some(a) => a,
+                None => {
+                    return Err(ProjectError::Config(ConfigError::InvalidExecutor(
+                        "--model requires an execution agent. Supply --agent <id> or configure an agent first.".into()
+                    )));
+                }
+            };
+
+            let effective_model = match model_arg {
+                Some("auto") => None,
+                Some(m) => Some(m.trim().to_string()),
+                None => {
+                    if LocalExecutorConfig::agent_supports_model_override(&effective_agent) {
+                        current_model
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if effective_model.is_some()
+                && !LocalExecutorConfig::agent_supports_model_override(&effective_agent)
+            {
+                return Err(ProjectError::Config(ConfigError::InvalidExecutor(format!(
+                    "model override is not supported for agent '{effective_agent}'"
+                ))));
+            }
+
+            let exec = LocalExecutorConfig::new_logical(effective_agent, effective_model)?;
+            exec.validate()?;
+            Some(exec)
+        }
+    };
 
     config.targets.insert(
         ensured.target_id.clone(),
         LocalTarget {
             local_path: canonical_str.clone(),
-            executor,
+            executor: final_executor,
         },
     );
     config.save(&paths.config_file())?;
@@ -600,40 +653,33 @@ pub async fn project_set(
     let interactive = is_tty();
     let new_agent = resolve_agent_choice(agent_arg, interactive).await?;
 
-    if let Some(ref aid) = new_agent {
-        let existing_model = target.executor.as_ref().and_then(|e| e.model.clone());
-        target.executor = Some(LocalExecutorConfig::new_logical(
-            aid.clone(),
-            existing_model,
-        )?);
-    }
+    let current_agent = target.executor.as_ref().map(|e| e.agent_id.clone());
+    let current_model = target.executor.as_ref().and_then(|e| e.model.clone());
 
-    if let Some(m) = model_arg {
-        let target_agent = target
-            .executor
-            .as_ref()
-            .map(|e| e.agent_id.as_str())
-            .unwrap_or("auto");
-        if m == "auto" {
-            if let Some(ref mut exec) = target.executor {
-                exec.model = None;
-            }
-        } else {
-            if !LocalExecutorConfig::agent_supports_model_override(target_agent) {
-                return Err(ProjectError::Config(ConfigError::InvalidExecutor(format!(
-                    "model override is not supported for agent '{target_agent}'"
-                ))));
-            }
-            if let Some(ref mut exec) = target.executor {
-                exec.model = Some(m.trim().to_string());
-                exec.validate()?;
-            } else {
-                target.executor = Some(LocalExecutorConfig::new_logical(
-                    "auto".to_string(),
-                    Some(m.trim().to_string()),
-                )?);
-            }
+    let final_agent = match new_agent {
+        Some(aid) => Some(aid),
+        None => current_agent,
+    };
+
+    let final_model = match model_arg {
+        Some("auto") => None,
+        Some(m) => Some(m.trim().to_string()),
+        None => current_model,
+    };
+
+    if let Some(agent) = final_agent {
+        if final_model.is_some() && !LocalExecutorConfig::agent_supports_model_override(&agent) {
+            return Err(ProjectError::Config(ConfigError::InvalidExecutor(format!(
+                "model override is not supported for agent '{agent}'"
+            ))));
         }
+        let exec = LocalExecutorConfig::new_logical(agent, final_model)?;
+        exec.validate()?;
+        target.executor = Some(exec);
+    } else if final_model.is_some() {
+        return Err(ProjectError::Config(ConfigError::InvalidExecutor(
+            "cannot configure a model override without an agent".into(),
+        )));
     }
 
     config.save(&paths.config_file())?;

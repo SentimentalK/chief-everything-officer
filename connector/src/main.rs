@@ -381,12 +381,12 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        Commands::Setup => {
-            // Interactive-terminal contract: fail fast/actionably on a
-            // non-TTY; never hang, never fall back to numeric menus.
-            if !ceo_connector::setup_frontend::is_interactive_terminal() {
+        Commands::Setup { runtime_path } => {
+            // Interactive-terminal contract: when runtime_path is omitted,
+            // require an interactive terminal (stdin and stdout attached to a TTY).
+            if runtime_path.is_none() && !ceo_connector::setup_frontend::is_interactive_terminal() {
                 eprintln!(
-                    "Error: `ceo-connector setup` requires an interactive terminal (stdin and stdout attached to a TTY). Re-run it inside a normal terminal session. (SETUP_INTERACTIVE_TTY_REQUIRED)"
+                    "Error: `ceo-connector setup` requires an interactive terminal (stdin and stdout attached to a TTY). Re-run it inside a normal terminal session, or specify `--runtime-path <path>`. (SETUP_INTERACTIVE_TTY_REQUIRED)"
                 );
                 return ExitCode::FAILURE;
             }
@@ -395,6 +395,7 @@ async fn main() -> ExitCode {
                 &paths,
                 &mut ui,
                 &ceo_connector::setup_frontend::ProductionDoctor,
+                runtime_path.as_deref(),
             )
             .await
             {

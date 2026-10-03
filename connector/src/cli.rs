@@ -80,8 +80,12 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Guided, interactive device setup (arrow-key menus)
-    Setup,
+    /// Guided, interactive device setup (convergence)
+    Setup {
+        /// Optional explicit agent runtime path to link
+        #[arg(long)]
+        runtime_path: Option<String>,
+    },
 
     /// Redeliver managed results to the server
     Redeliver {
