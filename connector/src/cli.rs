@@ -120,6 +120,10 @@ pub enum ProjectSubcommands {
 
     /// List configured projects
     List {
+        /// Show full Workspace Server Target catalogue, including unbound entries
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -163,7 +167,20 @@ pub enum ProjectSubcommands {
         json: bool,
     },
 
-    /// Remove a project binding from this device
+    /// Detach a project from this device (removes device binding and local configuration)
+    Detach {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+    },
+
+    /// Workspace-level logical deletion of a project
+    Delete {
+        /// Project selector: exact project alias, display name, or target ID
+        project: String,
+    },
+
+    /// Remove a project binding from this device (deprecated: use 'detach')
+    #[command(hide = true)]
     Remove {
         /// Project selector: exact project alias, display name, or target ID
         project: String,

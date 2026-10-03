@@ -11,7 +11,9 @@ use ceo_connector::credential::DeviceCredential;
 use ceo_connector::orca::discovery::extract_known_agents_from_agent_context_json;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::projects::{
-    infer_project_name, project_add, render_project_list, render_project_show, ProjectDisplayItem,
+    build_project_display_items, infer_project_name, project_add, project_delete, project_detach,
+    project_list, project_remove, render_project_list, render_project_show, ProjectDisplayItem,
+    ProjectError,
 };
 use ceo_connector::redelivery::{
     receipt_file_path, run_redeliver, DeliveryReceipt, PreservedResultMeta,
@@ -165,6 +167,62 @@ fn test_cli_parsing_project_first_surface() {
         } => {
             assert_eq!(project, "my-proj");
             assert_eq!(agent.as_deref(), Some(""));
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    // project list with and without flags
+    let cli = Cli::try_parse_from(["ceo-connector", "project", "list"]).unwrap();
+    match cli.command {
+        Commands::Project {
+            sub: ProjectSubcommands::List { all, json },
+        } => {
+            assert!(!all);
+            assert!(!json);
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    let cli = Cli::try_parse_from(["ceo-connector", "project", "list", "--all", "--json"]).unwrap();
+    match cli.command {
+        Commands::Project {
+            sub: ProjectSubcommands::List { all, json },
+        } => {
+            assert!(all);
+            assert!(json);
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    // project detach
+    let cli = Cli::try_parse_from(["ceo-connector", "project", "detach", "my-proj"]).unwrap();
+    match cli.command {
+        Commands::Project {
+            sub: ProjectSubcommands::Detach { project },
+        } => {
+            assert_eq!(project, "my-proj");
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    // project delete
+    let cli = Cli::try_parse_from(["ceo-connector", "project", "delete", "my-proj"]).unwrap();
+    match cli.command {
+        Commands::Project {
+            sub: ProjectSubcommands::Delete { project },
+        } => {
+            assert_eq!(project, "my-proj");
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    // project remove
+    let cli = Cli::try_parse_from(["ceo-connector", "project", "remove", "my-proj"]).unwrap();
+    match cli.command {
+        Commands::Project {
+            sub: ProjectSubcommands::Remove { project },
+        } => {
+            assert_eq!(project, "my-proj");
         }
         _ => panic!("unexpected command"),
     }
@@ -950,4 +1008,450 @@ async fn test_project_set_agent_auto_model_auto_clears_both_without_transient_co
     let updated_exec = updated_t.executor.as_ref().unwrap();
     assert_eq!(updated_exec.agent_id, "auto");
     assert_eq!(updated_exec.model, None, "model must be cleared to None");
+}
+
+// ---------------------------------------------------------------------------
+// PROJECT-039: Project detach / delete / list semantics & regression tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_project_list_default_excludes_unbound_and_all_includes_unbound_and_json_scope() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let temp_repo = tempfile::tempdir().unwrap();
+    let repo_dir = temp_repo.path().join("bound-proj");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let target_bound_id = "tgt_bound_1";
+    let target_unbound_id = "tgt_unbound_2";
+
+    // Seed local config with bound-proj only
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg.targets.insert(
+        target_bound_id.to_string(),
+        LocalTarget {
+            local_path: repo_dir.to_string_lossy().to_string(),
+            executor: None,
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [
+                        {
+                            "target": {
+                                "id": target_bound_id,
+                                "workspace_id": "ws_1",
+                                "alias": "bound-proj",
+                                "display_name": "bound-proj",
+                                "kind": "coding",
+                                "repository": null,
+                                "disabled": false,
+                                "is_default_agent_runtime": false
+                            },
+                            "this_device_binding": { "id": "bnd_1", "enabled": true },
+                            "active_binding_count": 1
+                        },
+                        {
+                            "target": {
+                                "id": target_unbound_id,
+                                "workspace_id": "ws_1",
+                                "alias": "unbound-proj",
+                                "display_name": "unbound-proj",
+                                "kind": "coding",
+                                "repository": null,
+                                "disabled": false,
+                                "is_default_agent_runtime": false
+                            },
+                            "this_device_binding": null,
+                            "active_binding_count": 0
+                        }
+                    ]
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let all_items = build_project_display_items(&paths).await.unwrap();
+    assert_eq!(all_items.len(), 2);
+
+    // 1. Default list scope: excludes unbound server targets
+    let mut default_items = all_items.clone();
+    default_items.retain(|i| i.status != "UNBOUND");
+    assert_eq!(default_items.len(), 1);
+    assert_eq!(default_items[0].alias.as_deref(), Some("bound-proj"));
+    assert_eq!(default_items[0].status, "READY");
+
+    let rendered_default = render_project_list(&default_items, false);
+    assert!(rendered_default.contains("Project: bound-proj"));
+    assert!(!rendered_default.contains("unbound-proj"));
+
+    // 2. --all list scope: includes unbound server targets
+    let rendered_all = render_project_list(&all_items, false);
+    assert!(rendered_all.contains("Project: bound-proj"));
+    assert!(rendered_all.contains("Project: unbound-proj"));
+    assert!(rendered_all.contains("Status:     UNBOUND"));
+
+    // 3. JSON output scope mirrors human output scope
+    let default_json = serde_json::to_string(&default_items).unwrap();
+    let default_parsed: Vec<serde_json::Value> = serde_json::from_str(&default_json).unwrap();
+    assert_eq!(default_parsed.len(), 1);
+    assert_eq!(default_parsed[0]["alias"], "bound-proj");
+
+    let all_json = serde_json::to_string(&all_items).unwrap();
+    let all_parsed: Vec<serde_json::Value> = serde_json::from_str(&all_json).unwrap();
+    assert_eq!(all_parsed.len(), 2);
+    assert!(all_parsed.iter().any(|p| p["alias"] == "unbound-proj"));
+
+    // 4. Exercise project_list directly (both human and json modes)
+    assert!(project_list(&paths, false, false).await.is_ok());
+    assert!(project_list(&paths, false, true).await.is_ok());
+    assert!(project_list(&paths, true, false).await.is_ok());
+    assert!(project_list(&paths, true, true).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_project_detach_and_remove_compat_alias_and_delete_semantics() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let target_id = "tgt_detach_test_1";
+    let unbind_calls = Arc::new(AtomicU32::new(0));
+    let unbind_calls_clone = unbind_calls.clone();
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": target_id,
+                            "workspace_id": "ws_1",
+                            "alias": "hello-detach",
+                            "display_name": "hello-detach",
+                            "kind": "coding",
+                            "repository": null,
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        if req.method == "POST"
+            && req
+                .path
+                .contains("/api/connector/targets/tgt_detach_test_1/unbind")
+        {
+            unbind_calls_clone.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({ "ok": true }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // 1. Seed local config
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg.targets.insert(
+        target_id.to_string(),
+        LocalTarget {
+            local_path: "/tmp/some-path".to_string(),
+            executor: None,
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    // 2. Active attempt guard check
+    ceo_connector::local_state::atomic_write_json(
+        &paths.active_attempt_file(),
+        &serde_json::json!({
+            "target_id": target_id,
+            "job_id": "job_1",
+            "attempt_id": "att_1"
+        }),
+    )
+    .unwrap();
+    let err_in_use = project_detach(&paths, "hello-detach").await.unwrap_err();
+    match err_in_use {
+        ProjectError::Target(ceo_connector::targets::TargetError::TargetInUse(tid)) => {
+            assert_eq!(tid, target_id);
+        }
+        other => panic!("expected TargetInUse error, got: {:?}", other),
+    }
+    fs::remove_file(paths.active_attempt_file()).unwrap();
+
+    // 3. Detach removes device binding on server + removes local mapping
+    let detach_res = project_detach(&paths, "hello-detach").await;
+    assert!(detach_res.is_ok(), "detach must succeed: {:?}", detach_res);
+    assert_eq!(unbind_calls.load(Ordering::SeqCst), 1);
+
+    let cfg_after_detach = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(!cfg_after_detach.targets.contains_key(target_id));
+
+    // 4. project remove is a compatibility alias for detach (emits warning and calls detach)
+    // Re-seed config to test remove
+    let mut cfg_reseed = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg_reseed.targets.insert(
+        target_id.to_string(),
+        LocalTarget {
+            local_path: "/tmp/some-path".to_string(),
+            executor: None,
+        },
+    );
+    cfg_reseed.save(&paths.config_file()).unwrap();
+
+    let remove_res = project_remove(&paths, "hello-detach").await;
+    assert!(
+        remove_res.is_ok(),
+        "remove compat alias must succeed: {:?}",
+        remove_res
+    );
+    assert_eq!(unbind_calls.load(Ordering::SeqCst), 2);
+    let cfg_after_remove = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(!cfg_after_remove.targets.contains_key(target_id));
+
+    // 5. project delete fails explicitly with DeleteUnsupported, never destroys historical records
+    // Re-seed config to verify delete does not destructively remove local or server state
+    let mut cfg_for_delete = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg_for_delete.targets.insert(
+        target_id.to_string(),
+        LocalTarget {
+            local_path: "/tmp/some-path".to_string(),
+            executor: None,
+        },
+    );
+    cfg_for_delete.save(&paths.config_file()).unwrap();
+
+    let delete_err = project_delete(&paths, "hello-detach").await.unwrap_err();
+    match delete_err {
+        ProjectError::DeleteUnsupported(msg) => {
+            assert!(msg.contains(
+                "the server does not currently expose a workspace-level project deletion API"
+            ));
+            assert!(msg.contains("project detach"));
+        }
+        other => panic!("expected DeleteUnsupported error, got: {:?}", other),
+    }
+
+    // Local mapping and server target remain intact after unsupported delete
+    let cfg_after_delete = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(cfg_after_delete.targets.contains_key(target_id));
+
+    // Nonexistent selector gives clean ProjectNotFound
+    let not_found_err = project_delete(&paths, "nonexistent-proj")
+        .await
+        .unwrap_err();
+    match not_found_err {
+        ProjectError::ProjectNotFound(name) => {
+            assert_eq!(name, "nonexistent-proj");
+        }
+        other => panic!("expected ProjectNotFound error, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_project_detach_then_add_reuses_existing_server_target() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let target_id = "tgt_reuse_42";
+    let alias = "my-reuse-project";
+
+    let temp_repo = tempfile::tempdir().unwrap();
+    let repo_dir = temp_repo.path().join(alias);
+    init_git_repo(&repo_dir, None);
+
+    let register_count = Arc::new(AtomicU32::new(0));
+    let bind_count = Arc::new(AtomicU32::new(0));
+    let unbind_count = Arc::new(AtomicU32::new(0));
+    let is_bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let reg_c = register_count.clone();
+    let bnd_c = bind_count.clone();
+    let unb_c = unbind_count.clone();
+    let is_b = is_bound.clone();
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/workspaces") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "workspaces": [{ "id": "ws_1", "role": "owner", "created_at": "2026-10-01T00:00:00Z" }]
+                }),
+            );
+        }
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            if reg_c.load(Ordering::SeqCst) == 0 {
+                return MockResponse::json(200, &serde_json::json!({ "targets": [] }));
+            } else {
+                let bound = is_b.load(Ordering::SeqCst);
+                let binding = if bound {
+                    serde_json::json!({ "id": "bnd_1", "enabled": true })
+                } else {
+                    serde_json::json!({ "id": "bnd_1", "enabled": false })
+                };
+                return MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "targets": [{
+                            "target": {
+                                "id": target_id,
+                                "workspace_id": "ws_1",
+                                "alias": alias,
+                                "display_name": alias,
+                                "kind": "coding",
+                                "repository": null,
+                                "disabled": false,
+                                "is_default_agent_runtime": false
+                            },
+                            "this_device_binding": binding,
+                            "active_binding_count": if bound { 1 } else { 0 }
+                        }]
+                    }),
+                );
+            }
+        }
+        if req.method == "POST" && req.path.contains("/api/connector/targets/register") {
+            reg_c.fetch_add(1, Ordering::SeqCst);
+            is_b.store(true, Ordering::SeqCst);
+            return MockResponse::json(
+                201,
+                &serde_json::json!({
+                    "target": {
+                        "id": target_id,
+                        "workspace_id": "ws_1",
+                        "alias": alias,
+                        "display_name": alias,
+                        "kind": "coding",
+                        "repository": null,
+                        "disabled": false,
+                        "is_default_agent_runtime": false
+                    },
+                    "binding": { "id": "bnd_1", "enabled": true },
+                    "target_created": true,
+                    "binding_created": true,
+                    "replayed": false
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.ends_with("/bind") {
+            bnd_c.fetch_add(1, Ordering::SeqCst);
+            is_b.store(true, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "target_id": target_id,
+                    "binding_id": "bnd_1",
+                    "enabled": true,
+                    "replayed": false
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.ends_with("/unbind") {
+            unb_c.fetch_add(1, Ordering::SeqCst);
+            is_b.store(false, Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({ "ok": true }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // 1. Initial add: registers target on server and binds to this device
+    let add_res = project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some(alias),
+        None,
+        None,
+    )
+    .await;
+    assert!(add_res.is_ok(), "initial project add failed: {:?}", add_res);
+    assert_eq!(register_count.load(Ordering::SeqCst), 1);
+    assert_eq!(bind_count.load(Ordering::SeqCst), 0);
+
+    let cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(cfg.targets.contains_key(target_id));
+
+    // Default list shows project as READY
+    let items = build_project_display_items(&paths).await.unwrap();
+    let mut default_items = items.clone();
+    default_items.retain(|i| i.status != "UNBOUND");
+    assert_eq!(default_items.len(), 1);
+    assert_eq!(default_items[0].target_id, target_id);
+    assert_eq!(default_items[0].status, "READY");
+
+    // 2. Detach project
+    let detach_res = project_detach(&paths, alias).await;
+    assert!(detach_res.is_ok(), "detach failed: {:?}", detach_res);
+    assert_eq!(unbind_count.load(Ordering::SeqCst), 1);
+
+    // Local mapping removed
+    let cfg_after_detach = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(!cfg_after_detach.targets.contains_key(target_id));
+
+    // Default list hidden
+    let items_after_detach = build_project_display_items(&paths).await.unwrap();
+    let mut default_hidden = items_after_detach.clone();
+    default_hidden.retain(|i| i.status != "UNBOUND");
+    assert_eq!(
+        default_hidden.len(),
+        0,
+        "default list must hide detached project"
+    );
+
+    // --all visible as UNBOUND
+    assert_eq!(items_after_detach.len(), 1);
+    assert_eq!(items_after_detach[0].target_id, target_id);
+    assert_eq!(items_after_detach[0].status, "UNBOUND");
+
+    // 3. Add same project again: must REUSE existing Server Target!
+    let re_add_res = project_add(
+        &paths,
+        Some(repo_dir.to_str().unwrap()),
+        Some(alias),
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        re_add_res.is_ok(),
+        "re-add project failed: {:?}",
+        re_add_res
+    );
+
+    // Crucial regression verification:
+    // register_count must STILL be 1 (no duplicate server target created!)
+    assert_eq!(
+        register_count.load(Ordering::SeqCst),
+        1,
+        "must NOT register a duplicate target!"
+    );
+    // bind_count was called to re-bind this device
+    assert_eq!(
+        bind_count.load(Ordering::SeqCst),
+        1,
+        "must rebind existing target on server"
+    );
+
+    // Local mapping restored with the exact same Server Target ID
+    let cfg_after_readd = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(
+        cfg_after_readd.targets.contains_key(target_id),
+        "local config must have original target_id"
+    );
+
+    // Default list now shows it as READY again!
+    let items_after_readd = build_project_display_items(&paths).await.unwrap();
+    let mut default_restored = items_after_readd.clone();
+    default_restored.retain(|i| i.status != "UNBOUND");
+    assert_eq!(default_restored.len(), 1);
+    assert_eq!(default_restored[0].target_id, target_id);
+    assert_eq!(default_restored[0].status, "READY");
 }

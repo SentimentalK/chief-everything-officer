@@ -16,7 +16,7 @@ use crate::setup::{
 };
 use crate::targets::{
     build_target_display_items, check_active_attempt_target_in_use, resolve_target_selector,
-    target_remove, target_rename, target_set_default_runtime, TargetDisplayItem, TargetError,
+    target_rename, target_set_default_runtime, TargetDisplayItem, TargetError,
 };
 
 #[derive(Error, Debug)]
@@ -53,8 +53,18 @@ pub enum ProjectError {
     InteractiveRequired(String),
     #[error("Orca agent discovery failed: {0}")]
     OrcaDiscovery(String),
+    #[error("Workspace-level project deletion is not currently supported: {0}")]
+    DeleteUnsupported(String),
     #[error("Device not logged in. Please run `ceo-connector login` first.")]
     NotLoggedIn,
+}
+
+pub(crate) fn map_target_error_for_project(err: TargetError) -> ProjectError {
+    match err {
+        TargetError::TargetNotFound(s) => ProjectError::ProjectNotFound(s),
+        TargetError::AmbiguousSelector(s) => ProjectError::AmbiguousSelector(s),
+        other => ProjectError::Target(other),
+    }
 }
 
 impl From<crate::config::ProfileError> for ProjectError {
@@ -557,8 +567,15 @@ pub async fn project_add(
     Ok(())
 }
 
-pub async fn project_list(paths: &ConnectorPaths, json_format: bool) -> Result<(), ProjectError> {
-    let items = build_project_display_items(paths).await?;
+pub async fn project_list(
+    paths: &ConnectorPaths,
+    all: bool,
+    json_format: bool,
+) -> Result<(), ProjectError> {
+    let mut items = build_project_display_items(paths).await?;
+    if !all {
+        items.retain(|i| i.status != "UNBOUND");
+    }
     if json_format {
         println!("{}", serde_json::to_string_pretty(&items)?);
     } else {
@@ -621,7 +638,9 @@ pub async fn project_set(
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
-    let resolved = resolve_target_selector(paths, &client, &cred, selector).await?;
+    let resolved = resolve_target_selector(paths, &client, &cred, selector)
+        .await
+        .map_err(map_target_error_for_project)?;
     let target_id = resolved.target_id;
 
     let _lock = match ExecutionLock::acquire_with_retry(
@@ -635,7 +654,7 @@ pub async fn project_set(
         }
         Err(e) => return Err(ProjectError::Io(e)),
     };
-    check_active_attempt_target_in_use(paths, &target_id)?;
+    check_active_attempt_target_in_use(paths, &target_id).map_err(map_target_error_for_project)?;
 
     let mut config = LocalConfig::load(&paths.config_file())?
         .ok_or_else(|| ProjectError::ProjectNotFound(target_id.clone()))?;
@@ -695,21 +714,67 @@ pub async fn project_rename(
 ) -> Result<(), ProjectError> {
     target_rename(paths, selector, new_name, json_format)
         .await
-        .map_err(ProjectError::Target)
+        .map_err(map_target_error_for_project)
 }
 
-pub async fn project_remove(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {
+pub async fn project_detach(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {
+    paths.ensure_dirs()?;
+    let profile = crate::config::load_bound_profile(paths)?;
+    let mut config = profile.config;
+    let cred = profile.credential;
+    let client = ConnectorClient::new(&cred.server_origin)?;
+
+    let resolved = resolve_target_selector(paths, &client, &cred, selector)
+        .await
+        .map_err(map_target_error_for_project)?;
+
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(ProjectError::Target(TargetError::ProfileBusy))
+        }
+        Err(e) => return Err(ProjectError::Io(e)),
+    };
+    check_active_attempt_target_in_use(paths, &resolved.target_id)
+        .map_err(map_target_error_for_project)?;
+
+    // Unbind on server first
+    client.unbind_target(&cred, &resolved.target_id).await?;
+
+    // Then update local config
+    if config.targets.remove(&resolved.target_id).is_some() {
+        config.save(&paths.config_file())?;
+    }
+
+    println!("Project '{selector}' detached from this device.");
+    Ok(())
+}
+
+pub async fn project_delete(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {
     paths.ensure_dirs()?;
     let profile = crate::config::load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
-    let resolved = resolve_target_selector(paths, &client, &cred, selector).await?;
-    target_remove(paths, &resolved.target_id)
+    let resolved = resolve_target_selector(paths, &client, &cred, selector)
         .await
-        .map_err(ProjectError::Target)?;
-    println!("Project '{selector}' removed from this device.");
-    Ok(())
+        .map_err(map_target_error_for_project)?;
+
+    check_active_attempt_target_in_use(paths, &resolved.target_id)
+        .map_err(map_target_error_for_project)?;
+
+    Err(ProjectError::DeleteUnsupported(format!(
+        "the server does not currently expose a workspace-level project deletion API. Historical jobs and workspace audit references are preserved. To detach project '{selector}' from this device, use 'ceo-connector project detach {selector}'."
+    )))
+}
+
+pub async fn project_remove(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {
+    eprintln!("project remove is deprecated; use project detach");
+    project_detach(paths, selector).await
 }
 
 pub async fn project_default_runtime(

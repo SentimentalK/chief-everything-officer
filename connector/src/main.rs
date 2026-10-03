@@ -149,8 +149,8 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            ProjectSubcommands::List { json } => {
-                if let Err(e) = ceo_connector::projects::project_list(&paths, json).await {
+            ProjectSubcommands::List { all, json } => {
+                if let Err(e) = ceo_connector::projects::project_list(&paths, all, json).await {
                     eprintln!("Project list failed: {}", e);
                     return ExitCode::FAILURE;
                 }
@@ -190,6 +190,18 @@ async fn main() -> ExitCode {
                     ceo_connector::projects::project_rename(&paths, &project, &new_name, json).await
                 {
                     eprintln!("Project rename failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Detach { project } => {
+                if let Err(e) = ceo_connector::projects::project_detach(&paths, &project).await {
+                    eprintln!("Project detach failed: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ProjectSubcommands::Delete { project } => {
+                if let Err(e) = ceo_connector::projects::project_delete(&paths, &project).await {
+                    eprintln!("Project delete failed: {}", e);
                     return ExitCode::FAILURE;
                 }
             }
