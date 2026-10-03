@@ -198,6 +198,7 @@ fn make_default_executor(kind: &str, ver: &str) -> AttemptExecutorState {
         dispatch_turn_started: false,
         dispatch_baseline_state_started_at: None,
         turn_started_observed: false,
+        structured_lifecycle_observed: false,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
         runtime_error: None,
@@ -1827,7 +1828,7 @@ async fn test_advisory_readiness_unsatisfied_persists_none_ready_at_and_advances
 }
 
 #[tokio::test]
-async fn test_pre_turn_tui_idle_is_ignored_until_turn_started() {
+async fn test_transient_post_working_tui_idle_never_completes_or_closes_terminal() {
     let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
     let attempt_id = format!("att-{}", Uuid::new_v4());
     let now = chrono::Utc::now().timestamp_millis();
@@ -1838,7 +1839,7 @@ async fn test_pre_turn_tui_idle_is_ignored_until_turn_started() {
     executor.dispatch_request_id = Some("req_123".into());
 
     executor.dispatch_started_at_ms = Some(now - 1000);
-    executor.execution_deadline_ms = Some(now + 10_000);
+    executor.execution_deadline_ms = Some(now + 2_000);
     executor.dispatch_turn_started = false;
     executor.turn_started_observed = false;
 
@@ -1855,8 +1856,207 @@ async fn test_pre_turn_tui_idle_is_ignored_until_turn_started() {
         ready: true,
         wait_seq: Arc::new(std::sync::Mutex::new(vec![
             Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored!
-            Ok(WaitOutcome::WorkingObserved { elapsed_ms: 50 }), // Turn start observed!
-            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Now accepted as completion!
+            Ok(WaitOutcome::WorkingObserved { elapsed_ms: 50 }), // Structured turn start observed!
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Transient post-working idle: MUST NOT complete!
+        ])),
+        // The live agent keeps reporting transient tui-idle afterwards (the
+        // observed OpenCode 1.18.34 dogfood state). Under durable turn-start
+        // evidence the wait loop must keep waiting until the deadline.
+        wait_result: Some(Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // Transient post-working tui-idle must NOT terminalize: the only way out
+    // is the durable execution timeout (never a "tui_idle" completion).
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("EXECUTION_TIMEOUT")
+    );
+    // Structured evidence was durably recorded and cannot regress.
+    assert!(exec.turn_started_observed);
+    assert!(exec.structured_lifecycle_observed);
+
+    // Drive OutcomeRecorded -> FinalizedLocal: TIMED_OUT keeps the terminal
+    // for inspection; the terminal must never have been closed here.
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Transient post-working tui-idle must never close the terminal"
+    );
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_eq!(record.report.execution_status, ExecutionStatus::TIMED_OUT);
+}
+
+/// Structured-observation path: an authoritative non-interrupted AgentDone
+/// completes the attempt and the existing lifecycle cleanup closes and
+/// verifies the terminal.
+#[tokio::test]
+async fn test_working_then_agent_done_completes_and_closes_terminal() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 30_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Pre-turn: ignored
+            Ok(WaitOutcome::WorkingObserved { elapsed_ms: 50 }), // Structured working observed
+            Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 }), // Transient post-working idle: no completion
+            Ok(WaitOutcome::AgentDone { elapsed_ms: 50 }), // Authoritative non-interrupted done
+        ])),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    // Drive Waiting: transient post-working tui-idle keeps waiting; the
+    // authoritative AgentDone completes agent-side.
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+    assert!(exec.runtime_error.is_none());
+    assert!(exec.turn_started_observed);
+    assert!(exec.structured_lifecycle_observed);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Terminal close happens only in the OutcomeRecorded cleanup stage"
+    );
+
+    // Drive OutcomeRecorded -> COMPLETED: close called and verified, once.
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        1,
+        "Successful AgentDone must close the terminal exactly once"
+    );
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_eq!(record.report.execution_status, ExecutionStatus::COMPLETED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::UNVERIFIED);
+}
+
+/// Structured-observation path: done with interrupted=true must NEVER map to
+/// COMPLETED (regression for authoritative agent-interrupted evidence).
+#[tokio::test]
+async fn test_working_then_agent_done_interrupted_true_never_completes() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 30_000);
+    executor.dispatch_turn_started = false;
+    executor.turn_started_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_seq: Arc::new(std::sync::Mutex::new(vec![
+            Ok(WaitOutcome::WorkingObserved { elapsed_ms: 50 }), // working observed
+            Ok(WaitOutcome::Interrupted {
+                // ps: state=done, interrupted=true
+                reason: "agent pane 'term_test' reported state 'done' with interrupted=true".into(),
+            }),
         ])),
         ..Default::default()
     });
@@ -1877,9 +2077,197 @@ async fn test_pre_turn_tui_idle_is_ignored_until_turn_started() {
         .unwrap();
     assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
     let exec = cur.executor.as_ref().unwrap();
+    // interrupted done: never completed; converges to the interrupted failure
+    // semantics and retains the terminal for inspection.
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("interrupted"));
+    assert_eq!(
+        exec.runtime_error.as_ref().map(|e| e.code.as_str()),
+        Some("TERMINAL_EXITED")
+    );
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "FAILED attempts must retain the terminal session"
+    );
+
+    let outbox_entries = fs::read_dir(paths.outbox_dir())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(outbox_entries.len(), 1);
+    let outbox_content = fs::read_to_string(outbox_entries[0].path()).unwrap();
+    let record: OutboxRecord = serde_json::from_str(&outbox_content).unwrap();
+    assert_eq!(record.report.execution_status, ExecutionStatus::FAILED);
+    assert_eq!(record.report.business_outcome, BusinessOutcome::FAILED);
+}
+
+/// Requirement: the bounded tui-idle completion fallback is retained ONLY for
+/// attempts with no structured Agent lifecycle observation (dispatch reported
+/// turn_started, but Orca ps never exposes a structured state).
+#[tokio::test]
+async fn test_unstructured_tui_idle_fallback_still_completes_without_structured_observation() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = true;
+    executor.turn_started_observed = false;
+    executor.structured_lifecycle_observed = false;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_result: Some(Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
     assert_eq!(exec.runtime_completion_kind.as_deref(), Some("tui_idle"));
-    assert!(exec.turn_started_observed);
     assert!(exec.runtime_error.is_none());
+    assert!(!exec.turn_started_observed);
+    assert!(!exec.structured_lifecycle_observed);
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        1,
+        "Fallback completion closes the terminal as before"
+    );
+}
+
+/// Restart/recovery: after a prior run durably persisted structured Agent
+/// lifecycle observation, a later TuiIdle must still be rejected as a
+/// completion signal (durable state cannot regress to the idle fallback).
+#[tokio::test]
+async fn test_restart_after_structured_observation_rejects_tui_idle() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.209");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_test".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 1000);
+    executor.execution_deadline_ms = Some(now + 2_000);
+    executor.dispatch_turn_started = false;
+    // Durable state as persisted by the previous process run right after the
+    // structured working observation.
+    executor.turn_started_observed = true;
+    executor.structured_lifecycle_observed = true;
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::Waiting,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        wait_result: Some(Ok(WaitOutcome::TuiIdle { elapsed_ms: 50 })),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::OutcomeRecorded);
+    let exec = cur.executor.as_ref().unwrap();
+    // Structured observation was seen: tui-idle can never complete.
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("timed_out"));
+    assert!(exec.structured_lifecycle_observed);
+    assert!(exec.turn_started_observed);
+
+    drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "Restarted transient tui-idle must never close the terminal"
+    );
 }
 
 #[tokio::test]

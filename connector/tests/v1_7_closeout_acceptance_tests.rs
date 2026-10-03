@@ -266,6 +266,7 @@ fi
         dispatch_turn_started: true,
         dispatch_baseline_state_started_at: None,
         turn_started_observed: true,
+        structured_lifecycle_observed: true,
         runtime_completion_kind: Some("tui_idle".into()),
         runtime_completed_at_ms: Some(now - 2_000),
         runtime_error: None,

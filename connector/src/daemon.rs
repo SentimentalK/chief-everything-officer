@@ -1252,6 +1252,17 @@ pub async fn drive_active_attempt(
                 .as_ref()
                 .map(|e| e.turn_started_observed)
                 .unwrap_or(false);
+            // Durable monotonic flag: once positive structured Agent lifecycle
+            // observation has been seen for this Attempt (at minimum
+            // WorkingObserved for the current pane/generation), generic
+            // terminal idle must never terminalize it. Successful completion
+            // in this mode requires authoritative AgentDone evidence
+            // (state=done, interrupted=false, new generation) from Orca.
+            let mut structured_lifecycle_observed = active
+                .executor
+                .as_ref()
+                .map(|e| e.structured_lifecycle_observed)
+                .unwrap_or(false);
 
             let mut completion_kind: Option<String> = None;
             let mut completion_err: Option<ExecutionReportError> = None;
@@ -1310,8 +1321,9 @@ pub async fn drive_active_attempt(
 
                 match wait_outcome {
                     crate::scheduler::WaitOutcome::WorkingObserved { .. } => {
-                        if !turn_started_observed {
+                        if !turn_started_observed || !structured_lifecycle_observed {
                             turn_started_observed = true;
+                            structured_lifecycle_observed = true;
                             let _lock = ExecutionLock::acquire_with_retry(
                                 &paths.state_lock_file(),
                                 Duration::from_secs(5),
@@ -1324,10 +1336,35 @@ pub async fn drive_active_attempt(
                                 };
                             if let Some(ref mut exec) = current.executor {
                                 exec.turn_started_observed = true;
+                                exec.structured_lifecycle_observed = true;
                             }
                             current.save(&paths.active_attempt_file())?;
                             println!(
-                                "Attempt '{}' agent working state observed; turn_started_observed marked true.",
+                                "Attempt '{}' agent working state observed; structured Agent lifecycle observation recorded (tui-idle fallback disabled).",
+                                active.attempt_id
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    crate::scheduler::WaitOutcome::AgentSeen { .. } => {
+                        if !structured_lifecycle_observed {
+                            structured_lifecycle_observed = true;
+                            let _lock = ExecutionLock::acquire_with_retry(
+                                &paths.state_lock_file(),
+                                Duration::from_secs(5),
+                                Duration::from_millis(50),
+                            )?;
+                            let mut current =
+                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    Some(c) if c.attempt_id == active.attempt_id => c,
+                                    _ => return Ok(true),
+                                };
+                            if let Some(ref mut exec) = current.executor {
+                                exec.structured_lifecycle_observed = true;
+                            }
+                            current.save(&paths.active_attempt_file())?;
+                            println!(
+                                "Attempt '{}' structured Agent lifecycle observation recorded; generic terminal idle must not terminalize.",
                                 active.attempt_id
                             );
                         }
@@ -1371,6 +1408,22 @@ pub async fn drive_active_attempt(
                         }
                     }
                     crate::scheduler::WaitOutcome::TuiIdle { .. } => {
+                        if structured_lifecycle_observed {
+                            // Structured Agent lifecycle evidence outranks
+                            // generic terminal idle: after a working state was
+                            // observed for this pane/generation, a TuiIdle must
+                            // never terminalize the attempt (never close the
+                            // terminal). Only authoritative AgentDone may
+                            // complete here; otherwise wait inside the durable
+                            // deadline.
+                            println!(
+                                "Post-working tui-idle observed for attempt '{}' with structured Agent lifecycle observation; waiting for authoritative AgentDone.",
+                                active.attempt_id
+                            );
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            continue;
+                        }
+
                         let is_turn_started = active
                             .executor
                             .as_ref()

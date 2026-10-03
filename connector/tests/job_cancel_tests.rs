@@ -133,6 +133,7 @@ fn make_waiting_attempt(cred: &DeviceCredential, attempt_id: String) -> ActiveAt
         dispatch_turn_started: true,
         dispatch_baseline_state_started_at: None,
         turn_started_observed: true,
+        structured_lifecycle_observed: true,
         runtime_completion_kind: None,
         runtime_completed_at_ms: None,
         runtime_error: None,

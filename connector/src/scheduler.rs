@@ -11,7 +11,7 @@ use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
-pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 5;
+pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -107,6 +107,8 @@ pub struct AttemptExecutorState {
     pub dispatch_baseline_state_started_at: Option<i64>,
     #[serde(default)]
     pub turn_started_observed: bool,
+    #[serde(default)]
+    pub structured_lifecycle_observed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dispatch_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +136,7 @@ impl AttemptExecutorState {
             dispatch_turn_started: false,
             dispatch_baseline_state_started_at: None,
             turn_started_observed: false,
+            structured_lifecycle_observed: false,
             last_dispatch_outcome: None,
             runtime_completion_kind: None,
             runtime_completed_at_ms: None,
@@ -394,16 +397,26 @@ impl ActiveAttempt {
             as u32;
 
         let attempt = match version {
-            5 => {
+            4 | 5 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
+                att.schema_version = ACTIVE_ATTEMPT_SCHEMA_VERSION;
+                // Legacy versions (4/5) persisted `turn_started_observed` only
+                // from a positive structured Agent lifecycle observation
+                // (`WorkingObserved` for the current pane/generation). Promote
+                // it into the stronger durable flag so restart/recovery cannot
+                // regress the attempt to the tui-idle fallback.
+                if let Some(ref mut exec) = att.executor {
+                    if exec.turn_started_observed {
+                        exec.structured_lifecycle_observed = true;
+                    }
+                }
                 if att.phase == AttemptPhase::LegacyRunning {
                     att.phase = AttemptPhase::RecoveryRequired;
                 }
                 att
             }
-            4 => {
+            6 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
-                att.schema_version = ACTIVE_ATTEMPT_SCHEMA_VERSION;
                 if att.phase == AttemptPhase::LegacyRunning {
                     att.phase = AttemptPhase::RecoveryRequired;
                 }
@@ -452,11 +465,30 @@ pub enum DispatchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
-    AgentDone { elapsed_ms: u64 },
-    TuiIdle { elapsed_ms: u64 },
-    WorkingObserved { elapsed_ms: u64 },
-    TimedOut { elapsed_ms: u64 },
-    Interrupted { reason: String },
+    AgentDone {
+        elapsed_ms: u64,
+    },
+    TuiIdle {
+        elapsed_ms: u64,
+    },
+    WorkingObserved {
+        elapsed_ms: u64,
+    },
+    /// Structured Agent lifecycle state for the current pane was observed via
+    /// `worktree ps` but is neither a "working" turn start nor an
+    /// authoritative new-generation done (e.g. stale-baseline done, or any
+    /// other structured state). Callers must treat this as positive evidence
+    /// that structured lifecycle observation is available for the Attempt and
+    /// keep waiting instead of falling back to generic terminal idle.
+    AgentSeen {
+        elapsed_ms: u64,
+    },
+    TimedOut {
+        elapsed_ms: u64,
+    },
+    Interrupted {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

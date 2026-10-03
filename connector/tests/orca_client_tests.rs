@@ -1445,6 +1445,63 @@ fn test_active_attempt_v4_schema_and_rejection_of_legacy() {
         loaded.executor.unwrap().dispatch_request_id.as_deref(),
         Some("req_1")
     );
+
+    // Case 5: V5 with turn_started_observed=true (only ever persisted from a
+    // structured WorkingObserved) promotes into the stronger durable flag so
+    // restart/recovery cannot regress to the tui-idle fallback.
+    let hash5 = ActiveAttempt::compute_payload_sha256(
+        "job_5", "ws_1", "tgt_1", None, prompt, acceptance, 60, "none",
+    );
+    let v5_json = serde_json::json!({
+        "schema_version": 5,
+        "server_origin": "http://127.0.0.1:4000",
+        "device_id": "dev_test",
+        "job_id": "job_5",
+        "workspace_id": "ws_1",
+        "target_id": "tgt_1",
+        "attempt_id": "att-4654f590-7d68-4560-a548-d3e75e5264b3",
+        "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "phase": "waiting",
+        "prompt": prompt,
+        "acceptance": acceptance,
+        "execution_timeout_seconds": 60,
+        "result_target": "none",
+        "payload_sha256": hash5,
+        "claimed_at_ms": 1727000000000i64,
+        "executor": {
+            "type": "orca",
+            "worktree_id": "wt_1",
+            "terminal_id": "term_1",
+            "agent_id": "agy",
+            "agent_ready_at_ms": 1727000000000i64,
+            "dispatch_send_count": 1,
+            "dispatch_request_id": "req_1",
+            "execution_deadline_ms": 1727000060000i64,
+            "turn_started_observed": true
+        }
+    });
+    fs::write(&state_file, serde_json::to_string_pretty(&v5_json).unwrap()).unwrap();
+    let loaded_v5 = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    assert_eq!(loaded_v5.schema_version, ACTIVE_ATTEMPT_SCHEMA_VERSION);
+    let exec_v5 = loaded_v5.executor.clone().unwrap();
+    assert!(exec_v5.turn_started_observed);
+    assert!(
+        exec_v5.structured_lifecycle_observed,
+        "v5 restart must promote turn_started_observed into the durable structured flag"
+    );
+
+    // Case 6: V6 round-trip preserves the durable structured flag as stored
+    // (no re-derivation or regression).
+    let mut exec_v6 = exec_v5;
+    exec_v6.structured_lifecycle_observed = true;
+    exec_v6.turn_started_observed = false;
+    let mut attempt_v6 = loaded_v5;
+    attempt_v6.executor = Some(exec_v6);
+    attempt_v6.save(&state_file).unwrap();
+    let reloaded = ActiveAttempt::load(&state_file).unwrap().unwrap();
+    let exec_reloaded = reloaded.executor.unwrap();
+    assert!(exec_reloaded.structured_lifecycle_observed);
+    assert!(!exec_reloaded.turn_started_observed);
 }
 
 #[tokio::test]
@@ -1635,6 +1692,7 @@ async fn test_dispatch_correlation_regression_matrix() {
             dispatch_accepted_at_ms: None,
             dispatch_turn_started: false,
             dispatch_baseline_state_started_at: None,
+            structured_lifecycle_observed: false,
             turn_started_observed: false,
             last_dispatch_outcome: None,
             runtime_completion_kind: None,
@@ -2058,6 +2116,7 @@ fi
             dispatch_accepted_at_ms: Some(1727000010),
             dispatch_turn_started: true,
             dispatch_baseline_state_started_at: None,
+            structured_lifecycle_observed: false,
             turn_started_observed: true,
             last_dispatch_outcome: None,
             runtime_completion_kind: None,
@@ -2129,6 +2188,7 @@ fi
             dispatch_accepted_at_ms: Some(1727000010),
             dispatch_turn_started: true,
             dispatch_baseline_state_started_at: None,
+            structured_lifecycle_observed: false,
             turn_started_observed: true,
             last_dispatch_outcome: None,
             runtime_completion_kind: None,
@@ -2186,6 +2246,7 @@ async fn test_wait_baseline_generation_stale_done_does_not_complete() {
                 dispatch_accepted_at_ms: Some(1727000010),
                 dispatch_turn_started: false,
                 dispatch_baseline_state_started_at: baseline,
+                structured_lifecycle_observed: false,
                 turn_started_observed: false,
                 last_dispatch_outcome: None,
                 runtime_completion_kind: None,
@@ -2212,15 +2273,17 @@ fi
     let adapter = OrcaExecutionAdapter::new(client);
 
     // 1. Stale/baseline done (same stateStartedAt as baseline) must NOT
-    //    complete the turn: falls through to tui-idle wait (unsatisfied).
+    //    complete the turn: structured ps output confirms the pane is
+    //    observable, so the adapter reports AgentSeen instead of falling back
+    //    to generic terminal idle.
     let attempt = attempt_with_baseline(Some(1727000100));
     let wait_outcome = adapter
         .wait(&attempt, "term_my_pane", Duration::from_millis(500))
         .await
         .unwrap();
     match wait_outcome {
-        WaitOutcome::TimedOut { .. } => {}
-        other => panic!("expected TimedOut for stale baseline done state, got {other:?}"),
+        WaitOutcome::AgentSeen { .. } => {}
+        other => panic!("expected AgentSeen for stale baseline done state, got {other:?}"),
     }
 
     // 2. New-generation done (different stateStartedAt) DOES complete as
@@ -2249,6 +2312,218 @@ fi
         WaitOutcome::AgentDone { .. } => {}
         other => panic!("expected AgentDone for new-generation done state, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured Agent-done with interrupted=true regression (OpenCode 1.18.34):
+// `state=done, interrupted=true` is authoritative structured evidence that the
+// dispatched turn was interrupted. It must NEVER map to a completion outcome
+// (AgentDone / TuiIdle terminalization), and never override the baseline
+// generation semantics.
+// ---------------------------------------------------------------------------
+
+fn ps_wait_script(ps_agents_json: &str, wait_log: &std::path::Path) -> String {
+    format!(
+        r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1","connected":true}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    echo '{ps_agents_json}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{}"
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_my_pane","condition":"tui-idle","satisfied":false,"elapsedMs":100}}}}}}'
+else
+    echo '{{"ok":false}}'
+fi
+"#,
+        wait_log.display()
+    )
+}
+
+async fn ps_wait_outcome(
+    temp: &tempfile::TempDir,
+    attempt: &ActiveAttempt,
+    ps_agents_json: &str,
+) -> (WaitOutcome, String) {
+    let wait_log = temp.path().join("ps_wait_invocations.log");
+    let script = ps_wait_script(ps_agents_json, &wait_log);
+    let bin = create_mock_orca_script(temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+    let outcome = adapter
+        .wait(attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    let invoked = fs::read_to_string(&wait_log).unwrap_or_default();
+    (outcome, invoked)
+}
+
+#[tokio::test]
+async fn test_worktree_ps_interrupted_done_never_maps_to_completion() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let mut exec = AttemptExecutorState::new_orca();
+    exec.worktree_id = Some("wt_1".into());
+    exec.terminal_id = Some("term_my_pane".into());
+    exec.agent_id = Some("agy".into());
+    exec.dispatch_send_count = 1;
+    exec.dispatch_request_id = Some("req_1".into());
+    exec.dispatch_turn_started = true;
+    exec.dispatch_baseline_state_started_at = None;
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_interrupted".into(),
+        attempt_id: "att_interrupted".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: Some(exec),
+    };
+
+    // New-generation done with interrupted=true: authoritative interrupt.
+    // Must fail promptly, never map to AgentDone or TuiIdle completion.
+    let (outcome, wait_invoked) = ps_wait_outcome(
+        &temp,
+        &attempt,
+        r#"{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"done","interrupted":true,"stateStartedAt":1727000300}]}]}}"#,
+    )
+    .await;
+    match outcome {
+        WaitOutcome::Interrupted { reason } => {
+            assert!(reason.contains("interrupted=true"), "reason: {reason}");
+        }
+        other => panic!("expected Interrupted for done+interrupted=true, got {other:?}"),
+    }
+    assert!(!wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_worktree_ps_interrupted_done_stale_baseline_is_agent_seen() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let mut exec = AttemptExecutorState::new_orca();
+    exec.worktree_id = Some("wt_1".into());
+    exec.terminal_id = Some("term_my_pane".into());
+    exec.agent_id = Some("agy".into());
+    exec.dispatch_send_count = 1;
+    exec.dispatch_request_id = Some("req_1".into());
+    exec.dispatch_turn_started = true;
+    exec.dispatch_baseline_state_started_at = Some(1727000100);
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_interrupted_stale".into(),
+        attempt_id: "att_interrupted_stale".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: Some(exec),
+    };
+
+    // Stale-baseline done+interrupted=true (identical stateStartedAt to the
+    // dispatch baseline) is a pre-dispatch state, not evidence for the current
+    // turn: structured pane observation (AgentSeen), never completion.
+    let (outcome, wait_invoked) = ps_wait_outcome(
+        &temp,
+        &attempt,
+        r#"{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"done","interrupted":true,"stateStartedAt":1727000100}]}]}}"#,
+    )
+    .await;
+    match outcome {
+        WaitOutcome::AgentSeen { .. } => {}
+        other => {
+            panic!("expected AgentSeen for stale-baseline done+interrupted=true, got {other:?}")
+        }
+    }
+    assert!(!wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_worktree_ps_non_working_state_outranks_generic_tui_idle() {
+    let temp = tempfile::tempdir().unwrap();
+    let wait_log = temp.path().join("idle_invocations.log");
+    let script = r#"#!/bin/bash
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_my_pane","tabId":"tab1","leafId":"leaf1","connected":true}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "ps" ]; then
+    echo '{"ok":true,"result":{"worktrees":[{"worktreeId":"wt_1","agents":[{"paneKey":"tab1:leaf1","state":"idle","stateStartedAt":1727000400}]}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{WAIT_LOG}"
+    echo '{"ok":true,"result":{"wait":{"handle":"term_my_pane","condition":"tui-idle","satisfied":true,"elapsedMs":10}}}'
+else
+    echo '{"ok":false}'
+fi
+"#
+    .replace("{WAIT_LOG}", &wait_log.display().to_string());
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let mut exec = AttemptExecutorState::new_orca();
+    exec.worktree_id = Some("wt_1".into());
+    exec.terminal_id = Some("term_my_pane".into());
+    exec.agent_id = Some("agy".into());
+    exec.dispatch_send_count = 1;
+    exec.dispatch_request_id = Some("req_1".into());
+    exec.dispatch_turn_started = true;
+    exec.dispatch_baseline_state_started_at = None;
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_idle".into(),
+        attempt_id: "att_idle".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::Waiting,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: Some(exec),
+    };
+
+    let outcome = adapter
+        .wait(&attempt, "term_my_pane", Duration::from_millis(500))
+        .await
+        .unwrap();
+    match outcome {
+        WaitOutcome::AgentSeen { .. } => {}
+        other => panic!("expected AgentSeen for structured non-working state, got {other:?}"),
+    }
+    let invoked = fs::read_to_string(&wait_log).unwrap_or_default();
+    // Structured lifecycle state was available: the generic tui-idle wait must
+    // never be reached for this tick.
+    assert!(!invoked.contains("WAIT_INVOKED"));
 }
 
 // ---------------------------------------------------------------------------

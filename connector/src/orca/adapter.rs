@@ -687,7 +687,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                 if ag.state == "working" {
                                     return Ok(WaitOutcome::WorkingObserved { elapsed_ms: 100 });
                                 }
-                                if ag.state == "done" && !ag.interrupted {
+                                if ag.state == "done" {
                                     let baseline = attempt
                                         .executor
                                         .as_ref()
@@ -697,9 +697,29 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                         None => true,
                                     };
                                     if is_new_generation {
+                                        if ag.interrupted {
+                                            // Authoritative structured evidence that the
+                                            // dispatched turn was interrupted: must never
+                                            // map to COMPLETED (and never to a generic
+                                            // tui-idle completion either). Fails promptly
+                                            // through the existing Interrupted path.
+                                            return Ok(WaitOutcome::Interrupted {
+                                                reason: format!(
+                                                    "agent pane '{pk}' reported state 'done' with interrupted=true"
+                                                ),
+                                            });
+                                        }
                                         return Ok(WaitOutcome::AgentDone { elapsed_ms: 100 });
                                     }
                                 }
+                                // The pane's Agent is visible in structured ps
+                                // output but the observation is not authoritative
+                                // for completion (pre-dispatch/baseline state or
+                                // any other non-working state). Structured
+                                // lifecycle observation IS available for this
+                                // Attempt, so generic terminal idle must never
+                                // terminalize it: keep waiting inside the pane.
+                                return Ok(WaitOutcome::AgentSeen { elapsed_ms: 100 });
                             }
                         }
                     }
