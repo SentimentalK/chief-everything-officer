@@ -5,9 +5,37 @@ use std::process::Command;
 
 use ceo_connector::config::{LocalConfig, LocalExecutorConfig, LocalTarget};
 use ceo_connector::credential::DeviceCredential;
-use ceo_connector::doctor::{run_doctor, DiagnosticSeverity};
+use ceo_connector::doctor::{run_doctor, run_doctor_with_orca, DiagnosticSeverity};
+use ceo_connector::orca::client::OrcaCliClient;
 use ceo_connector::paths::ConnectorPaths;
 use common::mock_server::{MockResponse, MockServer};
+
+fn healthy_mock_orca(temp: &tempfile::TempDir) -> OrcaCliClient {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = temp.path().join("mock-orca");
+        let script = r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+    echo '{"ok":true,"result":{"app":{"running":true},"runtime":{"state":"ready","reachable":true,"appVersion":"1.4.209"}}}'
+    exit 0
+fi
+echo '{"ok":true}'
+"#;
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+    #[cfg(windows)]
+    {
+        let script_path = temp.path().join("mock-orca.cmd");
+        let script = "@echo off\r\nif \"%~1\"==\"status\" (\r\necho {\"ok\":true,\"result\":{\"app\":{\"running\":true},\"runtime\":{\"state\":\"ready\",\"reachable\":true,\"appVersion\":\"1.4.209\"}}}\r\nexit /b 0\r\n)\r\necho {\"ok\":true}\r\n";
+        fs::write(&script_path, script).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+}
 
 fn init_git_repo(path: &std::path::Path, remote_url: &str) {
     fs::create_dir_all(path).unwrap();
@@ -252,8 +280,15 @@ async fn doctor_healthy_report_detects_git_and_targets() {
     );
     config.save(&paths.config_file()).unwrap();
 
-    let report = run_doctor(&paths, true).await;
+    let orca_client = healthy_mock_orca(&temp);
+    let report = run_doctor_with_orca(&paths, true, orca_client).await;
     assert!(report.overall_passed);
+
+    // Orca CLI & Runtime detected and ready
+    assert!(report
+        .checks
+        .iter()
+        .any(|c| c.name == "Orca CLI & Runtime" && c.severity == DiagnosticSeverity::Pass));
 
     // Git executable detected
     assert!(report
@@ -452,8 +487,13 @@ async fn doctor_fully_configured_fixture_passes_with_executor() {
     );
     config.save(&paths.config_file()).unwrap();
 
-    let report = run_doctor(&paths, true).await;
+    let orca_client = healthy_mock_orca(&temp);
+    let report = run_doctor_with_orca(&paths, true, orca_client).await;
     assert!(report.overall_passed);
+    assert!(report
+        .checks
+        .iter()
+        .any(|c| c.name == "Orca CLI & Runtime" && c.severity == DiagnosticSeverity::Pass));
     // Executor configured and validated for the alias-named target.
     assert!(report.checks.iter().any(|c| c.name
         == "Target 'healthy-target' Executor Configuration"
