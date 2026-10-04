@@ -22,8 +22,9 @@ use crate::setup::{
     SetupError,
 };
 use crate::targets::{
-    build_target_display_items, check_active_attempt_target_in_use, resolve_target_selector,
-    target_rename, target_set_default_runtime, TargetDisplayItem, TargetError,
+    build_target_display_items, check_active_attempt_target_in_use,
+    check_active_attempt_target_in_use_converged, resolve_target_selector, target_rename,
+    target_set_default_runtime, TargetDisplayItem, TargetError,
 };
 
 #[derive(Error, Debug)]
@@ -664,8 +665,10 @@ pub async fn project_add(
     )
     .await?;
 
-    // Check active attempt
-    check_active_attempt_target_in_use(paths, &ensured.target_id)?;
+    // Check active attempt (bounded operator-cancel convergence first:
+    // never proceed while the local marker may represent live/ambiguous
+    // execution, but converge a server-proven exact-cancelled stale marker).
+    check_active_attempt_target_in_use_converged(paths, &client, &cred, &ensured.target_id).await?;
 
     // Ensure device binding
     let _ = ensure_binding_step(&client, &cred, &ensured).await?;
@@ -832,6 +835,14 @@ pub async fn project_set(
         .map_err(map_target_error_for_project)?;
     let target_id = resolved.target_id;
 
+    // Bounded operator-cancel convergence BEFORE the state lock: the
+    // convergence finalizer acquires `state.lock` itself, so it must never
+    // run while this process already holds it. The raw guard is re-applied
+    // under the lock below, keeping the concurrent-attempt race fail-closed.
+    check_active_attempt_target_in_use_converged(paths, &client, &cred, &target_id)
+        .await
+        .map_err(map_target_error_for_project)?;
+
     let _lock = match ExecutionLock::acquire_with_retry(
         &paths.state_lock_file(),
         std::time::Duration::from_secs(3),
@@ -917,6 +928,13 @@ pub async fn project_detach(paths: &ConnectorPaths, selector: &str) -> Result<()
         .await
         .map_err(map_target_error_for_project)?;
 
+    // Bounded operator-cancel convergence BEFORE the state lock (the
+    // convergence finalizer acquires `state.lock` itself); the raw guard is
+    // re-applied under the lock below.
+    check_active_attempt_target_in_use_converged(paths, &client, &cred, &resolved.target_id)
+        .await
+        .map_err(map_target_error_for_project)?;
+
     let _lock = match ExecutionLock::acquire_with_retry(
         &paths.state_lock_file(),
         std::time::Duration::from_secs(3),
@@ -967,7 +985,11 @@ pub async fn project_delete(
         .map(|p| p.display_name.clone())
         .unwrap_or_else(|| selector.to_string());
 
-    check_active_attempt_target_in_use(paths, &target_id).map_err(map_target_error_for_project)?;
+    // Bounded operator-cancel convergence: converge a server-proven
+    // exact-cancelled stale marker before the destructive confirmation flow.
+    check_active_attempt_target_in_use_converged(paths, &client, &cred, &target_id)
+        .await
+        .map_err(map_target_error_for_project)?;
 
     // Confirmation/force semantics: interactive confirmation by default;
     // `--force` is the automation escape hatch; non-TTY callers must pass

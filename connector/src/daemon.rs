@@ -6,6 +6,7 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attempt_convergence::FinalizeLocalOperatorCancelledError;
 use crate::client::{ClientError, ConnectorClient, ConnectorTargetProjection, PendingJobCandidate};
 use crate::config::{load_bound_profile, ConfigError, ProfileError};
 use crate::credential::{CredentialError, DeviceCredential};
@@ -14,12 +15,11 @@ use crate::execution_contract::{
     BusinessOutcome, ExecutionReport, ExecutionReportError, ExecutionReportExecutor,
     ExecutionStatus, REPORT_SCHEMA_VERSION,
 };
-use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
+use crate::local_state::{remove_durable, ExecutionLock};
 use crate::orca::receipt::ExecutionReceipt;
 use crate::outbox::{
     compute_report_sha256, deliver_outbox_record, flush_outbox, flushable_outbox_files,
-    operator_cancel_digest, OutboxError, OutboxRecord, SanitizedHistoryRecord,
-    HISTORY_SCHEMA_VERSION, OUTBOX_SCHEMA_VERSION,
+    OutboxError, OutboxRecord, OUTBOX_SCHEMA_VERSION,
 };
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{
@@ -524,41 +524,18 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
 
 /// Terminalizes a local active attempt as operator-cancelled (Wave 2B).
 ///
-/// Used when the server has authoritatively CANCELLED the job (stale runner
-/// convergence or live interruption). Best-effort idempotent: if the active
-/// attempt on disk no longer matches (already cleaned up), this is a no-op.
+/// Thin delegation to the shared owner (`crate::attempt_convergence`); the
+/// daemon must never keep a separate finalization truth table.
 fn finalize_local_operator_cancelled(
     paths: &ConnectorPaths,
     active: &ActiveAttempt,
 ) -> Result<(), DaemonError> {
-    let _lock = ExecutionLock::acquire_with_retry(
-        &paths.state_lock_file(),
-        Duration::from_secs(5),
-        Duration::from_millis(50),
-    )?;
-
-    // Re-check under the lock: another path may have already cleaned up.
-    let current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-        Some(c) if c.attempt_id == active.attempt_id => c,
-        _ => return Ok(()),
-    };
-
-    let history = SanitizedHistoryRecord {
-        schema_version: HISTORY_SCHEMA_VERSION,
-        job_id: current.job_id.clone(),
-        attempt_id: current.attempt_id.clone(),
-        target_id: current.target_id.clone(),
-        status: "cancelled".to_string(),
-        receipt_sha256: None,
-        duration_ms: None,
-        terminal_report_sha256: operator_cancel_digest(&current.job_id, &current.attempt_id),
-        recorded_at_ms: now_utc_ms(),
-    };
-    let hist_file = paths.history_file(&current.job_id, &current.attempt_id);
-    atomic_write_json(&hist_file, &history)?;
-
-    remove_durable(&paths.active_attempt_file())?;
-    Ok(())
+    crate::attempt_convergence::finalize_local_operator_cancelled(paths, active).map_err(|err| {
+        match err {
+            FinalizeLocalOperatorCancelledError::Io(e) => DaemonError::Io(e),
+            FinalizeLocalOperatorCancelledError::State(e) => DaemonError::Scheduler(e),
+        }
+    })
 }
 
 pub async fn drive_active_attempt(
@@ -2075,30 +2052,36 @@ pub async fn drive_active_attempt(
             // Bounded convergence repair: a locally persisted recovery_required
             // attempt (e.g. prepare failed after the Server authoritatively
             // cancelled the job) would otherwise block this device forever.
-            // When the Server's device-scoped read model proves terminal
-            // CANCELLED for this exact attempt, converge the local durable
-            // state through the existing operator-cancel finalization. Any
-            // other server state, missing/ambiguous attempt identity,
-            // transport failure, or attempt mismatch remains fail-closed
-            // recovery_required.
-            match client.get_job(cred, &active.job_id, false).await {
-                Ok(detail)
-                    if detail.state == "terminal"
-                        && detail.execution_status.as_deref() == Some("CANCELLED")
-                        && detail.execution.as_ref().map(|e| e.attempt_id.as_str())
-                            == Some(active.attempt_id.as_str()) =>
-                {
-                    finalize_local_operator_cancelled(paths, &active)?;
+            // Converge through the shared owner
+            // (`crate::attempt_convergence::reconcile_active_attempt_with_
+            // server_operator_cancel`), which this project-side convergence
+            // also reuses. Any other server state, missing/ambiguous attempt
+            // identity, transport failure, or attempt mismatch remains
+            // fail-closed recovery_required.
+            let reason = match crate::attempt_convergence::reconcile_active_attempt_with_server_operator_cancel(
+                paths, client, cred,
+            )
+            .await
+            {
+                crate::attempt_convergence::OperatorCancelReconciliation::Finalized => {
                     println!(
                         "Job '{}' was operator-cancelled on the server; local recovery_required attempt terminalized as cancelled.",
                         active.job_id
                     );
-                    Ok(true)
+                    return Ok(true);
                 }
-                Ok(_) | Err(_) => Err(DaemonError::RecoveryRequired(
-                    "Active attempt is in recovery_required phase".into(),
-                )),
-            }
+                // The marker was already converged by another path; nothing
+                // left to drive on this pass.
+                crate::attempt_convergence::OperatorCancelReconciliation::NoMarker => {
+                    return Ok(true)
+                }
+                crate::attempt_convergence::OperatorCancelReconciliation::Blocked { reason } => {
+                    reason
+                }
+            };
+            Err(DaemonError::RecoveryRequired(format!(
+                "Active attempt is in recovery_required phase: {reason}"
+            )))
         }
         AttemptPhase::LegacyRunning => {
             let _lock = ExecutionLock::acquire_with_retry(

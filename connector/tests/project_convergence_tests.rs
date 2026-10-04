@@ -1204,12 +1204,21 @@ async fn test_project_detach_and_remove_compat_alias_and_delete_semantics() {
     )
     .unwrap();
     let err_in_use = project_detach(&paths, "hello-detach").await.unwrap_err();
+    // The guard stays fail-closed (TARGET_IN_USE) for a marker that cannot
+    // be safely converged (legacy/corrupt partial marker): the enriched
+    // variant still carries the TARGET_IN_USE code and never proceeds.
     match err_in_use {
-        ProjectError::Target(ceo_connector::targets::TargetError::TargetInUse(tid)) => {
+        ProjectError::Target(ceo_connector::targets::TargetError::TargetInUseUnconverged {
+            target_id: tid,
+            reason,
+        }) => {
             assert_eq!(tid, target_id);
+            assert!(reason.contains("LOCAL_STATE_INVALID"));
         }
-        other => panic!("expected TargetInUse error, got: {:?}", other),
+        other => panic!("expected TargetInUseUnconverged error, got: {:?}", other),
     }
+    // No mutation happened on server or locally while blocked.
+    assert_eq!(unbind_calls.load(Ordering::SeqCst), 0);
     fs::remove_file(paths.active_attempt_file()).unwrap();
 
     // 3. Detach removes device binding on server + removes local mapping

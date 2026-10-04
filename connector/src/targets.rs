@@ -41,6 +41,10 @@ pub enum TargetError {
     AmbiguousSelector(String),
     #[error("Target '{0}' is currently in use by active attempt (TARGET_IN_USE)")]
     TargetInUse(String),
+    #[error(
+        "Target '{target_id}' may still be in use by a live/ambiguous active attempt ({reason}); refusing to mutate (TARGET_IN_USE)"
+    )]
+    TargetInUseUnconverged { target_id: String, reason: String },
     #[error("Target '{0}' is disabled on server (TARGET_DISABLED)")]
     TargetDisabled(String),
     #[error("Target '{0}' device binding is not active on server")]
@@ -210,6 +214,60 @@ pub fn check_active_attempt_target_in_use(
         }
     }
     Ok(())
+}
+
+/// Server-connected variant of [`check_active_attempt_target_in_use`] for
+/// project mutations (PROJECT-039): when the raw local guard blocks, perform
+/// exactly ONE bounded reconciliation of the device's local active-attempt
+/// marker against the server's device-scoped truth. When the server
+/// authoritatively proves the exact local attempt is terminal CANCELLED, the
+/// marker is durably finalized through the shared operator-cancel owner
+/// (`crate::attempt_convergence`) and the mutation may proceed. Every other
+/// case — server unreachable, non-terminal job, non-CANCELLED terminal,
+/// attempt identity mismatch, ambiguous/missing attempt identity, corrupt
+/// local marker — fails closed as TARGET_IN_USE while preserving the local
+/// marker byte-for-byte.
+///
+/// Must NOT be called while the caller holds `state.lock`: the convergence
+/// finalizer acquires that same lock itself, so this guard is always invoked
+/// BEFORE the caller's lock acquisition (the caller then re-applies the raw
+/// local guard under its own lock, keeping the fail-closed race window).
+pub async fn check_active_attempt_target_in_use_converged(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &crate::credential::DeviceCredential,
+    target_id: &str,
+) -> Result<(), TargetError> {
+    // Raw local guard first: no network round-trip unless the target is
+    // genuinely blocked by the local active-attempt marker.
+    let blocked = check_active_attempt_target_in_use(paths, target_id).is_err();
+    if !blocked {
+        return Ok(());
+    }
+
+    // Blocked: one bounded reconciliation (single server read; no polling).
+    match crate::attempt_convergence::reconcile_active_attempt_with_server_operator_cancel(
+        paths, client, cred,
+    )
+    .await
+    {
+        crate::attempt_convergence::OperatorCancelReconciliation::Finalized => {
+            println!(
+                "Target '{target_id}' was blocked by an operator-cancelled attempt; local state converged from server truth. Continuing."
+            );
+        }
+        crate::attempt_convergence::OperatorCancelReconciliation::NoMarker => return Ok(()),
+        crate::attempt_convergence::OperatorCancelReconciliation::Blocked { reason } => {
+            return Err(TargetError::TargetInUseUnconverged {
+                target_id: target_id.to_string(),
+                reason,
+            });
+        }
+    }
+
+    // Re-apply the raw local guard: a still-present marker (or a fresh
+    // attempt racing into existence) keeps the mutation fail-closed.
+    check_active_attempt_target_in_use(paths, target_id)
 }
 
 fn resolve_executor_args(
