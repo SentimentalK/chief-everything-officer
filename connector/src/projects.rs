@@ -9,7 +9,8 @@ use crate::client::{ClientError, ConnectorClient, RegisterTargetRepoSource};
 use crate::config::{ConfigError, LocalConfig, LocalExecutorConfig, LocalTarget};
 use crate::credential::CredentialError;
 use crate::execution_admission::{
-    evaluate_project_runnability, probe_device_runtime_snapshot, ExecutionCompatibilityProbe,
+    evaluate_project_runnability, probe_device_runtime_snapshot,
+    project_needs_launch_surface_probe, ExecutionCompatibilityProbe,
 };
 pub use crate::execution_admission::{ProjectRunnableAssessment, ProjectRunnableStatus};
 use crate::local_state::ExecutionLock;
@@ -191,33 +192,38 @@ pub async fn build_project_display_items_with_probe(
 ) -> Result<Vec<ProjectDisplayItem>, ProjectError> {
     let target_items = build_target_display_items(paths).await?;
     let config = crate::config::load_current_config(paths).ok().flatten();
-    let snapshot = probe_device_runtime_snapshot(probe).await;
 
-    let items = target_items
+    let resolved_items: Vec<_> = target_items
         .into_iter()
         .map(|t| {
-            let synthetic_exec;
-            let executor = match config
+            let executor = config
                 .as_ref()
                 .and_then(|c| c.targets.get(&t.target_id))
-                .and_then(|lt| lt.executor.as_ref())
-            {
-                Some(e) => Some(e),
-                None => {
-                    if let Some(ref agent_id) = t.agent_id {
-                        synthetic_exec = LocalExecutorConfig::new_internal(
+                .and_then(|lt| lt.executor.clone())
+                .or_else(|| {
+                    t.agent_id.as_ref().and_then(|agent_id| {
+                        LocalExecutorConfig::new_internal(
                             agent_id.clone(),
                             t.agent_command.clone(),
                             t.model.clone(),
                         )
-                        .ok();
-                        synthetic_exec.as_ref()
-                    } else {
-                        None
-                    }
-                }
-            };
-            let runnable = evaluate_project_runnability(&t.status, executor, &snapshot);
+                        .ok()
+                    })
+                });
+            (t, executor)
+        })
+        .collect();
+
+    let needs_launch_surface = resolved_items
+        .iter()
+        .any(|(t, exec)| project_needs_launch_surface_probe(&t.status, exec.as_ref()));
+
+    let snapshot = probe_device_runtime_snapshot(probe, needs_launch_surface).await;
+
+    let items = resolved_items
+        .into_iter()
+        .map(|(t, executor)| {
+            let runnable = evaluate_project_runnability(&t.status, executor.as_ref(), &snapshot);
             let mut item = ProjectDisplayItem::from(t);
             item.runnable = Some(runnable);
             item

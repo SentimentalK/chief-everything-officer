@@ -429,33 +429,7 @@ impl OrcaCliClient {
         &self,
     ) -> crate::execution_admission::OrcaRuntimeReadiness {
         match self.status().await {
-            Ok(status) if status.ok => {
-                if let Some(res) = status.result {
-                    let app_running = res.app.running;
-                    let runtime_state = res.runtime.state;
-                    if app_running && runtime_state == "ready" {
-                        crate::execution_admission::OrcaRuntimeReadiness::Ready
-                    } else if !app_running {
-                        crate::execution_admission::OrcaRuntimeReadiness::NotReady {
-                            code: "ORCA_NOT_RUNNING".to_string(),
-                            reason: "Orca desktop app is not running".to_string(),
-                        }
-                    } else {
-                        crate::execution_admission::OrcaRuntimeReadiness::NotReady {
-                            code: "ORCA_RUNTIME_NOT_READY".to_string(),
-                            reason: format!(
-                                "Orca desktop app running, runtime state: {runtime_state} (expected 'ready')"
-                            ),
-                        }
-                    }
-                } else {
-                    crate::execution_admission::OrcaRuntimeReadiness::Ready
-                }
-            }
-            Ok(_) => crate::execution_admission::OrcaRuntimeReadiness::NotReady {
-                code: "ORCA_STATUS_FAILED".to_string(),
-                reason: "Orca status reported ok=false".to_string(),
-            },
+            Ok(status) => crate::execution_admission::evaluate_orca_status_response(&status),
             Err(OrcaError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 crate::execution_admission::OrcaRuntimeReadiness::NotReady {
                     code: "ORCA_CLI_NOT_FOUND".to_string(),

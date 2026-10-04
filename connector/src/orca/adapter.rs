@@ -453,16 +453,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
     }
 
     async fn is_ready(&self) -> bool {
-        match self.client.status().await {
-            Ok(resp) if resp.ok => {
-                if let Some(res) = resp.result {
-                    res.app.running && res.runtime.state == "ready"
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
+        self.client.probe_runtime_readiness().await.is_ready()
     }
 
     async fn get_agent_status_baseline(&self, terminal_id: &str) -> Result<Option<i64>, String> {
@@ -1529,5 +1520,19 @@ mod tests {
     fn test_missing_stages_is_not_turn_start_evidence() {
         let p = send_prompt(None, Some("terminal"), Some("structured"));
         assert!(!send_prompt_turn_started(&p));
+    }
+
+    #[test]
+    fn test_adapter_readiness_rejects_missing_result() {
+        use crate::execution_admission::evaluate_orca_status_response;
+        use crate::orca::types::OrcaStatusResponse;
+
+        // Verify that ok=true, result=None evaluates to NotReady and is_ready = false
+        let status = OrcaStatusResponse {
+            ok: true,
+            result: None,
+        };
+        let readiness = evaluate_orca_status_response(&status);
+        assert!(!readiness.is_ready());
     }
 }

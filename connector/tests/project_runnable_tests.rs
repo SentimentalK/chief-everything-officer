@@ -787,3 +787,334 @@ fn test_json_preserves_prior_fields_and_adds_runnable_data() {
     assert_eq!(deserialized_old.status, "READY");
     assert_eq!(deserialized_old.runnable, None);
 }
+
+#[tokio::test]
+async fn test_orca_status_missing_result_is_not_runnable_daemon_match() {
+    use ceo_connector::execution_admission::evaluate_orca_status_response;
+    use ceo_connector::orca::types::OrcaStatusResponse;
+
+    // 1. Shared canonical helper proof: ok=true, result=None must not be Ready
+    let raw_status = OrcaStatusResponse {
+        ok: true,
+        result: None,
+    };
+    let canonical_readiness = evaluate_orca_status_response(&raw_status);
+    assert_eq!(
+        canonical_readiness,
+        OrcaRuntimeReadiness::NotReady {
+            code: "ORCA_STATUS_MISSING_RESULT".to_string(),
+            reason: "Orca status reported ok=true but result payload is missing".to_string(),
+        }
+    );
+    assert!(!canonical_readiness.is_ready());
+
+    // 2. Integration proof: project runnability with this status reports not_runnable
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let repo_dir = _temp.path().join("my-repo");
+    init_git_repo(&repo_dir, Some("https://github.com/org/repo.git"));
+
+    server.add_handler(|req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": "tgt_missing_res_1",
+                            "workspace_id": "ws_1",
+                            "alias": "missing-res-proj",
+                            "display_name": "Missing Result Project",
+                            "kind": "ordinary",
+                            "repository": { "provider": "github", "external_id": "123", "full_name": "org/repo" },
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg.targets.insert(
+        "tgt_missing_res_1".to_string(),
+        LocalTarget {
+            local_path: repo_dir.display().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()),
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    let probe = CountingMockProbe::new(canonical_readiness, AgentLaunchSurface::Available);
+    let items = build_project_display_items_with_probe(&paths, Some(&probe))
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item.status, "READY");
+    let runnable = item.runnable.as_ref().unwrap();
+    assert_eq!(runnable.status, ProjectRunnableStatus::NotRunnable);
+    assert_eq!(runnable.code.as_deref(), Some("ORCA_STATUS_MISSING_RESULT"));
+    assert_eq!(
+        runnable.reason.as_deref(),
+        Some("Orca status reported ok=true but result payload is missing")
+    );
+
+    // Launch surface probe must NOT be called when runtime is not ready
+    assert_eq!(probe.surface_probes.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.readiness_probes.load(Ordering::SeqCst), 1);
+
+    // Human rendering
+    let human_show = render_project_show(item, false);
+    assert!(human_show.contains("  Config:          READY\n"));
+    assert!(human_show.contains("  Runnable:        no (ORCA_STATUS_MISSING_RESULT)\n"));
+    assert!(human_show.contains(
+        "  Reason:          Orca status reported ok=true but result payload is missing\n"
+    ));
+}
+
+#[tokio::test]
+async fn test_explicit_command_only_project_set_skips_launch_surface_probe() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let agent_bin = temp_dir.path().join("my-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&agent_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    let mut server_targets = Vec::new();
+
+    for i in 1..=3 {
+        let tid = format!("tgt_cmd_only_{i}");
+        let repo_dir = _temp.path().join(format!("cmd-repo-{i}"));
+        init_git_repo(
+            &repo_dir,
+            Some(&format!("https://github.com/org/cmd-repo-{i}.git")),
+        );
+
+        server_targets.push(serde_json::json!({
+            "target": {
+                "id": tid,
+                "workspace_id": "ws_1",
+                "alias": format!("cmd-proj-{i}"),
+                "display_name": format!("Cmd Project {i}"),
+                "kind": "ordinary",
+                "repository": { "provider": "github", "external_id": format!("{i}"), "full_name": format!("org/cmd-repo-{i}") },
+                "disabled": false,
+                "is_default_agent_runtime": false
+            },
+            "this_device_binding": { "id": format!("bnd_{i}"), "enabled": true },
+            "active_binding_count": 1
+        }));
+
+        cfg.targets.insert(
+            format!("tgt_cmd_only_{i}"),
+            LocalTarget {
+                local_path: repo_dir.display().to_string(),
+                executor: Some(
+                    LocalExecutorConfig::new("custom".into(), agent_bin.display().to_string())
+                        .unwrap(),
+                ),
+            },
+        );
+    }
+    cfg.save(&paths.config_file()).unwrap();
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(200, &serde_json::json!({ "targets": server_targets }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let probe = CountingMockProbe::new(OrcaRuntimeReadiness::Ready, AgentLaunchSurface::Available);
+    let items = build_project_display_items_with_probe(&paths, Some(&probe))
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 3);
+    for item in &items {
+        assert_eq!(item.status, "READY");
+        assert_eq!(
+            item.runnable.as_ref().map(|r| r.status),
+            Some(ProjectRunnableStatus::Runnable)
+        );
+    }
+
+    // Readiness probed once
+    assert_eq!(probe.readiness_probes.load(Ordering::SeqCst), 1);
+    // Launch surface probe MUST BE SKIPPED (0 calls) for explicit-command-only project set!
+    assert_eq!(
+        probe.surface_probes.load(Ordering::SeqCst),
+        0,
+        "explicit command only project set must never invoke launch surface probe"
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_projects_invoke_readiness_once_and_launch_surface_at_most_once() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let agent_bin = temp_dir.path().join("my-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&agent_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    let mut server_targets = Vec::new();
+
+    // 2 explicit command projects, 2 logical projects
+    for i in 1..=4 {
+        let tid = format!("tgt_mixed_{i}");
+        let repo_dir = _temp.path().join(format!("mixed-repo-{i}"));
+        init_git_repo(
+            &repo_dir,
+            Some(&format!("https://github.com/org/mixed-repo-{i}.git")),
+        );
+
+        server_targets.push(serde_json::json!({
+            "target": {
+                "id": tid,
+                "workspace_id": "ws_1",
+                "alias": format!("mixed-proj-{i}"),
+                "display_name": format!("Mixed Project {i}"),
+                "kind": "ordinary",
+                "repository": { "provider": "github", "external_id": format!("{i}"), "full_name": format!("org/mixed-repo-{i}") },
+                "disabled": false,
+                "is_default_agent_runtime": false
+            },
+            "this_device_binding": { "id": format!("bnd_{i}"), "enabled": true },
+            "active_binding_count": 1
+        }));
+
+        let exec = if i <= 2 {
+            LocalExecutorConfig::new("custom".into(), agent_bin.display().to_string()).unwrap()
+        } else {
+            LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()
+        };
+
+        cfg.targets.insert(
+            format!("tgt_mixed_{i}"),
+            LocalTarget {
+                local_path: repo_dir.display().to_string(),
+                executor: Some(exec),
+            },
+        );
+    }
+    cfg.save(&paths.config_file()).unwrap();
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(200, &serde_json::json!({ "targets": server_targets }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let probe = CountingMockProbe::new(OrcaRuntimeReadiness::Ready, AgentLaunchSurface::Available);
+    let items = build_project_display_items_with_probe(&paths, Some(&probe))
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 4);
+    for item in &items {
+        assert_eq!(item.status, "READY");
+        assert_eq!(
+            item.runnable.as_ref().map(|r| r.status),
+            Some(ProjectRunnableStatus::Runnable)
+        );
+    }
+
+    // Readiness probed once
+    assert_eq!(probe.readiness_probes.load(Ordering::SeqCst), 1);
+    // Launch surface probed AT MOST ONCE (exactly 1 time across all 4 mixed projects)
+    assert_eq!(
+        probe.surface_probes.load(Ordering::SeqCst),
+        1,
+        "mixed project set must probe launch surface at most once"
+    );
+}
+
+#[tokio::test]
+async fn test_logical_launch_probe_failure_renders_unknown_never_false_verdict() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let repo_dir = _temp.path().join("my-repo");
+    init_git_repo(&repo_dir, Some("https://github.com/org/repo.git"));
+
+    server.add_handler(|req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": "tgt_indeterminate_1",
+                            "workspace_id": "ws_1",
+                            "alias": "indeterminate-proj",
+                            "display_name": "Indeterminate Project",
+                            "kind": "ordinary",
+                            "repository": { "provider": "github", "external_id": "123", "full_name": "org/repo" },
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg.targets.insert(
+        "tgt_indeterminate_1".to_string(),
+        LocalTarget {
+            local_path: repo_dir.display().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()),
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    // Launch surface probe is Unknown (indeterminate probe failure)
+    let probe = CountingMockProbe::new(OrcaRuntimeReadiness::Ready, AgentLaunchSurface::Unknown);
+    let items = build_project_display_items_with_probe(&paths, Some(&probe))
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item.status, "READY");
+    let runnable = item.runnable.as_ref().unwrap();
+    assert_eq!(runnable.status, ProjectRunnableStatus::Unknown);
+    assert!(!runnable.is_runnable());
+    assert_eq!(runnable.code.as_deref(), Some("PROBE_FAILED"));
+
+    // Verify human rendering displays 'unknown (PROBE_FAILED)', NOT 'no (ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE)'
+    let human_show = render_project_show(item, false);
+    assert!(human_show.contains("  Config:          READY\n"));
+    assert!(human_show.contains("  Runnable:        unknown (PROBE_FAILED)\n"));
+    assert!(!human_show.contains("no (ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE)"));
+
+    let human_list = render_project_list(&items, false);
+    assert!(human_list.contains("  Config:     READY\n  Runnable:   unknown (PROBE_FAILED)\n"));
+    assert!(!human_list.contains("no (ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE)"));
+}

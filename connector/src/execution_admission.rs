@@ -72,6 +72,22 @@ impl ExecutionCompatibility {
         }
     }
 
+    /// User-facing explanatory message without severity code prefix.
+    pub fn reason(&self) -> String {
+        match self {
+            ExecutionCompatibility::MissingExecutor => "no agent executor configured".to_string(),
+            ExecutionCompatibility::InvalidExecutor(err) => {
+                format!("invalid executor configuration: {err}")
+            }
+            ExecutionCompatibility::AgentLaunchUnavailable { .. } => {
+                "installed Orca version does not expose the required orchestration Agent launch surface required by Connector".to_string()
+            }
+            ExecutionCompatibility::CommandUnavailable(cmd) => {
+                format!("configured command executable '{cmd}' not found in PATH")
+            }
+        }
+    }
+
     /// The configured command binary whose local executable discovery failed.
     pub fn missing_command(&self) -> Option<&str> {
         match self {
@@ -148,6 +164,51 @@ pub enum OrcaRuntimeReadiness {
     Ready,
     NotReady { code: String, reason: String },
     ProbeFailed { code: String, reason: String },
+}
+
+impl OrcaRuntimeReadiness {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, OrcaRuntimeReadiness::Ready)
+    }
+}
+
+/// Canonical evaluation of an Orca CLI status response into an `OrcaRuntimeReadiness` state.
+/// Ensures identical readiness semantics across daemon execution admission and project runnability.
+pub fn evaluate_orca_status_response(
+    status: &crate::orca::types::OrcaStatusResponse,
+) -> OrcaRuntimeReadiness {
+    if !status.ok {
+        return OrcaRuntimeReadiness::NotReady {
+            code: "ORCA_STATUS_FAILED".to_string(),
+            reason: "Orca status reported ok=false".to_string(),
+        };
+    }
+
+    let Some(ref res) = status.result else {
+        return OrcaRuntimeReadiness::NotReady {
+            code: "ORCA_STATUS_MISSING_RESULT".to_string(),
+            reason: "Orca status reported ok=true but result payload is missing".to_string(),
+        };
+    };
+
+    if !res.app.running {
+        return OrcaRuntimeReadiness::NotReady {
+            code: "ORCA_NOT_RUNNING".to_string(),
+            reason: "Orca desktop app is not running".to_string(),
+        };
+    }
+
+    if res.runtime.state != "ready" {
+        return OrcaRuntimeReadiness::NotReady {
+            code: "ORCA_RUNTIME_NOT_READY".to_string(),
+            reason: format!(
+                "Orca desktop app running, runtime state: {} (expected 'ready')",
+                res.runtime.state
+            ),
+        };
+    }
+
+    OrcaRuntimeReadiness::Ready
 }
 
 /// Machine-readable verdict on whether a Project is runnable on the current Device.
@@ -309,10 +370,22 @@ pub async fn target_execution_admission(
     evaluate_executor_compatibility(target_executor, probe).await
 }
 
+/// Helper to determine if a Project being assessed requires probing the Orca
+/// agent launch surface. Only structurally READY projects with a logical-only
+/// executor (command=None) need this capability probed.
+pub fn project_needs_launch_surface_probe(
+    structural_status: &str,
+    executor: Option<&LocalExecutorConfig>,
+) -> bool {
+    structural_status == "READY" && executor.is_some_and(|e| e.command.is_none())
+}
+
 /// Probes the device runtime environment once to obtain an immutable snapshot
-/// for evaluating project runnability.
+/// for evaluating project runnability. Probes runtime readiness once, and only
+/// probes agent launch surface if `needs_launch_surface` is true and runtime readiness is Ready.
 pub async fn probe_device_runtime_snapshot(
     probe: Option<&dyn ExecutionCompatibilityProbe>,
+    needs_launch_surface: bool,
 ) -> DeviceRuntimeSnapshot {
     let Some(p) = probe else {
         return DeviceRuntimeSnapshot {
@@ -325,13 +398,13 @@ pub async fn probe_device_runtime_snapshot(
     };
 
     let orca_readiness = p.probe_runtime_readiness().await;
-    let launch_surface = match orca_readiness {
-        OrcaRuntimeReadiness::Ready => p.probe_agent_launch_surface().await,
-        OrcaRuntimeReadiness::NotReady { ref code, .. } if code == "ORCA_CLI_NOT_FOUND" => {
-            AgentLaunchSurface::Unavailable
-        }
-        OrcaRuntimeReadiness::NotReady { .. } => p.probe_agent_launch_surface().await,
-        OrcaRuntimeReadiness::ProbeFailed { .. } => AgentLaunchSurface::Unknown,
+    let launch_surface = if needs_launch_surface && orca_readiness.is_ready() {
+        p.probe_agent_launch_surface().await
+    } else if matches!(&orca_readiness, OrcaRuntimeReadiness::NotReady { code, .. } if code == "ORCA_CLI_NOT_FOUND")
+    {
+        AgentLaunchSurface::Unavailable
+    } else {
+        AgentLaunchSurface::Unknown
     };
 
     DeviceRuntimeSnapshot {
@@ -340,12 +413,32 @@ pub async fn probe_device_runtime_snapshot(
     }
 }
 
+/// Maps an authoritative executor compatibility result and launch surface snapshot
+/// to a runnability verdict when Orca runtime is confirmed Ready.
+pub fn map_executor_compatibility_to_runnable(
+    compat: Result<(), &ExecutionCompatibility>,
+    launch_surface: AgentLaunchSurface,
+) -> ProjectRunnableAssessment {
+    match compat {
+        Ok(()) => ProjectRunnableAssessment::runnable(),
+        Err(ExecutionCompatibility::AgentLaunchUnavailable { .. })
+            if launch_surface == AgentLaunchSurface::Unknown =>
+        {
+            ProjectRunnableAssessment::unknown(
+                "PROBE_FAILED",
+                "Orca Agent launch capability probe failed or could not be determined",
+            )
+        }
+        Err(err) => ProjectRunnableAssessment::not_runnable(err.code(), err.reason()),
+    }
+}
+
 /// Evaluates whether a Project is currently runnable on this Device.
 ///
 /// Runnable=true only when BOTH structural/local Project prerequisites represented
 /// by current Project/Target state are acceptable for execution AND the current
-/// Device/runtime/executor is presently admissible using existing execution-admission
-/// and runtime readiness facts.
+/// Device/runtime/executor is presently admissible using authoritative
+/// execution-admission and shared runtime readiness facts.
 pub fn evaluate_project_runnability(
     structural_status: &str,
     executor: Option<&LocalExecutorConfig>,
@@ -359,66 +452,33 @@ pub fn evaluate_project_runnability(
         );
     }
 
-    // 2. Executor configuration
-    let Some(exec) = executor else {
-        return ProjectRunnableAssessment::not_runnable(
-            "NO_EXECUTOR_CONFIGURED",
-            "no agent executor configured",
-        );
-    };
+    // 2. Authoritative executor compatibility evaluation
+    let compat = evaluate_executor_compatibility_with_surface(executor, snapshot.launch_surface);
 
-    if let Err(e) = exec.validate() {
-        return ProjectRunnableAssessment::not_runnable(
-            "INVALID_EXECUTOR",
-            format!("invalid executor configuration: {e}"),
-        );
+    // If executor configuration or command itself is invalid/missing, fail before checking runtime
+    match &compat {
+        Err(ExecutionCompatibility::MissingExecutor)
+        | Err(ExecutionCompatibility::InvalidExecutor(_))
+        | Err(ExecutionCompatibility::CommandUnavailable(_)) => {
+            let err = compat.as_ref().unwrap_err();
+            return ProjectRunnableAssessment::not_runnable(err.code(), err.reason());
+        }
+        _ => {}
     }
 
-    // 3. Command vs Logical executor compatibility & runtime readiness
-    match exec.command.as_deref() {
-        Some(cmd) => {
-            let bin = cmd.split_whitespace().next().unwrap_or(cmd);
-            if !executable_in_path(bin) {
-                return ProjectRunnableAssessment::not_runnable(
-                    "COMMAND_UNAVAILABLE",
-                    format!("configured command executable '{bin}' not found in PATH"),
-                );
-            }
-
-            match &snapshot.orca_readiness {
-                OrcaRuntimeReadiness::Ready => ProjectRunnableAssessment::runnable(),
-                OrcaRuntimeReadiness::NotReady { code, reason } => {
-                    ProjectRunnableAssessment::not_runnable(code, reason)
-                }
-                OrcaRuntimeReadiness::ProbeFailed { code, reason } => {
-                    ProjectRunnableAssessment::unknown(code, reason)
-                }
-            }
+    // 3. Orthogonal runtime readiness check
+    match &snapshot.orca_readiness {
+        OrcaRuntimeReadiness::ProbeFailed { code, reason } => {
+            return ProjectRunnableAssessment::unknown(code, reason);
         }
-        None => {
-            match &snapshot.orca_readiness {
-                OrcaRuntimeReadiness::ProbeFailed { code, reason } => {
-                    return ProjectRunnableAssessment::unknown(code, reason);
-                }
-                OrcaRuntimeReadiness::NotReady { code, reason } => {
-                    return ProjectRunnableAssessment::not_runnable(code, reason);
-                }
-                OrcaRuntimeReadiness::Ready => {}
-            }
-
-            match snapshot.launch_surface {
-                AgentLaunchSurface::Available => ProjectRunnableAssessment::runnable(),
-                AgentLaunchSurface::Unavailable => ProjectRunnableAssessment::not_runnable(
-                    ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE,
-                    "installed Orca version does not expose the required orchestration Agent launch surface required by Connector",
-                ),
-                AgentLaunchSurface::Unknown => ProjectRunnableAssessment::unknown(
-                    "PROBE_FAILED",
-                    "Orca Agent launch capability probe failed or could not be determined",
-                ),
-            }
+        OrcaRuntimeReadiness::NotReady { code, reason } => {
+            return ProjectRunnableAssessment::not_runnable(code, reason);
         }
+        OrcaRuntimeReadiness::Ready => {}
     }
+
+    // 4. Map remaining compatibility (logical launch surface) to runnability
+    map_executor_compatibility_to_runnable(compat.as_ref().copied(), snapshot.launch_surface)
 }
 
 #[cfg(test)]
@@ -697,5 +757,224 @@ mod tests {
         assert_eq!(res.status, ProjectRunnableStatus::Unknown);
         assert!(!res.is_runnable());
         assert_eq!(res.code.as_deref(), Some("PROBE_FAILED"));
+    }
+
+    #[test]
+    fn test_canonical_shared_readiness_parsing_and_adapter_semantics() {
+        use crate::orca::types::{
+            OrcaAppStatus, OrcaRuntimeStatus, OrcaStatusResponse, OrcaStatusResult,
+        };
+
+        // 1. ok=true with result=None MUST NOT be Ready, must be NotReady(ORCA_STATUS_MISSING_RESULT)
+        let missing_result = OrcaStatusResponse {
+            ok: true,
+            result: None,
+        };
+        let readiness = evaluate_orca_status_response(&missing_result);
+        assert_eq!(
+            readiness,
+            OrcaRuntimeReadiness::NotReady {
+                code: "ORCA_STATUS_MISSING_RESULT".to_string(),
+                reason: "Orca status reported ok=true but result payload is missing".to_string(),
+            }
+        );
+        assert!(!readiness.is_ready());
+
+        // Check runnability also rejects this state as not runnable
+        let logical_exec = LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap();
+        let snapshot = DeviceRuntimeSnapshot {
+            orca_readiness: readiness,
+            launch_surface: AgentLaunchSurface::Available,
+        };
+        let run_res = evaluate_project_runnability("READY", Some(&logical_exec), &snapshot);
+        assert_eq!(run_res.status, ProjectRunnableStatus::NotRunnable);
+        assert_eq!(run_res.code.as_deref(), Some("ORCA_STATUS_MISSING_RESULT"));
+
+        // 2. ok=false
+        let status_failed = OrcaStatusResponse {
+            ok: false,
+            result: None,
+        };
+        let readiness = evaluate_orca_status_response(&status_failed);
+        assert_eq!(
+            readiness,
+            OrcaRuntimeReadiness::NotReady {
+                code: "ORCA_STATUS_FAILED".to_string(),
+                reason: "Orca status reported ok=false".to_string(),
+            }
+        );
+        assert!(!readiness.is_ready());
+
+        // 3. ok=true, app not running
+        let app_down = OrcaStatusResponse {
+            ok: true,
+            result: Some(OrcaStatusResult {
+                app: OrcaAppStatus {
+                    running: false,
+                    pid: None,
+                },
+                runtime: OrcaRuntimeStatus {
+                    state: "ready".into(),
+                    reachable: true,
+                    app_version: Some("1.0.0".into()),
+                },
+            }),
+        };
+        let readiness = evaluate_orca_status_response(&app_down);
+        assert_eq!(
+            readiness,
+            OrcaRuntimeReadiness::NotReady {
+                code: "ORCA_NOT_RUNNING".to_string(),
+                reason: "Orca desktop app is not running".to_string(),
+            }
+        );
+        assert!(!readiness.is_ready());
+
+        // 4. ok=true, app running but runtime not ready
+        let runtime_starting = OrcaStatusResponse {
+            ok: true,
+            result: Some(OrcaStatusResult {
+                app: OrcaAppStatus {
+                    running: true,
+                    pid: Some(1234),
+                },
+                runtime: OrcaRuntimeStatus {
+                    state: "starting".into(),
+                    reachable: true,
+                    app_version: Some("1.0.0".into()),
+                },
+            }),
+        };
+        let readiness = evaluate_orca_status_response(&runtime_starting);
+        assert_eq!(
+            readiness,
+            OrcaRuntimeReadiness::NotReady {
+                code: "ORCA_RUNTIME_NOT_READY".to_string(),
+                reason: "Orca desktop app running, runtime state: starting (expected 'ready')"
+                    .to_string(),
+            }
+        );
+        assert!(!readiness.is_ready());
+
+        // 5. ok=true, app running, runtime ready
+        let ready = OrcaStatusResponse {
+            ok: true,
+            result: Some(OrcaStatusResult {
+                app: OrcaAppStatus {
+                    running: true,
+                    pid: Some(1234),
+                },
+                runtime: OrcaRuntimeStatus {
+                    state: "ready".into(),
+                    reachable: true,
+                    app_version: Some("1.0.0".into()),
+                },
+            }),
+        };
+        let readiness = evaluate_orca_status_response(&ready);
+        assert_eq!(readiness, OrcaRuntimeReadiness::Ready);
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn test_executor_compatibility_evaluator_codes_match_project_runnability() {
+        let ready_snapshot = DeviceRuntimeSnapshot {
+            orca_readiness: OrcaRuntimeReadiness::Ready,
+            launch_surface: AgentLaunchSurface::Available,
+        };
+
+        // Missing executor
+        let missing_err = ExecutionCompatibility::MissingExecutor;
+        let res = evaluate_project_runnability("READY", None, &ready_snapshot);
+        assert_eq!(res.status, ProjectRunnableStatus::NotRunnable);
+        assert_eq!(res.code.unwrap(), missing_err.code());
+        assert_eq!(res.reason.unwrap(), missing_err.reason());
+
+        // Invalid executor
+        let invalid = LocalExecutorConfig {
+            kind: "orca_tui".into(),
+            agent_id: "bad agent!".into(),
+            command: None,
+            model: None,
+        };
+        let invalid_err = evaluate_executor_compatibility_with_surface(
+            Some(&invalid),
+            AgentLaunchSurface::Available,
+        )
+        .unwrap_err();
+        let res = evaluate_project_runnability("READY", Some(&invalid), &ready_snapshot);
+        assert_eq!(res.status, ProjectRunnableStatus::NotRunnable);
+        assert_eq!(res.code.unwrap(), invalid_err.code());
+        assert_eq!(res.reason.unwrap(), invalid_err.reason());
+
+        // Command unavailable
+        let missing_cmd_exec =
+            LocalExecutorConfig::new("cursor".into(), "non-existent-binary-for-test-9999".into())
+                .unwrap();
+        let cmd_err = evaluate_executor_compatibility_with_surface(
+            Some(&missing_cmd_exec),
+            AgentLaunchSurface::Available,
+        )
+        .unwrap_err();
+        let res = evaluate_project_runnability("READY", Some(&missing_cmd_exec), &ready_snapshot);
+        assert_eq!(res.status, ProjectRunnableStatus::NotRunnable);
+        assert_eq!(res.code.unwrap(), cmd_err.code());
+        assert_eq!(res.reason.unwrap(), cmd_err.reason());
+
+        // Logical unavailable
+        let logical_exec = LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap();
+        let unavail_snapshot = DeviceRuntimeSnapshot {
+            orca_readiness: OrcaRuntimeReadiness::Ready,
+            launch_surface: AgentLaunchSurface::Unavailable,
+        };
+        let logical_err = evaluate_executor_compatibility_with_surface(
+            Some(&logical_exec),
+            AgentLaunchSurface::Unavailable,
+        )
+        .unwrap_err();
+        let res = evaluate_project_runnability("READY", Some(&logical_exec), &unavail_snapshot);
+        assert_eq!(res.status, ProjectRunnableStatus::NotRunnable);
+        assert_eq!(res.code.unwrap(), logical_err.code());
+        assert_eq!(res.reason.unwrap(), logical_err.reason());
+    }
+
+    #[test]
+    fn test_project_needs_launch_surface_probe_rules() {
+        let logical_exec = LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let agent_bin = temp.path().join("fake-agent");
+        std::fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+        let cmd_exec =
+            LocalExecutorConfig::new("agy".into(), agent_bin.display().to_string()).unwrap();
+
+        // 1. Structurally READY + logical executor => true
+        assert!(project_needs_launch_surface_probe(
+            "READY",
+            Some(&logical_exec)
+        ));
+
+        // 2. Structurally READY + command executor => false
+        assert!(!project_needs_launch_surface_probe(
+            "READY",
+            Some(&cmd_exec)
+        ));
+
+        // 3. Structurally READY + no executor => false
+        assert!(!project_needs_launch_surface_probe("READY", None));
+
+        // 4. Structurally non-READY + logical executor => false
+        for status in &[
+            "UNBOUND",
+            "PATH_MISSING",
+            "TARGET_DISABLED",
+            "REPOSITORY_MISMATCH",
+            "LOCAL_ONLY",
+            "SERVER_BOUND_NOT_LOCAL",
+        ] {
+            assert!(
+                !project_needs_launch_surface_probe(status, Some(&logical_exec)),
+                "status {status} must not trigger launch surface probe"
+            );
+        }
     }
 }
