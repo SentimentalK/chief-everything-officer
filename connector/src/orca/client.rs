@@ -449,16 +449,21 @@ impl OrcaCliClient {
         &self,
         from_terminal: &str,
         objective: &str,
+        retry_request: Option<&str>,
     ) -> Result<OrcaRunItem, OrcaError> {
-        let args = vec![
+        let mut args = vec![
             "orchestration",
             "run-create",
             "--objective",
             objective,
             "--from",
             from_terminal,
-            "--json",
         ];
+        if let Some(req) = retry_request {
+            args.push("--retry-request");
+            args.push(req);
+        }
+        args.push("--json");
         let output = self
             .execute_command(&args, None, self.default_timeout)
             .await?;
@@ -472,31 +477,123 @@ impl OrcaCliClient {
     }
 
     pub async fn list_runs(&self) -> Result<Vec<OrcaRunItem>, OrcaError> {
-        let args = vec!["orchestration", "run-list", "--json"];
-        let output = self
-            .execute_command(&args, None, self.default_timeout)
-            .await?;
-        let resp: OrcaRunListResponse = parse_orca_json(output)?;
-        Ok(resp.result.map(|r| r.runs).unwrap_or_default())
+        let mut all_runs = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+
+        loop {
+            let mut args = vec!["orchestration", "run-list"];
+            let cursor_str;
+            if let Some(ref c) = cursor {
+                cursor_str = c.clone();
+                args.push("--cursor");
+                args.push(&cursor_str);
+            }
+            args.push("--json");
+
+            let output = self
+                .execute_command(&args, None, self.default_timeout)
+                .await?;
+            let resp: OrcaRunListResponse = parse_orca_json(output)?;
+            let result = resp.result.ok_or_else(|| {
+                OrcaError::Protocol(
+                    "run-list returned ok=true but missing result object".into(),
+                    String::new(),
+                )
+            })?;
+
+            let next_cursor_res = result.get_next_cursor();
+            all_runs.extend(result.runs);
+
+            match next_cursor_res {
+                Ok(Some(next)) => {
+                    if seen_cursors.contains(&next) || seen_cursors.len() >= 500 {
+                        return Err(OrcaError::Protocol(
+                            format!(
+                                "run-list pagination cycle or limit exceeded for cursor '{next}'"
+                            ),
+                            String::new(),
+                        ));
+                    }
+                    seen_cursors.insert(next.clone());
+                    cursor = Some(next);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(OrcaError::Protocol(
+                        format!("run-list malformed pagination: {err}"),
+                        String::new(),
+                    ));
+                }
+            }
+        }
+
+        Ok(all_runs)
     }
 
     pub async fn list_workers(
         &self,
         run_id: Option<&str>,
     ) -> Result<Vec<OrcaWorkerItem>, OrcaError> {
-        let mut args = vec!["orchestration", "worker-list"];
-        if let Some(r) = run_id {
-            args.push("--run");
-            args.push(r);
+        let mut all_workers = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+
+        loop {
+            let mut args = vec!["orchestration", "worker-list"];
+            if let Some(r) = run_id {
+                args.push("--run");
+                args.push(r);
+            }
+            let cursor_str;
+            if let Some(ref c) = cursor {
+                cursor_str = c.clone();
+                args.push("--cursor");
+                args.push(&cursor_str);
+            }
+            args.push("--json");
+
+            let output = self
+                .execute_command(&args, None, self.default_timeout)
+                .await?;
+            let resp: OrcaWorkerListResponse = parse_orca_json(output)?;
+            let result = resp.result.ok_or_else(|| {
+                OrcaError::Protocol(
+                    "worker-list returned ok=true but missing result object".into(),
+                    String::new(),
+                )
+            })?;
+
+            let next_cursor_res = result.get_next_cursor();
+            all_workers.extend(result.workers);
+
+            match next_cursor_res {
+                Ok(Some(next)) => {
+                    if seen_cursors.contains(&next) || seen_cursors.len() >= 500 {
+                        return Err(OrcaError::Protocol(
+                            format!(
+                                "worker-list pagination cycle or limit exceeded for cursor '{next}'"
+                            ),
+                            String::new(),
+                        ));
+                    }
+                    seen_cursors.insert(next.clone());
+                    cursor = Some(next);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(OrcaError::Protocol(
+                        format!("worker-list malformed pagination: {err}"),
+                        String::new(),
+                    ));
+                }
+            }
         }
-        args.push("--json");
-        let output = self
-            .execute_command(&args, None, self.default_timeout)
-            .await?;
-        let resp: OrcaWorkerListResponse = parse_orca_json(output)?;
-        Ok(resp.result.map(|r| r.workers).unwrap_or_default())
+
+        Ok(all_workers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn worker_start(
         &self,
         from_terminal: &str,
@@ -505,6 +602,7 @@ impl OrcaCliClient {
         agent: &str,
         model: Option<&str>,
         spec: &str,
+        retry_request: Option<&str>,
     ) -> Result<OrcaWorkerStartResult, OrcaError> {
         let mut args = vec![
             "orchestration",
@@ -519,14 +617,18 @@ impl OrcaCliClient {
             agent,
             "--spec",
             spec,
-            "--json",
         ];
+        if let Some(req) = retry_request {
+            args.push("--retry-request");
+            args.push(req);
+        }
         if let Some(m) = model {
             if m != "auto" {
                 args.push("--model");
                 args.push(m);
             }
         }
+        args.push("--json");
         // Worker launch and agent readiness inside Orca may take up to 60s
         let launch_timeout = Duration::from_secs(75);
         let output = self.execute_command(&args, None, launch_timeout).await?;
@@ -534,6 +636,26 @@ impl OrcaCliClient {
         resp.result.ok_or_else(|| {
             OrcaError::Protocol(
                 "worker-start returned ok=true but missing result object".into(),
+                String::new(),
+            )
+        })
+    }
+
+    pub async fn request_show(&self, request_id: &str) -> Result<OrcaRequestShowResult, OrcaError> {
+        let args = vec![
+            "orchestration",
+            "request-show",
+            "--request",
+            request_id,
+            "--json",
+        ];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaRequestShowResponse = parse_orca_json(output)?;
+        resp.result.ok_or_else(|| {
+            OrcaError::Protocol(
+                "request-show returned ok=true but missing result object".into(),
                 String::new(),
             )
         })

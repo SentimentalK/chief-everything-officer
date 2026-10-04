@@ -344,6 +344,19 @@ pub struct OrcaRunCreateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaPageInfo {
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default, rename = "hasMore")]
+    pub has_more: Option<bool>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaRunListResponse {
     pub ok: bool,
     pub result: Option<OrcaRunListResult>,
@@ -352,9 +365,40 @@ pub struct OrcaRunListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaRunListResult {
+    #[serde(default)]
     pub runs: Vec<OrcaRunItem>,
     #[serde(default, rename = "nextCursor")]
     pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub page: Option<OrcaPageInfo>,
+}
+
+impl OrcaRunListResult {
+    pub fn get_next_cursor(&self) -> Result<Option<String>, String> {
+        if let Some(ref page) = self.page {
+            if page.has_more == Some(true) {
+                match page.next_cursor.as_deref().map(str::trim) {
+                    Some(c) if !c.is_empty() && c != "null" => return Ok(Some(c.to_string())),
+                    _ => {
+                        return Err("page.hasMore is true but nextCursor is missing or empty".into())
+                    }
+                }
+            }
+            if let Some(ref c) = page.next_cursor {
+                let trimmed = c.trim();
+                if !trimmed.is_empty() && trimmed != "null" {
+                    return Ok(Some(trimmed.to_string()));
+                }
+            }
+        }
+        if let Some(ref c) = self.next_cursor {
+            let trimmed = c.trim();
+            if !trimmed.is_empty() && trimmed != "null" {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +424,72 @@ pub struct OrcaWorkerListResponse {
 pub struct OrcaWorkerListResult {
     #[serde(default)]
     pub workers: Vec<OrcaWorkerItem>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub page: Option<OrcaPageInfo>,
+}
+
+impl OrcaWorkerListResult {
+    pub fn get_next_cursor(&self) -> Result<Option<String>, String> {
+        if let Some(ref page) = self.page {
+            if page.has_more == Some(true) {
+                match page.next_cursor.as_deref().map(str::trim) {
+                    Some(c) if !c.is_empty() && c != "null" => return Ok(Some(c.to_string())),
+                    _ => {
+                        return Err("page.hasMore is true but nextCursor is missing or empty".into())
+                    }
+                }
+            }
+            if let Some(ref c) = page.next_cursor {
+                let trimmed = c.trim();
+                if !trimmed.is_empty() && trimmed != "null" {
+                    return Ok(Some(trimmed.to_string()));
+                }
+            }
+        }
+        if let Some(ref c) = self.next_cursor {
+            let trimmed = c.trim();
+            if !trimmed.is_empty() && trimmed != "null" {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRequestShowResponse {
+    pub ok: bool,
+    pub result: Option<OrcaRequestShowResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaRequestShowResult {
+    pub request_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub receipt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub interpretation: Option<String>,
+}
+
+impl OrcaRequestShowResult {
+    pub fn is_completed(&self) -> bool {
+        self.state.eq_ignore_ascii_case("completed")
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.state.eq_ignore_ascii_case("pending")
+    }
+
+    pub fn is_absent(&self) -> bool {
+        self.state.eq_ignore_ascii_case("absent")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

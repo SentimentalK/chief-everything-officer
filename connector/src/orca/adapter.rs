@@ -3,7 +3,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::client::{OrcaCliClient, OrcaError};
-use super::types::{OrcaTerminalItem, TerminalLiveness};
+use super::types::{
+    OrcaRunCreateResult, OrcaRunItem, OrcaTerminalItem, OrcaWorkerStartResult, TerminalLiveness,
+};
 use crate::config::LocalTarget;
 use crate::scheduler::{
     ActiveAttempt, CleanupOutcome, DispatchOutcome, DispatchReconciliation, ExecutionAdapter,
@@ -20,6 +22,27 @@ impl Default for OrcaExecutionAdapter {
     fn default() -> Self {
         Self::new(OrcaCliClient::default())
     }
+}
+
+/// Derives a stable, deterministic per-Attempt mutation identity (UUID v5 format)
+/// for orchestration mutations (e.g. "run-create", "worker-start").
+/// Retries/restarts of the same Attempt reuse the same identity; different mutation kinds
+/// never share the same UUID.
+pub fn derive_mutation_request_id(mutation_kind: &str, attempt_id: &str) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ceo:orca:mutation:");
+    hasher.update(mutation_kind.as_bytes());
+    hasher.update(b":");
+    hasher.update(attempt_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    // Set RFC 4122 variant (bits 6-7 of byte 8 to 10)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    // Set RFC 4122 version 5 (bits 4-7 of byte 6 to 0101)
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    uuid::Uuid::from_bytes(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,7 +550,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                 .into_iter()
                                 .find(|r| r.objective.as_deref() == Some(&run_obj)),
                             Err(e) => {
-                                return Ok(PrepareOutcome::Retryable {
+                                return Ok(PrepareOutcome::RecoveryRequired {
                                     execution: None,
                                     reason: format!("failed to list orchestration runs: {e}"),
                                 });
@@ -536,34 +559,44 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
                         if let Some(existing_run) = existing_run {
                             // Run already exists. Check if a worker was already started and has an unambiguous live terminal.
-                            let recoverable_terminal =
-                                match self.client.list_workers(Some(&existing_run.id)).await {
-                                    Ok(workers) => {
-                                        let candidate_handles: Vec<String> = workers
-                                            .into_iter()
-                                            .filter_map(|w| w.agent_terminal_handle)
-                                            .filter(|h| !h.trim().is_empty())
-                                            .collect();
-                                        if candidate_handles.len() == 1 {
-                                            let handle =
-                                                candidate_handles.into_iter().next().unwrap();
-                                            match self.client.show_terminal(&handle).await {
-                                                Ok(Some(term))
-                                                    if term.worktree_id.as_deref()
-                                                        == Some(&worktree.id)
-                                                        && term.liveness()
-                                                            == TerminalLiveness::Live =>
-                                                {
-                                                    Some(handle)
-                                                }
-                                                _ => None,
+                            let recoverable_terminal = match self
+                                .client
+                                .list_workers(Some(&existing_run.id))
+                                .await
+                            {
+                                Ok(workers) => {
+                                    let candidate_handles: Vec<String> = workers
+                                        .into_iter()
+                                        .filter_map(|w| w.agent_terminal_handle)
+                                        .filter(|h| !h.trim().is_empty())
+                                        .collect();
+                                    if candidate_handles.len() == 1 {
+                                        let handle = candidate_handles.into_iter().next().unwrap();
+                                        match self.client.show_terminal(&handle).await {
+                                            Ok(Some(term))
+                                                if term.worktree_id.as_deref()
+                                                    == Some(&worktree.id)
+                                                    && term.liveness()
+                                                        == TerminalLiveness::Live =>
+                                            {
+                                                Some(handle)
                                             }
-                                        } else {
-                                            None
+                                            _ => None,
                                         }
+                                    } else {
+                                        None
                                     }
-                                    Err(_) => None,
-                                };
+                                }
+                                Err(e) => {
+                                    return Ok(PrepareOutcome::RecoveryRequired {
+                                            execution: None,
+                                            reason: format!(
+                                                "AMBIGUOUS_PREPARE_RETRY: failed to list workers for existing run '{}': {e}",
+                                                existing_run.id
+                                            ),
+                                        });
+                                }
+                            };
 
                             if let Some(handle) = recoverable_terminal {
                                 handle
@@ -588,15 +621,66 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                     format!("failed to reconcile coordinator terminal: {e}")
                                 })?;
 
-                            let run_item = self
+                            let run_retry_id =
+                                derive_mutation_request_id("run-create", &attempt.attempt_id)
+                                    .to_string();
+                            let worker_retry_id =
+                                derive_mutation_request_id("worker-start", &attempt.attempt_id)
+                                    .to_string();
+
+                            let run_item = match self
                                 .client
-                                .create_run(&coordinator_handle, &run_obj)
+                                .create_run(&coordinator_handle, &run_obj, Some(&run_retry_id))
                                 .await
-                                .map_err(|e| format!("failed to create orchestration run: {e}"))?;
+                            {
+                                Ok(r) => r,
+                                Err(e) => match self.client.request_show(&run_retry_id).await {
+                                    Ok(show) if show.is_completed() => {
+                                        if let Some(receipt) = show.receipt {
+                                            let unwrapped =
+                                                receipt.get("result").unwrap_or(&receipt);
+                                            if let Ok(res) =
+                                                serde_json::from_value::<OrcaRunCreateResult>(
+                                                    unwrapped.clone(),
+                                                )
+                                            {
+                                                res.run
+                                            } else if let Ok(run) =
+                                                serde_json::from_value::<OrcaRunItem>(
+                                                    unwrapped.clone(),
+                                                )
+                                            {
+                                                run
+                                            } else {
+                                                return Err(format!(
+                                                    "failed to recover run from request-show receipt: {e}"
+                                                ));
+                                            }
+                                        } else {
+                                            return Err(format!(
+                                                "request-show completed but missing receipt: {e}"
+                                            ));
+                                        }
+                                    }
+                                    Ok(show) if show.is_pending() => {
+                                        return Ok(PrepareOutcome::Retryable {
+                                            execution: None,
+                                            reason: format!(
+                                                "run-create mutation is still pending in Orca: {e}"
+                                            ),
+                                        });
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "failed to create orchestration run: {e}"
+                                        ));
+                                    }
+                                },
+                            };
 
                             let spec = format!("ceo:{}", attempt.attempt_id);
                             let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
-                            let worker_start_res = self
+                            let worker_start_res = match self
                                 .client
                                 .worker_start(
                                     &coordinator_handle,
@@ -605,9 +689,46 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                     &executor.agent_id,
                                     model_opt,
                                     &spec,
+                                    Some(&worker_retry_id),
                                 )
                                 .await
-                                .map_err(|e| format!("failed to start worker: {e}"))?;
+                            {
+                                Ok(w) => w,
+                                Err(e) => match self.client.request_show(&worker_retry_id).await {
+                                    Ok(show) if show.is_completed() => {
+                                        if let Some(receipt) = show.receipt {
+                                            let unwrapped =
+                                                receipt.get("result").unwrap_or(&receipt);
+                                            if let Ok(w) =
+                                                serde_json::from_value::<OrcaWorkerStartResult>(
+                                                    unwrapped.clone(),
+                                                )
+                                            {
+                                                w
+                                            } else {
+                                                return Err(format!(
+                                                    "failed to recover worker from request-show receipt: {e}"
+                                                ));
+                                            }
+                                        } else {
+                                            return Err(format!(
+                                                "request-show completed but missing receipt: {e}"
+                                            ));
+                                        }
+                                    }
+                                    Ok(show) if show.is_pending() => {
+                                        return Ok(PrepareOutcome::Retryable {
+                                            execution: None,
+                                            reason: format!(
+                                                "worker-start mutation is still pending in Orca: {e}"
+                                            ),
+                                        });
+                                    }
+                                    _ => {
+                                        return Err(format!("failed to start worker: {e}"));
+                                    }
+                                },
+                            };
 
                             worker_start_res.worker_terminal_handle().ok_or_else(|| {
                                 format!(
