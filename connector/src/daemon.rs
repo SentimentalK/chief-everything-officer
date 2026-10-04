@@ -1973,9 +1973,35 @@ pub async fn drive_active_attempt(
                 ))
             }
         }
-        AttemptPhase::RecoveryRequired => Err(DaemonError::RecoveryRequired(
-            "Active attempt is in recovery_required phase".into(),
-        )),
+        AttemptPhase::RecoveryRequired => {
+            // Bounded convergence repair: a locally persisted recovery_required
+            // attempt (e.g. prepare failed after the Server authoritatively
+            // cancelled the job) would otherwise block this device forever.
+            // When the Server's device-scoped read model proves terminal
+            // CANCELLED for this exact attempt, converge the local durable
+            // state through the existing operator-cancel finalization. Any
+            // other server state, missing/ambiguous attempt identity,
+            // transport failure, or attempt mismatch remains fail-closed
+            // recovery_required.
+            match client.get_job(cred, &active.job_id, false).await {
+                Ok(detail)
+                    if detail.state == "terminal"
+                        && detail.execution_status.as_deref() == Some("CANCELLED")
+                        && detail.execution.as_ref().map(|e| e.attempt_id.as_str())
+                            == Some(active.attempt_id.as_str()) =>
+                {
+                    finalize_local_operator_cancelled(paths, &active)?;
+                    println!(
+                        "Job '{}' was operator-cancelled on the server; local recovery_required attempt terminalized as cancelled.",
+                        active.job_id
+                    );
+                    Ok(true)
+                }
+                Ok(_) | Err(_) => Err(DaemonError::RecoveryRequired(
+                    "Active attempt is in recovery_required phase".into(),
+                )),
+            }
+        }
         AttemptPhase::LegacyRunning => {
             let _lock = ExecutionLock::acquire_with_retry(
                 &paths.state_lock_file(),

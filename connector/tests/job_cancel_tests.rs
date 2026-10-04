@@ -453,6 +453,207 @@ async fn live_waiting_attempt_observes_operator_cancel_and_interrupts() {
     assert!(parsed["terminal_report_sha256"].is_string());
 }
 
+fn cancelled_job_detail_json_with_attempt(job_id: &str, attempt_id: &str) -> serde_json::Value {
+    let mut detail = cancelled_job_detail_json(job_id);
+    detail["execution"] = serde_json::json!({
+        "attempt_id": attempt_id,
+        "phase": "claimed",
+        "claimed_at": "2026-09-29T00:00:05.000Z",
+        "started_at": null
+    });
+    detail
+}
+
+// ------------------------- recovery_required -> server-cancel convergence
+
+async fn drive_recovery_required_attempt(
+    server: &MockServer,
+    attempt_id: &str,
+) -> (
+    tempfile::TempDir,
+    ConnectorPaths,
+    Result<bool, ceo_connector::daemon::DaemonError>,
+) {
+    let (temp, paths, cred) = setup_test_env(&server.origin());
+    let mut active = make_waiting_attempt(&cred, attempt_id.to_string());
+    active.phase = AttemptPhase::RecoveryRequired;
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter::default());
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let res = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    (temp, paths, res)
+}
+
+#[tokio::test]
+async fn recovery_required_converges_when_server_cancelled_exact_attempt() {
+    let server = MockServer::start().await;
+    let attempt_id = "att-7a8140bc-1dec-43be-90fe-91eab39864eb".to_string();
+    let detail = cancelled_job_detail_json_with_attempt("job_mock_1", &attempt_id);
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse::json(200, &detail);
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    let advanced = res.unwrap();
+    assert!(advanced);
+
+    // Local durable active attempt cleaned up without manual deletion.
+    assert!(!paths.active_attempt_file().exists());
+
+    // Reuses operator-cancel finalization semantics: sanitized cancelled history.
+    let hist = paths.history_file("job_mock_1", &attempt_id);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hist).unwrap()).unwrap();
+    assert_eq!(parsed["status"], "cancelled");
+    assert_eq!(parsed["receipt_sha256"], serde_json::Value::Null);
+    assert!(parsed["terminal_report_sha256"].is_string());
+}
+
+#[tokio::test]
+async fn recovery_required_stays_blocked_on_server_attempt_mismatch() {
+    let server = MockServer::start().await;
+    let detail =
+        cancelled_job_detail_json_with_attempt("job_mock_1", "att-other-0000-0000-000000000000");
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse::json(200, &detail);
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let attempt_id = "att-7a8140bc-1dec-43be-90fe-91eab39864eb".to_string();
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    match res.unwrap_err() {
+        ceo_connector::daemon::DaemonError::RecoveryRequired(_) => {}
+        other => panic!("expected RecoveryRequired, got {other:?}"),
+    }
+
+    // Fail closed: attempt remains durable, no cancellation history written.
+    let active = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("active attempt must remain blocked");
+    assert_eq!(active.attempt_id, attempt_id);
+    assert_eq!(active.phase, AttemptPhase::RecoveryRequired);
+    assert!(!paths.history_file("job_mock_1", &attempt_id).exists());
+}
+
+#[tokio::test]
+async fn recovery_required_stays_blocked_on_non_cancelled_terminal() {
+    let server = MockServer::start().await;
+    let attempt_id = "att-7a8140bc-1dec-43be-90fe-91eab39864eb".to_string();
+    let mut detail = cancelled_job_detail_json_with_attempt("job_mock_1", &attempt_id);
+    detail["execution_status"] = serde_json::json!("COMPLETED");
+    detail["business_outcome"] = serde_json::json!("VERIFIED");
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse::json(200, &detail);
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    match res.unwrap_err() {
+        ceo_connector::daemon::DaemonError::RecoveryRequired(_) => {}
+        other => panic!("expected RecoveryRequired, got {other:?}"),
+    }
+
+    let active = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("active attempt must remain blocked");
+    assert_eq!(active.attempt_id, attempt_id);
+    assert_eq!(active.phase, AttemptPhase::RecoveryRequired);
+    assert!(!paths.history_file("job_mock_1", &attempt_id).exists());
+}
+
+#[tokio::test]
+async fn recovery_required_stays_blocked_when_attempt_identity_ambiguous() {
+    let server = MockServer::start().await;
+    // Terminal CANCELLED but missing execution part: attempt identity is
+    // ambiguous, so the local attempt must stay blocked.
+    let detail = cancelled_job_detail_json("job_mock_1");
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse::json(200, &detail);
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let attempt_id = "att-7a8140bc-1dec-43be-90fe-91eab39864eb".to_string();
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    match res.unwrap_err() {
+        ceo_connector::daemon::DaemonError::RecoveryRequired(_) => {}
+        other => panic!("expected RecoveryRequired, got {other:?}"),
+    }
+
+    let active = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("active attempt must remain blocked");
+    assert_eq!(active.attempt_id, attempt_id);
+    assert_eq!(active.phase, AttemptPhase::RecoveryRequired);
+    assert!(!paths.history_file("job_mock_1", &attempt_id).exists());
+}
+
+#[tokio::test]
+async fn recovery_required_stays_blocked_on_transport_failure() {
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            };
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let attempt_id = "att-7a8140bc-1dec-43be-90fe-91eab39864eb".to_string();
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    match res.unwrap_err() {
+        ceo_connector::daemon::DaemonError::RecoveryRequired(_) => {}
+        other => panic!("expected RecoveryRequired, got {other:?}"),
+    }
+
+    let active = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("active attempt must remain blocked");
+    assert_eq!(active.attempt_id, attempt_id);
+    assert_eq!(active.phase, AttemptPhase::RecoveryRequired);
+    assert!(!paths.history_file("job_mock_1", &attempt_id).exists());
+}
+
 // ------------------------------------ late report vs operator cancel race
 
 #[tokio::test]
