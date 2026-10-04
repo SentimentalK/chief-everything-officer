@@ -127,14 +127,19 @@ async fn v1_6_observe_only_acceptance_pending_observed_zero_claims() {
     let target_dir = temp.path().join("local_tgt");
     fs::create_dir_all(&target_dir).unwrap();
 
+    // Legacy explicit command executors are admission-gated on local
+    // executable discovery; point the command at a locally existing file.
+    let agent_bin = temp.path().join("fake-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+    let agent_cmd = agent_bin.display().to_string();
+
     let mut config = LocalConfig::new(server.origin()).unwrap();
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
-                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
-                    .unwrap(),
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), agent_cmd).unwrap(),
             ),
         },
     );
@@ -289,14 +294,19 @@ async fn claim_intent_persisted_before_network_and_lost_response_replayed() {
     let target_dir = temp.path().join("local_tgt");
     fs::create_dir_all(&target_dir).unwrap();
 
+    // Legacy explicit command executors are admission-gated on local
+    // executable discovery; point the command at a locally existing file.
+    let agent_bin = temp.path().join("fake-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+    let agent_cmd = agent_bin.display().to_string();
+
     let mut config = LocalConfig::new(server.origin()).unwrap();
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
-                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
-                    .unwrap(),
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), agent_cmd).unwrap(),
             ),
         },
     );
@@ -523,14 +533,19 @@ async fn run_claim_mismatch_case(
     let target_dir = temp.path().join("local_tgt");
     fs::create_dir_all(&target_dir).unwrap();
 
+    // Legacy explicit command executors are admission-gated on local
+    // executable discovery; point the command at a locally existing file.
+    let agent_bin = temp.path().join("fake-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+    let agent_cmd = agent_bin.display().to_string();
+
     let mut config = LocalConfig::new(server.origin()).unwrap();
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
-                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
-                    .unwrap(),
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), agent_cmd).unwrap(),
             ),
         },
     );
@@ -751,14 +766,19 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
     let target_dir = temp.path().join("local_tgt");
     fs::create_dir_all(&target_dir).unwrap();
 
+    // Legacy explicit command executors are admission-gated on local
+    // executable discovery; point the command at a locally existing file.
+    let agent_bin = temp.path().join("fake-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+    let agent_cmd = agent_bin.display().to_string();
+
     let mut config = LocalConfig::new(server.origin()).unwrap();
     config.targets.insert(
         "tgt_1".into(),
         LocalTarget {
             local_path: target_dir.to_string_lossy().to_string(),
             executor: Some(
-                ceo_connector::config::LocalExecutorConfig::new("agy".into(), "agy".into())
-                    .unwrap(),
+                ceo_connector::config::LocalExecutorConfig::new("agy".into(), agent_cmd).unwrap(),
             ),
         },
     );

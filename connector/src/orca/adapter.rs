@@ -423,7 +423,10 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     } else {
                         return Ok(PrepareOutcome::RecoveryRequired {
                             execution: None,
-                            reason: "ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector".to_string(),
+                            reason: format!(
+                                "{}: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector",
+                                crate::execution_admission::ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE
+                            ),
                         });
                     };
 

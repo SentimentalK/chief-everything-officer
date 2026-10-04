@@ -5,6 +5,7 @@ pub mod credential;
 pub mod daemon;
 pub mod doctor;
 pub mod enrollment;
+pub mod execution_admission;
 pub mod execution_contract;
 pub mod jobs;
 pub mod local_state;

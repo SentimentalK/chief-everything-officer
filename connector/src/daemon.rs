@@ -94,6 +94,26 @@ pub async fn run_daemon_with_hooks(
     max_iterations: Option<usize>,
     hooks: DaemonHooks,
 ) -> Result<(), DaemonError> {
+    run_daemon_with_hooks_and_admission_orca(
+        paths,
+        adapter,
+        max_iterations,
+        hooks,
+        crate::orca::client::OrcaCliClient::default(),
+    )
+    .await
+}
+
+/// Like [`run_daemon_with_hooks`], but takes the Orca CLI client used for the
+/// shared per-Target execution admission preflight. Production uses the
+/// default Orca discovery; tests inject a deterministic probe.
+pub async fn run_daemon_with_hooks_and_admission_orca(
+    paths: &ConnectorPaths,
+    adapter: Arc<dyn ExecutionAdapter>,
+    max_iterations: Option<usize>,
+    hooks: DaemonHooks,
+    admission_orca: crate::orca::client::OrcaCliClient,
+) -> Result<(), DaemonError> {
     paths.ensure_dirs()?;
 
     // 1. Acquire resident daemon.lock
@@ -119,6 +139,12 @@ pub async fn run_daemon_with_hooks(
     let mut config = profile.config;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
+
+    // Shared per-Target execution admission probe (PROJECT-039 slice): the
+    // daemon probes the installed Orca launch surface independently of the
+    // execution adapter so incompatible executor configs are filtered before
+    // any ClaimIntent persistence or Server claim request.
+    let admission_probe = admission_orca;
 
     // 3. Reconcile enrollment & credential coexistence
     if let Ok(Some(sess)) = PendingEnrollmentSession::load(&paths.enrollment_file()) {
@@ -299,6 +325,23 @@ pub async fn run_daemon_with_hooks(
                 continue;
             }
 
+            // 9. Local execution admission preflight (shared policy with Doctor):
+            // a Project whose executor/runtime configuration cannot be launched
+            // on this Device is NOT claimable. Skip it and keep scanning the
+            // pending batch so a later compatible candidate is never starved.
+            if let Err(incompat) = crate::execution_admission::target_execution_admission(
+                local_t.executor.as_ref(),
+                Some(&admission_probe),
+            )
+            .await
+            {
+                eprintln!(
+                    "Skipping candidate for target '{}' (not locally launchable: {})",
+                    cand.target_id, incompat
+                );
+                continue;
+            }
+
             selected_candidate = Some(cand.clone());
             break;
         }
@@ -383,7 +426,27 @@ pub async fn run_daemon_with_hooks(
             }
 
             // Require candidate target still locally mapped (Item 11)
-            if !disk_config.targets.contains_key(&cand.target_id) {
+            let disk_target = match disk_config.targets.get(&cand.target_id) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Re-evaluate execution admission against the config reloaded
+            // under the state lock, immediately before ClaimIntent
+            // persistence and any Server claim request (PROJECT-039 slice).
+            // An incompatibility here leaves the Server Job queued: no claim
+            // intent is persisted, no claim request is made, and the Job is
+            // neither cancelled nor terminalized.
+            if let Err(incompat) = crate::execution_admission::target_execution_admission(
+                disk_target.executor.as_ref(),
+                Some(&admission_probe),
+            )
+            .await
+            {
+                eprintln!(
+                    "Candidate target '{}' became not locally launchable under state lock ({}). Leaving Server Job queued.",
+                    cand.target_id, incompat
+                );
                 continue;
             }
 

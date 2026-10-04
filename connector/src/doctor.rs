@@ -594,20 +594,37 @@ async fn check_server_integration(
                                         });
                                     }
                                 } else {
-                                    let supports_launch =
-                                        orca_client.supports_agent_session_launch().await;
-                                    if supports_launch {
-                                        checks.push(DiagnosticCheck {
+                                    // Shared admission policy (PROJECT-039
+                                    // slice): the daemon refuses to claim
+                                    // logical-only executors when the
+                                    // installed Orca lacks the Agent-aware
+                                    // launch surface; surface the same verdict
+                                    // as a Doctor FAIL.
+                                    let compatible = crate::execution_admission::evaluate_executor_compatibility(
+                                        Some(exec),
+                                        Some(orca_client),
+                                    )
+                                    .await;
+                                    match compatible {
+                                        Ok(()) => checks.push(DiagnosticCheck {
                                             name: format!("Target '{}' Agent Launch Surface", display),
                                             severity: DiagnosticSeverity::Pass,
                                             message: format!("Orca supports non-orchestrating Agent launch for '{}'", exec.agent_id),
-                                        });
-                                    } else {
-                                        checks.push(DiagnosticCheck {
-                                            name: format!("Target '{}' Agent Launch Compatibility", display),
-                                            severity: DiagnosticSeverity::Fail,
-                                            message: "ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector".to_string(),
-                                        });
+                                        }),
+                                        Err(crate::execution_admission::ExecutionCompatibility::AgentLaunchUnavailable { .. }) => {
+                                            checks.push(DiagnosticCheck {
+                                                name: format!("Target '{}' Agent Launch Compatibility", display),
+                                                severity: DiagnosticSeverity::Fail,
+                                                message: crate::execution_admission::ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string() + ": installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector",
+                                            });
+                                        }
+                                        Err(other) => {
+                                            checks.push(DiagnosticCheck {
+                                                name: format!("Target '{}' Agent Launch Compatibility", display),
+                                                severity: DiagnosticSeverity::Fail,
+                                                message: other.to_string(),
+                                            });
+                                        }
                                     }
                                 }
                             }

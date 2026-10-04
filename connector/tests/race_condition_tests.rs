@@ -42,6 +42,12 @@ async fn setup_race_environment(server: &MockServer) -> (tempfile::TempDir, Conn
     let target_dir = temp.path().join("repo");
     fs::create_dir_all(&target_dir).unwrap();
 
+    // Legacy explicit command executors are admission-gated on local
+    // executable discovery; point the command at a locally existing file.
+    let agent_bin = temp.path().join("fake-agent");
+    fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+    let agent_cmd = agent_bin.display().to_string();
+
     let cred = DeviceCredential::new(
         server.origin(),
         "usr_race".into(),
@@ -58,7 +64,7 @@ async fn setup_race_environment(server: &MockServer) -> (tempfile::TempDir, Conn
         "tgt_race".into(),
         LocalTarget {
             local_path: target_dir.to_string_lossy().to_string(),
-            executor: Some(LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap()),
+            executor: Some(LocalExecutorConfig::new("agy".into(), agent_cmd).unwrap()),
         },
     );
     config.save(&paths.config_file()).unwrap();
