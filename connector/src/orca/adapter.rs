@@ -130,10 +130,11 @@ impl OrcaExecutionAdapter {
         anchor_worktree_id: &str,
         device_id: &str,
     ) -> Result<String, String> {
-        let coordinator_title = if device_id.trim().is_empty() {
-            "ceo:coordinator".to_string()
-        } else {
+        let is_device_specific = !device_id.trim().is_empty();
+        let coordinator_title = if is_device_specific {
             format!("ceo:coordinator:{}", device_id.trim())
+        } else {
+            "ceo:coordinator".to_string()
         };
 
         // 1. Try durable record from coordinator_file if available
@@ -142,8 +143,11 @@ impl OrcaExecutionAdapter {
             if coord_file.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&coord_file) {
                     if let Ok(record) = serde_json::from_str::<CoordinatorRecord>(&content) {
-                        let record_matches =
-                            record.title == coordinator_title || record.title == "ceo:coordinator";
+                        let record_matches = if is_device_specific {
+                            record.title == coordinator_title
+                        } else {
+                            record.title == coordinator_title || record.title == "ceo:coordinator"
+                        };
                         if record_matches {
                             if let Ok(Some(term)) =
                                 self.client.show_terminal(&record.terminal_handle).await
@@ -161,8 +165,12 @@ impl OrcaExecutionAdapter {
         // 2. Scan live terminals in Orca for an existing live coordinator
         if let Ok(terms) = self.client.list_terminals(None).await {
             for term in terms {
-                let matches_title = term.title.as_deref() == Some(&coordinator_title)
-                    || term.title.as_deref() == Some("ceo:coordinator");
+                let matches_title = if is_device_specific {
+                    term.title.as_deref() == Some(&coordinator_title)
+                } else {
+                    term.title.as_deref() == Some(&coordinator_title)
+                        || term.title.as_deref() == Some("ceo:coordinator")
+                };
                 if matches_title && term.liveness() == TerminalLiveness::Live {
                     self.save_coordinator_record(
                         &term.handle,
@@ -509,43 +517,105 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                         term.handle
                     } else if self.client.supports_agent_session_launch().await {
                         // Logical Agent launch: orchestration launch via coordinator + run-create + worker-start
-                        let anchor_wt_id =
-                            self.resolve_coordinator_anchor_worktree(&worktree.id).await;
-                        let coordinator_handle = self
-                            .ensure_coordinator_terminal(&anchor_wt_id, &attempt.device_id)
-                            .await
-                            .map_err(|e| {
-                                format!("failed to reconcile coordinator terminal: {e}")
-                            })?;
-
                         let run_obj = format!("ceo:{}", attempt.attempt_id);
-                        let run_item = self
-                            .client
-                            .create_run(&coordinator_handle, &run_obj)
-                            .await
-                            .map_err(|e| format!("failed to create orchestration run: {e}"))?;
 
-                        let spec = format!("ceo:{}", attempt.attempt_id);
-                        let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
-                        let worker_start_res = self
-                            .client
-                            .worker_start(
-                                &coordinator_handle,
-                                &run_item.id,
-                                &worktree.id,
-                                &executor.agent_id,
-                                model_opt,
-                                &spec,
-                            )
-                            .await
-                            .map_err(|e| format!("failed to start worker: {e}"))?;
+                        // Guard against duplicate worker-start on prepare retry:
+                        // If an orchestration run already exists for this attempt in Orca, the first worker-start
+                        // may already have succeeded before local terminal identity was persisted.
+                        let existing_run = match self.client.list_runs().await {
+                            Ok(runs) => runs
+                                .into_iter()
+                                .find(|r| r.objective.as_deref() == Some(&run_obj)),
+                            Err(e) => {
+                                return Ok(PrepareOutcome::Retryable {
+                                    execution: None,
+                                    reason: format!("failed to list orchestration runs: {e}"),
+                                });
+                            }
+                        };
 
-                        worker_start_res.worker_terminal_handle().ok_or_else(|| {
-                            format!(
-                                "RECOVERY_REQUIRED: worker-start returned ok=true but no worker terminal handle could be correlated. Result: {:?}",
-                                worker_start_res
-                            )
-                        })?
+                        if let Some(existing_run) = existing_run {
+                            // Run already exists. Check if a worker was already started and has an unambiguous live terminal.
+                            let recoverable_terminal =
+                                match self.client.list_workers(Some(&existing_run.id)).await {
+                                    Ok(workers) => {
+                                        let candidate_handles: Vec<String> = workers
+                                            .into_iter()
+                                            .filter_map(|w| w.agent_terminal_handle)
+                                            .filter(|h| !h.trim().is_empty())
+                                            .collect();
+                                        if candidate_handles.len() == 1 {
+                                            let handle =
+                                                candidate_handles.into_iter().next().unwrap();
+                                            match self.client.show_terminal(&handle).await {
+                                                Ok(Some(term))
+                                                    if term.worktree_id.as_deref()
+                                                        == Some(&worktree.id)
+                                                        && term.liveness()
+                                                            == TerminalLiveness::Live =>
+                                                {
+                                                    Some(handle)
+                                                }
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    Err(_) => None,
+                                };
+
+                            if let Some(handle) = recoverable_terminal {
+                                handle
+                            } else {
+                                // Ambiguous retry boundary: first worker-start may already have succeeded or run is in
+                                // an unrecoverable/ambiguous state. Fail closed with RecoveryRequired to avoid issuing a second worker-start.
+                                return Ok(PrepareOutcome::RecoveryRequired {
+                                    execution: None,
+                                    reason: format!(
+                                        "AMBIGUOUS_PREPARE_RETRY: orchestration run '{}' already exists for attempt '{}' before local terminal identity was persisted, but no live worker terminal could be safely recovered; refusing duplicate worker-start",
+                                        existing_run.id, attempt.attempt_id
+                                    ),
+                                });
+                            }
+                        } else {
+                            let anchor_wt_id =
+                                self.resolve_coordinator_anchor_worktree(&worktree.id).await;
+                            let coordinator_handle = self
+                                .ensure_coordinator_terminal(&anchor_wt_id, &attempt.device_id)
+                                .await
+                                .map_err(|e| {
+                                    format!("failed to reconcile coordinator terminal: {e}")
+                                })?;
+
+                            let run_item = self
+                                .client
+                                .create_run(&coordinator_handle, &run_obj)
+                                .await
+                                .map_err(|e| format!("failed to create orchestration run: {e}"))?;
+
+                            let spec = format!("ceo:{}", attempt.attempt_id);
+                            let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
+                            let worker_start_res = self
+                                .client
+                                .worker_start(
+                                    &coordinator_handle,
+                                    &run_item.id,
+                                    &worktree.id,
+                                    &executor.agent_id,
+                                    model_opt,
+                                    &spec,
+                                )
+                                .await
+                                .map_err(|e| format!("failed to start worker: {e}"))?;
+
+                            worker_start_res.worker_terminal_handle().ok_or_else(|| {
+                                format!(
+                                    "RECOVERY_REQUIRED: worker-start returned ok=true but no worker terminal handle could be correlated. Result: {:?}",
+                                    worker_start_res
+                                )
+                            })?
+                        }
                     } else {
                         return Ok(PrepareOutcome::RecoveryRequired {
                             execution: None,

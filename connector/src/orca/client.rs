@@ -471,6 +471,32 @@ impl OrcaCliClient {
         })
     }
 
+    pub async fn list_runs(&self) -> Result<Vec<OrcaRunItem>, OrcaError> {
+        let args = vec!["orchestration", "run-list", "--json"];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaRunListResponse = parse_orca_json(output)?;
+        Ok(resp.result.map(|r| r.runs).unwrap_or_default())
+    }
+
+    pub async fn list_workers(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<OrcaWorkerItem>, OrcaError> {
+        let mut args = vec!["orchestration", "worker-list"];
+        if let Some(r) = run_id {
+            args.push("--run");
+            args.push(r);
+        }
+        args.push("--json");
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaWorkerListResponse = parse_orca_json(output)?;
+        Ok(resp.result.map(|r| r.workers).unwrap_or_default())
+    }
+
     pub async fn worker_start(
         &self,
         from_terminal: &str,

@@ -344,6 +344,45 @@ pub struct OrcaRunCreateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRunListResponse {
+    pub ok: bool,
+    pub result: Option<OrcaRunListResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRunListResult {
+    pub runs: Vec<OrcaRunItem>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaWorkerItem {
+    pub dispatch_id: Option<String>,
+    pub task_id: Option<String>,
+    pub run_id: Option<String>,
+    pub agent_terminal_handle: Option<String>,
+    pub worker_state: Option<String>,
+    pub dispatch_status: Option<String>,
+    pub terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorkerListResponse {
+    pub ok: bool,
+    pub result: Option<OrcaWorkerListResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorkerListResult {
+    #[serde(default)]
+    pub workers: Vec<OrcaWorkerItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrcaWorkerEffect {
     pub kind: String,
     #[serde(default)]
