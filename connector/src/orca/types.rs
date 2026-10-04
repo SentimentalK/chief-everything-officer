@@ -322,3 +322,102 @@ pub struct OrcaClosePart {
     pub pty_stop_verdict: Option<String>,
     pub pty_stop_reason: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRunItem {
+    pub id: String,
+    pub objective: Option<String>,
+    #[serde(rename = "coordinator_handle")]
+    pub coordinator_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRunCreateResponse {
+    pub ok: bool,
+    pub result: Option<OrcaRunCreateResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaRunCreateResult {
+    pub run: OrcaRunItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorkerEffect {
+    pub kind: String,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWorkerStartResponse {
+    pub ok: bool,
+    pub result: Option<OrcaWorkerStartResult>,
+    pub error: Option<OrcaErrorPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrcaWorkerStartResult {
+    #[serde(rename = "runId")]
+    pub run_id: Option<String>,
+    #[serde(rename = "taskId")]
+    pub task_id: Option<String>,
+    #[serde(rename = "dispatchId")]
+    pub dispatch_id: Option<String>,
+    pub state: Option<String>,
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub effects: Vec<OrcaWorkerEffect>,
+    #[serde(default)]
+    pub terminal_handle: Option<String>,
+}
+
+impl OrcaWorkerStartResult {
+    /// Defensively correlates the worker terminal handle from the worker-start response.
+    pub fn worker_terminal_handle(&self) -> Option<String> {
+        // 1. Direct field if present
+        if let Some(ref h) = self.terminal_handle {
+            if !h.trim().is_empty() {
+                return Some(h.trim().to_string());
+            }
+        }
+        // 2. Search effects for terminal role agent
+        for eff in &self.effects {
+            if eff.kind == "terminal" && eff.role.as_deref() == Some("agent") {
+                if let Some(ref id) = eff.id {
+                    if !id.trim().is_empty() {
+                        return Some(id.trim().to_string());
+                    }
+                }
+            }
+        }
+        // 3. Search effects for dispatch_input
+        for eff in &self.effects {
+            if eff.kind == "dispatch_input" {
+                if let Some(ref id) = eff.id {
+                    if !id.trim().is_empty() {
+                        return Some(id.trim().to_string());
+                    }
+                }
+            }
+        }
+        // 4. Any effect whose id starts with "term_"
+        for eff in &self.effects {
+            if let Some(ref id) = eff.id {
+                let trimmed = id.trim();
+                if trimmed.starts_with("term_") {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+}

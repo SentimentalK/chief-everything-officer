@@ -10,8 +10,8 @@
 //! 1. Missing executor is not claimable.
 //! 2. Invalid executor configuration is not claimable.
 //! 3. Logical-only executor (command=None) is not claimable unless Orca
-//!    exposes the required non-orchestrating existing-worktree Agent-aware
-//!    launch surface (`ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE` otherwise).
+//!    exposes the required orchestration Agent launch surface
+//!    (`ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE` otherwise).
 //! 4. Explicit legacy command executor remains supported, but is claimable
 //!    only if the configured command is locally executable using the shared
 //!    cross-platform executable discovery.
@@ -49,8 +49,8 @@ pub enum ExecutionCompatibility {
     /// Logical-only executor, but the installed Orca lacks the required
     /// Agent-aware launch surface.
     #[error(
-        "{code}: installed Orca version does not expose a non-orchestrating \
-existing-worktree Agent-aware launch surface required by Connector"
+        "{code}: installed Orca version does not expose the required orchestration \
+Agent launch surface required by Connector"
     )]
     AgentLaunchUnavailable { code: String },
     /// Explicit legacy command executor, but its configured command is not

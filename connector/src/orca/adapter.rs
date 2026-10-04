@@ -13,6 +13,7 @@ use crate::scheduler::{
 #[derive(Clone, Debug)]
 pub struct OrcaExecutionAdapter {
     pub client: OrcaCliClient,
+    pub paths: Option<crate::paths::ConnectorPaths>,
 }
 
 impl Default for OrcaExecutionAdapter {
@@ -89,9 +90,114 @@ pub fn send_prompt_turn_started(prompt: &super::types::OrcaSendPromptPart) -> bo
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoordinatorRecord {
+    pub schema_version: u32,
+    pub terminal_handle: String,
+    pub title: String,
+    pub worktree_id: String,
+    pub created_at_ms: i64,
+}
+
 impl OrcaExecutionAdapter {
     pub fn new(client: OrcaCliClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            paths: crate::paths::ConnectorPaths::resolve().ok(),
+        }
+    }
+
+    pub fn with_paths(mut self, paths: crate::paths::ConnectorPaths) -> Self {
+        self.paths = Some(paths);
+        self
+    }
+
+    pub async fn resolve_coordinator_anchor_worktree(&self, fallback_worktree_id: &str) -> String {
+        if let Ok(worktrees) = self.client.list_worktrees().await {
+            for wt in worktrees {
+                if wt.path.ends_with(crate::setup::AGENT_RUNTIME_TARGET_ALIAS)
+                    || wt.display_name.as_deref() == Some(crate::setup::AGENT_RUNTIME_TARGET_ALIAS)
+                {
+                    return wt.id;
+                }
+            }
+        }
+        fallback_worktree_id.to_string()
+    }
+
+    pub async fn ensure_coordinator_terminal(
+        &self,
+        anchor_worktree_id: &str,
+        device_id: &str,
+    ) -> Result<String, String> {
+        let coordinator_title = if device_id.trim().is_empty() {
+            "ceo:coordinator".to_string()
+        } else {
+            format!("ceo:coordinator:{}", device_id.trim())
+        };
+
+        // 1. Try durable record from coordinator_file if available
+        if let Some(ref paths) = self.paths {
+            let coord_file = paths.coordinator_file();
+            if coord_file.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&coord_file) {
+                    if let Ok(record) = serde_json::from_str::<CoordinatorRecord>(&content) {
+                        let record_matches =
+                            record.title == coordinator_title || record.title == "ceo:coordinator";
+                        if record_matches {
+                            if let Ok(Some(term)) =
+                                self.client.show_terminal(&record.terminal_handle).await
+                            {
+                                if term.liveness() == TerminalLiveness::Live {
+                                    return Ok(record.terminal_handle);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Scan live terminals in Orca for an existing live coordinator
+        if let Ok(terms) = self.client.list_terminals(None).await {
+            for term in terms {
+                let matches_title = term.title.as_deref() == Some(&coordinator_title)
+                    || term.title.as_deref() == Some("ceo:coordinator");
+                if matches_title && term.liveness() == TerminalLiveness::Live {
+                    self.save_coordinator_record(
+                        &term.handle,
+                        &coordinator_title,
+                        term.worktree_id.as_deref().unwrap_or(anchor_worktree_id),
+                    );
+                    return Ok(term.handle);
+                }
+            }
+        }
+
+        // 3. Create fresh coordinator terminal on anchor worktree
+        let created = self
+            .client
+            .create_terminal(anchor_worktree_id, &coordinator_title, None, None)
+            .await
+            .map_err(|e| format!("failed to create coordinator terminal: {e}"))?;
+
+        self.save_coordinator_record(&created.handle, &coordinator_title, anchor_worktree_id);
+        Ok(created.handle)
+    }
+
+    fn save_coordinator_record(&self, handle: &str, title: &str, worktree_id: &str) {
+        if let Some(ref paths) = self.paths {
+            let record = CoordinatorRecord {
+                schema_version: 1,
+                terminal_handle: handle.to_string(),
+                title: title.to_string(),
+                worktree_id: worktree_id.to_string(),
+                created_at_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&record) {
+                let _ = std::fs::write(paths.coordinator_file(), json);
+            }
+        }
     }
 
     async fn run_readiness_gate(
@@ -402,29 +508,49 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                             .map_err(|e| format!("failed to create terminal for attempt: {e}"))?;
                         term.handle
                     } else if self.client.supports_agent_session_launch().await {
-                        // Pure Agent-aware Orca launch: normal path passes logical agent_id and optional model.
-                        // Non-orchestrating, existing-worktree pure launch primitive.
-                        let agent_id = &executor.agent_id;
-                        let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
-                        let term = self
-                            .client
-                            .create_agent_terminal(
-                                &worktree.id,
-                                &expected_title,
-                                agent_id,
-                                model_opt,
-                                Some(&canonical_target_path),
-                            )
+                        // Logical Agent launch: orchestration launch via coordinator + run-create + worker-start
+                        let anchor_wt_id =
+                            self.resolve_coordinator_anchor_worktree(&worktree.id).await;
+                        let coordinator_handle = self
+                            .ensure_coordinator_terminal(&anchor_wt_id, &attempt.device_id)
                             .await
                             .map_err(|e| {
-                                format!("failed to create agent terminal for attempt: {e}")
+                                format!("failed to reconcile coordinator terminal: {e}")
                             })?;
-                        term.handle
+
+                        let run_obj = format!("ceo:{}", attempt.attempt_id);
+                        let run_item = self
+                            .client
+                            .create_run(&coordinator_handle, &run_obj)
+                            .await
+                            .map_err(|e| format!("failed to create orchestration run: {e}"))?;
+
+                        let spec = format!("ceo:{}", attempt.attempt_id);
+                        let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
+                        let worker_start_res = self
+                            .client
+                            .worker_start(
+                                &coordinator_handle,
+                                &run_item.id,
+                                &worktree.id,
+                                &executor.agent_id,
+                                model_opt,
+                                &spec,
+                            )
+                            .await
+                            .map_err(|e| format!("failed to start worker: {e}"))?;
+
+                        worker_start_res.worker_terminal_handle().ok_or_else(|| {
+                            format!(
+                                "RECOVERY_REQUIRED: worker-start returned ok=true but no worker terminal handle could be correlated. Result: {:?}",
+                                worker_start_res
+                            )
+                        })?
                     } else {
                         return Ok(PrepareOutcome::RecoveryRequired {
                             execution: None,
                             reason: format!(
-                                "{}: installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector",
+                                "{}: installed Orca version does not expose the required orchestration Agent launch surface required by Connector",
                                 crate::execution_admission::ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE
                             ),
                         });

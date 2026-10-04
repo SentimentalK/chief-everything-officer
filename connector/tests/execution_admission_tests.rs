@@ -653,7 +653,7 @@ async fn orca_capability_probe_is_not_awaited_under_state_lock() {
     let probe_log = temp.path().join("probe.log");
     let state_lock = paths.state_lock_file();
     let script = format!(
-        "#!/bin/sh\nprintf 'probe\\n' >> \"{log}\"\nif command -v flock >/dev/null 2>&1; then\n  if flock -x -n \"{lock}\" true 2>/dev/null; then\n    printf 'lock-acquired\\n' >> \"{log}\"\n  else\n    printf 'lock-blocked\\n' >> \"{log}\"\n  fi\nelse\n  printf 'flock-unavailable\\n' >> \"{log}\"\nfi\necho 'usage: terminal create [--agent]'\n",
+        "#!/bin/sh\nprintf 'probe\\n' >> \"{log}\"\nif command -v flock >/dev/null 2>&1; then\n  if flock -x -n \"{lock}\" true 2>/dev/null; then\n    printf 'lock-acquired\\n' >> \"{log}\"\n  else\n    printf 'lock-blocked\\n' >> \"{log}\"\n  fi\nelse\n  printf 'flock-unavailable\\n' >> \"{log}\"\nfi\necho 'usage: orca orchestration worker-start --agent <id>'\n",
         log = probe_log.display(),
         lock = state_lock.display()
     );

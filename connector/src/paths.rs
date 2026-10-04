@@ -131,6 +131,10 @@ impl ConnectorPaths {
             .join("managed-result.json")
     }
 
+    pub fn coordinator_file(&self) -> PathBuf {
+        self.root_dir.join("coordinator.json")
+    }
+
     pub fn tmp_dir(&self) -> PathBuf {
         self.root_dir.join("tmp")
     }
@@ -297,6 +301,7 @@ mod tests {
             paths.managed_result_file("att-1"),
             root.join("runtime/att-1/managed-result.json")
         );
+        assert_eq!(paths.coordinator_file(), root.join("coordinator.json"));
     }
 
     #[test]
@@ -311,6 +316,7 @@ mod tests {
             paths.enrollment_file(),
             paths.control_file(),
             paths.active_attempt_file(),
+            paths.coordinator_file(),
             paths.locks_dir(),
             paths.daemon_lock_file(),
             paths.state_lock_file(),

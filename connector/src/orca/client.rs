@@ -425,16 +425,10 @@ impl OrcaCliClient {
         Ok(output.stdout)
     }
 
-    pub async fn supports_agent_session_launch(&self) -> bool {
-        if std::env::var("CEO_FORCE_ORCA_AGENT_LAUNCH")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false)
-        {
-            return true;
-        }
+    pub async fn supports_orchestration_worker_start(&self) -> bool {
         let output = match self
             .execute_command(
-                &["terminal", "create", "--help"],
+                &["orchestration", "worker-start", "--help"],
                 None,
                 Duration::from_secs(3),
             )
@@ -443,7 +437,80 @@ impl OrcaCliClient {
             Ok(o) => o,
             Err(_) => return false,
         };
-        output.stdout.contains("--agent") || output.stderr.contains("--agent")
+        (output.stdout.contains("worker-start") || output.stderr.contains("worker-start"))
+            && (output.stdout.contains("--agent") || output.stderr.contains("--agent"))
+    }
+
+    pub async fn supports_agent_session_launch(&self) -> bool {
+        self.supports_orchestration_worker_start().await
+    }
+
+    pub async fn create_run(
+        &self,
+        from_terminal: &str,
+        objective: &str,
+    ) -> Result<OrcaRunItem, OrcaError> {
+        let args = vec![
+            "orchestration",
+            "run-create",
+            "--objective",
+            objective,
+            "--from",
+            from_terminal,
+            "--json",
+        ];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaRunCreateResponse = parse_orca_json(output)?;
+        resp.result.map(|r| r.run).ok_or_else(|| {
+            OrcaError::Protocol(
+                "run-create returned ok=true but missing run object".into(),
+                String::new(),
+            )
+        })
+    }
+
+    pub async fn worker_start(
+        &self,
+        from_terminal: &str,
+        run_id: &str,
+        worktree_selector: &str,
+        agent: &str,
+        model: Option<&str>,
+        spec: &str,
+    ) -> Result<OrcaWorkerStartResult, OrcaError> {
+        let mut args = vec![
+            "orchestration",
+            "worker-start",
+            "--from",
+            from_terminal,
+            "--run",
+            run_id,
+            "--worktree",
+            worktree_selector,
+            "--agent",
+            agent,
+            "--spec",
+            spec,
+            "--json",
+        ];
+        if let Some(m) = model {
+            if m != "auto" {
+                args.push("--model");
+                args.push(m);
+            }
+        }
+        // Worker launch and agent readiness inside Orca may take up to 60s
+        let launch_timeout = Duration::from_secs(75);
+        let output = self.execute_command(&args, None, launch_timeout).await?;
+        let resp: OrcaWorkerStartResponse = parse_orca_json(output)?;
+        resp.result.ok_or_else(|| {
+            OrcaError::Protocol(
+                "worker-start returned ok=true but missing result object".into(),
+                String::new(),
+            )
+        })
     }
 
     pub async fn create_agent_terminal(

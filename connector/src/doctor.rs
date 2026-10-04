@@ -609,14 +609,14 @@ async fn check_server_integration(
                                         Ok(()) => checks.push(DiagnosticCheck {
                                             name: format!("Target '{}' Agent Launch Surface", display),
                                             severity: DiagnosticSeverity::Pass,
-                                            message: format!("Orca supports non-orchestrating Agent launch for '{}'", exec.agent_id),
+                                            message: format!("Orca supports orchestration Agent launch for '{}'", exec.agent_id),
                                         }),
                                         Err(crate::execution_admission::ExecutionCompatibility::AgentLaunchUnavailable { .. }) => {
                                             checks.push(DiagnosticCheck {
-                                                name: format!("Target '{}' Agent Launch Compatibility", display),
-                                                severity: DiagnosticSeverity::Fail,
-                                                message: crate::execution_admission::ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string() + ": installed Orca version does not expose a non-orchestrating existing-worktree Agent-aware launch surface required by Connector",
-                                            });
+                                                 name: format!("Target '{}' Agent Launch Compatibility", display),
+                                                 severity: DiagnosticSeverity::Fail,
+                                                 message: crate::execution_admission::ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string() + ": installed Orca version does not expose the required orchestration Agent launch surface required by Connector",
+                                             });
                                         }
                                         Err(other) => {
                                             checks.push(DiagnosticCheck {

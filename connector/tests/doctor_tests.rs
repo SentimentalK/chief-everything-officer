@@ -37,6 +37,37 @@ echo '{"ok":true}'
     }
 }
 
+fn orchestration_mock_orca(temp: &tempfile::TempDir) -> OrcaCliClient {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = temp.path().join("mock-orca-orch");
+        let script = r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+    echo '{"ok":true,"result":{"app":{"running":true},"runtime":{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}'
+    exit 0
+fi
+if [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo 'orca orchestration worker-start --agent <id>'
+    exit 0
+fi
+echo '{"ok":true}'
+"#;
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+    #[cfg(windows)]
+    {
+        let script_path = temp.path().join("mock-orca-orch.cmd");
+        let script = "@echo off\r\nif \"%~1\"==\"status\" (\r\necho {\"ok\":true,\"result\":{\"app\":{\"running\":true},\"runtime\":{\"state\":\"ready\",\"reachable\":true,\"appVersion\":\"1.4.219\"}}}\r\nexit /b 0\r\n)\r\nif \"%~1\"==\"orchestration\" if \"%~2\"==\"worker-start\" (\r\necho orca orchestration worker-start --agent ^<id^>\r\nexit /b 0\r\n)\r\necho {\"ok\":true}\r\n";
+        fs::write(&script_path, script).unwrap();
+        OrcaCliClient::new(script_path)
+    }
+}
+
 fn init_git_repo(path: &std::path::Path, remote_url: &str) {
     fs::create_dir_all(path).unwrap();
     let status = Command::new("git")
@@ -602,10 +633,10 @@ async fn doctor_logical_agent_target_fails_when_pure_launch_unavailable() {
     );
     config.save(&paths.config_file()).unwrap();
 
-    let report = run_doctor(&paths, true).await;
+    let report = run_doctor_with_orca(&paths, true, healthy_mock_orca(&temp)).await;
     assert!(
         !report.overall_passed,
-        "Doctor must FAIL when Orca lacks pure agent launch surface for logical config"
+        "Doctor must FAIL when Orca lacks orchestration launch surface for logical config"
     );
 
     let compat_check = report
@@ -617,6 +648,84 @@ async fn doctor_logical_agent_target_fails_when_pure_launch_unavailable() {
     assert!(compat_check
         .message
         .contains("ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE"));
+}
+
+#[tokio::test]
+async fn doctor_logical_agent_target_passes_when_orchestration_launch_available() {
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_1",
+                    "device": { "id": "dev_1", "display_name": "Dev", "platform": "linux-x86_64" },
+                    "credential": { "id": "dcr_1", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": "tgt_logical",
+                            "workspace_id": "ws_1",
+                            "alias": "logical-target",
+                            "display_name": "Logical Target",
+                            "kind": "general_automation",
+                            "repository": null,
+                            "disabled": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let repo_dir = temp.path().join("logical_repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_logical".into(),
+        LocalTarget {
+            local_path: repo_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("auto".into(), None).unwrap()),
+        },
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    let report = run_doctor_with_orca(&paths, true, orchestration_mock_orca(&temp)).await;
+    let surface_check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "Target 'logical-target' Agent Launch Surface")
+        .expect("must contain surface check");
+    assert_eq!(surface_check.severity, DiagnosticSeverity::Pass);
 }
 
 #[tokio::test]
