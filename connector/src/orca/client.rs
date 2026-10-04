@@ -425,7 +425,53 @@ impl OrcaCliClient {
         Ok(output.stdout)
     }
 
-    pub async fn supports_orchestration_worker_start(&self) -> bool {
+    pub async fn probe_runtime_readiness(
+        &self,
+    ) -> crate::execution_admission::OrcaRuntimeReadiness {
+        match self.status().await {
+            Ok(status) if status.ok => {
+                if let Some(res) = status.result {
+                    let app_running = res.app.running;
+                    let runtime_state = res.runtime.state;
+                    if app_running && runtime_state == "ready" {
+                        crate::execution_admission::OrcaRuntimeReadiness::Ready
+                    } else if !app_running {
+                        crate::execution_admission::OrcaRuntimeReadiness::NotReady {
+                            code: "ORCA_NOT_RUNNING".to_string(),
+                            reason: "Orca desktop app is not running".to_string(),
+                        }
+                    } else {
+                        crate::execution_admission::OrcaRuntimeReadiness::NotReady {
+                            code: "ORCA_RUNTIME_NOT_READY".to_string(),
+                            reason: format!(
+                                "Orca desktop app running, runtime state: {runtime_state} (expected 'ready')"
+                            ),
+                        }
+                    }
+                } else {
+                    crate::execution_admission::OrcaRuntimeReadiness::Ready
+                }
+            }
+            Ok(_) => crate::execution_admission::OrcaRuntimeReadiness::NotReady {
+                code: "ORCA_STATUS_FAILED".to_string(),
+                reason: "Orca status reported ok=false".to_string(),
+            },
+            Err(OrcaError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                crate::execution_admission::OrcaRuntimeReadiness::NotReady {
+                    code: "ORCA_CLI_NOT_FOUND".to_string(),
+                    reason: "Orca CLI not found in PATH".to_string(),
+                }
+            }
+            Err(e) => crate::execution_admission::OrcaRuntimeReadiness::ProbeFailed {
+                code: "PROBE_FAILED".to_string(),
+                reason: format!("Orca status probe failed: {e}"),
+            },
+        }
+    }
+
+    pub async fn probe_agent_session_launch(
+        &self,
+    ) -> crate::execution_admission::AgentLaunchSurface {
         let output = match self
             .execute_command(
                 &["orchestration", "worker-start", "--help"],
@@ -435,10 +481,23 @@ impl OrcaCliClient {
             .await
         {
             Ok(o) => o,
-            Err(_) => return false,
+            Err(OrcaError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                return crate::execution_admission::AgentLaunchSurface::Unavailable;
+            }
+            Err(_) => return crate::execution_admission::AgentLaunchSurface::Unknown,
         };
-        (output.stdout.contains("worker-start") || output.stderr.contains("worker-start"))
+        if (output.stdout.contains("worker-start") || output.stderr.contains("worker-start"))
             && (output.stdout.contains("--agent") || output.stderr.contains("--agent"))
+        {
+            crate::execution_admission::AgentLaunchSurface::Available
+        } else {
+            crate::execution_admission::AgentLaunchSurface::Unavailable
+        }
+    }
+
+    pub async fn supports_orchestration_worker_start(&self) -> bool {
+        self.probe_agent_session_launch().await
+            == crate::execution_admission::AgentLaunchSurface::Available
     }
 
     pub async fn supports_agent_session_launch(&self) -> bool {

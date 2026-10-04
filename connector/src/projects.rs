@@ -8,6 +8,10 @@ use thiserror::Error;
 use crate::client::{ClientError, ConnectorClient, RegisterTargetRepoSource};
 use crate::config::{ConfigError, LocalConfig, LocalExecutorConfig, LocalTarget};
 use crate::credential::CredentialError;
+use crate::execution_admission::{
+    evaluate_project_runnability, probe_device_runtime_snapshot, ExecutionCompatibilityProbe,
+};
+pub use crate::execution_admission::{ProjectRunnableAssessment, ProjectRunnableStatus};
 use crate::local_state::ExecutionLock;
 use crate::orca::discovery::{AgentDiscovery, OrcaCliAgentDiscovery};
 use crate::paths::ConnectorPaths;
@@ -142,6 +146,8 @@ pub struct ProjectDisplayItem {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runnable: Option<ProjectRunnableAssessment>,
 }
 
 impl From<TargetDisplayItem> for ProjectDisplayItem {
@@ -164,6 +170,7 @@ impl From<TargetDisplayItem> for ProjectDisplayItem {
             repository: t.repository,
             agent_id: t.agent_id,
             model: t.model,
+            runnable: None,
         }
     }
 }
@@ -171,8 +178,52 @@ impl From<TargetDisplayItem> for ProjectDisplayItem {
 pub async fn build_project_display_items(
     paths: &ConnectorPaths,
 ) -> Result<Vec<ProjectDisplayItem>, ProjectError> {
+    build_project_display_items_with_probe(
+        paths,
+        Some(&crate::orca::client::OrcaCliClient::default()),
+    )
+    .await
+}
+
+pub async fn build_project_display_items_with_probe(
+    paths: &ConnectorPaths,
+    probe: Option<&dyn ExecutionCompatibilityProbe>,
+) -> Result<Vec<ProjectDisplayItem>, ProjectError> {
     let target_items = build_target_display_items(paths).await?;
-    Ok(target_items.into_iter().map(Into::into).collect())
+    let config = crate::config::load_current_config(paths).ok().flatten();
+    let snapshot = probe_device_runtime_snapshot(probe).await;
+
+    let items = target_items
+        .into_iter()
+        .map(|t| {
+            let synthetic_exec;
+            let executor = match config
+                .as_ref()
+                .and_then(|c| c.targets.get(&t.target_id))
+                .and_then(|lt| lt.executor.as_ref())
+            {
+                Some(e) => Some(e),
+                None => {
+                    if let Some(ref agent_id) = t.agent_id {
+                        synthetic_exec = LocalExecutorConfig::new_internal(
+                            agent_id.clone(),
+                            t.agent_command.clone(),
+                            t.model.clone(),
+                        )
+                        .ok();
+                        synthetic_exec.as_ref()
+                    } else {
+                        None
+                    }
+                }
+            };
+            let runnable = evaluate_project_runnability(&t.status, executor, &snapshot);
+            let mut item = ProjectDisplayItem::from(t);
+            item.runnable = Some(runnable);
+            item
+        })
+        .collect();
+    Ok(items)
 }
 
 fn color_status(status: &str, is_tty: bool) -> String {
@@ -194,6 +245,53 @@ fn bold(text: &str, is_tty: bool) -> String {
         text.to_string()
     } else {
         format!("\x1b[1m{text}\x1b[0m")
+    }
+}
+
+pub fn render_runnable_status(
+    runnable: Option<&ProjectRunnableAssessment>,
+    is_tty: bool,
+) -> String {
+    let Some(assessment) = runnable else {
+        return if is_tty {
+            "\x1b[33munknown (NOT_EVALUATED)\x1b[0m".to_string()
+        } else {
+            "unknown (NOT_EVALUATED)".to_string()
+        };
+    };
+
+    match assessment.status {
+        ProjectRunnableStatus::Runnable => {
+            if is_tty {
+                "\x1b[32myes\x1b[0m".to_string()
+            } else {
+                "yes".to_string()
+            }
+        }
+        ProjectRunnableStatus::NotRunnable => {
+            let code_str = assessment
+                .code
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            if is_tty {
+                format!("\x1b[31mno{}\x1b[0m", code_str)
+            } else {
+                format!("no{}", code_str)
+            }
+        }
+        ProjectRunnableStatus::Unknown => {
+            let code_str = assessment
+                .code
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            if is_tty {
+                format!("\x1b[33munknown{}\x1b[0m", code_str)
+            } else {
+                format!("unknown{}", code_str)
+            }
+        }
     }
 }
 
@@ -224,8 +322,12 @@ pub fn render_project_list(items: &[ProjectDisplayItem], is_tty: bool) -> String
             out.push_str(&format!("  Kind:       {kind}\n"));
         }
         out.push_str(&format!(
-            "  Status:     {}\n",
+            "  Config:     {}\n",
             color_status(&item.status, is_tty)
+        ));
+        out.push_str(&format!(
+            "  Runnable:   {}\n",
+            render_runnable_status(item.runnable.as_ref(), is_tty)
         ));
         match &item.local_path {
             Some(path) => out.push_str(&format!("  Path:       {path}\n")),
@@ -269,9 +371,20 @@ pub fn render_project_show(item: &ProjectDisplayItem, is_tty: bool) -> String {
         out.push_str(&format!("  Kind:            {kind}\n"));
     }
     out.push_str(&format!(
-        "  Status:          {}\n",
+        "  Config:          {}\n",
         color_status(&item.status, is_tty)
     ));
+    out.push_str(&format!(
+        "  Runnable:        {}\n",
+        render_runnable_status(item.runnable.as_ref(), is_tty)
+    ));
+    if let Some(ref assessment) = item.runnable {
+        if let Some(ref reason) = assessment.reason {
+            if assessment.status != ProjectRunnableStatus::Runnable {
+                out.push_str(&format!("  Reason:          {reason}\n"));
+            }
+        }
+    }
     out.push_str(&format!(
         "  Default runtime: {}\n",
         if item.is_default_agent_runtime {

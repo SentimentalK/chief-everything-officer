@@ -413,6 +413,7 @@ fn test_project_render_formatting_and_zero_ansi_on_non_tty() {
         repository: Some("SentimentalK/chief-everything-officer".to_string()),
         agent_id: Some("opencode".to_string()),
         model: None,
+        runnable: None,
     };
 
     // 1. Non-TTY list rendering must NOT contain ANSI escape codes
@@ -458,6 +459,7 @@ fn test_project_json_output_guarantees() {
         repository: None,
         agent_id: Some("codex".to_string()),
         model: Some("gpt-5".to_string()),
+        runnable: None,
     };
 
     let json_str = serde_json::to_string_pretty(&item).unwrap();
@@ -1118,7 +1120,7 @@ async fn test_project_list_default_excludes_unbound_and_all_includes_unbound_and
     let rendered_all = render_project_list(&all_items, false);
     assert!(rendered_all.contains("Project: bound-proj"));
     assert!(rendered_all.contains("Project: unbound-proj"));
-    assert!(rendered_all.contains("Status:     UNBOUND"));
+    assert!(rendered_all.contains("Config:     UNBOUND"));
 
     // 3. JSON output scope mirrors human output scope
     let default_json = serde_json::to_string(&default_items).unwrap();
