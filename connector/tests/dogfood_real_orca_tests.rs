@@ -16,6 +16,10 @@ use ceo_connector::paths::ConnectorPaths;
 use common::mock_server::{MockRequest, MockResponse, MockServer};
 use uuid::Uuid;
 
+use ceo_connector::scheduler::{
+    ActiveAttempt, AttemptPhase, ExecutionAdapter, PrepareOutcome, ACTIVE_ATTEMPT_SCHEMA_VERSION,
+};
+
 fn setup_dogfood_env_with_cmd(
     server_origin: &str,
     target_path: &str,
@@ -523,4 +527,117 @@ async fn test_dogfood_real_orca_synthetic_agent_suite() {
             let _ = client.close_terminal(&term.handle).await;
         }
     }
+}
+
+#[tokio::test]
+async fn test_real_orca_1_4_219_existing_run_replay_and_no_new_worktree() {
+    if !check_orca_available().await {
+        return;
+    }
+
+    let client = OrcaCliClient::default();
+    let target_path = "/home/sentimentalk/codes/chief-everything-officer";
+
+    let target_wt = client
+        .show_worktree_by_path(std::path::Path::new(target_path))
+        .await
+        .unwrap()
+        .expect("target worktree must exist in Orca");
+
+    let worktrees_before = client.list_worktrees().await.unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(".ceo");
+    let paths = ConnectorPaths::from_root(&root);
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client.clone()).with_paths(paths);
+
+    let attempt_id = format!("smoke-replay-{}", &Uuid::new_v4().to_string()[..8]);
+    let target = LocalTarget {
+        local_path: target_path.to_string(),
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_smoke".into(),
+        attempt_id: attempt_id.clone(),
+        claim_token: "token".into(),
+        device_id: "dev_smoke".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_smoke".into(),
+        target_id: "tgt_smoke".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let anchor_wt_id = adapter
+        .resolve_coordinator_anchor_worktree(&target_wt.id)
+        .await;
+    let coordinator_handle = adapter
+        .ensure_coordinator_terminal(&anchor_wt_id, &attempt.device_id)
+        .await
+        .unwrap();
+
+    let run_obj = format!("ceo:{}", attempt.attempt_id);
+    let run_retry_id =
+        ceo_connector::orca::derive_mutation_request_id("run-create", &attempt.attempt_id)
+            .to_string();
+    let worker_retry_id =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", &attempt.attempt_id)
+            .to_string();
+
+    let run_item = client
+        .create_run(&coordinator_handle, &run_obj, Some(&run_retry_id))
+        .await
+        .unwrap();
+
+    // 1. Verify defect starting condition on real Orca:
+    // Run exists, 0 workers, worker-start request-show is absent
+    let runs = client.list_runs().await.unwrap();
+    assert_eq!(
+        runs.iter()
+            .filter(|r| r.objective.as_deref() == Some(&run_obj))
+            .count(),
+        1
+    );
+    let workers = client.list_workers(Some(&run_item.id)).await.unwrap();
+    assert!(workers.is_empty());
+    let show = client.request_show(&worker_retry_id).await.unwrap();
+    assert!(show.is_absent());
+
+    // 2. Prepare against the unique existing Run with 0 workers
+    // Repaired adapter will consult request-show (absent) and safely issue worker-start with worker_retry_id
+    let prep_outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = match prep_outcome {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+
+    // 3. Verify no new Git worktree was created
+    let worktrees_after = client.list_worktrees().await.unwrap();
+    assert_eq!(
+        worktrees_after.len(),
+        worktrees_before.len(),
+        "Orca worktrees count must remain identical (never create a new Git worktree)"
+    );
+
+    // 4. Verify idempotent replay on the same attempt
+    let replay_outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let replay_prep = match replay_outcome {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready on replay, got {other:?}"),
+    };
+    assert_eq!(replay_prep.terminal_id, prep.terminal_id);
+
+    // 5. Cleanup
+    let _ = client.close_terminal(&prep.terminal_id).await;
 }

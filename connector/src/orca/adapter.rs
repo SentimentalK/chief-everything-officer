@@ -275,6 +275,162 @@ impl OrcaExecutionAdapter {
             .as_ref()
             .and_then(pane_key_of)
     }
+
+    async fn validate_worker_terminal(
+        &self,
+        terminal_handle: &str,
+        expected_worktree_id: &str,
+    ) -> Result<(), String> {
+        match self.client.show_terminal(terminal_handle).await {
+            Ok(Some(term)) => {
+                if term.worktree_id.as_deref() != Some(expected_worktree_id) {
+                    return Err(format!(
+                        "recovered worker terminal '{terminal_handle}' belongs to worktree '{:?}', expected '{expected_worktree_id}'; preserving evidence",
+                        term.worktree_id
+                    ));
+                }
+                if term.liveness() != TerminalLiveness::Live {
+                    return Err(format!(
+                        "recovered worker terminal '{terminal_handle}' is not live (liveness: {:?}); preserving evidence",
+                        term.liveness()
+                    ));
+                }
+                Ok(())
+            }
+            Ok(None) => Err(format!(
+                "recovered worker terminal '{terminal_handle}' not found in Orca; preserving evidence"
+            )),
+            Err(e) => Err(format!(
+                "failed to inspect recovered worker terminal '{terminal_handle}': {e}; preserving evidence"
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_worker_and_reconcile(
+        &self,
+        coordinator_handle: &str,
+        run_id: &str,
+        worktree_id: &str,
+        agent_id: &str,
+        model_opt: Option<&str>,
+        spec: &str,
+        worker_retry_id: &str,
+    ) -> Result<WorkerStartOutcome, String> {
+        match self
+            .client
+            .worker_start(
+                coordinator_handle,
+                run_id,
+                worktree_id,
+                agent_id,
+                model_opt,
+                spec,
+                Some(worker_retry_id),
+            )
+            .await
+        {
+            Ok(w) => match w.worker_terminal_handle() {
+                Some(h) => Ok(WorkerStartOutcome::Terminal(h)),
+                None => Ok(WorkerStartOutcome::Outcome(
+                    PrepareOutcome::RecoveryRequired {
+                        execution: None,
+                        reason: format!(
+                            "RECOVERY_REQUIRED: worker-start returned ok=true but no worker terminal handle could be correlated. Result: {:?}",
+                            w
+                        ),
+                    },
+                )),
+            },
+            Err(e) => {
+                match self.client.request_show(worker_retry_id).await {
+                    Ok(show) if show.is_completed() => {
+                        let receipt = match show.receipt {
+                            Some(r) => r,
+                            None => {
+                                return Ok(WorkerStartOutcome::Outcome(
+                                    PrepareOutcome::RecoveryRequired {
+                                        execution: None,
+                                        reason: format!(
+                                            "request-show completed for worker-start but missing receipt: {e}; preserving evidence"
+                                        ),
+                                    },
+                                ));
+                            }
+                        };
+                        let handle = match extract_worker_terminal_from_receipt(&receipt) {
+                            Some(h) => h,
+                            None => {
+                                return Ok(WorkerStartOutcome::Outcome(
+                                    PrepareOutcome::RecoveryRequired {
+                                        execution: None,
+                                        reason: format!(
+                                            "failed to recover worker terminal from request-show receipt: {e}; preserving evidence"
+                                        ),
+                                    },
+                                ));
+                            }
+                        };
+                        match self.validate_worker_terminal(&handle, worktree_id).await {
+                            Ok(()) => Ok(WorkerStartOutcome::Terminal(handle)),
+                            Err(reason) => Ok(WorkerStartOutcome::Outcome(
+                                PrepareOutcome::RecoveryRequired {
+                                    execution: None,
+                                    reason,
+                                },
+                            )),
+                        }
+                    }
+                    Ok(show) if show.is_pending() => Ok(WorkerStartOutcome::Outcome(
+                        PrepareOutcome::Retryable {
+                            execution: None,
+                            reason: format!(
+                                "worker-start mutation is still pending in Orca: {e}"
+                            ),
+                        },
+                    )),
+                    _ => Ok(WorkerStartOutcome::Outcome(
+                        PrepareOutcome::RecoveryRequired {
+                            execution: None,
+                            reason: format!(
+                                "failed to start worker for run '{run_id}' and request-show unresolved: {e}"
+                            ),
+                        },
+                    )),
+                }
+            }
+        }
+    }
+}
+
+enum WorkerStartOutcome {
+    Terminal(String),
+    Outcome(PrepareOutcome),
+}
+
+fn extract_worker_terminal_from_receipt(receipt: &serde_json::Value) -> Option<String> {
+    let unwrapped = receipt.get("result").unwrap_or(receipt);
+    if let Ok(res) = serde_json::from_value::<OrcaWorkerStartResult>(unwrapped.clone()) {
+        if let Some(h) = res.worker_terminal_handle() {
+            return Some(h);
+        }
+    }
+    for key in &[
+        "agentTerminalHandle",
+        "agent_terminal_handle",
+        "terminalHandle",
+        "terminal_handle",
+        "terminalId",
+        "terminal_id",
+    ] {
+        if let Some(h) = unwrapped.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = h.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Extracts the `tab:leaf` pane key from a terminal item, if present.
@@ -541,14 +697,15 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     } else if self.client.supports_agent_session_launch().await {
                         // Logical Agent launch: orchestration launch via coordinator + run-create + worker-start
                         let run_obj = format!("ceo:{}", attempt.attempt_id);
+                        let run_retry_id =
+                            derive_mutation_request_id("run-create", &attempt.attempt_id)
+                                .to_string();
+                        let worker_retry_id =
+                            derive_mutation_request_id("worker-start", &attempt.attempt_id)
+                                .to_string();
 
-                        // Guard against duplicate worker-start on prepare retry:
-                        // If an orchestration run already exists for this attempt in Orca, the first worker-start
-                        // may already have succeeded before local terminal identity was persisted.
-                        let existing_run = match self.client.list_runs().await {
-                            Ok(runs) => runs
-                                .into_iter()
-                                .find(|r| r.objective.as_deref() == Some(&run_obj)),
+                        let runs = match self.client.list_runs().await {
+                            Ok(runs) => runs,
                             Err(e) => {
                                 return Ok(PrepareOutcome::RecoveryRequired {
                                     execution: None,
@@ -557,61 +714,22 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                             }
                         };
 
-                        if let Some(existing_run) = existing_run {
-                            // Run already exists. Check if a worker was already started and has an unambiguous live terminal.
-                            let recoverable_terminal = match self
-                                .client
-                                .list_workers(Some(&existing_run.id))
-                                .await
-                            {
-                                Ok(workers) => {
-                                    let candidate_handles: Vec<String> = workers
-                                        .into_iter()
-                                        .filter_map(|w| w.agent_terminal_handle)
-                                        .filter(|h| !h.trim().is_empty())
-                                        .collect();
-                                    if candidate_handles.len() == 1 {
-                                        let handle = candidate_handles.into_iter().next().unwrap();
-                                        match self.client.show_terminal(&handle).await {
-                                            Ok(Some(term))
-                                                if term.worktree_id.as_deref()
-                                                    == Some(&worktree.id)
-                                                    && term.liveness()
-                                                        == TerminalLiveness::Live =>
-                                            {
-                                                Some(handle)
-                                            }
-                                            _ => None,
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Err(e) => {
-                                    return Ok(PrepareOutcome::RecoveryRequired {
-                                            execution: None,
-                                            reason: format!(
-                                                "AMBIGUOUS_PREPARE_RETRY: failed to list workers for existing run '{}': {e}",
-                                                existing_run.id
-                                            ),
-                                        });
-                                }
-                            };
+                        let matching_runs: Vec<OrcaRunItem> = runs
+                            .into_iter()
+                            .filter(|r| r.objective.as_deref() == Some(&run_obj))
+                            .collect();
 
-                            if let Some(handle) = recoverable_terminal {
-                                handle
-                            } else {
-                                // Ambiguous retry boundary: first worker-start may already have succeeded or run is in
-                                // an unrecoverable/ambiguous state. Fail closed with RecoveryRequired to avoid issuing a second worker-start.
-                                return Ok(PrepareOutcome::RecoveryRequired {
-                                    execution: None,
-                                    reason: format!(
-                                        "AMBIGUOUS_PREPARE_RETRY: orchestration run '{}' already exists for attempt '{}' before local terminal identity was persisted, but no live worker terminal could be safely recovered; refusing duplicate worker-start",
-                                        existing_run.id, attempt.attempt_id
-                                    ),
-                                });
-                            }
-                        } else {
+                        if matching_runs.len() > 1 {
+                            return Ok(PrepareOutcome::RecoveryRequired {
+                                execution: None,
+                                reason: format!(
+                                    "multiple orchestration runs ({}) found matching objective '{run_obj}'; failing closed to avoid ambiguous reconciliation",
+                                    matching_runs.len()
+                                ),
+                            });
+                        }
+
+                        if matching_runs.is_empty() {
                             let anchor_wt_id =
                                 self.resolve_coordinator_anchor_worktree(&worktree.id).await;
                             let coordinator_handle = self
@@ -620,13 +738,6 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                 .map_err(|e| {
                                     format!("failed to reconcile coordinator terminal: {e}")
                                 })?;
-
-                            let run_retry_id =
-                                derive_mutation_request_id("run-create", &attempt.attempt_id)
-                                    .to_string();
-                            let worker_retry_id =
-                                derive_mutation_request_id("worker-start", &attempt.attempt_id)
-                                    .to_string();
 
                             let run_item = match self
                                 .client
@@ -680,62 +791,181 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 
                             let spec = format!("ceo:{}", attempt.attempt_id);
                             let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
-                            let worker_start_res = match self
-                                .client
-                                .worker_start(
+                            match self
+                                .launch_worker_and_reconcile(
                                     &coordinator_handle,
                                     &run_item.id,
                                     &worktree.id,
                                     &executor.agent_id,
                                     model_opt,
                                     &spec,
-                                    Some(&worker_retry_id),
+                                    &worker_retry_id,
                                 )
+                                .await?
+                            {
+                                WorkerStartOutcome::Terminal(h) => h,
+                                WorkerStartOutcome::Outcome(out) => return Ok(out),
+                            }
+                        } else {
+                            let existing_run = &matching_runs[0];
+                            let workers = match self
+                                .client
+                                .list_workers(Some(&existing_run.id))
                                 .await
                             {
                                 Ok(w) => w,
-                                Err(e) => match self.client.request_show(&worker_retry_id).await {
+                                Err(e) => {
+                                    return Ok(PrepareOutcome::RecoveryRequired {
+                                        execution: None,
+                                        reason: format!(
+                                            "AMBIGUOUS_PREPARE_RETRY: failed to list workers for existing run '{}': {e}",
+                                            existing_run.id
+                                        ),
+                                    });
+                                }
+                            };
+
+                            let candidate_handles: Vec<String> = workers
+                                .into_iter()
+                                .filter_map(|w| w.agent_terminal_handle)
+                                .filter(|h| !h.trim().is_empty())
+                                .collect();
+
+                            if candidate_handles.len() > 1 {
+                                return Ok(PrepareOutcome::RecoveryRequired {
+                                    execution: None,
+                                    reason: format!(
+                                        "AMBIGUOUS_PREPARE_RETRY: multiple workers ({}) found for existing orchestration run '{}'; refusing duplicate worker-start",
+                                        candidate_handles.len(),
+                                        existing_run.id
+                                    ),
+                                });
+                            }
+
+                            let recoverable_worker = if candidate_handles.len() == 1 {
+                                let handle = &candidate_handles[0];
+                                match self.client.show_terminal(handle).await {
+                                    Ok(Some(term))
+                                        if term.worktree_id.as_deref() == Some(&worktree.id)
+                                            && term.liveness() == TerminalLiveness::Live =>
+                                    {
+                                        Some(handle.clone())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(handle) = recoverable_worker {
+                                handle
+                            } else {
+                                // No safely recoverable worker exists. Reconcile the stable worker-start request identity before deciding to fail.
+                                match self.client.request_show(&worker_retry_id).await {
                                     Ok(show) if show.is_completed() => {
-                                        if let Some(receipt) = show.receipt {
-                                            let unwrapped =
-                                                receipt.get("result").unwrap_or(&receipt);
-                                            if let Ok(w) =
-                                                serde_json::from_value::<OrcaWorkerStartResult>(
-                                                    unwrapped.clone(),
-                                                )
-                                            {
-                                                w
-                                            } else {
-                                                return Err(format!(
-                                                    "failed to recover worker from request-show receipt: {e}"
-                                                ));
+                                        let receipt = match show.receipt {
+                                            Some(r) => r,
+                                            None => {
+                                                return Ok(PrepareOutcome::RecoveryRequired {
+                                                    execution: None,
+                                                    reason: format!(
+                                                        "request-show completed for worker-start on run '{}' but missing receipt; preserving evidence",
+                                                        existing_run.id
+                                                    ),
+                                                });
                                             }
-                                        } else {
-                                            return Err(format!(
-                                                "request-show completed but missing receipt: {e}"
-                                            ));
+                                        };
+                                        let handle = match extract_worker_terminal_from_receipt(
+                                            &receipt,
+                                        ) {
+                                            Some(h) => h,
+                                            None => {
+                                                return Ok(PrepareOutcome::RecoveryRequired {
+                                                    execution: None,
+                                                    reason: format!(
+                                                        "failed to recover worker terminal from request-show receipt on run '{}'; preserving evidence",
+                                                        existing_run.id
+                                                    ),
+                                                });
+                                            }
+                                        };
+                                        match self
+                                            .validate_worker_terminal(&handle, &worktree.id)
+                                            .await
+                                        {
+                                            Ok(()) => handle,
+                                            Err(reason) => {
+                                                return Ok(PrepareOutcome::RecoveryRequired {
+                                                    execution: None,
+                                                    reason,
+                                                });
+                                            }
                                         }
                                     }
                                     Ok(show) if show.is_pending() => {
                                         return Ok(PrepareOutcome::Retryable {
                                             execution: None,
                                             reason: format!(
-                                                "worker-start mutation is still pending in Orca: {e}"
+                                                "worker-start mutation is still pending in Orca for run '{}'",
+                                                existing_run.id
                                             ),
                                         });
                                     }
-                                    _ => {
-                                        return Err(format!("failed to start worker: {e}"));
-                                    }
-                                },
-                            };
+                                    Ok(show) if show.is_absent() => {
+                                        if !candidate_handles.is_empty() {
+                                            return Ok(PrepareOutcome::RecoveryRequired {
+                                                execution: None,
+                                                reason: format!(
+                                                    "AMBIGUOUS_PREPARE_RETRY: orchestration run '{}' already has unrecoverable workers but worker-start request-show is absent; refusing duplicate worker-start",
+                                                    existing_run.id
+                                                ),
+                                            });
+                                        }
+                                        let anchor_wt_id = self
+                                            .resolve_coordinator_anchor_worktree(&worktree.id)
+                                            .await;
+                                        let coordinator_handle = self
+                                            .ensure_coordinator_terminal(
+                                                &anchor_wt_id,
+                                                &attempt.device_id,
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                format!(
+                                                    "failed to reconcile coordinator terminal: {e}"
+                                                )
+                                            })?;
+                                        let spec = format!("ceo:{}", attempt.attempt_id);
+                                        let model_opt =
+                                            executor.model.as_deref().filter(|m| *m != "auto");
 
-                            worker_start_res.worker_terminal_handle().ok_or_else(|| {
-                                format!(
-                                    "RECOVERY_REQUIRED: worker-start returned ok=true but no worker terminal handle could be correlated. Result: {:?}",
-                                    worker_start_res
-                                )
-                            })?
+                                        match self
+                                            .launch_worker_and_reconcile(
+                                                &coordinator_handle,
+                                                &existing_run.id,
+                                                &worktree.id,
+                                                &executor.agent_id,
+                                                model_opt,
+                                                &spec,
+                                                &worker_retry_id,
+                                            )
+                                            .await?
+                                        {
+                                            WorkerStartOutcome::Terminal(h) => h,
+                                            WorkerStartOutcome::Outcome(out) => return Ok(out),
+                                        }
+                                    }
+                                    _ => {
+                                        return Ok(PrepareOutcome::RecoveryRequired {
+                                            execution: None,
+                                            reason: format!(
+                                                "AMBIGUOUS_PREPARE_RETRY: orchestration run '{}' already exists for attempt '{}' before local terminal identity was persisted, but no live worker terminal could be safely recovered and worker-start request-show was unavailable or unresolved; refusing duplicate worker-start",
+                                                existing_run.id, attempt.attempt_id
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
                         }
                     } else {
                         return Ok(PrepareOutcome::RecoveryRequired {

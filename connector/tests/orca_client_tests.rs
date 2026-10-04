@@ -4482,3 +4482,838 @@ fi
         "must NOT start worker when worker-list pagination fails, log:\n{recorded}"
     );
 }
+
+#[tokio::test]
+async fn test_crash_boundary_unique_run_zero_workers_absent_request_show_starts_worker_and_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_crash_boundary")
+            .to_string();
+
+    // Unique run already exists, 0 workers, request-show for worker-start reports absent.
+    // Prepare must safely issue worker-start with the deterministic worker retry UUID and become Ready.
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_coord_1" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_crash_1","objective":"ceo:att_crash_boundary","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"absent"}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    if echo "$@" | grep -q -- "--retry-request {}"; then
+        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_crash","runId":"run_crash_1","taskId":"task_1","dispatchId":"disp_1"}}}}'
+    else
+        echo '{{"ok":false,"error":{{"code":"missing_retry_request"}}}}'
+        exit 1
+    fi
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_crash","condition":"tui-idle","satisfied":true,"elapsedMs":20}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_crash" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_crash","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon,
+        repo_canon,
+        worker_uuid,
+        worker_uuid,
+        worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_crash_boundary".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_worker_crash");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains(&format!(
+            "orchestration request-show --request {worker_uuid}"
+        )),
+        "must check request-show before starting worker, log:\n{recorded}"
+    );
+    assert!(
+        recorded.contains(&format!(
+            "orchestration worker-start --from term_coord_1 --run run_crash_1 --worktree wt_123 --agent cursor --spec ceo:att_crash_boundary --retry-request {worker_uuid}"
+        )),
+        "must start worker with deterministic retry UUID, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration run-create"),
+        "must NOT create new run when unique run already exists, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_pending_boundary_unique_run_zero_workers_pending_request_show_returns_retryable_no_start(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_pending_boundary")
+            .to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_pending_1","objective":"ceo:att_pending_boundary","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"pending"}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon,
+        repo_canon,
+        worker_uuid,
+        worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_pending_boundary".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    match outcome {
+        PrepareOutcome::Retryable { reason, .. } => {
+            assert!(
+                reason.contains("pending"),
+                "expected retryable pending reason, got: {reason}"
+            );
+        }
+        other => panic!("expected PrepareOutcome::Retryable, got {other:?}"),
+    }
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains(&format!(
+            "orchestration request-show --request {worker_uuid}"
+        )),
+        "must check request-show, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "must NOT issue worker-start when mutation is pending, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_boundary_unique_run_empty_workers_completed_request_show_recovers_terminal()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_completed_boundary")
+            .to_string();
+
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_stale_1","objective":"ceo:att_completed_boundary","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    # Worker list is empty/stale (worker not yet indexed in worker-list)
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    # request-show contains completed receipt with worker terminal
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_worker_stale"}}]}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_stale" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_stale","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ] && [ "$4" = "term_worker_stale" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_stale","condition":"tui-idle","satisfied":true,"elapsedMs":30}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon,
+        repo_canon,
+        worker_uuid,
+        worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_completed_boundary".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_worker_stale");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains(&format!(
+            "orchestration request-show --request {worker_uuid}"
+        )),
+        "must check request-show, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "must NOT issue a second worker-start when request-show is completed, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_matching_runs_across_pages_fails_closed_recovery_required() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    // Run 1 on page 1, Run 2 on page 2 for the same objective
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    if echo "$@" | grep -q -- "--cursor r_p2_cursor"; then
+        echo '{{"ok":true,"result":{{"runs":[{{"id":"run_p2","objective":"ceo:att_multi_run","coordinator_handle":"term_coord_2"}}],"page":{{"hasMore":false,"nextCursor":null}}}}}}'
+    else
+        echo '{{"ok":true,"result":{{"runs":[{{"id":"run_p1","objective":"ceo:att_multi_run","coordinator_handle":"term_coord_1"}}],"page":{{"hasMore":true,"nextCursor":"r_p2_cursor"}}}}}}'
+    fi
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-create" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_run_create_prohibited"}}}}'
+    exit 1
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon,
+        repo_canon
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_multi_run".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    match outcome {
+        PrepareOutcome::RecoveryRequired { reason, .. } => {
+            assert!(
+                reason.contains("multiple orchestration runs") || reason.contains("failing closed"),
+                "expected fail-closed reason for multiple runs, got: {reason}"
+            );
+        }
+        other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
+    }
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains("orchestration run-list --cursor r_p2_cursor"),
+        "must paginate across all run-list pages, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration run-create"),
+        "must NOT create run when multiple runs exist, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "must NOT start worker when multiple runs exist, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_stable_worker_start_retry_uuid_across_restart_state_transition() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let state_file = temp.path().join("sim_state");
+    fs::write(&state_file, "phase1").unwrap();
+
+    let expected_worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_restart_lifecycle")
+            .to_string();
+    let expected_run_uuid =
+        ceo_connector::orca::derive_mutation_request_id("run-create", "att_restart_lifecycle")
+            .to_string();
+
+    // Script simulates real phase progression:
+    // Phase 1: run-list empty -> run-create succeeds with run_uuid -> worker-start called with worker_uuid -> fails with timeout -> request-show reports pending -> Prepare returns Retryable.
+    // Phase 2: restart! State is updated to phase2. run-list now shows run_1 -> worker-list empty -> request-show reports absent -> worker-start called with worker_uuid -> succeeds -> Ready!
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+PHASE=$(cat "{}")
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_coord_1" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    if [ "$PHASE" = "phase1" ]; then
+        echo '{{"ok":true,"result":{{"runs":[]}}}}'
+    else
+        echo '{{"ok":true,"result":{{"runs":[{{"id":"run_lifecycle_1","objective":"ceo:att_restart_lifecycle","coordinator_handle":"term_coord_1"}}]}}}}'
+    fi
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-create" ]; then
+    echo '{{"ok":true,"result":{{"run":{{"id":"run_lifecycle_1","objective":"ceo:att_restart_lifecycle","coordinator_handle":"term_coord_1"}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    if [ "$PHASE" = "phase1" ]; then
+        # Phase 1 worker-start times out
+        echo '{{"ok":false,"error":{{"code":"timeout","message":"worker-start timed out"}}}}'
+        exit 1
+    else
+        # Phase 2 worker-start succeeds
+        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_replayed","runId":"run_lifecycle_1","taskId":"task_1","dispatchId":"disp_1"}}}}'
+    fi
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    if [ "$PHASE" = "phase1" ]; then
+        echo '{{"ok":true,"result":{{"requestId":"{}","state":"pending"}}}}'
+    else
+        echo '{{"ok":true,"result":{{"requestId":"{}","state":"absent"}}}}'
+    fi
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ] && [ "$4" = "term_worker_replayed" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_replayed","condition":"tui-idle","satisfied":true,"elapsedMs":25}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_replayed" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_replayed","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        state_file.display(),
+        repo_canon,
+        repo_canon,
+        expected_worker_uuid,
+        expected_worker_uuid,
+        expected_worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_restart_lifecycle".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    // --- Phase 1: fresh launch -> pending -> Retryable ---
+    let outcome1 = adapter.prepare(&attempt, &target).await.unwrap();
+    assert!(
+        matches!(outcome1, PrepareOutcome::Retryable { .. }),
+        "Phase 1 must return Retryable when worker-start is pending, got: {outcome1:?}"
+    );
+
+    let log_phase1 = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        log_phase1.contains(&format!(
+            "orchestration run-create --objective ceo:att_restart_lifecycle --from term_coord_1 --retry-request {expected_run_uuid}"
+        )),
+        "Phase 1 must issue run-create with stable run retry UUID, log:\n{log_phase1}"
+    );
+    assert!(
+        log_phase1.contains(&format!(
+            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec ceo:att_restart_lifecycle --retry-request {expected_worker_uuid}"
+        )),
+        "Phase 1 must issue worker-start with stable worker retry UUID, log:\n{log_phase1}"
+    );
+
+    // --- Transition to Phase 2: run exists in inventory, prepare is retried ---
+    fs::write(&state_file, "phase2").unwrap();
+    fs::write(&args_log, "").unwrap(); // clear log to inspect Phase 2 specifically
+
+    let outcome2 = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = match outcome2 {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("Phase 2 must return PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_worker_replayed");
+
+    let log_phase2 = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        !log_phase2.contains("orchestration run-create"),
+        "Phase 2 must NOT create run because run_lifecycle_1 already exists in inventory, log:\n{log_phase2}"
+    );
+    assert!(
+        log_phase2.contains(&format!(
+            "orchestration request-show --request {expected_worker_uuid}"
+        )),
+        "Phase 2 must check request-show with same worker UUID, log:\n{log_phase2}"
+    );
+    assert!(
+        log_phase2.contains(&format!(
+            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec ceo:att_restart_lifecycle --retry-request {expected_worker_uuid}"
+        )),
+        "Phase 2 MUST replay worker-start using the EXACT SAME stable worker retry UUID, log:\n{log_phase2}"
+    );
+}
+
+#[tokio::test]
+async fn test_absent_case_worker_start_unknown_outcome_reconciles_via_request_show() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_absent_reconcile")
+            .to_string();
+
+    let call_count_file = temp.path().join("req_show_count");
+    fs::write(&call_count_file, "0").unwrap();
+
+    // Unique Run exists, zero workers.
+    // 1st request-show reports absent -> worker-start is invoked.
+    // worker-start returns unknown outcome (timeout).
+    // 2nd request-show is queried -> reports completed with receipt -> recovers terminal and Ready!
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+COUNT_FILE="{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_coord_1" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_absent_1","objective":"ceo:att_absent_reconcile","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    CUR=$(cat "$COUNT_FILE")
+    if [ "$CUR" = "0" ]; then
+        echo "1" > "$COUNT_FILE"
+        echo '{{"ok":true,"result":{{"requestId":"{}","state":"absent"}}}}'
+    else
+        echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_worker_recovered"}}]}}}}}}'
+    fi
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"timeout","message":"worker-start timed out"}}}}'
+    exit 1
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ] && [ "$4" = "term_worker_recovered" ]; then
+    echo '{{"ok":true,"result":{{"wait":{{"handle":"term_worker_recovered","condition":"tui-idle","satisfied":true,"elapsedMs":15}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_recovered" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_recovered","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        call_count_file.display(),
+        repo_canon,
+        repo_canon,
+        worker_uuid,
+        worker_uuid,
+        worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_absent_reconcile".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+        PrepareOutcome::Ready(p) => p,
+        other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
+    };
+    assert_eq!(prep.terminal_id, "term_worker_recovered");
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains(&format!(
+            "orchestration worker-start --from term_coord_1 --run run_absent_1 --worktree wt_123 --agent cursor --spec ceo:att_absent_reconcile --retry-request {worker_uuid}"
+        )),
+        "must have called worker-start after absent request-show, log:\n{recorded}"
+    );
+    let request_show_count = recorded
+        .matches(&format!(
+            "orchestration request-show --request {worker_uuid}"
+        ))
+        .count();
+    assert_eq!(
+        request_show_count, 2,
+        "must query request-show twice (before start when absent, and after start when timed out), got {request_show_count}, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_request_show_with_dead_terminal_fails_closed_preserving_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let args_log = temp.path().join("args.log");
+    let worker_uuid =
+        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_dead_worker")
+            .to_string();
+
+    // Unique run exists, zero workers.
+    // request-show reports completed with term_dead.
+    // terminal show reports orphaned: true (dead).
+    // Prepare must fail closed with RecoveryRequired preserving evidence!
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_dead_1","objective":"ceo:att_dead_worker","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_dead"}}]}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_dead" ]; then
+    # Dead terminal
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_dead","title":"worker-dead","worktreeId":"wt_123","connected":false,"orphaned":true}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        args_log.display(),
+        repo_canon,
+        repo_canon,
+        worker_uuid,
+        worker_uuid
+    );
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+
+    let target = LocalTarget {
+        local_path: repo_canon,
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    };
+
+    let attempt = ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: "att_dead_worker".into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        executor: None,
+    };
+
+    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    match outcome {
+        PrepareOutcome::RecoveryRequired { reason, .. } => {
+            assert!(
+                reason.contains("not live") && reason.contains("preserving evidence"),
+                "expected fail-closed preserving evidence reason, got: {reason}"
+            );
+        }
+        other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
+    }
+
+    let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "must NOT issue a second worker-start when terminal is dead; evidence must be preserved, log:\n{recorded}"
+    );
+}
