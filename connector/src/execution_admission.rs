@@ -226,7 +226,13 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_command_claimable_iff_executable_locally() {
-        let good = LocalExecutorConfig::new("agy".into(), "agy".into()).unwrap();
+        // Positive branch: an absolute-path command that exists locally.
+        // executable_in_path() only requires the file to exist for absolute
+        // paths, so this is deterministic on every platform.
+        let temp = tempfile::tempdir().unwrap();
+        let agent_bin = temp.path().join("fake-agent");
+        std::fs::write(&agent_bin, b"#!/bin/sh\n").unwrap();
+        let good = LocalExecutorConfig::new("agy".into(), agent_bin.display().to_string()).unwrap();
         assert!(evaluate_executor_compatibility(Some(&good), None)
             .await
             .is_ok());
