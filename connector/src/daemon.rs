@@ -272,6 +272,15 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
 
         // Find eligible candidate
         let mut selected_candidate = None;
+        // Orca Agent-aware launch-surface capability snapshot for this
+        // pending batch. Probing is deferred until a candidate actually
+        // needs it (logical-only executor) and always happens OUTSIDE any
+        // state.lock scope; the snapshot is immutable for the rest of the
+        // iteration. A stale/unavailable snapshot is conservatively safe:
+        // an affected Job simply stays queued for a later poll, and the
+        // prepare/recovery path remains the final fail-closed backstop.
+        let mut launch_surface = crate::execution_admission::AgentLaunchSurface::Unknown;
+        let mut launch_surface_probed = false;
         for cand in &pending {
             // 1. Is target mapped in local config with configured executor?
             let local_t = match config.targets.get(&cand.target_id) {
@@ -329,11 +338,32 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             // a Project whose executor/runtime configuration cannot be launched
             // on this Device is NOT claimable. Skip it and keep scanning the
             // pending batch so a later compatible candidate is never starved.
-            if let Err(incompat) = crate::execution_admission::target_execution_admission(
-                local_t.executor.as_ref(),
-                Some(&admission_probe),
-            )
-            .await
+            //
+            // Lock-boundary invariant: the Orca launch-surface probe performs
+            // external Orca CLI process I/O, so it is awaited HERE — during
+            // candidate scanning, before any state.lock acquisition — and the
+            // resulting immutable snapshot is reused below by the purely local
+            // re-check under the lock. state.lock is never held across
+            // external I/O.
+            if !launch_surface_probed
+                && local_t
+                    .executor
+                    .as_ref()
+                    .map(|e| e.command.is_none())
+                    .unwrap_or(false)
+            {
+                launch_surface = if admission_probe.supports_agent_session_launch().await {
+                    crate::execution_admission::AgentLaunchSurface::Available
+                } else {
+                    crate::execution_admission::AgentLaunchSurface::Unavailable
+                };
+                launch_surface_probed = true;
+            }
+            if let Err(incompat) =
+                crate::execution_admission::evaluate_executor_compatibility_with_surface(
+                    local_t.executor.as_ref(),
+                    launch_surface,
+                )
             {
                 eprintln!(
                     "Skipping candidate for target '{}' (not locally launchable: {})",
@@ -434,14 +464,19 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             // Re-evaluate execution admission against the config reloaded
             // under the state lock, immediately before ClaimIntent
             // persistence and any Server claim request (PROJECT-039 slice).
-            // An incompatibility here leaves the Server Job queued: no claim
-            // intent is persisted, no claim request is made, and the Job is
-            // neither cancelled nor terminalized.
-            if let Err(incompat) = crate::execution_admission::target_execution_admission(
-                disk_target.executor.as_ref(),
-                Some(&admission_probe),
-            )
-            .await
+            // This re-check is PURELY LOCAL (no `.await`, no Orca CLI
+            // process, no network/adapter call): the launch-surface
+            // snapshot was probed before the lock was acquired, and the
+            // freshly reloaded executor config below is authoritative for
+            // compatibility, so a late config change cannot bypass
+            // admission. An incompatibility here leaves the Server Job
+            // queued: no claim intent is persisted, no claim request is
+            // made, and the Job is neither cancelled nor terminalized.
+            if let Err(incompat) =
+                crate::execution_admission::evaluate_executor_compatibility_with_surface(
+                    disk_target.executor.as_ref(),
+                    launch_surface,
+                )
             {
                 eprintln!(
                     "Candidate target '{}' became not locally launchable under state lock ({}). Leaving Server Job queued.",

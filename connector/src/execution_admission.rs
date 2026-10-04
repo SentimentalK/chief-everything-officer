@@ -17,6 +17,15 @@
 //!    cross-platform executable discovery.
 //! 5. Global Orca runtime readiness stays a separate, adapter-level gate and
 //!    is NOT re-decided here (doctor reports it independently).
+//!
+//! Lock-boundary invariant (Connector design): `state.lock` protects short
+//! local durable-state transitions only. Orca capability probing performs
+//! external Orca CLI process I/O and therefore MUST run outside any
+//! `state.lock` scope; its result is captured in an [`AgentLaunchSurface`]
+//! snapshot and consumed by the purely local evaluation
+//! ([`evaluate_executor_compatibility_with_surface`]) both during candidate
+//! scanning and in the immediate pre-ClaimIntent re-check under the lock
+//! (which performs no `.await`, no Orca CLI process, and no network call).
 
 use crate::config::LocalExecutorConfig;
 use crate::setup_frontend::executable_in_path;
@@ -88,15 +97,65 @@ impl ExecutionCompatibilityProbe for crate::orca::client::OrcaCliClient {
     }
 }
 
+/// Snapshot of the Orca Agent-aware launch-surface capability.
+///
+/// The probe itself performs external Orca CLI process I/O and must be
+/// awaited OUTSIDE any `state.lock` scope; the resulting snapshot is then
+/// consumed by the pure evaluator
+/// ([`evaluate_executor_compatibility_with_surface`]) under the lock (if
+/// any) with no further external I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLaunchSurface {
+    /// The installed Orca exposes the required non-orchestrating
+    /// existing-worktree Agent-aware launch surface.
+    Available,
+    /// The installed Orca does not expose the required launch surface (the
+    /// probe ran and deterministically reported absence).
+    Unavailable,
+    /// No probe was performed (or it could not determine capability):
+    /// conservatively fail-closed for logical-only executors.
+    Unknown,
+}
+
 /// Shared executor-compatibility policy (Doctor + daemon admission).
 ///
 /// Callers that do not possess a live Orca probe may pass `None` for the
 /// probe only when the executor is NOT logical-only; for a logical-only
 /// executor with no probe the conservative fail-closed answer is
 /// AgentLaunchUnavailable.
+///
+/// This wrapper performs the async/external Orca capability probe (only for
+/// logical-only executors) and then delegates to the purely local
+/// [`evaluate_executor_compatibility_with_surface`]. Callers that already
+/// hold a lock (or otherwise cannot await external I/O) must NOT use this
+/// wrapper: probe first, then call the pure evaluator with the snapshot.
 pub async fn evaluate_executor_compatibility(
     executor: Option<&LocalExecutorConfig>,
     probe: Option<&dyn ExecutionCompatibilityProbe>,
+) -> Result<(), ExecutionCompatibility> {
+    // The launch surface is only ever consulted for logical-only executors
+    // (command=None); every other shape is decided purely locally.
+    let surface = match executor.map(|e| e.command.as_deref()) {
+        Some(None) => match probe {
+            Some(p) if p.supports_agent_session_launch().await => AgentLaunchSurface::Available,
+            Some(_) => AgentLaunchSurface::Unavailable,
+            None => AgentLaunchSurface::Unknown,
+        },
+        _ => AgentLaunchSurface::Unknown,
+    };
+    evaluate_executor_compatibility_with_surface(executor, surface)
+}
+
+/// Pure/local executor-compatibility evaluation.
+///
+/// Consumes the current executor configuration plus an ALREADY-PROBED Orca
+/// launch-surface snapshot. This function performs no `.await`, no Orca CLI
+/// process spawn, no network call, and no adapter call: it is safe to call
+/// while holding `state.lock`. All compatibility exceptions must therefore
+/// come from the snapshot, never from a live probe.
+pub fn evaluate_executor_compatibility_with_surface(
+    executor: Option<&LocalExecutorConfig>,
+    agent_launch_surface: AgentLaunchSurface,
 ) -> Result<(), ExecutionCompatibility> {
     let Some(exec) = executor else {
         return Err(ExecutionCompatibility::MissingExecutor);
@@ -110,23 +169,23 @@ pub async fn evaluate_executor_compatibility(
         None => {
             // Logical-only executor: claimable only if the installed Orca
             // exposes the non-orchestrating existing-worktree Agent-aware
-            // launch surface required to create the agent terminal.
-            let supported = match probe {
-                Some(p) => p.supports_agent_session_launch().await,
-                None => false,
-            };
-            if supported {
-                Ok(())
-            } else {
-                Err(ExecutionCompatibility::AgentLaunchUnavailable {
-                    code: ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string(),
-                })
+            // launch surface required to create the agent terminal. The
+            // snapshot (probed outside any lock) is authoritative here;
+            // Unknown is conservatively fail-closed.
+            match agent_launch_surface {
+                AgentLaunchSurface::Available => Ok(()),
+                AgentLaunchSurface::Unavailable | AgentLaunchSurface::Unknown => {
+                    Err(ExecutionCompatibility::AgentLaunchUnavailable {
+                        code: ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string(),
+                    })
+                }
             }
         }
         Some(cmd) => {
             // Explicit legacy command executor: the first whitespace-delimited
             // token of the configured command must be locally executable using
-            // the existing shared cross-platform executable discovery.
+            // the existing shared cross-platform executable discovery (a
+            // local, non-async PATH lookup).
             let bin = cmd.split_whitespace().next().unwrap_or(cmd);
             if executable_in_path(bin) {
                 Ok(())
@@ -166,6 +225,36 @@ mod tests {
     async fn missing_executor_is_not_claimable() {
         let res = evaluate_executor_compatibility(None, None).await;
         assert_eq!(res.unwrap_err(), ExecutionCompatibility::MissingExecutor);
+    }
+
+    #[test]
+    fn pure_snapshot_evaluation_never_probes_and_is_fail_closed() {
+        let exec = LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap();
+
+        // Available snapshot: claimable. Unavailable snapshot: not claimable.
+        assert!(evaluate_executor_compatibility_with_surface(
+            Some(&exec),
+            AgentLaunchSurface::Available
+        )
+        .is_ok());
+        assert!(evaluate_executor_compatibility_with_surface(
+            Some(&exec),
+            AgentLaunchSurface::Unavailable
+        )
+        .is_err());
+
+        // Unknown (no snapshot / undetermined capability) must fail closed:
+        // this is what the under-lock pre-ClaimIntent re-check hits when the
+        // probe was never performed for the scanned executor shape.
+        let err =
+            evaluate_executor_compatibility_with_surface(Some(&exec), AgentLaunchSurface::Unknown)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            ExecutionCompatibility::AgentLaunchUnavailable {
+                code: ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE.to_string()
+            }
+        );
     }
 
     #[tokio::test]

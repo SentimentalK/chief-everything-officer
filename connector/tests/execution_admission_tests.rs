@@ -605,3 +605,97 @@ async fn compatible_legacy_command_still_claims_with_default_probe() {
         ["job_legacy_default"]
     );
 }
+
+/// Lock-boundary regression: the Orca Agent-aware launch-surface probe is
+/// external process I/O and must NOT be awaited while the daemon holds the
+/// Connector state.lock.
+///
+/// The injected fake Orca CLI attempts to acquire the state.lock during the
+/// daemon's pre-claim admission flow and records whether acquisition
+/// succeeded. A daemon that held state.lock across the async probe would
+/// starve it (flock WouldBlock) and this test would fail.
+#[cfg(unix)]
+#[tokio::test]
+async fn orca_capability_probe_is_not_awaited_under_state_lock() {
+    let server = MockServer::start().await;
+    let claim_calls = Arc::new(AtomicUsize::new(0));
+    let claimed_job_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    standard_target_handlers(
+        &server,
+        &["tgt_logical"],
+        &["job_probe_lock"],
+        claim_calls.clone(),
+        claimed_job_ids.clone(),
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = ConnectorPaths::from_root(temp.path().join("root"));
+    paths.ensure_dirs().unwrap();
+    base_credential(&server, &paths);
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_logical".into(),
+        mapped_target(
+            &temp,
+            Some(LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap()),
+        ),
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    // Fake Orca CLI: every probe invocation logs, then tries a
+    // non-blocking exclusive flock on the Connector state.lock (the same
+    // lock primitive the daemon uses via ExecutionLock). It reports the
+    // Agent-aware launch surface as AVAILABLE so the candidate is admitted
+    // and the daemon reaches the immediate pre-ClaimIntent re-check under
+    // the lock — where the pre-repair code re-probed Orca while holding the
+    // lock (which the probe would record as lock-blocked).
+    let probe_log = temp.path().join("probe.log");
+    let state_lock = paths.state_lock_file();
+    let script = format!(
+        "#!/bin/sh\nprintf 'probe\\n' >> \"{log}\"\nif command -v flock >/dev/null 2>&1; then\n  if flock -x -n \"{lock}\" true 2>/dev/null; then\n    printf 'lock-acquired\\n' >> \"{log}\"\n  else\n    printf 'lock-blocked\\n' >> \"{log}\"\n  fi\nelse\n  printf 'flock-unavailable\\n' >> \"{log}\"\nfi\necho 'usage: terminal create [--agent]'\n",
+        log = probe_log.display(),
+        lock = state_lock.display()
+    );
+    let probe_bin = temp.path().join("fake-orca");
+    fs::write(&probe_bin, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    run_daemon_with_hooks_and_admission_orca(
+        &paths,
+        fake_ready_adapter(),
+        Some(1),
+        DaemonHooks::default(),
+        OrcaCliClient::new(probe_bin),
+    )
+    .await
+    .unwrap();
+
+    // The probe must have executed as part of the pre-claim admission flow.
+    let log = fs::read_to_string(&probe_log).unwrap();
+    assert!(
+        log.contains("probe"),
+        "Orca capability probe did not run during the pre-claim flow"
+    );
+    assert!(
+        !log.contains("lock-blocked"),
+        "the daemon held state.lock across the async Orca capability probe (lock-blocked)"
+    );
+    assert!(
+        log.contains("lock-acquired") || log.contains("flock-unavailable"),
+        "unexpected probe log: {log}"
+    );
+
+    // With the surface available, the logical-only executor claim proceeded
+    // end-to-end — proving the under-lock pre-ClaimIntent re-check ran with
+    // NO further external probe.
+    assert_eq!(claim_calls.load(Ordering::SeqCst), 1);
+    let attempt = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("claim intent persisted and reconciled");
+    assert_eq!(attempt.phase, AttemptPhase::Claimed);
+    assert_eq!(attempt.job_id, "job_probe_lock");
+}
