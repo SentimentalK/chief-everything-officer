@@ -5,7 +5,7 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **2.5.2**. Check with:
+Current baseline: **2.5.3**. Check with:
 
 ```bash
 ceo-connector --version
@@ -28,7 +28,7 @@ Deterministic binary packages are provided for five supported platforms:
 ### Manual Installation
 
 #### Linux and macOS
-1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.2`).
+1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.3`).
 2. Verify the archive against `SHA256SUMS`:
    ```bash
    sha256sum -c SHA256SUMS --ignore-missing
@@ -45,7 +45,7 @@ Deterministic binary packages are provided for five supported platforms:
 4. Place `ceo-connector` in a directory on your `PATH` (such as `~/.local/bin`) and ensure executable permissions:
    ```bash
    mkdir -p ~/.local/bin
-   cp ceo-connector-2.5.2/ceo-connector ~/.local/bin/ceo-connector
+   cp ceo-connector-2.5.3/ceo-connector ~/.local/bin/ceo-connector
    chmod +x ~/.local/bin/ceo-connector
    ```
 5. Verify the installation:
@@ -64,7 +64,7 @@ Deterministic binary packages are provided for five supported platforms:
    ```powershell
    Expand-Archive -Path ceo-connector-windows-x64.zip -DestinationPath .
    ```
-4. Place `ceo-connector-2.5.2\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
+4. Place `ceo-connector-2.5.3\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
 5. Verify the installation:
    ```cmd
    ceo-connector.exe --version
