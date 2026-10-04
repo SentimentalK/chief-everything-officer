@@ -441,11 +441,12 @@ async fn target_list_fails_clearly_when_server_unavailable() {
 }
 
 #[tokio::test]
-async fn local_only_target_renders_without_fabricated_server_metadata() {
+async fn successful_catalogue_sync_prunes_stale_local_mapping_project039() {
     let server = MockServer::start().await;
     server.add_handler(|req| {
         if req.path == "/api/connector/targets" && req.method == "GET" {
-            // Catalogue does NOT contain the locally mapped target.
+            // Catalogue does NOT contain the locally mapped target: its
+            // Workspace-level Project was deleted on the Server.
             return MockResponse::json(200, &serde_json::json!({ "targets": [] }));
         }
         MockResponse {
@@ -467,12 +468,12 @@ async fn local_only_target_renders_without_fabricated_server_metadata() {
     .unwrap();
     cred.save(&paths.credential_file()).unwrap();
 
-    let repo_dir = std::env::temp_dir().join(format!("ceo_v3_local_only_{}", std::process::id()));
+    let repo_dir = std::env::temp_dir().join(format!("ceo_v3_stale_prune_{}", std::process::id()));
     fs::create_dir_all(&repo_dir).unwrap();
 
     let mut config = LocalConfig::new(server.origin()).unwrap();
     config.targets.insert(
-        "tgt_local_only".into(),
+        "tgt_stale_deleted".into(),
         LocalTarget {
             local_path: repo_dir.to_string_lossy().to_string(),
             executor: Some(
@@ -487,18 +488,62 @@ async fn local_only_target_renders_without_fabricated_server_metadata() {
     );
     config.save(&paths.config_file()).unwrap();
 
+    // The successful authoritative catalogue sync prunes the stale mapping
+    // instead of rendering a permanent ghost.
     let items = build_target_display_items(&paths).await.unwrap();
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
-    assert_eq!(item.target_id, "tgt_local_only");
-    // Device-owned fields merge from v3 local config.
-    assert_eq!(
-        item.local_path.as_deref(),
-        Some(repo_dir.to_string_lossy().as_ref())
+    assert!(items.is_empty(), "stale mapping must not render: {items:?}");
+
+    let cfg_after = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(
+        !cfg_after.targets.contains_key("tgt_stale_deleted"),
+        "stale local mapping must be pruned by successful sync"
     );
-    assert_eq!(item.model.as_deref(), Some("gpt-5"));
-    // Server-owned fields are honestly unknown, never fabricated from local data.
-    assert!(item.alias.is_none());
-    assert!(item.kind.is_none());
-    assert_eq!(item.status, "LOCAL_ONLY");
+}
+
+#[tokio::test]
+async fn catalogue_failure_never_prunes_local_mappings() {
+    let server = MockServer::start().await;
+    server.add_handler(|req| {
+        if req.path == "/api/connector/targets" && req.method == "GET" {
+            return MockResponse::json(500, &serde_json::json!({ "error": "boom" }));
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let (_temp, paths) = temp_paths();
+    let cred = DeviceCredential::new(
+        server.origin(),
+        "usr_1".into(),
+        "dev_1".into(),
+        "dcr_1".into(),
+        "secret".into(),
+        2000000000000,
+    )
+    .unwrap();
+    cred.save(&paths.credential_file()).unwrap();
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_keep_me".into(),
+        LocalTarget {
+            local_path: "/tmp/anywhere".to_string(),
+            executor: None,
+        },
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    // Catalogue unreachable: the projection fails clearly and pruning never
+    // runs (offline direct-ID behavior preserved).
+    let res = build_target_display_items(&paths).await;
+    assert!(res.is_err());
+
+    let cfg_after = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(
+        cfg_after.targets.contains_key("tgt_keep_me"),
+        "catalogue failure must never prune local mappings"
+    );
 }

@@ -562,6 +562,39 @@ export class ConnectorControlStore {
   }
 
   /**
+   * PROJECT-039: hard Workspace-level Project deletion — physically removes
+   * the execution_targets row by its immutable id inside a BEGIN IMMEDIATE
+   * transaction. The FK cascades remove the row's device_target_bindings and
+   * any workspace_execution_defaults reference. Historical Job/Attempt
+   * records live in the separate Job store and are intentionally untouched
+   * (they retain their historical target_id).
+   *
+   * Authorization (workspace membership + owner role) and the
+   * quiescence/delete fence are enforced by the TargetDeleteCoordinator
+   * BEFORE this call; this method is the atomic physical-delete step only.
+   *
+   * Returns true when the row existed and was removed; false when it was
+   * already gone (idempotent, no resurrection).
+   */
+  deleteExecutionTargetRow(targetId: string): boolean {
+    return this.identityStore.withDb((db) => {
+      db.exec("BEGIN IMMEDIATE;");
+      try {
+        const res = db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetId);
+        db.exec("COMMIT;");
+        return Number(res.changes) > 0;
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK;");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
+    });
+  }
+
+  /**
    * Renames an existing ExecutionTarget by its immutable ID: atomically
    * updates the workspace-unique human alias without recreating the row.
    * The target keeps its id and every relationship attached to it

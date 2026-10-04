@@ -31,6 +31,12 @@ import {
   TargetValidationError,
   TARGET_ERROR_CODES,
 } from "./target-schema.js";
+import {
+  TargetDeleteBlockedError,
+  TargetDeleteCoordinator,
+  TargetDeleteInProgressError,
+} from "../jobs/target-delete.js";
+import { V2StoreError } from "../jobs/v2-store.js";
 
 export interface ConnectorRouterOptions {
   controlStore: ConnectorControlStore;
@@ -40,6 +46,12 @@ export interface ConnectorRouterOptions {
   publicOrigin: string;
   hostGuard?: RequestHandler;
   originGuard?: RequestHandler;
+  /**
+   * PROJECT-039: owns the fenced quiescence -> physical delete contract for
+   * workspace-level project deletion. Present only when the job queue is
+   * configured; deletion is refused (503) without it.
+   */
+  targetDeleteCoordinator?: TargetDeleteCoordinator;
 }
 
 function escapeHtml(s: string): string {
@@ -164,7 +176,7 @@ function renderHtml(title: string, bodyContent: string): string {
 }
 
 export function createConnectorRouter(options: ConnectorRouterOptions): Router {
-  const { controlStore, enrollmentStore, identityStore, sessionManager, publicOrigin, hostGuard, originGuard } = options;
+  const { controlStore, enrollmentStore, identityStore, sessionManager, publicOrigin, hostGuard, originGuard, targetDeleteCoordinator } = options;
   if (!publicOrigin || typeof publicOrigin !== "string" || publicOrigin.trim().length === 0) {
     throw new Error("ConnectorRouter requires an authoritative non-empty publicOrigin.");
   }
@@ -890,6 +902,97 @@ export function createConnectorRouter(options: ConnectorRouterOptions): Router {
         }
         if (err instanceof ConnectorValidationError) {
           res.status(400).json({ error: TARGET_ERROR_CODES.INVALID_REQUEST, message: err.message });
+          return;
+        }
+        throw err;
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // 10c. Native API: Delete Execution Target (Device-Auth)
+  // ---------------------------------------------------------------------------
+  // PROJECT-039: Workspace-level hard Project deletion. This is the ONLY
+  // destructive target contract: it genuinely removes the Project
+  // (execution_targets row) for ALL devices after an authoritative
+  // server-side quiescence barrier. `project detach` remains the
+  // Device-binding-only counterpart. Explicit confirmation is required in the
+  // body; no no-arg inference exists anywhere.
+  router.post(
+    "/api/connector/targets/:target_id/delete",
+    createDeviceAuthMiddleware(controlStore, identityStore),
+    async (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const auth = res.locals.deviceIdentity!;
+      const targetId = req.params.target_id;
+      if (!targetId || typeof targetId !== "string") {
+        res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND });
+        return;
+      }
+
+      const body = req.body;
+      if (
+        !body ||
+        typeof body !== "object" ||
+        Array.isArray(body) ||
+        Object.keys(body).length !== 1 ||
+        (body as Record<string, unknown>).confirm !== true
+      ) {
+        res.status(400).json({
+          error: TARGET_ERROR_CODES.INVALID_REQUEST,
+          message: "Delete request must contain exactly { \"confirm\": true }.",
+        });
+        return;
+      }
+
+      if (!targetDeleteCoordinator) {
+        res.status(503).json({
+          error: "QUEUE_UNAVAILABLE",
+          message: "Target deletion requires the job queue; it is not configured on this server.",
+        });
+        return;
+      }
+
+      try {
+        const result = await targetDeleteCoordinator.deleteTargetForDevice({
+          deviceId: auth.device_id,
+          targetId,
+          actorUserId: auth.user_id,
+        });
+
+        res.status(200).json({
+          ok: true,
+          target_id: result.target_id,
+          outcome: result.outcome,
+          terminal_job_count: result.terminal_job_count,
+        });
+      } catch (err) {
+        if (err instanceof IdentityDbUnavailable || err instanceof IdentityDbContextClosed) {
+          res.status(503).json({ error: TARGET_ERROR_CODES.IDENTITY_UNAVAILABLE });
+          return;
+        }
+        if (err instanceof TargetDeleteInProgressError) {
+          res.status(409).json({ error: TARGET_ERROR_CODES.TARGET_DELETE_IN_PROGRESS, message: err.message });
+          return;
+        }
+        if (err instanceof TargetDeleteBlockedError) {
+          res.status(409).json({
+            error: TARGET_ERROR_CODES.TARGET_DELETE_BLOCKED,
+            message: err.message,
+            evidence: err.evidence,
+          });
+          return;
+        }
+        if (err instanceof V2StoreError) {
+          res.status(503).json({ error: "QUEUE_UNAVAILABLE", message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorNotFoundError) {
+          res.status(404).json({ error: TARGET_ERROR_CODES.TARGET_NOT_FOUND, message: err.message });
+          return;
+        }
+        if (err instanceof ConnectorDeviceRevokedError || err instanceof ConnectorPermissionError) {
+          res.status(403).json({ error: TARGET_ERROR_CODES.DEVICE_NOT_ELIGIBLE, message: err.message });
           return;
         }
         throw err;

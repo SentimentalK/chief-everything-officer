@@ -470,7 +470,7 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
   });
 
   describe("Target linkage integrity and host projections", () => {
-    it("fails closed with CORRUPT_TARGET_STATE when target is missing from control store", async () => {
+    it("keeps historical jobs queryable after the target row is deleted (PROJECT-039)", async () => {
       const scopeA = { user_id: userAliceId, workspace_id: workspaceAId };
 
       const sub = await coordinator.submit(scopeA, {
@@ -483,18 +483,20 @@ describe("Connector V1.5 Host Job Query & Stream Traversal", () => {
         result_target: "none",
       });
 
-      // Delete target from control plane SQLite
+      // Workspace-level project delete physically removes the control-plane
+      // row; historical Job records keep their historical target_id and must
+      // remain queryable, with the display alias degrading to target_id.
       identityStore.withDb((db) => {
         db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetA1.id);
       });
 
-      await expect(coordinator.getJobForHost(scopeA, sub.job.job_id)).rejects.toThrow(
-        /CORRUPT_TARGET_STATE/,
-      );
+      const detail = await coordinator.getJobForHost(scopeA, sub.job.job_id);
+      expect(detail.job_id).toBe(sub.job.job_id);
+      expect(detail.target_id).toBe(targetA1.id);
+      expect(detail.target_alias).toBe(targetA1.id);
 
-      await expect(coordinator.listJobsForHost(scopeA, { limit: 10 })).rejects.toThrow(
-        /CORRUPT_TARGET_STATE/,
-      );
+      const listing = await coordinator.listJobsForHost(scopeA, { limit: 10 });
+      expect(listing.jobs.some((j) => j.job_id === sub.job.job_id)).toBe(true);
     });
 
     it("verifies expires_at lifecycle (non-null only for queued and expired)", async () => {

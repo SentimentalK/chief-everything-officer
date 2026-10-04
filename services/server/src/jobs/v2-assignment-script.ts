@@ -11,6 +11,9 @@ local function badtype(key, ok)
   return false
 end
 
+local time_parts = redis.call('TIME')
+local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
+
 if badtype(KEYS[1], 'string') then
   return redis.error_reply('WRONGTYPE_REQ_KEY')
 end
@@ -18,6 +21,22 @@ end
 local existing_job_id = redis.call('GET', KEYS[1])
 if existing_job_id then
   return cjson.encode({ status = 'existing_request', job_id = existing_job_id })
+end
+
+-- Project-delete fence (PROJECT-039): a fresh fence on the target blocks all
+-- NEW submissions. Idempotent replays of an existing request still resolve
+-- above, so submit idempotency is preserved during a delete window. A stale
+-- fence (older than the fence TTL) self-heals and lets submissions proceed.
+if badtype(KEYS[5], 'string') then
+  return redis.error_reply('WRONGTYPE_DELETE_FENCE')
+end
+local fence_raw = redis.call('GET', KEYS[5])
+if fence_raw then
+  local fence_sep = string.find(fence_raw, ':', 1, true)
+  local fence_started = fence_sep and tonumber(string.sub(fence_raw, 1, fence_sep - 1)) or 0
+  if now_ms - fence_started < 60000 then
+    return cjson.encode({ error = 'TARGET_DELETE_FENCED', target_id = ARGV[4] })
+  end
 end
 
 if badtype(KEYS[2], 'string') then
@@ -88,9 +107,25 @@ end
 if badtype(KEYS[4], 'string') then
   return redis.error_reply('WRONGTYPE_ATTEMPT_KEY')
 end
+if badtype(KEYS[5], 'string') then
+  return redis.error_reply('WRONGTYPE_DELETE_FENCE')
+end
 
 local time_parts = redis.call('TIME')
 local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
+
+-- Project-delete fence (PROJECT-039): while a fresh fence is held, claims do
+-- not proceed at all (including attempt-replay claims), so a delete that
+-- passed quiescence can never be raced by a claim landing afterwards. A stale
+-- fence (older than the fence TTL) self-heals and lets claims proceed.
+local fence_raw = redis.call('GET', KEYS[5])
+if fence_raw then
+  local fence_sep = string.find(fence_raw, ':', 1, true)
+  local fence_started = fence_sep and tonumber(string.sub(fence_raw, 1, fence_sep - 1)) or 0
+  if now_ms - fence_started < 60000 then
+    return cjson.encode({ error = 'TARGET_DELETE_FENCED', target_id = ARGV[3] })
+  end
+end
 
 local job_raw = redis.call('GET', KEYS[1])
 if not job_raw then

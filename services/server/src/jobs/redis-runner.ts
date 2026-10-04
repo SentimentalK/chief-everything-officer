@@ -74,6 +74,14 @@ export interface RedisRunner {
   zrangeWithScores(key: string, start: number, stop: number): Promise<Array<{ member: string; score: number }>>;
   /** ZREM members from a ZSET key; returns number of removed members. */
   zrem(key: string, ...members: string[]): Promise<number>;
+  /** SET key value NX PX ms; true when the key was newly set (fence acquisition). */
+  setNxPx(key: string, value: string, pxMs: number): Promise<boolean>;
+  /** Overwrite an existing key and (re)arm its PX TTL; false when the key is absent. */
+  setXxPx(key: string, value: string, pxMs: number): Promise<boolean>;
+  /** PEXPIRE a key; false when the key does not exist. */
+  pexpire(key: string, pxMs: number): Promise<boolean>;
+  /** DEL a single key; returns the number of keys removed. */
+  del(key: string): Promise<number>;
 }
 
 export class StoreError extends Error {
@@ -372,6 +380,30 @@ export function createRedisRunnerFromClient(
       if (members.length === 0) return 0;
       return execute("ZREM", async (client) => {
         const out = await client.sendCommand(["ZREM", key, ...members]);
+        return typeof out === "number" ? out : Number(out);
+      });
+    },
+    async setNxPx(key, value, pxMs) {
+      return execute("SET-NX-PX", async (client) => {
+        const out = await client.sendCommand(["SET", key, value, "NX", "PX", String(pxMs)]);
+        return out !== null && out !== undefined;
+      });
+    },
+    async setXxPx(key, value, pxMs) {
+      return execute("SET-XX-PX", async (client) => {
+        const out = await client.sendCommand(["SET", key, value, "XX", "PX", String(pxMs)]);
+        return out !== null && out !== undefined;
+      });
+    },
+    async pexpire(key, pxMs) {
+      return execute("PEXPIRE", async (client) => {
+        const out = await client.sendCommand(["PEXPIRE", key, String(pxMs)]);
+        return Number(out) === 1;
+      });
+    },
+    async del(key) {
+      return execute("DEL", async (client) => {
+        const out = await client.sendCommand(["DEL", key]);
         return typeof out === "number" ? out : Number(out);
       });
     },

@@ -71,6 +71,33 @@ export function targetQueueKeyV1(target_id: string): string {
   return `ceo:target:v1:${target_id}:jobs`;
 }
 
+/**
+ * Workspace project-delete quiescence fence (PROJECT-039).
+ *
+ * A short-lived per-target Redis fence held by the TargetDeleteCoordinator
+ * between fence acquisition and the physical execution_targets row deletion.
+ * While a FRESH fence exists, the create/claim Lua scripts refuse to create or
+ * claim work for that target, closing the submit/claim-vs-delete race. The
+ * fence value is `<started_ms>:<random token>`; a fence older than
+ * TARGET_DELETE_FENCE_TTL_MS is considered stale (crashed operation) and
+ * self-heals (scripts ignore it, a retrying delete takes it over). The fence
+ * is always released (or TTL-expires) at the end of the operation — it is an
+ * internal transitional barrier, never a user-visible state.
+ */
+export const TARGET_DELETE_FENCE_PREFIX = "ceo:target:delete-fence:v1:";
+export const TARGET_DELETE_FENCE_TTL_MS = 60_000;
+
+export function targetDeleteFenceKeyV1(target_id: string): string {
+  return `${TARGET_DELETE_FENCE_PREFIX}${target_id}`;
+}
+
+export function parseDeleteFenceStartedMs(value: string): number {
+  const sep = value.indexOf(":");
+  if (sep <= 0) return 0;
+  const started = Number(value.slice(0, sep));
+  return Number.isFinite(started) ? started : 0;
+}
+
 export type JobRecordV2Status = "preparing" | "queued" | "active" | "terminal";
 export type AttemptRecordV1Phase = "claimed" | "running" | "terminal";
 

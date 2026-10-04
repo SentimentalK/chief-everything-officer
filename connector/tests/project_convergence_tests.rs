@@ -205,13 +205,45 @@ fn test_cli_parsing_project_first_surface() {
         _ => panic!("unexpected command"),
     }
 
-    // project delete
+    // project delete (explicit selector; confirmation/force + json flags)
     let cli = Cli::try_parse_from(["ceo-connector", "project", "delete", "my-proj"]).unwrap();
     match cli.command {
         Commands::Project {
-            sub: ProjectSubcommands::Delete { project },
+            sub:
+                ProjectSubcommands::Delete {
+                    project,
+                    force,
+                    json,
+                },
         } => {
             assert_eq!(project, "my-proj");
+            assert!(!force);
+            assert!(!json);
+        }
+        _ => panic!("unexpected command"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "ceo-connector",
+        "project",
+        "delete",
+        "my-proj",
+        "--force",
+        "--json",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Project {
+            sub:
+                ProjectSubcommands::Delete {
+                    project,
+                    force,
+                    json,
+                },
+        } => {
+            assert_eq!(project, "my-proj");
+            assert!(force);
+            assert!(json);
         }
         _ => panic!("unexpected command"),
     }
@@ -1208,8 +1240,10 @@ async fn test_project_detach_and_remove_compat_alias_and_delete_semantics() {
     let cfg_after_remove = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     assert!(!cfg_after_remove.targets.contains_key(target_id));
 
-    // 5. project delete fails explicitly with DeleteUnsupported, never destroys historical records
-    // Re-seed config to verify delete does not destructively remove local or server state
+    // 5. project delete = workspace-level permanent deletion via the Server
+    //    delete contract (PROJECT-039): explicit selector + force, and the
+    //    local mapping is removed only after confirmed Server success.
+    // Re-seed config to verify delete removes local state after Server success
     let mut cfg_for_delete = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     cfg_for_delete.targets.insert(
         target_id.to_string(),
@@ -1220,23 +1254,79 @@ async fn test_project_detach_and_remove_compat_alias_and_delete_semantics() {
     );
     cfg_for_delete.save(&paths.config_file()).unwrap();
 
-    let delete_err = project_delete(&paths, "hello-detach").await.unwrap_err();
-    match delete_err {
-        ProjectError::DeleteUnsupported(msg) => {
-            assert!(msg.contains(
-                "the server does not currently expose a workspace-level project deletion API"
-            ));
-            assert!(msg.contains("project detach"));
+    let delete_calls = Arc::new(AtomicU32::new(0));
+    let delete_calls_clone = delete_calls.clone();
+    let unbind_calls_clone2 = unbind_calls.clone();
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": target_id,
+                            "workspace_id": "ws_1",
+                            "alias": "hello-detach",
+                            "display_name": "hello-detach",
+                            "kind": "coding",
+                            "repository": null,
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
         }
-        other => panic!("expected DeleteUnsupported error, got: {:?}", other),
-    }
+        if req.method == "POST"
+            && req
+                .path
+                .contains("/api/connector/targets/tgt_detach_test_1/delete")
+        {
+            // The Connector must send the explicit confirmation flag.
+            let body: serde_json::Value = req.json().unwrap_or(serde_json::Value::Null);
+            if body.get("confirm") != Some(&serde_json::json!(true)) {
+                return MockResponse::json(400, &serde_json::json!({ "error": "INVALID_REQUEST" }));
+            }
+            delete_calls_clone.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "target_id": target_id,
+                    "outcome": "deleted",
+                    "terminal_job_count": 3
+                }),
+            );
+        }
+        if req.method == "POST"
+            && req
+                .path
+                .contains("/api/connector/targets/tgt_detach_test_1/unbind")
+        {
+            unbind_calls_clone2.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(200, &serde_json::json!({ "ok": true }));
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
 
-    // Local mapping and server target remain intact after unsupported delete
+    let delete_res = project_delete(&paths, "hello-detach", true, false).await;
+    assert!(
+        delete_res.is_ok(),
+        "workspace-level delete must succeed: {:?}",
+        delete_res
+    );
+    assert_eq!(delete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(unbind_calls.load(Ordering::SeqCst), 2); // detach/unbind untouched
+
+    // Local mapping removed only after confirmed Server success
     let cfg_after_delete = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
-    assert!(cfg_after_delete.targets.contains_key(target_id));
+    assert!(!cfg_after_delete.targets.contains_key(target_id));
 
-    // Nonexistent selector gives clean ProjectNotFound
-    let not_found_err = project_delete(&paths, "nonexistent-proj")
+    // Nonexistent selector gives clean ProjectNotFound (resolved from the
+    // authoritative catalogue; never a delete inference)
+    let not_found_err = project_delete(&paths, "nonexistent-proj", true, false)
         .await
         .unwrap_err();
     match not_found_err {
@@ -1245,6 +1335,91 @@ async fn test_project_detach_and_remove_compat_alias_and_delete_semantics() {
         }
         other => panic!("expected ProjectNotFound error, got: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_project_delete_confirmation_and_server_failure_keeps_local_mapping() {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let target_id = "tgt_delete_guard_1";
+
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/api/connector/targets") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "targets": [{
+                        "target": {
+                            "id": target_id,
+                            "workspace_id": "ws_1",
+                            "alias": "guarded-project",
+                            "display_name": "guarded-project",
+                            "kind": "coding",
+                            "repository": null,
+                            "disabled": false,
+                            "is_default_agent_runtime": false
+                        },
+                        "this_device_binding": { "id": "bnd_1", "enabled": true },
+                        "active_binding_count": 1
+                    }]
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.contains("/targets/tgt_delete_guard_1/delete") {
+            // Server-side quiescence barrier: non-terminal jobs exist.
+            return MockResponse::json(
+                409,
+                &serde_json::json!({
+                    "error": "TARGET_DELETE_BLOCKED",
+                    "message": "still has non-terminal jobs (queued: 1)",
+                    "evidence": { "preparing": [], "queued": ["job-1"], "claimed": [], "running": [] }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Seed local mapping
+    let mut cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    cfg.targets.insert(
+        target_id.to_string(),
+        LocalTarget {
+            local_path: "/tmp/some-path".to_string(),
+            executor: None,
+        },
+    );
+    cfg.save(&paths.config_file()).unwrap();
+
+    // 1. Non-TTY without --force: destructive action is refused BEFORE any
+    //    server delete request (clear confirmation semantics).
+    let confirm_err = project_delete(&paths, "guarded-project", false, false)
+        .await
+        .unwrap_err();
+    match confirm_err {
+        ProjectError::InteractiveRequired(msg) => {
+            assert!(msg.contains("--force"), "message: {msg}");
+        }
+        other => panic!("expected InteractiveRequired, got: {:?}", other),
+    }
+
+    // 2. With --force, the Server-side blocked outcome surfaces verbatim and
+    //    the local mapping is NEVER removed when Server deletion fails.
+    let blocked_err = project_delete(&paths, "guarded-project", true, false)
+        .await
+        .unwrap_err();
+    match blocked_err {
+        ProjectError::DeleteBlocked(msg) => {
+            assert!(msg.contains("non-terminal jobs"), "message: {msg}");
+        }
+        other => panic!("expected DeleteBlocked, got: {:?}", other),
+    }
+
+    let cfg_after = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
+    assert!(
+        cfg_after.targets.contains_key(target_id),
+        "failed Server deletion must keep the local mapping"
+    );
 }
 
 #[tokio::test]

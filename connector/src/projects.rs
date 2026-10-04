@@ -67,8 +67,10 @@ pub enum ProjectError {
     InteractiveRequired(String),
     #[error("Orca agent discovery failed: {0}")]
     OrcaDiscovery(String),
-    #[error("Workspace-level project deletion is not currently supported: {0}")]
-    DeleteUnsupported(String),
+    #[error("{0}")]
+    DeleteBlocked(String),
+    #[error("{0}")]
+    DeleteInProgress(String),
     #[error("Device not logged in. Please run `ceo-connector login` first.")]
     NotLoggedIn,
 }
@@ -822,22 +824,145 @@ pub async fn project_detach(paths: &ConnectorPaths, selector: &str) -> Result<()
     Ok(())
 }
 
-pub async fn project_delete(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {
+pub async fn project_delete(
+    paths: &ConnectorPaths,
+    selector: &str,
+    force: bool,
+    json_format: bool,
+) -> Result<(), ProjectError> {
     paths.ensure_dirs()?;
     let profile = crate::config::load_bound_profile(paths)?;
     let cred = profile.credential;
     let client = ConnectorClient::new(&cred.server_origin)?;
 
+    // Destructive actions require an explicit selector: no no-arg inference
+    // exists, and the resolved immutable target_id (never a display name) is
+    // what gets deleted.
     let resolved = resolve_target_selector(paths, &client, &cred, selector)
         .await
         .map_err(map_target_error_for_project)?;
+    let target_id = resolved.target_id;
+    let display_name = resolved
+        .projection
+        .as_ref()
+        .map(|p| p.display_name.clone())
+        .unwrap_or_else(|| selector.to_string());
 
-    check_active_attempt_target_in_use(paths, &resolved.target_id)
-        .map_err(map_target_error_for_project)?;
+    check_active_attempt_target_in_use(paths, &target_id).map_err(map_target_error_for_project)?;
 
-    Err(ProjectError::DeleteUnsupported(format!(
-        "the server does not currently expose a workspace-level project deletion API. Historical jobs and workspace audit references are preserved. To detach project '{selector}' from this device, use 'ceo-connector project detach {selector}'."
-    )))
+    // Confirmation/force semantics: interactive confirmation by default;
+    // `--force` is the automation escape hatch; non-TTY callers must pass
+    // --force explicitly.
+    if !force {
+        if !is_tty() {
+            return Err(ProjectError::InteractiveRequired(format!(
+                "Workspace-level project deletion is permanent and affects ALL devices. \
+                 Re-run with --force (or from an interactive terminal) to delete project '{selector}'."
+            )));
+        }
+        let prompt = format!(
+            "Permanently delete project '{display_name}' ({target_id}) from the workspace for ALL devices? Historical job records are preserved."
+        );
+        let answer = inquire::Confirm::new(&prompt)
+            .with_default(false)
+            .prompt()
+            .map_err(|e| ProjectError::InteractiveRequired(e.to_string()))?;
+        if !answer {
+            println!("Aborted. Project '{selector}' was not deleted.");
+            return Ok(());
+        }
+    }
+
+    // ONE server-side contract: fence -> authoritative quiescence check ->
+    // physical deletion. The Connector never assembles the destructive
+    // sequence itself, so it cannot race the Server.
+    match client.delete_target(&cred, &target_id, true).await {
+        Ok(resp) => {
+            // Confirmed Server deletion success: only now remove the local
+            // device mapping. A failed Server deletion never touches it.
+            remove_local_target_mapping(paths, &target_id)?;
+            let outcome = if resp.outcome == "already_deleted" {
+                "already deleted by a concurrent request"
+            } else {
+                "deleted"
+            };
+            if json_format {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "target_id": resp.target_id,
+                        "outcome": resp.outcome,
+                        "terminal_job_count": resp.terminal_job_count,
+                    }))?
+                );
+            } else if resp.outcome == "already_deleted" {
+                println!(
+                    "Project '{selector}' was {} on the server; local mapping removed. Historical job records are preserved.",
+                    outcome
+                );
+            } else {
+                println!(
+                    "Project '{selector}' ({}) permanently deleted from the workspace for all devices. Historical job records are preserved.",
+                    resp.target_id
+                );
+            }
+            Ok(())
+        }
+        Err(ClientError::TargetError { code, message }) if code == "TARGET_NOT_FOUND" => {
+            // Raced with a concurrent delete between selector resolution and
+            // the delete request. Prune the local mapping only after a fresh
+            // authoritative catalogue confirms the absence.
+            let catalogue = client.list_targets(&cred, None).await?;
+            if catalogue.iter().any(|t| t.target_id == target_id) {
+                return Err(ProjectError::DeleteBlocked(format!(
+                    "server reported target '{target_id}' as not found, but the catalogue still lists it; local mapping kept ({message})"
+                )));
+            }
+            remove_local_target_mapping(paths, &target_id)?;
+            println!(
+                "Project '{selector}' was already deleted on the server (concurrent request); local mapping removed. Historical job records are preserved."
+            );
+            Ok(())
+        }
+        Err(ClientError::TargetError { code, message }) if code == "TARGET_DELETE_BLOCKED" => {
+            Err(ProjectError::DeleteBlocked(message))
+        }
+        Err(ClientError::TargetError { code, message }) if code == "TARGET_DELETE_IN_PROGRESS" => {
+            Err(ProjectError::DeleteInProgress(format!(
+                "{message} (transient; retry shortly)"
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Removes a target's local mapping under the state lock (Device-owned v3
+/// config). Used by `project delete` after confirmed Server deletion.
+fn remove_local_target_mapping(
+    paths: &ConnectorPaths,
+    target_id: &str,
+) -> Result<(), ProjectError> {
+    let _lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_millis(50),
+    ) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(ProjectError::Target(TargetError::ProfileBusy))
+        }
+        Err(e) => return Err(ProjectError::Io(e)),
+    };
+
+    let mut config = match LocalConfig::load(&paths.config_file())? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    if config.targets.remove(target_id).is_some() {
+        config.save(&paths.config_file())?;
+    }
+    Ok(())
 }
 
 pub async fn project_remove(paths: &ConnectorPaths, selector: &str) -> Result<(), ProjectError> {

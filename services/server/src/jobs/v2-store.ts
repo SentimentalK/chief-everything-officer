@@ -10,6 +10,9 @@ import {
   targetQueueKeyV1,
   jobAttemptsKeyV1,
   requestKeyV2,
+  targetDeleteFenceKeyV1,
+  parseDeleteFenceStartedMs,
+  TARGET_DELETE_FENCE_TTL_MS,
   parseJobRecordV2,
   serializeJobRecordV2,
   parseAttemptRecordV1,
@@ -100,6 +103,18 @@ export class V2CancelRaceError extends Error {
   constructor() {
     super("Job attempt linkage changed during cancel; retry with a fresh read.");
     this.name = "V2CancelRaceError";
+  }
+}
+
+/**
+ * PROJECT-039: a fresh project-delete fence is currently held on the job's
+ * target. Transient by design (the fence is released or TTL-expires); callers
+ * surface a retryable conflict and must not treat the target as gone.
+ */
+export class V2TargetDeleteFencedError extends Error {
+  constructor(public readonly targetId: string | null = null) {
+    super("Target delete fence is active; submission/claim refused.");
+    this.name = "V2TargetDeleteFencedError";
   }
 }
 
@@ -196,6 +211,7 @@ export class RedisJobStoreV2 {
       jobKeyV2(job.job_id),
       KEY_STREAM_V2,
       targetQueueKeyV1(job.target_id),
+      targetDeleteFenceKeyV1(job.target_id),
     ];
     const args = [
       job.job_id,
@@ -228,6 +244,11 @@ export class RedisJobStoreV2 {
       const err = String(parsed.error);
       if (err === "JOB_ID_COLLISION") {
         throw new V2StoreError("QUEUE_UNAVAILABLE", "Job ID collision detected in queue.", "JOB_ID_COLLISION");
+      }
+      if (err === "TARGET_DELETE_FENCED") {
+        throw new V2TargetDeleteFencedError(
+          typeof parsed.target_id === "string" ? parsed.target_id : job.target_id,
+        );
       }
       if (err === "IDEMPOTENCY_CONFLICT") {
         throw new V2IdempotencyConflictError("A job with this request ID already exists with different parameters.");
@@ -302,6 +323,7 @@ export class RedisJobStoreV2 {
       targetQueueKeyV1(params.expected_target_id),
       jobAttemptsKeyV1(params.job_id),
       attemptKeyV1(params.attempt_id),
+      targetDeleteFenceKeyV1(params.expected_target_id),
     ];
     const args = [
       params.job_id,
@@ -332,6 +354,11 @@ export class RedisJobStoreV2 {
     if (parsed.error) {
       const err = String(parsed.error);
       if (err === "JOB_NOT_FOUND") throw new V2JobNotFoundError();
+      if (err === "TARGET_DELETE_FENCED") {
+        throw new V2TargetDeleteFencedError(
+          typeof parsed.target_id === "string" ? parsed.target_id : params.expected_target_id,
+        );
+      }
       if (err === "JOB_ALREADY_CLAIMED") throw new V2JobAlreadyClaimedError();
       if (err === "JOB_EXPIRED") throw new V2JobExpiredError();
       if (err === "JOB_FINISHED") throw new V2JobFinishedError();
@@ -630,5 +657,97 @@ export class RedisJobStoreV2 {
       }
       return { id, fields };
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Project-delete fence & quiescence support (PROJECT-039)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Forward XRANGE scan over the full job stream (batched, cursor-based).
+   * The stream is the durable history of every submitted Job, so a complete
+   * scan is the authoritative per-target job enumeration for delete
+   * quiescence — no secondary index is trusted.
+   */
+  async scanJobStream(
+    afterExclusive: string | null,
+    count: number,
+  ): Promise<Array<{ id: string; fields: Record<string, string> }>> {
+    this.checkReady();
+    const rows = await this.redis.xrange(KEY_STREAM_V2, afterExclusive ?? "0-0", count);
+    return rows.map(([id, flat]) => {
+      const fields: Record<string, string> = {};
+      for (let i = 0; i < flat.length; i += 2) {
+        const key = flat[i];
+        if (key !== undefined) {
+          fields[key] = flat[i + 1] ?? "";
+        }
+      }
+      return { id, fields };
+    });
+  }
+
+  /**
+   * Atomically acquires the target's delete fence with SET NX PX. Returns
+   * true only when this caller now owns the fence.
+   */
+  async acquireTargetDeleteFence(targetId: string, token: string): Promise<boolean> {
+    this.checkReady();
+    return this.redis.setNxPx(
+      targetDeleteFenceKeyV1(targetId),
+      `${Date.now()}:${token}`,
+      TARGET_DELETE_FENCE_TTL_MS,
+    );
+  }
+
+  /**
+   * Takeover path for a STALE fence (crashed delete operation): overwrites the
+   * fence value with a fresh started_ms + token and re-arms the TTL. Fails
+   * (false) when the key vanished — the caller should acquire normally.
+   */
+  async takeoverStaleTargetDeleteFence(targetId: string, token: string): Promise<boolean> {
+    this.checkReady();
+    return this.redis.setXxPx(
+      targetDeleteFenceKeyV1(targetId),
+      `${Date.now()}:${token}`,
+      TARGET_DELETE_FENCE_TTL_MS,
+    );
+  }
+
+  async getTargetDeleteFence(targetId: string): Promise<string | null> {
+    this.checkReady();
+    return this.redis.get(targetDeleteFenceKeyV1(targetId));
+  }
+
+  /**
+   * Re-arms the fence TTL while the delete is still in flight (used between
+   * quiescence scan batches so a slow scan can never outlive the fence).
+   * Only refreshes when the caller still owns the fence (token match).
+   */
+  async touchTargetDeleteFence(targetId: string, token: string): Promise<void> {
+    this.checkReady();
+    const value = await this.redis.get(targetDeleteFenceKeyV1(targetId));
+    if (value !== null && parseDeleteFenceStartedMs(value) > 0) {
+      const sep = value.indexOf(":");
+      if (sep >= 0 && value.slice(sep + 1) === token) {
+        await this.redis.pexpire(targetDeleteFenceKeyV1(targetId), TARGET_DELETE_FENCE_TTL_MS);
+      }
+    }
+  }
+
+  /**
+   * Releases the fence iff the caller still owns it (compare-and-delete on
+   * the token). Returns true when this call removed the fence.
+   */
+  async releaseTargetDeleteFence(targetId: string, token: string): Promise<boolean> {
+    this.checkReady();
+    const value = await this.redis.get(targetDeleteFenceKeyV1(targetId));
+    if (value === null) return false;
+    const sep = value.indexOf(":");
+    if (sep >= 0 && value.slice(sep + 1) === token) {
+      const removed = await this.redis.del(targetDeleteFenceKeyV1(targetId));
+      return removed > 0;
+    }
+    return false;
   }
 }

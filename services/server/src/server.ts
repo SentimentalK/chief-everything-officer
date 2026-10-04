@@ -36,6 +36,7 @@ import { BUILD_INFO } from "./build-info.js";
 import { openNeutralRedisRunner } from "./jobs/redis-runner.js";
 import { RedisJobStoreV2 } from "./jobs/v2-store.js";
 import { JobCoordinatorV2 } from "./jobs/v2-service.js";
+import { TargetDeleteCoordinator } from "./jobs/target-delete.js";
 import { createConnectorJobsRouter } from "./jobs/v2-router.js";
 import { resolveResourceLocation } from "./resource/locator.js";
 import { WorkspaceRuntimeRegistry } from "./runtime/registry.js";
@@ -218,6 +219,14 @@ app.use(
 );
 
 // Connector trusted-device enrollment & auth router (when publicOrigin is configured)
+const targetDeleteCoordinator = v2Store
+  ? new TargetDeleteCoordinator({
+      controlStore: connectorControlStore,
+      jobStore: v2Store,
+      identityStore: identityService.storeInstance,
+    })
+  : null;
+
 if (config.publicOrigin) {
   app.use(
     createConnectorRouter({
@@ -228,6 +237,7 @@ if (config.publicOrigin) {
       publicOrigin: config.publicOrigin,
       hostGuard: createHostGuard(config.allowedHosts),
       originGuard: createOriginGuard(config.allowedOrigins),
+      targetDeleteCoordinator: targetDeleteCoordinator ?? undefined,
     }),
   );
 } else {

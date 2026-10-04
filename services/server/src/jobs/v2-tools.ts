@@ -16,6 +16,7 @@ import {
   V2JobNotFoundError,
   V2IdempotencyConflictError,
   V2StoreError,
+  V2TargetDeleteFencedError,
 } from "./v2-store.js";
 import {
   assertHostWorkspaceAccess,
@@ -80,6 +81,9 @@ function errInfo(error: unknown): { code: string; message: string; reason?: stri
   }
   if (error instanceof TargetDisabledError) {
     return { code: "TARGET_DISABLED", message: error.message };
+  }
+  if (error instanceof V2TargetDeleteFencedError) {
+    return { code: "TARGET_DELETE_IN_PROGRESS", message: error.message };
   }
   if (error instanceof UserInactiveError) {
     return { code: "WORKSPACE_ACCESS_DENIED", message: error.message };

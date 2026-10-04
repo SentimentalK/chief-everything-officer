@@ -199,8 +199,14 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            ProjectSubcommands::Delete { project } => {
-                if let Err(e) = ceo_connector::projects::project_delete(&paths, &project).await {
+            ProjectSubcommands::Delete {
+                project,
+                force,
+                json,
+            } => {
+                if let Err(e) =
+                    ceo_connector::projects::project_delete(&paths, &project, force, json).await
+                {
                     eprintln!("Project delete failed: {}", e);
                     return ExitCode::FAILURE;
                 }

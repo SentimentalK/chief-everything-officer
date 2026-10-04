@@ -843,13 +843,25 @@ pub async fn build_target_display_items(
         vec![]
     };
 
-    let mut display_items: Vec<TargetDisplayItem> = Vec::new();
-
     // Index server targets by target_id
     let mut server_map: BTreeMap<String, ConnectorTargetProjection> = BTreeMap::new();
     for st in server_targets {
         server_map.insert(st.target_id.clone(), st);
     }
+
+    // PROJECT-039 convergence: after a SUCCESSFUL authoritative catalogue
+    // fetch, any locally mapped target_id that the Server no longer knows
+    // (e.g. its Workspace-level Project was deleted by another device) is a
+    // stale mapping — prune it so it cannot render a permanent ghost. A
+    // catalogue FAILURE never prunes (offline direct-ID behavior is
+    // preserved); lock contention only skips the prune.
+    let config = if cred.is_some() {
+        prune_stale_local_mappings(paths, config, &server_map)?
+    } else {
+        config
+    };
+
+    let mut display_items: Vec<TargetDisplayItem> = Vec::new();
 
     // Process local config targets
     for (tid, lt) in &config.targets {
@@ -1038,4 +1050,64 @@ pub async fn target_rename(
         );
     }
     Ok(())
+}
+
+/// PROJECT-039 stale-mapping convergence: after a SUCCESSFUL authoritative
+/// Server catalogue fetch, locally mapped target_ids that the Server no
+/// longer knows (their Workspace-level Project was deleted) are pruned from
+/// the Device-owned v3 config so they cannot render a permanent ghost.
+///
+/// Authority: only a successful full-catalogue fetch prunes. A catalogue
+/// failure keeps every local mapping (offline direct-ID behavior is
+/// preserved), and state-lock contention merely skips the prune instead of
+/// failing the read path.
+fn prune_stale_local_mappings(
+    paths: &ConnectorPaths,
+    config: LocalConfig,
+    server_map: &BTreeMap<String, ConnectorTargetProjection>,
+) -> Result<LocalConfig, TargetError> {
+    let stale_ids: Vec<String> = config
+        .targets
+        .keys()
+        .filter(|tid| !server_map.contains_key(*tid))
+        .cloned()
+        .collect();
+    if stale_ids.is_empty() {
+        return Ok(config);
+    }
+
+    // Re-serialize under the state lock against a FRESH config so a
+    // concurrent writer (daemon/setup) is never clobbered.
+    let lock = match ExecutionLock::acquire_with_retry(
+        &paths.state_lock_file(),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(25),
+    ) {
+        Ok(l) => l,
+        Err(_) => return Ok(config), // busy: skip pruning this round
+    };
+
+    let mut fresh = match LocalConfig::load(&paths.config_file())? {
+        Some(c) => c,
+        None => {
+            drop(lock);
+            return Ok(config);
+        }
+    };
+    let mut pruned_any = false;
+    for tid in stale_ids {
+        if fresh.targets.remove(&tid).is_some() {
+            pruned_any = true;
+        }
+    }
+    if pruned_any {
+        fresh.save(&paths.config_file())?;
+    }
+    drop(lock);
+
+    if pruned_any {
+        Ok(fresh)
+    } else {
+        Ok(config)
+    }
 }

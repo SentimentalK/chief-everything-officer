@@ -173,10 +173,19 @@ pub enum ProjectSubcommands {
         project: String,
     },
 
-    /// Workspace-level logical deletion of a project
+    /// Workspace-level permanent deletion of a project (Server-authoritative)
     Delete {
         /// Project selector: exact project alias, display name, or target ID
         project: String,
+
+        /// Skip the interactive confirmation prompt (required for
+        /// non-interactive use)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Output in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Remove a project binding from this device (deprecated: use 'detach')

@@ -41,7 +41,6 @@ import {
 } from "./v2-store.js";
 import type {
   ConnectorControlStore,
-  ExecutionTargetRecord,
 } from "../connector/control-store.js";
 import type { IdentityStore } from "../identity/store.js";
 import type { ResourceService } from "../resource/service.js";
@@ -58,19 +57,30 @@ export interface ListJobsQuery {
   cursor?: string | null;
 }
 
-export function loadHostJobTarget(
+/**
+ * PROJECT-039: workspace-level Project deletion physically removes the
+ * execution_targets row while historical Job records keep their historical
+ * target_id. Historical jobs must therefore remain queryable after deletion:
+ * when the Target row is gone, the record stays readable and the display
+ * alias degrades to the historical target_id (never fabricated metadata).
+ * A target row that EXISTS but mismatches the job remains corrupt state.
+ */
+export function resolveHostJobTargetAlias(
   controlStore: ConnectorControlStore,
   job: JobRecordV2,
-): ExecutionTargetRecord {
+): string {
   const target = controlStore.getExecutionTarget(job.target_id);
-  if (!target || target.id !== job.target_id || target.workspace_id !== job.workspace_id) {
+  if (!target) {
+    return job.target_id;
+  }
+  if (target.id !== job.target_id || target.workspace_id !== job.workspace_id) {
     throw new V2StoreError(
       "QUEUE_UNAVAILABLE",
-      `Job '${job.job_id}' references missing or invalid execution target '${job.target_id}'.`,
+      `Job '${job.job_id}' references invalid execution target '${job.target_id}'.`,
       "CORRUPT_TARGET_STATE",
     );
   }
-  return target;
+  return target.alias;
 }
 
 export interface HostJobSummary {
@@ -1125,7 +1135,7 @@ export class JobCoordinatorV2 {
     }
 
     const hostState = deriveHostJobState(job, attempt, this.nowMs());
-    const target = loadHostJobTarget(this.controlStore, job);
+    const targetAlias = resolveHostJobTargetAlias(this.controlStore, job);
 
     const expiresAt =
       hostState === "queued" || hostState === "expired"
@@ -1136,7 +1146,7 @@ export class JobCoordinatorV2 {
       job_id: job.job_id,
       request_id: job.request_id,
       target_id: job.target_id,
-      target_alias: target.alias,
+      target_alias: targetAlias,
       state: hostState,
       execution_status: jobExecutionStatusView(job, attempt),
       business_outcome: jobBusinessOutcomeView(job, attempt),
@@ -1210,8 +1220,12 @@ export class JobCoordinatorV2 {
       if (!TARGET_ID_V2_RE.test(query.target_id)) {
         throw new JobValidationError("Invalid target_id format.");
       }
+      // PROJECT-039: a deleted Target no longer has a control-store row, yet
+      // its historical jobs must remain queryable. Only an EXISTING target in
+      // a foreign workspace is rejected; an absent row defers isolation to
+      // the workspace-scoped stream scan below.
       const target = this.controlStore.getExecutionTarget(query.target_id);
-      if (!target || target.workspace_id !== scope.workspace_id) {
+      if (target && target.workspace_id !== scope.workspace_id) {
         throw new TargetNotFoundError();
       }
     }
@@ -1361,7 +1375,7 @@ export class JobCoordinatorV2 {
           }
         }
 
-        const target = loadHostJobTarget(this.controlStore, job);
+        const targetAlias = resolveHostJobTargetAlias(this.controlStore, job);
 
         const expiresAt =
           hostState === "queued" || hostState === "expired"
@@ -1372,7 +1386,7 @@ export class JobCoordinatorV2 {
           job_id: job.job_id,
           request_id: job.request_id,
           target_id: job.target_id,
-          target_alias: target.alias,
+          target_alias: targetAlias,
           state: hostState,
           execution_status: jobExecutionStatusView(job, attempt),
           business_outcome: jobBusinessOutcomeView(job, attempt),

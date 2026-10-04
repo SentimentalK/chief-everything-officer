@@ -15,6 +15,7 @@ import {
   V2AttemptLifecycleError,
   V2ReportConflictError,
   V2StoreError,
+  V2TargetDeleteFencedError,
 } from "./v2-store.js";
 import { jobResultRequestSchema } from "./v2-schema.js";
 import { CeoError } from "../errors.js";
@@ -175,6 +176,10 @@ export function createConnectorJobsRouter(
       }
       if (err instanceof V2JobNotFoundError) {
         res.status(404).json({ error: "JOB_NOT_FOUND" });
+        return;
+      }
+      if (err instanceof V2TargetDeleteFencedError) {
+        res.status(409).json({ error: "TARGET_DELETE_FENCED", message: err.message });
         return;
       }
       if (err instanceof V2JobAlreadyClaimedError) {

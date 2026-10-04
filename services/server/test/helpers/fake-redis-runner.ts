@@ -1,5 +1,18 @@
 import { createHash } from "node:crypto";
 import type { RedisRunner } from "../../src/jobs/redis-runner.js";
+import { parseDeleteFenceStartedMs, TARGET_DELETE_FENCE_TTL_MS } from "../../src/jobs/v2-schema.js";
+
+function isFreshFence(value: string): boolean {
+  return Date.now() - parseDeleteFenceStartedMs(value) < TARGET_DELETE_FENCE_TTL_MS;
+}
+
+function isStreamEntryAfter(entryId: string, afterExclusive: string): boolean {
+  if (entryId === afterExclusive) return false;
+  const [aMajor, aMinor] = entryId.split("-").map(Number);
+  const [bMajor, bMinor] = afterExclusive.split("-").map(Number);
+  if (aMajor !== bMajor) return (aMajor ?? 0) > (bMajor ?? 0);
+  return (aMinor ?? 0) > (bMinor ?? 0);
+}
 
 export function createFakeRedisRunner(): RedisRunner & {
   zadd(key: string, score: number, member: string): Promise<number>;
@@ -35,12 +48,11 @@ export function createFakeRedisRunner(): RedisRunner & {
     async xrange(key: string, afterExclusive: string, count: number) {
       const stream = streams.get(key) ?? [];
       const out: Array<[string, string[]]> = [];
-      let foundAfter = !afterExclusive;
+      // Exclusive-start semantics (matches real XRANGE "(<id>"): return
+      // entries with an id strictly greater than `afterExclusive`. Exact
+      // sentinel match short-circuits; otherwise compare numerically.
       for (const entry of stream) {
-        if (!foundAfter) {
-          if (entry.id === afterExclusive) foundAfter = true;
-          continue;
-        }
+        if (!isStreamEntryAfter(entry.id, afterExclusive)) continue;
         const flat: string[] = [];
         for (const [k, v] of Object.entries(entry.fields)) {
           flat.push(k, String(v));
@@ -114,6 +126,22 @@ export function createFakeRedisRunner(): RedisRunner & {
       zset.set(member, score);
       return 1;
     },
+    async setNxPx(key: string, value: string, _pxMs: number) {
+      if (strings.has(key)) return false;
+      strings.set(key, value);
+      return true;
+    },
+    async setXxPx(key: string, value: string, _pxMs: number) {
+      if (!strings.has(key)) return false;
+      strings.set(key, value);
+      return true;
+    },
+    async pexpire(_key: string, _pxMs: number) {
+      return strings.has(_key);
+    },
+    async del(key: string) {
+      return strings.delete(key) ? 1 : 0;
+    },
     async evalsha(shaKey: string, keyCount: number, keys: string[], args: string[]) {
       const script = scriptMap.get(shaKey);
       if (!script) {
@@ -125,14 +153,20 @@ export function createFakeRedisRunner(): RedisRunner & {
       // Check script identity by matching distinctive patterns in the script
       if (script.includes("WRONGTYPE_REQ_KEY")) {
         // V2_CREATE_JOB_SCRIPT
-        // Keys: [reqKey, jobKey, streamKey, targetQueueKey]
+        // Keys: [reqKey, jobKey, streamKey, targetQueueKey, deleteFenceKey]
         // Args: [jobId, userId, workspaceId, targetId, createdAtMs, claimDeadlineMs, requestDigest, serializedJobJson, requestId]
-        const [reqKey, jobKey, streamKey, targetQueueKey] = keys;
+        const [reqKey, jobKey, streamKey, targetQueueKey, deleteFenceKey] = keys;
         const [jobId, userId, workspaceId, targetId, createdAtMs, claimDeadlineMs, requestDigest, serializedJobJson, requestId] = args;
 
         const reqVal = strings.get(reqKey);
         if (reqVal) {
           return JSON.stringify({ status: "existing_request", job_id: reqVal });
+        }
+
+        // Fresh project-delete fence blocks NEW submissions (stale fences self-heal).
+        const fenceVal = strings.get(deleteFenceKey ?? "");
+        if (fenceVal !== undefined && isFreshFence(fenceVal)) {
+          return JSON.stringify({ error: "TARGET_DELETE_FENCED", target_id: targetId });
         }
 
         // New job collision check
@@ -182,14 +216,20 @@ export function createFakeRedisRunner(): RedisRunner & {
 
       if (script.includes("WRONGTYPE_JOB_ATTEMPTS")) {
         // V2_CLAIM_JOB_SCRIPT
-        // Keys: [jobKey, targetQueueKey, attemptsKey, attemptKey]
+        // Keys: [jobKey, targetQueueKey, attemptsKey, attemptKey, deleteFenceKey]
         // Args: [jobId, expectedWorkspaceId, expectedTargetId, deviceId, targetBindingId, attemptId, claimTokenSha256, isReplayOnly]
-        const [jobKey, targetQueueKey, attemptsKey, attemptKey] = keys;
+        const [jobKey, targetQueueKey, attemptsKey, attemptKey, deleteFenceKey] = keys;
         const [jobId, expectedWorkspaceId, expectedTargetId, deviceId, targetBindingId, attemptId, claimTokenSha256, isReplayOnly] = args;
 
         const nowMs = Date.now();
         const jobRaw = strings.get(jobKey);
         if (!jobRaw) return JSON.stringify({ error: "JOB_NOT_FOUND" });
+
+        // Fresh project-delete fence blocks ALL claims, including replays.
+        const fenceVal = strings.get(deleteFenceKey ?? "");
+        if (fenceVal !== undefined && isFreshFence(fenceVal)) {
+          return JSON.stringify({ error: "TARGET_DELETE_FENCED", target_id: expectedTargetId });
+        }
 
         let job: any;
         try {

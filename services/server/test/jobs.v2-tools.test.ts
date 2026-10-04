@@ -822,7 +822,7 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(getTrace!.output_json).not.toContain("2".repeat(64));
     });
 
-    it("fails closed with QUEUE_UNAVAILABLE and CORRUPT_TARGET_STATE when target is deleted", async () => {
+    it("keeps historical jobs queryable after the target row is deleted (PROJECT-039)", async () => {
       const { client } = await createConnectedClient({
         userId: userAliceId,
         workspaceId: workspaceAId,
@@ -847,11 +847,10 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
         name: "job_get",
         arguments: { job_id: jobId },
       });
-      expect(getRes.isError).toBe(true);
       const content = JSON.parse((getRes.content as any)[0].text);
-      expect(content.ok).toBe(false);
-      expect(content.code).toBe("QUEUE_UNAVAILABLE");
-      expect(content.reason).toBe("CORRUPT_TARGET_STATE");
+      expect(content.ok).toBe(true);
+      expect(content.target_id).toBe(targetA1.id);
+      expect(content.target_alias).toBe(targetA1.id);
     });
   });
 
@@ -966,13 +965,13 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
       expect(item.report).toBeUndefined();
     });
 
-    it("fails closed with QUEUE_UNAVAILABLE and CORRUPT_TARGET_STATE when target is deleted", async () => {
+    it("keeps historical jobs queryable after the target row is deleted (PROJECT-039)", async () => {
       const { client } = await createConnectedClient({
         userId: userAliceId,
         workspaceId: workspaceAId,
       });
 
-      await client.callTool({
+      const subRes = await client.callTool({
         name: "job_submit",
         arguments: {
           request_id: `req-${crypto.randomUUID()}`,
@@ -981,6 +980,7 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
           acceptance: "Criteria",
         },
       });
+      const jobId = JSON.parse((subRes.content as any)[0].text).job_id;
 
       identityStore.withDb((db) => {
         db.prepare("DELETE FROM execution_targets WHERE id = ?;").run(targetA1.id);
@@ -990,11 +990,12 @@ describe("Connector V1.5 Host MCP Job Tools", () => {
         name: "job_list",
         arguments: {},
       });
-      expect(listRes.isError).toBe(true);
       const content = JSON.parse((listRes.content as any)[0].text);
-      expect(content.ok).toBe(false);
-      expect(content.code).toBe("QUEUE_UNAVAILABLE");
-      expect(content.reason).toBe("CORRUPT_TARGET_STATE");
+      expect(content.ok).toBe(true);
+      const item = content.jobs.find((j: any) => j.job_id === jobId);
+      expect(item).toBeDefined();
+      expect(item.target_id).toBe(targetA1.id);
+      expect(item.target_alias).toBe(targetA1.id);
     });
 
     it("returns QUEUE_UNAVAILABLE when coordinator is null", async () => {
