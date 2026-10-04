@@ -17,12 +17,14 @@ import {
   TargetDeleteBlockedError,
   TargetDeleteCoordinator,
   TargetDeleteInProgressError,
+  TARGET_DELETE_STREAM_SCAN_BATCH,
 } from "../src/jobs/target-delete.js";
 import { createFakeRedisRunner } from "./helpers/fake-redis-runner.js";
 import {
   serializeJobRecordV2,
   jobKeyV2,
   targetDeleteFenceKeyV1,
+  parseDeleteFenceStartedMs,
   JOBS_V2_SCHEMA_VERSION,
   JOB_CLAIM_TTL_MS_V2,
   TARGET_DELETE_FENCE_TTL_MS,
@@ -578,6 +580,141 @@ describe("Workspace-level Project Delete (PROJECT-039)", () => {
     const res = await deleteTarget();
     expect(res.outcome).toBe("deleted");
     expect(controlStore.getExecutionTarget(target.id)).toBeNull();
+    expect(await v2Store.getTargetDeleteFence(target.id)).toBeNull();
+  });
+
+  it("H: an actively touched fence stays authoritative to create/claim beyond the 60s freshness window (regression)", async () => {
+    const fenceKey = targetDeleteFenceKeyV1(target.id);
+    const token = "fence-token-h";
+    // A queued job exists for the whole window and must stay unclaimable.
+    const { job } = await submitJob();
+    expect(await v2Store.acquireTargetDeleteFence(target.id, token)).toBe(true);
+
+    for (let cycle = 0; cycle < 3; cycle++) {
+      // Simulate the wall clock advancing 70s since the last refresh (the
+      // embedded started_ms ages past the original TTL between scan batches).
+      await runner.set(fenceKey, `${Date.now() - (TARGET_DELETE_FENCE_TTL_MS + 10_000)}:${token}`);
+
+      // The owner's periodic touch must re-anchor BOTH the embedded
+      // started_ms and the TTL for the same owner token.
+      expect(await v2Store.touchTargetDeleteFence(target.id, token)).toBe(true);
+      const value = await v2Store.getTargetDeleteFence(target.id);
+      expect(value).not.toBeNull();
+      expect(value!.endsWith(`:${token}`)).toBe(true);
+      expect(Date.now() - parseDeleteFenceStartedMs(value!)).toBeLessThan(TARGET_DELETE_FENCE_TTL_MS);
+
+      // Far beyond the original 60s window, create AND claim stay fenced...
+      await expect(submitJob()).rejects.toThrow(V2TargetDeleteFencedError);
+      await expect(
+        coordinator.claimJob(
+          aliceDeviceId,
+          job.job_id,
+          `att-00000000-0000-0000-0000-${(cycle + 1).toString().padStart(12, "0")}`,
+          crypto.randomBytes(32).toString("hex"),
+        ),
+      ).rejects.toThrow(V2TargetDeleteFencedError);
+      expect(await v2Store.getAttempt(`att-00000000-0000-0000-0000-${(cycle + 1).toString().padStart(12, "0")}`)).toBeNull();
+    }
+
+    // ...until the delete releases the fence.
+    expect(await v2Store.releaseTargetDeleteFence(target.id, token)).toBe(true);
+    const { res: claimRes } = await claim(job.job_id, 42);
+    expect(claimRes.replayed).toBe(false);
+    const { job: job2 } = await submitJob();
+    expect(job2.status).toBe("queued");
+    await coordinator.cancelJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+    await coordinator.cancelJobForDevice(aliceDeviceId, userAliceId, job2.job_id);
+  });
+
+  it("H2: coordinator quiescence spanning beyond the 60s window keeps the fence authoritative until the delete releases", async () => {
+    // >2 scan batches of foreign-target stream entries force the coordinator's
+    // periodic between-batch touches.
+    for (let i = 0; i < TARGET_DELETE_STREAM_SCAN_BATCH * 2 + 7; i++) {
+      await runner.xaddStream(KEY_STREAM_V2, {
+        schema_version: 2,
+        job_id: `job-${crypto.randomUUID()}`,
+        user_id: userAliceId,
+        workspace_id: workspaceId,
+        target_id: "tgt_ffffffff-ffff-ffff-ffff-ffffffffffff",
+        created_at_ms: Date.now(),
+      });
+    }
+
+    const fenceKey = targetDeleteFenceKeyV1(target.id);
+    const token = "fence-token-h2";
+    expect(await v2Store.acquireTargetDeleteFence(target.id, token)).toBe(true);
+
+    // Simulate a slow scan: each batch boundary lands >60s after the previous
+    // refresh, so the embedded started_ms is already stale when the next
+    // batch is read. Only the coordinator's touch between batches can keep
+    // the fence authoritative.
+    const realScan = v2Store.scanJobStream.bind(v2Store);
+    (v2Store as unknown as { scanJobStream: unknown }).scanJobStream = async (
+      afterExclusive: string | null,
+      count: number,
+    ) => {
+      await runner.set(fenceKey, `${Date.now() - (TARGET_DELETE_FENCE_TTL_MS + 10_000)}:${token}`);
+      return realScan(afterExclusive, count);
+    };
+
+    const quiescence = await deleteCoordinator.verifyTargetQuiescence(target.id, token);
+    expect(quiescence.quiescent).toBe(true);
+
+    // The touches re-anchored the fence to the current clock on every batch:
+    // still authoritative for create far beyond the original 60s window.
+    const value = await v2Store.getTargetDeleteFence(target.id);
+    expect(value).not.toBeNull();
+    expect(value!.endsWith(`:${token}`)).toBe(true);
+    expect(Date.now() - parseDeleteFenceStartedMs(value!)).toBeLessThan(TARGET_DELETE_FENCE_TTL_MS);
+    await expect(submitJob()).rejects.toThrow(V2TargetDeleteFencedError);
+
+    // The delete completes (physical row removal under the fence) and
+    // releases; the fence key is gone.
+    expect(controlStore.deleteExecutionTargetRow(target.id)).toBe(true);
+    expect(await v2Store.releaseTargetDeleteFence(target.id, token)).toBe(true);
+    expect(await v2Store.getTargetDeleteFence(target.id)).toBeNull();
+  });
+
+  it("H3: an old owner's touch cannot refresh or overwrite a fence taken over by a newer owner", async () => {
+    const fenceKey = targetDeleteFenceKeyV1(target.id);
+    const oldToken = "fence-token-old";
+    expect(await v2Store.acquireTargetDeleteFence(target.id, oldToken)).toBe(true);
+
+    // The fence goes stale (old owner crashed mid-delete); a newer delete
+    // takes it over with a fresh started_ms + new token.
+    await runner.set(fenceKey, `${Date.now() - (TARGET_DELETE_FENCE_TTL_MS + 5_000)}:${oldToken}`);
+    const newToken = "fence-token-new";
+    expect(await v2Store.takeoverStaleTargetDeleteFence(target.id, newToken)).toBe(true);
+    const takenOver = await v2Store.getTargetDeleteFence(target.id);
+    expect(takenOver).not.toBeNull();
+    expect(takenOver!.endsWith(`:${newToken}`)).toBe(true);
+
+    // The OLD owner's touch must be refused without mutating the new
+    // owner's fence (no overwrite, no timestamp refresh).
+    expect(await v2Store.touchTargetDeleteFence(target.id, oldToken)).toBe(false);
+    expect(await v2Store.getTargetDeleteFence(target.id)).toBe(takenOver);
+
+    // The OLD owner cannot release the newer owner's fence either (CAS by
+    // owner token).
+    expect(await v2Store.releaseTargetDeleteFence(target.id, oldToken)).toBe(false);
+
+    // The NEW owner's touch refreshes both freshness and TTL in place.
+    expect(await v2Store.touchTargetDeleteFence(target.id, newToken)).toBe(true);
+    const refreshed = await v2Store.getTargetDeleteFence(target.id);
+    expect(refreshed).not.toBeNull();
+    expect(refreshed!.endsWith(`:${newToken}`)).toBe(true);
+    expect(Date.now() - parseDeleteFenceStartedMs(refreshed!)).toBeLessThan(TARGET_DELETE_FENCE_TTL_MS);
+    await expect(submitJob()).rejects.toThrow(V2TargetDeleteFencedError);
+
+    // Release by the true owner unblocks submissions.
+    expect(await v2Store.releaseTargetDeleteFence(target.id, newToken)).toBe(true);
+    const { job } = await submitJob();
+    expect(job.status).toBe("queued");
+    await coordinator.cancelJobForDevice(aliceDeviceId, userAliceId, job.job_id);
+  });
+
+  it("H4: touch on a missing fence is a false no-op", async () => {
+    expect(await v2Store.touchTargetDeleteFence(target.id, "any-token")).toBe(false);
     expect(await v2Store.getTargetDeleteFence(target.id)).toBeNull();
   });
 

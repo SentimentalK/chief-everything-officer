@@ -78,11 +78,15 @@ export function targetQueueKeyV1(target_id: string): string {
  * between fence acquisition and the physical execution_targets row deletion.
  * While a FRESH fence exists, the create/claim Lua scripts refuse to create or
  * claim work for that target, closing the submit/claim-vs-delete race. The
- * fence value is `<started_ms>:<random token>`; a fence older than
- * TARGET_DELETE_FENCE_TTL_MS is considered stale (crashed operation) and
- * self-heals (scripts ignore it, a retrying delete takes it over). The fence
- * is always released (or TTL-expires) at the end of the operation — it is an
- * internal transitional barrier, never a user-visible state.
+ * fence value is `<started_ms>:<random token>`; freshness is anchored to the
+ * embedded started_ms (not the key TTL): a fence whose started_ms is older
+ * than TARGET_DELETE_FENCE_TTL_MS is considered stale (crashed operation) and
+ * self-heals (scripts ignore it, a retrying delete takes it over). The owner
+ * therefore refreshes BOTH the embedded started_ms and the key TTL atomically
+ * (V2_TOUCH_DELETE_FENCE_SCRIPT, owner-token CAS) while the delete is in
+ * flight, keeping the fence authoritative for the full critical section. The
+ * fence is always released (or TTL-expires) at the end of the operation — it
+ * is an internal transitional barrier, never a user-visible state.
  */
 export const TARGET_DELETE_FENCE_PREFIX = "ceo:target:delete-fence:v1:";
 export const TARGET_DELETE_FENCE_TTL_MS = 60_000;

@@ -278,7 +278,10 @@ export class TargetDeleteCoordinator {
 
       cursor = batch[batch.length - 1]!.id;
       // Keep the fence alive across slow scans so the barrier cannot expire
-      // mid-verification.
+      // mid-verification. The touch atomically refreshes BOTH the embedded
+      // started_ms and the TTL for the owning token, so the create/claim
+      // scripts' freshness window re-arms for the full critical section
+      // (fence-freshness repair, PROJECT-039).
       await this.deps.jobStore.touchTargetDeleteFence(targetId, fenceToken);
 
       if (batch.length < TARGET_DELETE_STREAM_SCAN_BATCH) break;

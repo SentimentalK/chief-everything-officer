@@ -651,6 +651,37 @@ end
 return cjson.encode({ error = 'INVALID_JOB_STATUS', status = job.status })
 `;
 
+/**
+ * PROJECT-039 fence-freshness repair: atomic delete-fence touch.
+ *
+ * The fence value is `<started_ms>:<token>`, and the create/claim scripts
+ * treat the fence as active only while `now_ms - started_ms < 60000`. A
+ * touch that merely PEXPIREs the key leaves the embedded started_ms stale,
+ * so after 60s the create/claim scripts would treat a still-held fence as
+ * stale and open the critical section. This script refreshes BOTH the
+ * embedded started_ms (anchored to the Redis clock, the same clock the
+ * create/claim scripts compare against) and the PX TTL in ONE atomic
+ * operation, and only for the fence's CURRENT owner token: a non-owner
+ * touch (fence taken over by a newer delete) is refused without mutation,
+ * and a missing fence is a no-op returning 0.
+ *
+ * KEYS: [fenceKey]
+ * ARGS: [token, ttlMs]
+ * Returns: 1 when refreshed, 0 otherwise.
+ */
+export const V2_TOUCH_DELETE_FENCE_SCRIPT = `
+-- TOUCH_DELETE_FENCE_V1
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local sep = string.find(raw, ':', 1, true)
+if not sep then return 0 end
+if string.sub(raw, sep + 1) ~= ARGV[1] then return 0 end
+local time_parts = redis.call('TIME')
+local now_ms = tonumber(time_parts[1]) * 1000 + math.floor(tonumber(time_parts[2]) / 1000)
+redis.call('SET', KEYS[1], tostring(now_ms) .. ':' .. ARGV[1], 'PX', ARGV[2])
+return 1
+`;
+
 export const V2_RECORD_RESULT_SCRIPT = `
 local function badtype(key, ok)
   local t = redis.call('TYPE', key)

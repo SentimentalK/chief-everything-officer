@@ -27,6 +27,7 @@ import {
   V2_REPORT_JOB_SCRIPT,
   V2_RECORD_RESULT_SCRIPT,
   V2_CANCEL_JOB_SCRIPT,
+  V2_TOUCH_DELETE_FENCE_SCRIPT,
 } from "./v2-assignment-script.js";
 
 export class V2StoreError extends StoreError {
@@ -134,6 +135,7 @@ export class RedisJobStoreV2 {
   private reportScriptSha: string | null = null;
   private recordResultScriptSha: string | null = null;
   private cancelScriptSha: string | null = null;
+  private touchDeleteFenceScriptSha: string | null = null;
 
   constructor(private readonly redis: RedisRunner) {}
 
@@ -720,19 +722,25 @@ export class RedisJobStoreV2 {
   }
 
   /**
-   * Re-arms the fence TTL while the delete is still in flight (used between
+   * Re-arms the fence while the delete is still in flight (used between
    * quiescence scan batches so a slow scan can never outlive the fence).
-   * Only refreshes when the caller still owns the fence (token match).
+   * ATOMIC and owner-gated (PROJECT-039 fence-freshness repair): a single Lua
+   * operation refreshes BOTH the embedded started_ms and the PX TTL, so the
+   * create/claim scripts' freshness window stays consistent with the key's
+   * remaining TTL. Returns false without any mutation when the fence is
+   * missing or now owned by a different token (a newer delete took over) —
+   * a touch can never overwrite a newer owner's fence.
    */
-  async touchTargetDeleteFence(targetId: string, token: string): Promise<void> {
+  async touchTargetDeleteFence(targetId: string, token: string): Promise<boolean> {
     this.checkReady();
-    const value = await this.redis.get(targetDeleteFenceKeyV1(targetId));
-    if (value !== null && parseDeleteFenceStartedMs(value) > 0) {
-      const sep = value.indexOf(":");
-      if (sep >= 0 && value.slice(sep + 1) === token) {
-        await this.redis.pexpire(targetDeleteFenceKeyV1(targetId), TARGET_DELETE_FENCE_TTL_MS);
-      }
-    }
+    const raw = await this.evalScript(
+      V2_TOUCH_DELETE_FENCE_SCRIPT,
+      () => this.touchDeleteFenceScriptSha,
+      (s) => (this.touchDeleteFenceScriptSha = s),
+      [targetDeleteFenceKeyV1(targetId)],
+      [token, String(TARGET_DELETE_FENCE_TTL_MS)],
+    );
+    return raw === "1";
   }
 
   /**

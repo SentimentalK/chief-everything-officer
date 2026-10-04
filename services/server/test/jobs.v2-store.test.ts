@@ -20,6 +20,9 @@ import {
   targetQueueKeyV1,
   jobAttemptsKeyV1,
   requestKeyV2,
+  targetDeleteFenceKeyV1,
+  parseDeleteFenceStartedMs,
+  TARGET_DELETE_FENCE_TTL_MS,
   KEY_STREAM_V2,
   type JobRecordV2,
 } from "../src/jobs/v2-schema.js";
@@ -662,5 +665,37 @@ describe.skipIf(!URL)("RedisJobStoreV2 (real Redis integration, CI-gated)", () =
     const replayRes = await store.createJob(job, job.request_id);
     expect(replayRes.status).toBe("replayed");
     expect(replayRes.job_id).toBe(job.job_id);
+  });
+
+  it("refreshes the delete fence atomically for the owner and refuses non-owner touches under real Redis", async () => {
+    const targetId = "tgt_00000000-0000-0000-0000-000000000001";
+    const fenceKey = targetDeleteFenceKeyV1(targetId);
+    const token = "tok-owner-1";
+    expect(await store.acquireTargetDeleteFence(targetId, token)).toBe(true);
+
+    // Age the fence beyond the freshness window without touching (simulates
+    // the embedded started_ms going stale while the key still exists).
+    await client.set(fenceKey, `${Date.now() - (TARGET_DELETE_FENCE_TTL_MS + 1_000)}:${token}`);
+
+    // Owner touch: refreshes BOTH the embedded started_ms and the PX TTL.
+    expect(await store.touchTargetDeleteFence(targetId, token)).toBe(true);
+    const refreshed = await client.get(fenceKey);
+    expect(refreshed).not.toBeNull();
+    expect(refreshed!.endsWith(`:${token}`)).toBe(true);
+    expect(Date.now() - parseDeleteFenceStartedMs(refreshed!)).toBeLessThan(TARGET_DELETE_FENCE_TTL_MS);
+    const pttl = await client.pTTL(fenceKey);
+    expect(pttl).toBeGreaterThan(TARGET_DELETE_FENCE_TTL_MS - 1_000);
+    expect(pttl).toBeLessThanOrEqual(TARGET_DELETE_FENCE_TTL_MS);
+
+    // Non-owner touch is refused without mutation (no overwrite of the
+    // current owner's fence).
+    expect(await store.touchTargetDeleteFence(targetId, "tok-other")).toBe(false);
+    expect(await client.get(fenceKey)).toBe(refreshed);
+
+    // Release remains compare-and-delete by owner token.
+    expect(await store.releaseTargetDeleteFence(targetId, "tok-other")).toBe(false);
+    expect(await client.get(fenceKey)).toBe(refreshed);
+    expect(await store.releaseTargetDeleteFence(targetId, token)).toBe(true);
+    expect(await client.get(fenceKey)).toBeNull();
   });
 });

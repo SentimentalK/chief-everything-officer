@@ -151,6 +151,23 @@ export function createFakeRedisRunner(): RedisRunner & {
       }
 
       // Check script identity by matching distinctive patterns in the script
+      if (script.includes("TOUCH_DELETE_FENCE")) {
+        // V2_TOUCH_DELETE_FENCE_SCRIPT (PROJECT-039 fence-freshness repair)
+        // Keys: [fenceKey]
+        // Args: [token, ttlMs]
+        const [fenceKey] = keys;
+        const [ownerToken] = args;
+        const raw = strings.get(fenceKey);
+        if (raw === undefined || raw === null) return "0";
+        const sep = raw.indexOf(":");
+        if (sep < 0) return "0";
+        if (raw.slice(sep + 1) !== ownerToken) return "0";
+        // Owner CAS hit: refresh BOTH the embedded started_ms and the TTL
+        // (the fake has no TTL modeling; the value rewrite is what matters).
+        strings.set(fenceKey, `${Date.now()}:${ownerToken}`);
+        return "1";
+      }
+
       if (script.includes("WRONGTYPE_REQ_KEY")) {
         // V2_CREATE_JOB_SCRIPT
         // Keys: [reqKey, jobKey, streamKey, targetQueueKey, deleteFenceKey]
