@@ -55,6 +55,11 @@ pub fn resolve_launch_agent_id(
     executor: &LocalExecutorConfig,
 ) -> Result<String, String> {
     if let Some(ref concrete) = attempt.frozen_agent_id {
+        if crate::config::is_default_agent_policy(concrete) {
+            return Err(format!(
+                "frozen_agent_id is a policy name ('{concrete}'); refusing to pass policy string to Orca"
+            ));
+        }
         return Ok(concrete.clone());
     }
     if crate::config::is_default_agent_policy(&executor.agent_id) {
@@ -1629,5 +1634,15 @@ mod tests {
             resolve_launch_agent_id(&att_none, &exec_other).unwrap(),
             "antigravity"
         );
+
+        // Rule 4: defense-in-depth: frozen_agent_id containing policy names fails closed
+        for policy_word in &["default", "DEFAULT", "Default", "auto", "AUTO", "Auto"] {
+            let att_policy = dummy_attempt(Some((*policy_word).into()));
+            let err = resolve_launch_agent_id(&att_policy, &exec_other).unwrap_err();
+            assert!(
+                err.contains("is a policy name"),
+                "expected rejection for frozen policy word '{policy_word}', got: {err}"
+            );
+        }
     }
 }

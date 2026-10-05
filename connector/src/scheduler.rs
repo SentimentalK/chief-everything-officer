@@ -7,7 +7,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::client::ClaimJobResponse;
-use crate::config::LocalTarget;
+use crate::config::{is_default_agent_policy, LocalTarget};
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
@@ -266,7 +266,7 @@ impl ActiveAttempt {
                     "frozen_agent_id cannot be empty".into(),
                 ));
             }
-            if trimmed == "auto" || trimmed == "default" {
+            if is_default_agent_policy(trimmed) {
                 return Err(SchedulerError::CorruptState(format!(
                     "frozen_agent_id cannot be policy name '{trimmed}'"
                 )));
@@ -1046,23 +1046,27 @@ mod tests {
             Err(SchedulerError::CorruptState(_))
         ));
 
-        // Policy names "auto" and "default" are rejected
-        assert!(matches!(
-            make_attempt(Some("auto".into())).validate(),
-            Err(SchedulerError::CorruptState(_))
-        ));
-        assert!(matches!(
-            make_attempt(Some("default".into())).validate(),
-            Err(SchedulerError::CorruptState(_))
-        ));
-        assert!(matches!(
-            make_attempt(Some("  auto  ".into())).validate(),
-            Err(SchedulerError::CorruptState(_))
-        ));
-        assert!(matches!(
-            make_attempt(Some("  default  ".into())).validate(),
-            Err(SchedulerError::CorruptState(_))
-        ));
+        // Policy names "auto" and "default" are rejected case-insensitively
+        for policy_word in &[
+            "auto",
+            "AUTO",
+            "Auto",
+            "default",
+            "DEFAULT",
+            "Default",
+            "  auto  ",
+            "  AUTO  ",
+            "  default  ",
+            "  DEFAULT  ",
+        ] {
+            assert!(
+                matches!(
+                    make_attempt(Some((*policy_word).into())).validate(),
+                    Err(SchedulerError::CorruptState(_))
+                ),
+                "expected frozen_agent_id '{policy_word}' to be rejected as CorruptState"
+            );
+        }
 
         // Invalid characters
         assert!(matches!(

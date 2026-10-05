@@ -11,10 +11,14 @@
 //! - Private transport is currently verified for Unix sockets only; Windows and
 //!   unverified versions fail closed safely without crashing.
 
+#[cfg(unix)]
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use super::client::OrcaCliClient;
+use crate::config::is_default_agent_policy;
 
 pub const VERIFIED_ORCA_VERSION: &str = "1.4.219";
 pub const ENV_ORCA_USER_DATA_PATH: &str = "ORCA_USER_DATA_PATH";
@@ -42,6 +46,7 @@ impl DefaultAgentResolution {
     }
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct RuntimeMetadata {
     #[serde(default)]
@@ -51,6 +56,7 @@ struct RuntimeMetadata {
     transports: Vec<RuntimeTransport>,
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct RuntimeTransport {
     kind: String,
@@ -65,6 +71,7 @@ struct RuntimeTransport {
 /// Priority:
 /// 1. `ORCA_USER_DATA_PATH` environment variable if non-empty.
 /// 2. Platform-standard user config directory + "orca".
+#[cfg(unix)]
 pub fn resolve_orca_user_data_path() -> Option<PathBuf> {
     if let Ok(val) = std::env::var(ENV_ORCA_USER_DATA_PATH) {
         let trimmed = val.trim();
@@ -111,6 +118,12 @@ pub fn parse_settings(value: &serde_json::Value) -> DefaultAgentResolution {
 
     if default_str.is_empty() {
         return DefaultAgentResolution::Missing("defaultTuiAgent is empty or blank".into());
+    }
+
+    if is_default_agent_policy(default_str) {
+        return DefaultAgentResolution::Malformed(format!(
+            "defaultTuiAgent cannot be a policy word ('{default_str}')"
+        ));
     }
 
     if default_str.len() > 80 {
@@ -519,6 +532,21 @@ mod tests {
             parse_settings(&bad_disabled),
             DefaultAgentResolution::Malformed(_)
         ));
+
+        // Policy words are rejected regardless of case
+        for word in &["default", "DEFAULT", "Default", "auto", "AUTO", "Auto"] {
+            let policy_val = serde_json::json!({
+                "defaultTuiAgent": word,
+                "disabledTuiAgents": []
+            });
+            assert!(
+                matches!(
+                    parse_settings(&policy_val),
+                    DefaultAgentResolution::Malformed(_)
+                ),
+                "expected '{word}' to be rejected as Malformed"
+            );
+        }
     }
 
     #[test]

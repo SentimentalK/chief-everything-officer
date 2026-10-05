@@ -484,6 +484,21 @@ fn test_02_resolver_parsing_pure() {
         DefaultAgentResolution::Malformed(_)
     ));
 
+    // Policy words are rejected regardless of case
+    for policy_word in &["default", "DEFAULT", "Default", "auto", "AUTO", "Auto"] {
+        let policy_json = serde_json::json!({
+            "defaultTuiAgent": policy_word,
+            "disabledTuiAgents": []
+        });
+        assert!(
+            matches!(
+                parse_settings(&policy_json),
+                DefaultAgentResolution::Malformed(_)
+            ),
+            "expected defaultTuiAgent '{policy_word}' to be rejected as Malformed"
+        );
+    }
+
     // Disabled
     let disabled_json = serde_json::json!({
         "defaultTuiAgent": "opencode",
@@ -903,6 +918,16 @@ fn test_11_adapter_fail_closed_on_unresolved_policy() {
         resolve_launch_agent_id(&att_unresolved, &exec_explicit).unwrap(),
         "antigravity"
     );
+
+    // Defense-in-depth: frozen_agent_id containing any policy word fails closed
+    for policy_word in &["default", "DEFAULT", "Default", "auto", "AUTO", "Auto"] {
+        let att_policy = dummy_attempt(Some((*policy_word).into()));
+        let err = resolve_launch_agent_id(&att_policy, &exec_explicit).unwrap_err();
+        assert!(
+            err.contains("is a policy name"),
+            "expected policy word '{policy_word}' in frozen_agent_id to fail closed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
