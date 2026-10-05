@@ -349,6 +349,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -449,6 +450,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -520,6 +522,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -617,6 +620,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -730,6 +734,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -816,6 +821,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -837,6 +843,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -956,6 +963,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1044,6 +1052,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1147,6 +1156,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1233,6 +1243,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1332,6 +1343,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1526,6 +1538,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1591,6 +1604,7 @@ echo '{"ok":true}'
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1653,6 +1667,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1687,6 +1702,7 @@ async fn test_fake_orca_dispatch_classification_tightening() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1769,6 +1785,7 @@ async fn test_dispatch_turn_started_requires_explicit_stage_not_unsupported() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -1884,6 +1901,7 @@ async fn test_fake_orca_wait_classification() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -2501,6 +2519,7 @@ async fn test_dispatch_correlation_regression_matrix() {
         payload_sha256: Some("hash".into()),
         claimed_at_ms: Some(1727000000000),
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(AttemptExecutorState {
             executor_type: "orca".into(),
             orca_version: Some("1.4.209".into()),
@@ -2653,6 +2672,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -2717,6 +2737,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -2780,6 +2801,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -2844,6 +2866,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -2925,6 +2948,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(AttemptExecutorState {
             executor_type: "orca".into(),
             orca_version: Some("1.4.209".into()),
@@ -2997,6 +3021,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(AttemptExecutorState {
             executor_type: "orca".into(),
             orca_version: Some("1.4.209".into()),
@@ -3055,6 +3080,7 @@ async fn test_wait_baseline_generation_stale_done_does_not_complete() {
             payload_sha256: None,
             claimed_at_ms: None,
             terminal_report_sha256: None,
+            frozen_agent_id: None,
             executor: Some(AttemptExecutorState {
                 executor_type: "orca".into(),
                 orca_version: Some("1.4.209".into()),
@@ -3212,6 +3238,7 @@ async fn test_worktree_ps_interrupted_done_never_maps_to_completion() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(exec),
     };
 
@@ -3263,6 +3290,7 @@ async fn test_worktree_ps_interrupted_done_stale_baseline_is_agent_seen() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(exec),
     };
 
@@ -3332,6 +3360,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(exec),
     };
 
@@ -3453,6 +3482,7 @@ fn waiting_attempt_without_executor() -> ActiveAttempt {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     }
 }
@@ -3749,6 +3779,7 @@ fi
         payload_sha256: Some(payload_sha256),
         claimed_at_ms: Some(now - 120_000),
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(exec),
     };
     active.save(&paths.active_attempt_file()).unwrap();
@@ -3941,6 +3972,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4034,6 +4066,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4135,6 +4168,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4266,6 +4300,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4354,6 +4389,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4457,6 +4493,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4575,6 +4612,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4681,6 +4719,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4792,6 +4831,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -4889,6 +4929,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -5031,6 +5072,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -5186,6 +5228,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -5297,6 +5340,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 

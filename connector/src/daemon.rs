@@ -272,6 +272,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
 
         // Find eligible candidate
         let mut selected_candidate = None;
+        let mut selected_candidate_frozen_agent_id: Option<String> = None;
         // Orca Agent-aware launch-surface capability snapshot for this
         // pending batch. Probing is deferred until a candidate actually
         // needs it (logical-only executor) and always happens OUTSIDE any
@@ -372,7 +373,28 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
                 continue;
             }
 
+            let mut candidate_frozen_agent_id = None;
+            if let Some(exec) = local_t.executor.as_ref() {
+                if exec.command.is_none() && crate::config::is_default_agent_policy(&exec.agent_id)
+                {
+                    match crate::orca::default_agent::resolve_default_agent(&admission_probe).await
+                    {
+                        crate::orca::default_agent::DefaultAgentResolution::Resolved(concrete) => {
+                            candidate_frozen_agent_id = Some(concrete);
+                        }
+                        other => {
+                            eprintln!(
+                                "Skipping candidate for target '{}' (default Agent policy unresolved: {:?}). Leaving Server Job queued.",
+                                cand.target_id, other
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             selected_candidate = Some(cand.clone());
+            selected_candidate_frozen_agent_id = candidate_frozen_agent_id;
             break;
         }
 
@@ -485,6 +507,37 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
                 continue;
             }
 
+            let disk_executor = disk_target.executor.as_ref();
+            let frozen_agent_id: Option<String>;
+
+            match disk_executor {
+                Some(exec)
+                    if exec.command.is_none()
+                        && crate::config::is_default_agent_policy(&exec.agent_id) =>
+                {
+                    match selected_candidate_frozen_agent_id {
+                        Some(ref concrete) => {
+                            frozen_agent_id = Some(concrete.clone());
+                        }
+                        None => {
+                            eprintln!(
+                                "Candidate target '{}' changed to default Agent policy under state lock without pre-resolved concrete Agent. Leaving Server Job queued.",
+                                cand.target_id
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Some(exec) if exec.command.is_none() => {
+                    // Reloaded executor became an explicit concrete Agent
+                    frozen_agent_id = None;
+                }
+                _ => {
+                    // Explicit command or no executor
+                    frozen_agent_id = None;
+                }
+            }
+
             let attempt = ActiveAttempt {
                 schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
                 server_origin: disk_cred.server_origin.clone(),
@@ -503,6 +556,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
                 payload_sha256: None,
                 claimed_at_ms: None,
                 terminal_report_sha256: None,
+                frozen_agent_id,
                 executor: None,
             };
 

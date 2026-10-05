@@ -1030,7 +1030,7 @@ async fn test_project_set_agent_auto_model_auto_clears_both_without_transient_co
     let updated_cfg = LocalConfig::load(&paths.config_file()).unwrap().unwrap();
     let updated_t = updated_cfg.targets.get(target_id).unwrap();
     let updated_exec = updated_t.executor.as_ref().unwrap();
-    assert_eq!(updated_exec.agent_id, "auto");
+    assert_eq!(updated_exec.agent_id, "default");
     assert_eq!(updated_exec.model, None, "model must be cleared to None");
 }
 

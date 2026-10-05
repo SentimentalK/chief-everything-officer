@@ -527,7 +527,7 @@ pub async fn resolve_agent_choice(
             // Flag --agent passed without a value
             if !interactive {
                 return Err(ProjectError::InteractiveRequired(
-                    "--agent without a value requires an interactive terminal. Provide an explicit agent ID, e.g. `--agent codex` or `--agent auto`.".into(),
+                    "--agent without a value requires an interactive terminal. Provide an explicit agent ID, e.g. `--agent codex` or `--agent default`.".into(),
                 ));
             }
             let client = crate::orca::client::OrcaCliClient::default();
@@ -537,7 +537,7 @@ pub async fn resolve_agent_choice(
                 .await
                 .map_err(ProjectError::OrcaDiscovery)?;
 
-            let mut options = vec!["auto (follow Orca default policy)".to_string()];
+            let mut options = vec!["default (follow Orca default)".to_string()];
             options.append(&mut known);
 
             let answer = inquire::Select::new("Select execution agent for this project:", options)
@@ -545,13 +545,15 @@ pub async fn resolve_agent_choice(
                 .prompt()
                 .map_err(|e| ProjectError::InteractiveRequired(e.to_string()))?;
 
-            if answer.starts_with("auto") {
-                Ok(Some("auto".to_string()))
+            if answer.starts_with("default") {
+                Ok(Some("default".to_string()))
             } else {
                 Ok(Some(answer))
             }
         }
-        Some("auto") => Ok(Some("auto".to_string())),
+        Some(explicit) if crate::config::is_default_agent_policy(explicit) => {
+            Ok(Some("default".to_string()))
+        }
         Some(explicit) => {
             let clean = explicit.trim().to_lowercase();
             // Validate explicit agent against Orca discovery when available

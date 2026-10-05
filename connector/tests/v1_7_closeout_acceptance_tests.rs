@@ -126,6 +126,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -193,6 +194,7 @@ fi
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 
@@ -299,6 +301,7 @@ fi
         )),
         claimed_at_ms: Some(now - 12_000),
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(executor_state),
     };
     active.save(&paths.active_attempt_file()).unwrap();

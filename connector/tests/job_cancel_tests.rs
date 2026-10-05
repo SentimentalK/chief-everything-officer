@@ -157,6 +157,7 @@ fn make_waiting_attempt(cred: &DeviceCredential, attempt_id: String) -> ActiveAt
         payload_sha256: Some(payload_sha256),
         claimed_at_ms: Some(now),
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: Some(executor),
     }
 }

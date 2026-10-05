@@ -576,6 +576,7 @@ async fn test_real_orca_1_4_219_existing_run_replay_and_no_new_worktree() {
         payload_sha256: None,
         claimed_at_ms: None,
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor: None,
     };
 

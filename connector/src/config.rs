@@ -219,18 +219,30 @@ impl LocalExecutorConfig {
         self.validate()?;
         let base_cmd = match &self.command {
             Some(cmd) => cmd.clone(),
-            None => {
-                if self.agent_id == "auto" {
-                    "auto".to_string()
-                } else {
-                    self.agent_id.clone()
-                }
-            }
+            None => self.agent_id.clone(),
         };
         match &self.model {
             None => Ok(base_cmd),
             Some(model) => Ok(format!("{} --model {}", base_cmd, model)),
         }
+    }
+}
+
+/// Returns true if the provided agent identifier represents a default agent policy
+/// ("default" or legacy "auto").
+pub fn is_default_agent_policy(agent_id: &str) -> bool {
+    let trimmed = agent_id.trim();
+    trimmed.eq_ignore_ascii_case("default") || trimmed.eq_ignore_ascii_case("auto")
+}
+
+/// Normalizes fresh input agent policy ("auto" -> "default", "default" -> "default",
+/// concrete IDs remain unchanged).
+pub fn canonicalize_agent_policy(agent_id: &str) -> &str {
+    let trimmed = agent_id.trim();
+    if is_default_agent_policy(trimmed) {
+        "default"
+    } else {
+        trimmed
     }
 }
 
@@ -917,5 +929,51 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("workspace_id"));
         assert!(!on_disk.contains("alias"));
+    }
+
+    #[test]
+    fn test_policy_normalization() {
+        assert!(is_default_agent_policy("default"));
+        assert!(is_default_agent_policy("auto"));
+        assert!(is_default_agent_policy("  default  "));
+        assert!(is_default_agent_policy("  auto  "));
+
+        assert!(!is_default_agent_policy("opencode"));
+        assert!(!is_default_agent_policy("cursor"));
+        assert!(!is_default_agent_policy("antigravity"));
+        assert!(!is_default_agent_policy(""));
+
+        assert_eq!(canonicalize_agent_policy("auto"), "default");
+        assert_eq!(canonicalize_agent_policy("default"), "default");
+        assert_eq!(canonicalize_agent_policy("  auto  "), "default");
+        assert_eq!(canonicalize_agent_policy("opencode"), "opencode");
+    }
+
+    #[test]
+    fn schema_v3_stored_auto_remains_readable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let paths = ConnectorPaths::from_root(temp_dir.path());
+        paths.ensure_dirs().unwrap();
+        let path = paths.config_file();
+        let v3_json = r#"{
+            "schema_version": 3,
+            "server_url": "https://ceo.example.com",
+            "targets": {
+                "t1": {
+                    "local_path": "/tmp/repo1",
+                    "executor": {
+                        "kind": "orca_tui",
+                        "agent_id": "auto"
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&path, v3_json).unwrap();
+        ensure_config_schema_current(&paths).unwrap();
+        let loaded = LocalConfig::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 3);
+        let exec = loaded.targets.get("t1").unwrap().executor.as_ref().unwrap();
+        assert_eq!(exec.agent_id, "auto");
+        assert!(is_default_agent_policy(&exec.agent_id));
     }
 }

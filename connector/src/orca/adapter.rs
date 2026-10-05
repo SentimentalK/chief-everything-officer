@@ -6,7 +6,7 @@ use super::client::{OrcaCliClient, OrcaError};
 use super::types::{
     OrcaRunCreateResult, OrcaRunItem, OrcaTerminalItem, OrcaWorkerStartResult, TerminalLiveness,
 };
-use crate::config::LocalTarget;
+use crate::config::{LocalExecutorConfig, LocalTarget};
 use crate::scheduler::{
     ActiveAttempt, CleanupOutcome, DispatchOutcome, DispatchReconciliation, ExecutionAdapter,
     InterruptOutcome, PrepareOutcome, PreparedExecution, PreparedExecutionIdentity, WaitOutcome,
@@ -43,6 +43,26 @@ pub fn derive_mutation_request_id(mutation_kind: &str, attempt_id: &str) -> uuid
     // Set RFC 4122 version 5 (bits 4-7 of byte 6 to 0101)
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     uuid::Uuid::from_bytes(bytes)
+}
+
+/// Resolves the concrete agent ID to use for worker launch.
+///
+/// If the Attempt has a frozen concrete agent identity, it takes precedence.
+/// Otherwise, if the executor specifies a default/auto policy, fails closed.
+/// Otherwise, returns the explicit agent ID.
+pub fn resolve_launch_agent_id(
+    attempt: &ActiveAttempt,
+    executor: &LocalExecutorConfig,
+) -> Result<String, String> {
+    if let Some(ref concrete) = attempt.frozen_agent_id {
+        return Ok(concrete.clone());
+    }
+    if crate::config::is_default_agent_policy(&executor.agent_id) {
+        return Err(
+            "default Agent policy is unresolved for this Attempt; refusing to pass policy string to Orca".to_string(),
+        );
+    }
+    Ok(executor.agent_id.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +567,20 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             Err(_) => "unknown".into(),
         };
 
+        let launch_agent_id = if executor.command.is_none() {
+            match resolve_launch_agent_id(attempt, executor) {
+                Ok(aid) => aid,
+                Err(reason) => {
+                    return Ok(PrepareOutcome::RecoveryRequired {
+                        execution: None,
+                        reason,
+                    });
+                }
+            }
+        } else {
+            executor.agent_id.clone()
+        };
+
         // 2. Terminal reconciliation on title `ceo:<attempt_id>`, scoped to resolved worktree
         let term_list_res = self
             .client
@@ -577,7 +611,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                         orca_version: orca_version.clone(),
                         worktree_id: worktree.id.clone(),
                         terminal_id: existing_tid.clone(),
-                        agent_id: executor.agent_id.clone(),
+                        agent_id: launch_agent_id.clone(),
                     };
                     if term.worktree_id.as_deref() != Some(&worktree.id) {
                         return Ok(PrepareOutcome::RecoveryRequired {
@@ -647,7 +681,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                 }
             }
         } else {
-            let expected_title = format!("ceo:{}:{}", attempt.attempt_id, executor.agent_id);
+            let expected_title = format!("ceo:{}:{}", attempt.attempt_id, launch_agent_id);
             let legacy_title = format!("ceo:{}", attempt.attempt_id);
             let matching_terminals: Vec<_> = term_list_res
                 .terminals
@@ -787,7 +821,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                     &coordinator_handle,
                                     &run_item.id,
                                     &worktree.id,
-                                    &executor.agent_id,
+                                    &launch_agent_id,
                                     model_opt,
                                     &spec,
                                     &worker_retry_id,
@@ -935,7 +969,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                                 &coordinator_handle,
                                                 &existing_run.id,
                                                 &worktree.id,
-                                                &executor.agent_id,
+                                                &launch_agent_id,
                                                 model_opt,
                                                 &spec,
                                                 &worker_retry_id,
@@ -972,7 +1006,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                         orca_version: orca_version.clone(),
                         worktree_id: worktree.id.clone(),
                         terminal_id: term_handle.clone(),
-                        agent_id: executor.agent_id.clone(),
+                        agent_id: launch_agent_id.clone(),
                     };
 
                     let ready_at = match self.run_readiness_gate(&term_handle).await {
@@ -1006,7 +1040,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                         orca_version: orca_version.clone(),
                         worktree_id: worktree.id.clone(),
                         terminal_id: handle.clone(),
-                        agent_id: executor.agent_id.clone(),
+                        agent_id: launch_agent_id.clone(),
                     };
                     let ready_at = if let Some(ts) =
                         attempt.executor.as_ref().and_then(|e| e.agent_ready_at_ms)
@@ -1055,7 +1089,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
             orca_version,
             worktree_id: worktree.id,
             terminal_id: terminal_handle,
-            agent_id: executor.agent_id.clone(),
+            agent_id: launch_agent_id.clone(),
             agent_ready_at_ms: ready_at,
         }))
     }
@@ -1478,6 +1512,7 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
 mod tests {
     use super::super::types::OrcaSendPromptPart;
     use super::send_prompt_turn_started;
+    use super::*;
 
     fn send_prompt(
         stages: Option<Vec<&str>>,
@@ -1534,5 +1569,65 @@ mod tests {
         };
         let readiness = evaluate_orca_status_response(&status);
         assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn test_resolve_launch_agent_id_semantics() {
+        let dummy_attempt = |frozen: Option<String>| ActiveAttempt {
+            schema_version: crate::scheduler::ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            server_origin: "https://server.test".into(),
+            device_id: "dev_1".into(),
+            job_id: "job_1".into(),
+            workspace_id: "ws_1".into(),
+            target_id: "tgt_1".into(),
+            attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+            claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            phase: crate::scheduler::AttemptPhase::Prepared,
+            resource_id: None,
+            prompt: None,
+            acceptance: None,
+            execution_timeout_seconds: None,
+            result_target: None,
+            payload_sha256: None,
+            claimed_at_ms: None,
+            terminal_report_sha256: None,
+            frozen_agent_id: frozen,
+            executor: None,
+        };
+
+        // Rule 1: frozen_agent_id wins
+        let att_frozen = dummy_attempt(Some("opencode".into()));
+        let exec_default = LocalExecutorConfig::new_logical("default".into(), None).unwrap();
+        assert_eq!(
+            resolve_launch_agent_id(&att_frozen, &exec_default).unwrap(),
+            "opencode"
+        );
+
+        let exec_auto = LocalExecutorConfig::new_logical("auto".into(), None).unwrap();
+        assert_eq!(
+            resolve_launch_agent_id(&att_frozen, &exec_auto).unwrap(),
+            "opencode"
+        );
+
+        // Immutability: even if executor changes to another agent, frozen_agent_id wins
+        let exec_other = LocalExecutorConfig::new_logical("antigravity".into(), None).unwrap();
+        assert_eq!(
+            resolve_launch_agent_id(&att_frozen, &exec_other).unwrap(),
+            "opencode"
+        );
+
+        // Rule 2: unresolved default or auto fails closed
+        let att_none = dummy_attempt(None);
+        let err_default = resolve_launch_agent_id(&att_none, &exec_default).unwrap_err();
+        assert!(err_default.contains("default Agent policy is unresolved"));
+
+        let err_auto = resolve_launch_agent_id(&att_none, &exec_auto).unwrap_err();
+        assert!(err_auto.contains("default Agent policy is unresolved"));
+
+        // Rule 3: explicit concrete agent succeeds
+        assert_eq!(
+            resolve_launch_agent_id(&att_none, &exec_other).unwrap(),
+            "antigravity"
+        );
     }
 }

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod client;
+pub mod default_agent;
 pub mod discovery;
 pub mod receipt;
 pub mod types;

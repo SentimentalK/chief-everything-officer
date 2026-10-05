@@ -258,6 +258,7 @@ fn make_test_attempt_with_resource(
         payload_sha256: Some(payload_sha256),
         claimed_at_ms: Some(1727000000000),
         terminal_report_sha256: None,
+        frozen_agent_id: None,
         executor,
     }
 }

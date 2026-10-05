@@ -11,7 +11,7 @@ use crate::config::LocalTarget;
 use crate::execution_contract::ExecutionReport;
 use crate::local_state::atomic_write_json;
 
-pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 6;
+pub const ACTIVE_ATTEMPT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -166,6 +166,8 @@ pub struct ActiveAttempt {
     pub claimed_at_ms: Option<i64>,
     pub terminal_report_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<AttemptExecutorState>,
 }
 
@@ -189,6 +191,7 @@ impl fmt::Debug for ActiveAttempt {
             .field("payload_sha256", &self.payload_sha256)
             .field("claimed_at_ms", &self.claimed_at_ms)
             .field("terminal_report_sha256", &self.terminal_report_sha256)
+            .field("frozen_agent_id", &self.frozen_agent_id)
             .field("executor", &self.executor)
             .finish()
     }
@@ -254,6 +257,39 @@ impl ActiveAttempt {
             return Err(SchedulerError::CorruptState(
                 "server_origin is not normalized".into(),
             ));
+        }
+
+        if let Some(ref frozen) = self.frozen_agent_id {
+            let trimmed = frozen.trim();
+            if trimmed.is_empty() {
+                return Err(SchedulerError::CorruptState(
+                    "frozen_agent_id cannot be empty".into(),
+                ));
+            }
+            if trimmed == "auto" || trimmed == "default" {
+                return Err(SchedulerError::CorruptState(format!(
+                    "frozen_agent_id cannot be policy name '{trimmed}'"
+                )));
+            }
+            if trimmed.len() > 80 {
+                return Err(SchedulerError::CorruptState(
+                    "frozen_agent_id exceeds maximum length of 80 bytes".into(),
+                ));
+            }
+            if trimmed.contains('\0') {
+                return Err(SchedulerError::CorruptState(
+                    "frozen_agent_id cannot contain NUL byte".into(),
+                ));
+            }
+            if !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                return Err(SchedulerError::CorruptState(
+                    "frozen_agent_id contains invalid characters (allowed: alphanumeric, -, _, .)"
+                        .into(),
+                ));
+            }
         }
 
         match self.phase {
@@ -416,6 +452,14 @@ impl ActiveAttempt {
                 att
             }
             6 => {
+                let mut att: ActiveAttempt = serde_json::from_value(val)?;
+                att.schema_version = ACTIVE_ATTEMPT_SCHEMA_VERSION;
+                if att.phase == AttemptPhase::LegacyRunning {
+                    att.phase = AttemptPhase::RecoveryRequired;
+                }
+                att
+            }
+            7 => {
                 let mut att: ActiveAttempt = serde_json::from_value(val)?;
                 if att.phase == AttemptPhase::LegacyRunning {
                     att.phase = AttemptPhase::RecoveryRequired;
@@ -841,6 +885,7 @@ mod tests {
             payload_sha256: None,
             claimed_at_ms: None,
             terminal_report_sha256: None,
+            frozen_agent_id: None,
             executor: None,
         };
 
@@ -889,6 +934,7 @@ mod tests {
             payload_sha256: None,
             claimed_at_ms: None,
             terminal_report_sha256: None,
+            frozen_agent_id: None,
             executor: None,
         };
 
@@ -957,5 +1003,147 @@ mod tests {
         assert_eq!(loaded.schema_version, ACTIVE_ATTEMPT_SCHEMA_VERSION);
         assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
         assert!(loaded.executor.is_none());
+    }
+
+    #[test]
+    fn test_frozen_agent_id_validation() {
+        let make_attempt = |frozen: Option<String>| ActiveAttempt {
+            schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            server_origin: "https://server.test".into(),
+            device_id: "dev_1".into(),
+            job_id: "job-1".into(),
+            workspace_id: "ws-1".into(),
+            target_id: "tgt-1".into(),
+            attempt_id: "att-00000000-0000-0000-0000-000000000001".into(),
+            claim_token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            phase: AttemptPhase::ClaimIntent,
+            resource_id: None,
+            prompt: None,
+            acceptance: None,
+            execution_timeout_seconds: None,
+            result_target: None,
+            payload_sha256: None,
+            claimed_at_ms: None,
+            terminal_report_sha256: None,
+            frozen_agent_id: frozen,
+            executor: None,
+        };
+
+        // None is valid
+        assert!(make_attempt(None).validate().is_ok());
+        // Concrete valid agent is valid
+        assert!(make_attempt(Some("opencode".into())).validate().is_ok());
+        assert!(make_attempt(Some("antigravity".into())).validate().is_ok());
+        assert!(make_attempt(Some("my-agent_1.0".into())).validate().is_ok());
+
+        // Empty is invalid
+        assert!(matches!(
+            make_attempt(Some("".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        assert!(matches!(
+            make_attempt(Some("   ".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+
+        // Policy names "auto" and "default" are rejected
+        assert!(matches!(
+            make_attempt(Some("auto".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        assert!(matches!(
+            make_attempt(Some("default".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        assert!(matches!(
+            make_attempt(Some("  auto  ".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        assert!(matches!(
+            make_attempt(Some("  default  ".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+
+        // Invalid characters
+        assert!(matches!(
+            make_attempt(Some("agent with spaces".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        assert!(matches!(
+            make_attempt(Some("agent$dollar".into())).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+        // Too long (> 80)
+        assert!(matches!(
+            make_attempt(Some("a".repeat(81))).validate(),
+            Err(SchedulerError::CorruptState(_))
+        ));
+    }
+
+    #[test]
+    fn test_v6_loading_upgrades_to_v7() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("active-attempt.json");
+
+        let v6_json = serde_json::json!({
+            "schema_version": 6,
+            "server_origin": "https://server.test",
+            "device_id": "dev_1",
+            "job_id": "job_1",
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000001",
+            "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "phase": "claim_intent",
+            "resource_id": null,
+            "prompt": null,
+            "acceptance": null,
+            "execution_timeout_seconds": null,
+            "result_target": null,
+            "payload_sha256": null,
+            "claimed_at_ms": null,
+            "terminal_report_sha256": null,
+            "executor": null
+        });
+        std::fs::write(&path, serde_json::to_string(&v6_json).unwrap()).unwrap();
+
+        let loaded = ActiveAttempt::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 7);
+        assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
+        assert!(loaded.frozen_agent_id.is_none());
+    }
+
+    #[test]
+    fn test_v7_loading_preserves_frozen_agent_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("active-attempt.json");
+
+        let v7_json = serde_json::json!({
+            "schema_version": 7,
+            "server_origin": "https://server.test",
+            "device_id": "dev_1",
+            "job_id": "job_1",
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "attempt_id": "att-00000000-0000-0000-0000-000000000001",
+            "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "phase": "claim_intent",
+            "resource_id": null,
+            "prompt": null,
+            "acceptance": null,
+            "execution_timeout_seconds": null,
+            "result_target": null,
+            "payload_sha256": null,
+            "claimed_at_ms": null,
+            "terminal_report_sha256": null,
+            "frozen_agent_id": "opencode",
+            "executor": null
+        });
+        std::fs::write(&path, serde_json::to_string(&v7_json).unwrap()).unwrap();
+
+        let loaded = ActiveAttempt::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 7);
+        assert_eq!(loaded.phase, AttemptPhase::ClaimIntent);
+        assert_eq!(loaded.frozen_agent_id.as_deref(), Some("opencode"));
     }
 }
