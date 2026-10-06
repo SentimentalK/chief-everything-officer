@@ -68,12 +68,21 @@ struct CanonicalPayload<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedDispatchEvidence {
+    pub request_id: String,
+    pub accepted_at_ms: i64,
+    pub turn_started: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreparedExecution {
     pub orca_version: String,
     pub worktree_id: String,
     pub terminal_id: String,
     pub agent_id: String,
     pub agent_ready_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<PreparedDispatchEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,6 +233,13 @@ impl ActiveAttempt {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         format!("{:x}", hasher.finalize())
+    }
+
+    pub fn has_positive_dispatch(&self) -> bool {
+        self.executor
+            .as_ref()
+            .map(|e| e.dispatch_request_id.is_some() && e.dispatch_turn_started)
+            .unwrap_or(false)
     }
 
     pub fn validate(&self) -> Result<(), SchedulerError> {
@@ -586,6 +602,7 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         attempt: &ActiveAttempt,
         target: &LocalTarget,
+        execution_prompt: &str,
     ) -> Result<PrepareOutcome, String>;
 
     async fn get_agent_status_baseline(&self, _terminal_id: &str) -> Result<Option<i64>, String> {
@@ -638,6 +655,7 @@ impl ExecutionAdapter for UnavailableExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
+        _execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
         Ok(PrepareOutcome::RecoveryRequired {
             execution: None,
@@ -706,6 +724,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
+        _execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
         Ok(PrepareOutcome::Ready(PreparedExecution {
             orca_version: "1.4.209".into(),
@@ -713,6 +732,7 @@ impl ExecutionAdapter for FakeExecutionAdapter {
             terminal_id: "term_fake".into(),
             agent_id: "fake_agent".into(),
             agent_ready_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            dispatch: None,
         }))
     }
 

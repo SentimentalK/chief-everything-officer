@@ -566,6 +566,7 @@ async fn run_claim_mismatch_case(
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
+            _execution_prompt: &str,
         ) -> Result<ceo_connector::scheduler::PrepareOutcome, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())
@@ -817,6 +818,7 @@ async fn lost_response_replay_mismatch_persists_recovery_required_no_second_atte
             &self,
             _attempt: &ActiveAttempt,
             _target: &LocalTarget,
+            _execution_prompt: &str,
         ) -> Result<ceo_connector::scheduler::PrepareOutcome, String> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Err("should not execute".into())

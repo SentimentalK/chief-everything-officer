@@ -44,6 +44,8 @@ struct MockAdapter {
 
     pub on_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     pub wait_seq: Arc<std::sync::Mutex<Vec<Result<WaitOutcome, String>>>>,
+    pub last_execution_prompt: Arc<std::sync::Mutex<Option<String>>>,
+    pub prepared_dispatch: Option<ceo_connector::scheduler::PreparedDispatchEvidence>,
 }
 
 #[async_trait]
@@ -60,8 +62,12 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         attempt: &ActiveAttempt,
         _target: &LocalTarget,
+        execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut lock) = self.last_execution_prompt.lock() {
+            *lock = Some(execution_prompt.to_string());
+        }
         if let Some(ref res) = self.prepare_result {
             res.clone()
         } else {
@@ -71,6 +77,7 @@ impl ExecutionAdapter for MockAdapter {
                 orca_version: "1.4.209".into(),
                 agent_id: "agy".into(),
                 agent_ready_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+                dispatch: self.prepared_dispatch.clone(),
             }))
         }
     }
@@ -971,6 +978,7 @@ async fn test_prepare_terminal_adoption() {
             orca_version: "1.4.209".into(),
             agent_id: "agy".into(),
             agent_ready_at_ms: Some(1727220000000),
+            dispatch: None,
         }))),
         ..Default::default()
     });
@@ -1757,6 +1765,7 @@ async fn test_advisory_readiness_unsatisfied_persists_none_ready_at_and_advances
             orca_version: "1.4.209".into(),
             agent_id: "agy".into(),
             agent_ready_at_ms: None,
+            dispatch: None,
         }))),
         ..Default::default()
     });
@@ -3661,5 +3670,250 @@ async fn test_restart_with_turn_started_observed_agent_done_completes() {
         adapter.close_calls.load(Ordering::SeqCst),
         1,
         "Successful AgentDone after restart closes the terminal exactly once"
+    );
+}
+
+/// Logical Agent Execution Tests
+/// 1. Logical agent worker-start receives full comprehensive prompt (not ceo:<attempt_id>),
+///    including managed result contract when result_target=resource.
+/// 2. Logical path never calls adapter.dispatch or issues terminal send.
+/// 3. Dispatch evidence is persisted: dispatch_turn_started=true, turn_started_observed=true.
+/// 4. Fast completion: first wait outcome is AgentDone without intermediate WorkingObserved -> completes cleanly.
+/// 5. In-flight legacy logical attempt in Prepared or DispatchIntent without positive dispatch
+///    fails closed to RecoveryRequired.
+#[tokio::test]
+async fn test_logical_agent_receives_full_prompt_and_never_calls_dispatch() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let target_dir = paths
+        .active_attempt_file()
+        .parent()
+        .unwrap()
+        .join("mock_logical_target");
+    fs::create_dir_all(&target_dir).unwrap();
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_logical".to_string(),
+        LocalTarget {
+            local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+        },
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    let attempt_uuid = Uuid::new_v4();
+    let attempt_id = format!("att-{}", attempt_uuid);
+
+    let start_called = Arc::new(AtomicUsize::new(0));
+    let start_called_clone = start_called.clone();
+    server.add_handler(move |req| {
+        if req.path == "/api/connector/identity" && req.method == "GET" {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "user_id": "usr_mock",
+                    "device": { "id": "dev_mock", "display_name": "Mock Device", "platform": "linux-x86_64" },
+                    "credential": { "id": "dcr_mock", "expires_at_ms": 2000000000000i64 }
+                }),
+            );
+        }
+        if req.path.contains("/start") && req.method == "POST" {
+            start_called_clone.fetch_add(1, Ordering::SeqCst);
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-24T12:00:00.000Z",
+                    "attempt": {
+                        "attempt_id": "mock_att",
+                        "phase": "started",
+                        "claimed_at": "2026-09-24T12:00:00.000Z",
+                        "started_at": "2026-09-24T12:00:01.000Z"
+                    }
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let mut attempt = make_test_attempt_with_resource(
+        &cred,
+        attempt_id.clone(),
+        AttemptPhase::PrepareIntent,
+        "resource",
+        Some("res_123"),
+        None,
+    );
+    attempt.target_id = "tgt_logical".into();
+    attempt.payload_sha256 = Some(ActiveAttempt::compute_payload_sha256(
+        &attempt.job_id,
+        &attempt.workspace_id,
+        &attempt.target_id,
+        attempt.resource_id.as_deref(),
+        attempt.prompt.as_deref().unwrap(),
+        attempt.acceptance.as_deref().unwrap(),
+        attempt.execution_timeout_seconds.unwrap(),
+        attempt.result_target.as_deref().unwrap(),
+    ));
+    attempt.save(&paths.active_attempt_file()).unwrap();
+
+    let mut adapter = MockAdapter {
+        ready: true,
+        ..Default::default()
+    };
+    adapter.prepared_dispatch = Some(ceo_connector::scheduler::PreparedDispatchEvidence {
+        request_id: "req_worker_start_test".into(),
+        accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+        turn_started: true,
+    });
+    adapter.wait_result = Some(Ok(WaitOutcome::AgentDone { elapsed_ms: 100 }));
+
+    let adapter_arc = Arc::new(adapter.clone()) as Arc<dyn ExecutionAdapter>;
+
+    // Drive PrepareIntent -> StartIntent -> AgentWait
+    let mut steps = 0;
+    while steps < 10 {
+        let cur = ActiveAttempt::load(&paths.active_attempt_file())
+            .unwrap()
+            .unwrap();
+        if cur.phase == AttemptPhase::OutcomeRecorded || cur.phase == AttemptPhase::FinalizedLocal {
+            break;
+        }
+        drive_active_attempt(
+            &paths,
+            &client,
+            &cred,
+            &adapter_arc,
+            &DaemonHooks::default(),
+        )
+        .await
+        .unwrap();
+        steps += 1;
+    }
+
+    // 1. Verify full comprehensive prompt was passed (contains task, acceptance criteria, and managed result contract)
+    let prompt_seen = adapter
+        .last_execution_prompt
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    assert!(
+        prompt_seen.contains("Create a simple calculator"),
+        "Execution prompt must contain prompt task"
+    );
+    assert!(
+        prompt_seen.contains("Calculator should add numbers"),
+        "Execution prompt must contain acceptance criteria"
+    );
+    assert!(
+        prompt_seen.contains("托管结果契约"),
+        "Execution prompt must contain managed result contract for result_target=resource"
+    );
+    assert!(
+        !prompt_seen.starts_with(&format!("ceo:{}", attempt_id)),
+        "Must NOT send placeholder ceo:<attempt-id> as task spec"
+    );
+
+    // 2. Verify adapter.dispatch was NEVER called (single authoritative dispatch via worker-start)
+    assert_eq!(
+        adapter.dispatch_calls.load(Ordering::SeqCst),
+        0,
+        "adapter.dispatch must NEVER be called for logical Agent path"
+    );
+
+    // 3. Verify server /start was notified
+    assert_eq!(start_called.load(Ordering::SeqCst), 1);
+
+    // 4. Verify dispatch evidence and fast completion
+    let final_att = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    let exec = final_att.executor.as_ref().unwrap();
+    assert_eq!(
+        exec.dispatch_request_id.as_deref(),
+        Some("req_worker_start_test")
+    );
+    assert!(exec.dispatch_turn_started);
+    assert!(exec.turn_started_observed);
+    assert_eq!(exec.runtime_completion_kind.as_deref(), Some("agent_done"));
+}
+
+#[tokio::test]
+async fn test_in_flight_legacy_logical_attempt_without_positive_dispatch_fails_closed() {
+    let server = MockServer::start().await;
+    let (_temp, paths, cred, _config) = setup_test_env(&server.origin());
+
+    let target_dir = paths
+        .active_attempt_file()
+        .parent()
+        .unwrap()
+        .join("mock_logical_legacy");
+    fs::create_dir_all(&target_dir).unwrap();
+
+    let mut config = LocalConfig::new(server.origin()).unwrap();
+    config.targets.insert(
+        "tgt_legacy".to_string(),
+        LocalTarget {
+            local_path: target_dir.to_string_lossy().to_string(),
+            executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+        },
+    );
+    config.save(&paths.config_file()).unwrap();
+
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let mut executor_state = make_default_executor("orca", "1.4.219");
+    executor_state.worktree_id = Some("wt_mock".into());
+    executor_state.terminal_id = Some("term_mock".into());
+    executor_state.dispatch_turn_started = false; // Missing positive dispatch
+
+    let mut attempt = make_test_attempt(
+        &cred,
+        attempt_id,
+        AttemptPhase::Prepared,
+        "none",
+        Some(executor_state),
+    );
+    attempt.target_id = "tgt_legacy".into();
+    attempt.payload_sha256 = Some(ActiveAttempt::compute_payload_sha256(
+        &attempt.job_id,
+        &attempt.workspace_id,
+        &attempt.target_id,
+        attempt.resource_id.as_deref(),
+        attempt.prompt.as_deref().unwrap(),
+        attempt.acceptance.as_deref().unwrap(),
+        attempt.execution_timeout_seconds.unwrap(),
+        attempt.result_target.as_deref().unwrap(),
+    ));
+    attempt.save(&paths.active_attempt_file()).unwrap();
+
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        ..Default::default()
+    }) as Arc<dyn ExecutionAdapter>;
+
+    let err = drive_active_attempt(&paths, &client, &cred, &adapter, &DaemonHooks::default())
+        .await
+        .unwrap_err();
+
+    let err_str = format!("{err:?}");
+    assert!(
+        err_str.contains("LEGACY_IN_FLIGHT_LOGICAL_ATTEMPT"),
+        "Legacy logical attempt without positive dispatch must fail closed to RecoveryRequired, got: {err_str}"
+    );
+
+    let loaded = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(loaded.phase, AttemptPhase::RecoveryRequired),
+        "Phase must be persisted as RecoveryRequired"
     );
 }

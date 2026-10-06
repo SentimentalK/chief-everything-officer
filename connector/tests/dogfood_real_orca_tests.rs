@@ -615,9 +615,11 @@ async fn test_real_orca_1_4_219_existing_run_replay_and_no_new_worktree() {
     let show = client.request_show(&worker_retry_id).await.unwrap();
     assert!(show.is_absent());
 
-    // 2. Prepare against the unique existing Run with 0 workers
-    // Repaired adapter will consult request-show (absent) and safely issue worker-start with worker_retry_id
-    let prep_outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let execution_prompt = "echo dogfood test";
+    let prep_outcome = adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap();
     let prep = match prep_outcome {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
@@ -632,7 +634,10 @@ async fn test_real_orca_1_4_219_existing_run_replay_and_no_new_worktree() {
     );
 
     // 4. Verify idempotent replay on the same attempt
-    let replay_outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let replay_outcome = adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap();
     let replay_prep = match replay_outcome {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready on replay, got {other:?}"),

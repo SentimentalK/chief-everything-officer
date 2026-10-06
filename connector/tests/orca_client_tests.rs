@@ -454,7 +454,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -528,7 +528,7 @@ fi
 
     // Logical agent launch fails closed with ORCA_AGENT_SESSION_LAUNCH_UNAVAILABLE
     // when orchestration agent launch surface is unavailable in Orca CLI
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -624,13 +624,19 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let execution_prompt = "full prompt for logical agent";
+    let prep = match adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap()
+    {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
     assert_eq!(prep.worktree_id, "wt_123");
     assert_eq!(prep.terminal_id, "term_worker_1");
     assert_eq!(prep.agent_id, "antigravity");
+    assert!(prep.dispatch.is_some());
 
     let recorded = fs::read_to_string(&args_log).unwrap();
     assert!(
@@ -738,7 +744,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -847,10 +853,10 @@ fi
         executor: None,
     };
 
-    let prep1 = adapter.prepare(&attempt1, &target).await.unwrap();
+    let prep1 = adapter.prepare(&attempt1, &target, "").await.unwrap();
     assert!(matches!(prep1, PrepareOutcome::Ready(_)));
 
-    let prep2 = adapter.prepare(&attempt2, &target).await.unwrap();
+    let prep2 = adapter.prepare(&attempt2, &target, "").await.unwrap();
     assert!(matches!(prep2, PrepareOutcome::Ready(_)));
 
     let recorded = fs::read_to_string(&args_log).unwrap();
@@ -967,7 +973,7 @@ fi
         executor: None,
     };
 
-    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = adapter.prepare(&attempt, &target, "").await.unwrap();
     assert!(matches!(prep, PrepareOutcome::Ready(_)));
 
     // Reconciled coordinator file should now hold the recreated live handle
@@ -1056,7 +1062,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target_b).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target_b, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -1160,7 +1166,7 @@ fi
         executor: None,
     };
 
-    let prep = adapter.prepare(&attempt, &target).await.unwrap();
+    let prep = adapter.prepare(&attempt, &target, "").await.unwrap();
     assert!(matches!(prep, PrepareOutcome::Ready(_)));
 
     let recorded = fs::read_to_string(&args_log).unwrap();
@@ -1247,7 +1253,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -1347,7 +1353,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -1542,7 +1548,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -1608,7 +1614,7 @@ echo '{"ok":true}'
         executor: None,
     };
 
-    let res = adapter.prepare(&attempt, &target).await;
+    let res = adapter.prepare(&attempt, &target, "").await;
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(err.contains("no agent executor configured"));
@@ -1671,7 +1677,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -2676,7 +2682,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -2741,7 +2747,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -2805,7 +2811,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -2870,7 +2876,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(reason.contains("mismatch") || reason.contains("term_different_alien"));
@@ -3976,7 +3982,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -4070,7 +4076,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -4173,7 +4179,11 @@ fi
     };
 
     // First prepare call
-    let outcome1 = adapter.prepare(&attempt, &target).await.unwrap();
+    let execution_prompt = "spec-task-body-replay";
+    let outcome1 = adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap();
     assert!(matches!(outcome1, PrepareOutcome::Ready(_)));
 
     let expected_run_uuid =
@@ -4192,13 +4202,16 @@ fi
         "run-create must use expected deterministic UUID, log:\n{recorded1}"
     );
     assert!(
-        recorded1.contains(&format!("worker-start --from term_coord_1 --run run_replay_1 --worktree wt_123 --agent antigravity --spec ceo:att_replay_1 --retry-request {expected_worker_uuid}")),
+        recorded1.contains(&format!("worker-start --from term_coord_1 --run run_replay_1 --worktree wt_123 --agent antigravity --spec spec-task-body-replay --retry-request {expected_worker_uuid}")),
         "worker-start must use expected deterministic UUID, log:\n{recorded1}"
     );
 
     // Second prepare call (simulating retry of same attempt)
     fs::write(&args_log, "").unwrap();
-    let outcome2 = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome2 = adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap();
     assert!(matches!(outcome2, PrepareOutcome::Ready(_)));
 
     let recorded2 = fs::read_to_string(&args_log).unwrap();
@@ -4304,7 +4317,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -4393,7 +4406,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -4497,7 +4510,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -4616,7 +4629,8 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prompt = "test task";
+    let prep = match adapter.prepare(&attempt, &target, prompt).await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -4631,7 +4645,7 @@ fi
     );
     assert!(
         recorded.contains(&format!(
-            "orchestration worker-start --from term_coord_1 --run run_crash_1 --worktree wt_123 --agent cursor --spec ceo:att_crash_boundary --retry-request {worker_uuid}"
+            "orchestration worker-start --from term_coord_1 --run run_crash_1 --worktree wt_123 --agent cursor --spec {prompt} --retry-request {worker_uuid}"
         )),
         "must start worker with deterministic retry UUID, log:\n{recorded}"
     );
@@ -4723,7 +4737,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::Retryable { reason, .. } => {
             assert!(
@@ -4835,7 +4849,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -4933,7 +4947,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(
@@ -5076,8 +5090,9 @@ fi
         executor: None,
     };
 
+    let prompt = "sample task";
     // --- Phase 1: fresh launch -> pending -> Retryable ---
-    let outcome1 = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome1 = adapter.prepare(&attempt, &target, prompt).await.unwrap();
     assert!(
         matches!(outcome1, PrepareOutcome::Retryable { .. }),
         "Phase 1 must return Retryable when worker-start is pending, got: {outcome1:?}"
@@ -5092,7 +5107,7 @@ fi
     );
     assert!(
         log_phase1.contains(&format!(
-            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec ceo:att_restart_lifecycle --retry-request {expected_worker_uuid}"
+            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec {prompt} --retry-request {expected_worker_uuid}"
         )),
         "Phase 1 must issue worker-start with stable worker retry UUID, log:\n{log_phase1}"
     );
@@ -5101,7 +5116,7 @@ fi
     fs::write(&state_file, "phase2").unwrap();
     fs::write(&args_log, "").unwrap(); // clear log to inspect Phase 2 specifically
 
-    let outcome2 = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome2 = adapter.prepare(&attempt, &target, prompt).await.unwrap();
     let prep = match outcome2 {
         PrepareOutcome::Ready(p) => p,
         other => panic!("Phase 2 must return PrepareOutcome::Ready, got {other:?}"),
@@ -5121,7 +5136,7 @@ fi
     );
     assert!(
         log_phase2.contains(&format!(
-            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec ceo:att_restart_lifecycle --retry-request {expected_worker_uuid}"
+            "orchestration worker-start --from term_coord_1 --run run_lifecycle_1 --worktree wt_123 --agent cursor --spec {prompt} --retry-request {expected_worker_uuid}"
         )),
         "Phase 2 MUST replay worker-start using the EXACT SAME stable worker retry UUID, log:\n{log_phase2}"
     );
@@ -5232,7 +5247,12 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let execution_prompt = "spec-task-body-absent";
+    let prep = match adapter
+        .prepare(&attempt, &target, execution_prompt)
+        .await
+        .unwrap()
+    {
         PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -5241,7 +5261,7 @@ fi
     let recorded = fs::read_to_string(&args_log).unwrap();
     assert!(
         recorded.contains(&format!(
-            "orchestration worker-start --from term_coord_1 --run run_absent_1 --worktree wt_123 --agent cursor --spec ceo:att_absent_reconcile --retry-request {worker_uuid}"
+            "orchestration worker-start --from term_coord_1 --run run_absent_1 --worktree wt_123 --agent cursor --spec spec-task-body-absent --retry-request {worker_uuid}"
         )),
         "must have called worker-start after absent request-show, log:\n{recorded}"
     );
@@ -5344,7 +5364,7 @@ fi
         executor: None,
     };
 
-    let outcome = adapter.prepare(&attempt, &target).await.unwrap();
+    let outcome = adapter.prepare(&attempt, &target, "").await.unwrap();
     match outcome {
         PrepareOutcome::RecoveryRequired { reason, .. } => {
             assert!(

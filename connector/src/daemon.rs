@@ -592,6 +592,24 @@ fn finalize_local_operator_cancelled(
     })
 }
 
+pub fn build_attempt_execution_prompt(paths: &ConnectorPaths, attempt: &ActiveAttempt) -> String {
+    let managed_contract = if attempt.result_target.as_deref() == Some("resource") {
+        Some(crate::execution_contract::ManagedContract {
+            path: paths.managed_result_file(&attempt.attempt_id),
+            job_id: attempt.job_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            resource_id: attempt.resource_id.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    crate::execution_contract::build_execution_prompt(
+        attempt.prompt.as_deref(),
+        attempt.acceptance.as_deref(),
+        managed_contract.as_ref(),
+    )
+}
+
 pub async fn drive_active_attempt(
     paths: &ConnectorPaths,
     client: &ConnectorClient,
@@ -881,7 +899,49 @@ pub async fn drive_active_attempt(
                 }
             };
 
-            match adapter.prepare(&active, &target).await {
+            let is_logical_agent = target
+                .executor
+                .as_ref()
+                .map(|e| e.command.is_none())
+                .unwrap_or(true);
+
+            let now = now_utc_ms();
+            let timeout_seconds = active.execution_timeout_seconds.unwrap_or(600);
+
+            if is_logical_agent {
+                let _lock = ExecutionLock::acquire_with_retry(
+                    &paths.state_lock_file(),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                )?;
+                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                    Some(c) if c.attempt_id == active.attempt_id => c,
+                    _ => return Ok(true),
+                };
+                let exec = current
+                    .executor
+                    .get_or_insert_with(crate::scheduler::AttemptExecutorState::new_orca);
+                if exec.dispatch_started_at_ms.is_none() {
+                    exec.dispatch_started_at_ms = Some(now);
+                }
+                if exec.execution_deadline_ms.is_none() {
+                    exec.execution_deadline_ms = Some(now + timeout_seconds as i64 * 1000);
+                }
+                if let Some(deadline) = exec.execution_deadline_ms {
+                    if now >= deadline {
+                        current.phase = AttemptPhase::RecoveryRequired;
+                        current.save(&paths.active_attempt_file())?;
+                        return Err(DaemonError::RecoveryRequired(
+                            "WORKER_START_RECONCILIATION_DEADLINE: attempt exceeded execution deadline during worker-start prepare reconciliation".into(),
+                        ));
+                    }
+                }
+                current.save(&paths.active_attempt_file())?;
+            }
+
+            let execution_prompt = build_attempt_execution_prompt(paths, &active);
+
+            match adapter.prepare(&active, &target, &execution_prompt).await {
                 Ok(crate::scheduler::PrepareOutcome::Ready(prep)) => {
                     paths.ensure_attempt_runtime_dir(&active.attempt_id)?;
                     let _lock = ExecutionLock::acquire_with_retry(
@@ -902,12 +962,26 @@ pub async fn drive_active_attempt(
                     exec.terminal_id = Some(prep.terminal_id);
                     exec.agent_id = Some(prep.agent_id);
                     exec.agent_ready_at_ms = prep.agent_ready_at_ms;
-                    current.phase = AttemptPhase::Prepared;
-                    current.save(&paths.active_attempt_file())?;
-                    println!(
-                        "Attempt '{}' prepared with worktree and agent terminal.",
-                        active.attempt_id
-                    );
+
+                    if let Some(dispatch_evidence) = prep.dispatch {
+                        exec.dispatch_request_id = Some(dispatch_evidence.request_id);
+                        exec.dispatch_accepted_at_ms = Some(dispatch_evidence.accepted_at_ms);
+                        exec.dispatch_turn_started = dispatch_evidence.turn_started;
+                        exec.turn_started_observed = dispatch_evidence.turn_started;
+                        current.phase = AttemptPhase::StartIntent;
+                        current.save(&paths.active_attempt_file())?;
+                        println!(
+                            "Attempt '{}' prepared and dispatched via worker-start. Advanced to StartIntent.",
+                            active.attempt_id
+                        );
+                    } else {
+                        current.phase = AttemptPhase::Prepared;
+                        current.save(&paths.active_attempt_file())?;
+                        println!(
+                            "Attempt '{}' prepared with worktree and agent terminal.",
+                            active.attempt_id
+                        );
+                    }
                     Ok(true)
                 }
                 Ok(crate::scheduler::PrepareOutcome::Retryable { execution, reason }) => {
@@ -1009,6 +1083,46 @@ pub async fn drive_active_attempt(
             }
         }
         AttemptPhase::Prepared => {
+            let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
+            let is_logical_agent = disk_config
+                .as_ref()
+                .and_then(|c| c.targets.get(&active.target_id))
+                .and_then(|t| t.executor.as_ref())
+                .map(|e| e.command.is_none())
+                .unwrap_or(true);
+
+            if is_logical_agent {
+                if !active.has_positive_dispatch() {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(
+                        "LEGACY_IN_FLIGHT_LOGICAL_ATTEMPT: logical agent attempt found in Prepared without positive dispatch evidence; failing closed to prevent double-dispatch".into(),
+                    ));
+                } else {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::StartIntent;
+                    current.save(&paths.active_attempt_file())?;
+                    return Ok(true);
+                }
+            }
+
             let now = now_utc_ms();
             let timeout_seconds = active.execution_timeout_seconds.unwrap_or(600);
             let _lock = ExecutionLock::acquire_with_retry(
@@ -1033,6 +1147,46 @@ pub async fn drive_active_attempt(
             Ok(true)
         }
         AttemptPhase::DispatchIntent => {
+            let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
+            let is_logical_agent = disk_config
+                .as_ref()
+                .and_then(|c| c.targets.get(&active.target_id))
+                .and_then(|t| t.executor.as_ref())
+                .map(|e| e.command.is_none())
+                .unwrap_or(true);
+
+            if is_logical_agent {
+                if !active.has_positive_dispatch() {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::RecoveryRequired;
+                    current.save(&paths.active_attempt_file())?;
+                    return Err(DaemonError::RecoveryRequired(
+                        "LEGACY_IN_FLIGHT_LOGICAL_ATTEMPT: logical agent attempt found in DispatchIntent without positive dispatch evidence; failing closed to prevent double-dispatch".into(),
+                    ));
+                } else {
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    current.phase = AttemptPhase::StartIntent;
+                    current.save(&paths.active_attempt_file())?;
+                    return Ok(true);
+                }
+            }
+
             let terminal_id = match active
                 .executor
                 .as_ref()
@@ -1165,24 +1319,7 @@ pub async fn drive_active_attempt(
                     current.save(&paths.active_attempt_file())?;
                     drop(_lock);
 
-                    let prompt_text = {
-                        let managed_contract =
-                            if active.result_target.as_deref() == Some("resource") {
-                                Some(crate::execution_contract::ManagedContract {
-                                    path: paths.managed_result_file(&active.attempt_id),
-                                    job_id: active.job_id.clone(),
-                                    attempt_id: active.attempt_id.clone(),
-                                    resource_id: active.resource_id.clone().unwrap_or_default(),
-                                })
-                            } else {
-                                None
-                            };
-                        crate::execution_contract::build_execution_prompt(
-                            active.prompt.as_deref(),
-                            active.acceptance.as_deref(),
-                            managed_contract.as_ref(),
-                        )
-                    };
+                    let prompt_text = build_attempt_execution_prompt(paths, &active);
 
                     let outcome = match adapter.dispatch(&active, &terminal_id, &prompt_text).await
                     {

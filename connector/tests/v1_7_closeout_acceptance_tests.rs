@@ -130,7 +130,7 @@ fi
         executor: None,
     };
 
-    let prep = match adapter.prepare(&attempt, &target).await.unwrap() {
+    let prep = match adapter.prepare(&attempt, &target, "").await.unwrap() {
         ceo_connector::scheduler::PrepareOutcome::Ready(p) => p,
         other => panic!("expected PrepareOutcome::Ready, got {other:?}"),
     };
@@ -198,7 +198,7 @@ fi
         executor: None,
     };
 
-    let res = adapter.prepare(&attempt, &target).await.unwrap();
+    let res = adapter.prepare(&attempt, &target, "").await.unwrap();
     match res {
         ceo_connector::scheduler::PrepareOutcome::Ready(prep) => {
             assert_eq!(prep.worktree_id, "wt_1");

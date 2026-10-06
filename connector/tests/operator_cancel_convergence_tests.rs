@@ -483,6 +483,7 @@ impl ExecutionAdapter for NoopAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
+        _execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
         Ok(PrepareOutcome::Ready(
             ceo_connector::scheduler::PreparedExecution {
@@ -491,6 +492,7 @@ impl ExecutionAdapter for NoopAdapter {
                 orca_version: "1.4.209".into(),
                 agent_id: "agy".into(),
                 agent_ready_at_ms: None,
+                dispatch: None,
             },
         ))
     }

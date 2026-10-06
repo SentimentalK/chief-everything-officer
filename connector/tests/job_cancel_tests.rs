@@ -182,6 +182,7 @@ impl ExecutionAdapter for MockAdapter {
         &self,
         _attempt: &ActiveAttempt,
         _target: &LocalTarget,
+        _execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
         Ok(PrepareOutcome::Ready(PreparedExecution {
             worktree_id: "wt".into(),
@@ -189,6 +190,7 @@ impl ExecutionAdapter for MockAdapter {
             orca_version: "1.4.209".into(),
             agent_id: "agy".into(),
             agent_ready_at_ms: None,
+            dispatch: None,
         }))
     }
 
