@@ -5752,3 +5752,50 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
         "{recorded}"
     );
 }
+
+#[tokio::test]
+async fn test_unique_inventory_worker_contradicting_receipt_terminal_is_recovery_required() {
+    let full = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_worker_contradiction",
+    )
+    .to_string();
+    let arms = format!(
+        r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_contra","objective":"ceo:att_worker_contradiction","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[{{"dispatchId":"disp_a","taskId":"task_a","runId":"run_contra","agentTerminalHandle":"term_worker_a"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{full}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{full}","state":"completed","receipt":{{"runId":"run_contra","taskId":"task_b","dispatchId":"disp_b","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_b"}}]}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_b" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_b","title":"worker-b","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"must_not_start"}}}}'
+    exit 1"#
+    );
+    let mock = logical_orca_mock(&arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(
+            &logical_attempt("att_worker_contradiction"),
+            &target,
+            "full prompt",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !matches!(outcome, PrepareOutcome::Ready(_)),
+        "receipt worker B must not be adopted over inventory worker A, got {outcome:?}"
+    );
+    let reason = assert_recovery(outcome, "contradictory worker evidence");
+    assert!(
+        reason.contains("term_worker_a") && reason.contains("term_worker_b"),
+        "{reason}"
+    );
+    let recorded = fs::read_to_string(&mock.args_log).unwrap();
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "{recorded}"
+    );
+}

@@ -1003,6 +1003,19 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                     .await?
                 {
                     WorkerStartOutcome::Reconciled(reconciled) => {
+                        if let Some(inventory_handle) = candidate_handles.first() {
+                            if inventory_handle.trim() != reconciled.terminal_handle.trim() {
+                                return Ok(PrepareOutcome::RecoveryRequired {
+                                    execution: None,
+                                    reason: format!(
+                                        "contradictory worker evidence on run '{}': inventory has unique worker '{}' but full-spec worker-start receipt recovered '{}'; preserving evidence",
+                                        existing_run.id,
+                                        inventory_handle.trim(),
+                                        reconciled.terminal_handle
+                                    ),
+                                });
+                            }
+                        }
                         return Ok(PrepareOutcome::Ready(PreparedExecution {
                             orca_version,
                             worktree_id: worktree.id,
