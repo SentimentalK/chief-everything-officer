@@ -1288,6 +1288,11 @@ async fn test_prepare_retry_recovers_live_worker_without_second_worker_start() {
         .to_string();
 
     let args_log = temp.path().join("args.log");
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_recover",
+    )
+    .to_string();
     let script = format!(
         r#"#!/bin/bash
 echo "$@" >> "{}"
@@ -1305,6 +1310,8 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
     echo '{{"ok":true,"result":{{"runs":[{{"id":"run_existing_live","objective":"ceo:att_recover","coordinator_handle":"term_coord_1"}}]}}}}'
 elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
     echo '{{"ok":true,"result":{{"workers":[{{"dispatchId":"disp_1","taskId":"task_1","runId":"run_existing_live","agentTerminalHandle":"term_recovered_worker"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"runId":"run_existing_live","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","action":"created","id":"term_recovered_worker"}}]}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_recovered_worker" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_recovered_worker","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -1317,7 +1324,9 @@ fi
 "#,
         args_log.display(),
         repo_canon,
-        repo_canon
+        repo_canon,
+        worker_uuid,
+        worker_uuid
     );
 
     let bin = create_mock_orca_script(&temp, &script);
@@ -1361,6 +1370,12 @@ fi
     assert_eq!(prep.worktree_id, "wt_123");
 
     let recorded = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        recorded.contains(&format!(
+            "orchestration request-show --request {worker_uuid}"
+        )),
+        "recovery must consult the full-spec worker-start receipt, log:\n{recorded}"
+    );
     assert!(
         !recorded.contains("orchestration worker-start --from"),
         "prepare retry MUST NOT issue a second worker-start when worker is recoverable, log:\n{recorded}"
@@ -3862,8 +3877,14 @@ fi
 fn test_mutation_request_id_determinism_and_distinctness() {
     let id_run1 = ceo_connector::orca::derive_mutation_request_id("run-create", "att_foo");
     let id_run2 = ceo_connector::orca::derive_mutation_request_id("run-create", "att_foo");
-    let id_worker1 = ceo_connector::orca::derive_mutation_request_id("worker-start", "att_foo");
-    let id_worker2 = ceo_connector::orca::derive_mutation_request_id("worker-start", "att_foo");
+    let id_worker1 = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_foo",
+    );
+    let id_worker2 = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_foo",
+    );
 
     // 1. Deterministic across invocations for same attempt
     assert_eq!(
@@ -3879,6 +3900,11 @@ fn test_mutation_request_id_determinism_and_distinctness() {
     assert_ne!(
         id_run1, id_worker1,
         "run-create and worker-start MUST have distinct mutation request IDs"
+    );
+    let legacy_worker = ceo_connector::orca::derive_mutation_request_id("worker-start", "att_foo");
+    assert_ne!(
+        legacy_worker, id_worker1,
+        "full-spec worker-start must not reuse the legacy worker-start mutation id"
     );
 
     // 3. Distinct IDs for different attempts
@@ -3910,6 +3936,11 @@ async fn test_run_exists_only_on_second_page_prevents_duplicate_run_create() {
         .to_string();
 
     let args_log = temp.path().join("args.log");
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_p2",
+    )
+    .to_string();
     // Mock Orca script:
     // run-list page 1 has cursor "p2_cursor" and does NOT contain ceo:att_p2
     // run-list page 2 has ceo:att_p2
@@ -3934,6 +3965,8 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
     fi
 elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
     echo '{{"ok":true,"result":{{"workers":[{{"dispatchId":"disp_1","taskId":"task_1","runId":"run_p2","agentTerminalHandle":"term_worker_recovered"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"runId":"run_p2","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","action":"created","id":"term_worker_recovered"}}]}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_recovered" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_recovered","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
@@ -3946,7 +3979,9 @@ fi
 "#,
         args_log.display(),
         repo_canon,
-        repo_canon
+        repo_canon,
+        worker_uuid,
+        worker_uuid
     );
 
     let bin = create_mock_orca_script(&temp, &script);
@@ -4188,8 +4223,11 @@ fi
 
     let expected_run_uuid =
         ceo_connector::orca::derive_mutation_request_id("run-create", "att_replay_1").to_string();
-    let expected_worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_replay_1").to_string();
+    let expected_worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_replay_1",
+    )
+    .to_string();
 
     assert_ne!(
         expected_run_uuid, expected_worker_uuid,
@@ -4236,9 +4274,11 @@ async fn test_request_show_reconciliation_recovers_unknown_outcome_without_dupli
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_lost_outcome")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_lost_outcome",
+    )
+    .to_string();
 
     // worker-start command fails (e.g. timeout / lost response), but request-show shows completed!
     let script = format!(
@@ -4544,9 +4584,11 @@ async fn test_crash_boundary_unique_run_zero_workers_absent_request_show_starts_
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_crash_boundary")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_crash_boundary",
+    )
+    .to_string();
 
     // Unique run already exists, 0 workers, request-show for worker-start reports absent.
     // Prepare must safely issue worker-start with the deterministic worker retry UUID and become Ready.
@@ -4575,7 +4617,7 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ];
     echo '{{"ok":true,"result":{{"requestId":"{}","state":"absent"}}}}'
 elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
     if echo "$@" | grep -q -- "--retry-request {}"; then
-        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_crash","runId":"run_crash_1","taskId":"task_1","dispatchId":"disp_1"}}}}'
+        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_crash","runId":"run_crash_1","taskId":"task_1","dispatchId":"disp_1","state":"ready"}}}}'
     else
         echo '{{"ok":false,"error":{{"code":"missing_retry_request"}}}}'
         exit 1
@@ -4667,9 +4709,11 @@ async fn test_pending_boundary_unique_run_zero_workers_pending_request_show_retu
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_pending_boundary")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_pending_boundary",
+    )
+    .to_string();
 
     let script = format!(
         r#"#!/bin/bash
@@ -4773,9 +4817,11 @@ async fn test_completed_boundary_unique_run_empty_workers_completed_request_show
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_completed_boundary")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_completed_boundary",
+    )
+    .to_string();
 
     let script = format!(
         r#"#!/bin/bash
@@ -4797,7 +4843,7 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
     echo '{{"ok":true,"result":{{"workers":[]}}}}'
 elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
     # request-show contains completed receipt with worker terminal
-    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_worker_stale"}}]}}}}}}'
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"runId":"run_stale_1","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_stale"}}]}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_worker_stale" ]; then
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_worker_stale","title":"worker-task_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "wait" ] && [ "$4" = "term_worker_stale" ]; then
@@ -4987,9 +5033,11 @@ async fn test_stable_worker_start_retry_uuid_across_restart_state_transition() {
     let state_file = temp.path().join("sim_state");
     fs::write(&state_file, "phase1").unwrap();
 
-    let expected_worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_restart_lifecycle")
-            .to_string();
+    let expected_worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_restart_lifecycle",
+    )
+    .to_string();
     let expected_run_uuid =
         ceo_connector::orca::derive_mutation_request_id("run-create", "att_restart_lifecycle")
             .to_string();
@@ -5032,7 +5080,7 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
         exit 1
     else
         # Phase 2 worker-start succeeds
-        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_replayed","runId":"run_lifecycle_1","taskId":"task_1","dispatchId":"disp_1"}}}}'
+        echo '{{"ok":true,"result":{{"terminalHandle":"term_worker_replayed","runId":"run_lifecycle_1","taskId":"task_1","dispatchId":"disp_1","state":"ready"}}}}'
     fi
 elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
     if [ "$PHASE" = "phase1" ]; then
@@ -5153,9 +5201,11 @@ async fn test_absent_case_worker_start_unknown_outcome_reconciles_via_request_sh
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_absent_reconcile")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_absent_reconcile",
+    )
+    .to_string();
 
     let call_count_file = temp.path().join("req_show_count");
     fs::write(&call_count_file, "0").unwrap();
@@ -5192,7 +5242,7 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ];
         echo "1" > "$COUNT_FILE"
         echo '{{"ok":true,"result":{{"requestId":"{}","state":"absent"}}}}'
     else
-        echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_worker_recovered"}}]}}}}}}'
+        echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"runId":"run_absent_1","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_worker_recovered"}}]}}}}}}'
     fi
 elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
     echo '{{"ok":false,"error":{{"code":"timeout","message":"worker-start timed out"}}}}'
@@ -5287,9 +5337,11 @@ async fn test_completed_request_show_with_dead_terminal_fails_closed_preserving_
         .to_string();
 
     let args_log = temp.path().join("args.log");
-    let worker_uuid =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", "att_dead_worker")
-            .to_string();
+    let worker_uuid = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_dead_worker",
+    )
+    .to_string();
 
     // Unique run exists, zero workers.
     // request-show reports completed with term_dead.
@@ -5313,7 +5365,7 @@ elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
 elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
     echo '{{"ok":true,"result":{{"workers":[]}}}}'
 elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{}" ]; then
-    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"effects":[{{"kind":"terminal","role":"agent","id":"term_dead"}}]}}}}}}'
+    echo '{{"ok":true,"result":{{"requestId":"{}","state":"completed","receipt":{{"runId":"run_dead_1","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_dead"}}]}}}}}}'
 elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_dead" ]; then
     # Dead terminal
     echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_dead","title":"worker-dead","worktreeId":"wt_123","connected":false,"orphaned":true}}}}}}'
@@ -5379,5 +5431,324 @@ fi
     assert!(
         !recorded.contains("orchestration worker-start --from"),
         "must NOT issue a second worker-start when terminal is dead; evidence must be preserved, log:\n{recorded}"
+    );
+}
+
+struct LogicalOrcaMock {
+    _temp: tempfile::TempDir,
+    args_log: PathBuf,
+    adapter: OrcaExecutionAdapter,
+}
+
+fn logical_orca_mock(orchestration_arms: &str) -> LogicalOrcaMock {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let repo_canon = fs::canonicalize(&repo_dir)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let args_log = temp.path().join("args.log");
+    let script = format!(
+        r#"#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = "status" ]; then
+    echo '{{"ok":true,"result":{{"app":{{"running":true}},"runtime":{{"state":"ready","reachable":true,"appVersion":"1.4.219"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "show" ]; then
+    echo '{{"ok":true,"result":{{"worktree":{{"id":"wt_123","path":"{repo}"}}}}}}'
+elif [ "$1" = "worktree" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"worktrees":[{{"id":"wt_123","path":"{repo}"}}],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "list" ]; then
+    echo '{{"ok":true,"result":{{"terminals":[],"truncated":false}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "create" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_coord_1" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_coord_1","title":"ceo:coordinator:dev_1","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ] && [ "$3" = "--help" ]; then
+    echo 'Usage: orca orchestration worker-start --agent <id>'
+{arms}
+else
+    echo '{{"ok":false,"error":{{"code":"unknown_command"}}}}'
+fi
+"#,
+        log = args_log.display(),
+        repo = repo_canon,
+        arms = orchestration_arms,
+    );
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let paths = ConnectorPaths::from_root(temp.path().join("dot-ceo"));
+    paths.ensure_dirs().unwrap();
+    let adapter = OrcaExecutionAdapter::new(client).with_paths(paths);
+    LogicalOrcaMock {
+        _temp: temp,
+        args_log,
+        adapter,
+    }
+}
+
+fn logical_attempt(attempt_id: &str) -> ActiveAttempt {
+    ActiveAttempt {
+        schema_version: ACTIVE_ATTEMPT_SCHEMA_VERSION,
+        job_id: "job_1".into(),
+        attempt_id: attempt_id.into(),
+        claim_token: "token".into(),
+        device_id: "dev_1".into(),
+        server_origin: "http://127.0.0.1:4000".into(),
+        phase: AttemptPhase::PrepareIntent,
+        workspace_id: "ws_1".into(),
+        target_id: "tgt_1".into(),
+        resource_id: None,
+        prompt: None,
+        acceptance: None,
+        execution_timeout_seconds: None,
+        result_target: None,
+        payload_sha256: None,
+        claimed_at_ms: None,
+        terminal_report_sha256: None,
+        frozen_agent_id: None,
+        executor: None,
+    }
+}
+
+fn logical_target(mock: &LogicalOrcaMock) -> LocalTarget {
+    let repo = mock._temp.path().join("repo");
+    LocalTarget {
+        local_path: fs::canonicalize(&repo)
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
+        executor: Some(LocalExecutorConfig::new_logical("cursor".into(), None).unwrap()),
+    }
+}
+
+fn assert_recovery(outcome: PrepareOutcome, needle: &str) -> String {
+    match outcome {
+        PrepareOutcome::RecoveryRequired { reason, .. } => {
+            assert!(
+                reason.contains(needle),
+                "expected reason to contain '{needle}', got: {reason}"
+            );
+            reason
+        }
+        other => panic!("expected PrepareOutcome::RecoveryRequired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_worker_start_id_with_existing_worker_is_not_full_spec_dispatch() {
+    let legacy = ceo_connector::orca::derive_mutation_request_id("worker-start", "att_legacy_spec")
+        .to_string();
+    let full = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_legacy_spec",
+    )
+    .to_string();
+    assert_ne!(legacy, full);
+
+    let arms = format!(
+        r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_legacy","objective":"ceo:att_legacy_spec","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[{{"dispatchId":"disp_old","taskId":"task_old","runId":"run_legacy","agentTerminalHandle":"term_legacy"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{full}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{full}","state":"absent"}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_legacy" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_legacy","title":"worker-old","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1"#
+    );
+    let mock = logical_orca_mock(&arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(&logical_attempt("att_legacy_spec"), &target, "full prompt")
+        .await
+        .unwrap();
+    assert_recovery(outcome, "AMBIGUOUS_PREPARE_RETRY");
+    let recorded = fs::read_to_string(&mock.args_log).unwrap();
+    assert!(
+        recorded.contains(&format!("orchestration request-show --request {full}")),
+        "must query the full-spec request id, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains(&legacy),
+        "legacy worker-start id must not be treated as dispatch authority, log:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "must not start another worker over a legacy worker, log:\n{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_absent_full_spec_request_with_existing_worker_is_recovery_required() {
+    let full = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_absent_one_worker",
+    )
+    .to_string();
+    let arms = format!(
+        r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_one","objective":"ceo:att_absent_one_worker","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[{{"dispatchId":"disp_1","taskId":"task_1","runId":"run_one","agentTerminalHandle":"term_one"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{full}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{full}","state":"absent"}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"duplicate_worker_start_prohibited"}}}}'
+    exit 1"#
+    );
+    let mock = logical_orca_mock(&arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(
+            &logical_attempt("att_absent_one_worker"),
+            &target,
+            "full prompt",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !matches!(outcome, PrepareOutcome::Ready(_)),
+        "existing worker without a full-spec receipt must not be Ready, got {outcome:?}"
+    );
+    assert_recovery(outcome, "AMBIGUOUS_PREPARE_RETRY");
+    let recorded = fs::read_to_string(&mock.args_log).unwrap();
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_immediate_worker_start_run_id_mismatch_is_recovery_required() {
+    let arms = r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{"ok":true,"result":{"runs":[]}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-create" ]; then
+    echo '{"ok":true,"result":{"run":{"id":"run_expected","objective":"ceo:att_run_mismatch","coordinator_handle":"term_coord_1"}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{"ok":true,"result":{"runId":"run_other","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{"kind":"terminal","role":"agent","id":"term_mismatch"}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_mismatch" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_mismatch","worktreeId":"wt_123","connected":true,"orphaned":false}}}'"#;
+    let mock = logical_orca_mock(arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(&logical_attempt("att_run_mismatch"), &target, "full prompt")
+        .await
+        .unwrap();
+    let reason = assert_recovery(outcome, "run_id mismatch");
+    assert!(
+        reason.contains("run_expected") && reason.contains("run_other"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn test_immediate_worker_start_without_positive_dispatch_is_recovery_required() {
+    let arms = r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{"ok":true,"result":{"runs":[]}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "run-create" ]; then
+    echo '{"ok":true,"result":{"run":{"id":"run_weak","objective":"ceo:att_weak_dispatch","coordinator_handle":"term_coord_1"}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{"ok":true,"result":{"runId":"run_weak","taskId":"task_1","dispatchId":"disp_1","state":"launching","effects":[{"kind":"terminal","role":"agent","id":"term_weak"}]}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_weak" ]; then
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_weak","worktreeId":"wt_123","connected":true,"orphaned":false}}}'"#;
+    let mock = logical_orca_mock(arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(
+            &logical_attempt("att_weak_dispatch"),
+            &target,
+            "full prompt",
+        )
+        .await
+        .unwrap();
+    let reason = assert_recovery(outcome, "expected ready, got launching");
+    assert!(reason.contains("preserving evidence"), "{reason}");
+}
+
+#[tokio::test]
+async fn test_completed_request_show_empty_request_id_is_recovery_required() {
+    let full = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_empty_request",
+    )
+    .to_string();
+    let arms = format!(
+        r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_empty","objective":"ceo:att_empty_request","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{full}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"","state":"completed","receipt":{{"runId":"run_empty","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_empty"}}]}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"must_not_start"}}}}'
+    exit 1"#
+    );
+    let mock = logical_orca_mock(&arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(
+            &logical_attempt("att_empty_request"),
+            &target,
+            "full prompt",
+        )
+        .await
+        .unwrap();
+    let reason = assert_recovery(outcome, "request_id mismatch");
+    assert!(reason.contains("<empty>"), "{reason}");
+    let recorded = fs::read_to_string(&mock.args_log).unwrap();
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "{recorded}"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_request_show_run_id_mismatch_is_recovery_required() {
+    let full = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        "att_receipt_run_mismatch",
+    )
+    .to_string();
+    let arms = format!(
+        r#"elif [ "$1" = "orchestration" ] && [ "$2" = "run-list" ]; then
+    echo '{{"ok":true,"result":{{"runs":[{{"id":"run_receipt","objective":"ceo:att_receipt_run_mismatch","coordinator_handle":"term_coord_1"}}]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-list" ]; then
+    echo '{{"ok":true,"result":{{"workers":[]}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "request-show" ] && [ "$4" = "{full}" ]; then
+    echo '{{"ok":true,"result":{{"requestId":"{full}","state":"completed","receipt":{{"runId":"run_other","taskId":"task_1","dispatchId":"disp_1","state":"ready","effects":[{{"kind":"terminal","role":"agent","id":"term_other"}}]}}}}}}'
+elif [ "$1" = "terminal" ] && [ "$2" = "show" ] && [ "$4" = "term_other" ]; then
+    echo '{{"ok":true,"result":{{"terminal":{{"handle":"term_other","worktreeId":"wt_123","connected":true,"orphaned":false}}}}}}'
+elif [ "$1" = "orchestration" ] && [ "$2" = "worker-start" ]; then
+    echo '{{"ok":false,"error":{{"code":"must_not_start"}}}}'
+    exit 1"#
+    );
+    let mock = logical_orca_mock(&arms);
+    let target = logical_target(&mock);
+    let outcome = mock
+        .adapter
+        .prepare(
+            &logical_attempt("att_receipt_run_mismatch"),
+            &target,
+            "full prompt",
+        )
+        .await
+        .unwrap();
+    let reason = assert_recovery(outcome, "run_id mismatch");
+    assert!(
+        reason.contains("run_receipt") && reason.contains("run_other"),
+        "{reason}"
+    );
+    let recorded = fs::read_to_string(&mock.args_log).unwrap();
+    assert!(
+        !recorded.contains("orchestration worker-start --from"),
+        "{recorded}"
     );
 }

@@ -592,9 +592,11 @@ async fn test_real_orca_1_4_219_existing_run_replay_and_no_new_worktree() {
     let run_retry_id =
         ceo_connector::orca::derive_mutation_request_id("run-create", &attempt.attempt_id)
             .to_string();
-    let worker_retry_id =
-        ceo_connector::orca::derive_mutation_request_id("worker-start", &attempt.attempt_id)
-            .to_string();
+    let worker_retry_id = ceo_connector::orca::derive_mutation_request_id(
+        ceo_connector::orca::WORKER_START_MUTATION_KIND,
+        &attempt.attempt_id,
+    )
+    .to_string();
 
     let run_item = client
         .create_run(&coordinator_handle, &run_obj, Some(&run_retry_id))
