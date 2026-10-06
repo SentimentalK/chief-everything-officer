@@ -5,10 +5,11 @@ mod common;
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use ceo_connector::cli::{Cli, Commands, ProjectSubcommands};
+use ceo_connector::cli::{Cli, Commands, CompletionSubcommands, ProjectSubcommands};
 use ceo_connector::completion::{command_with_project_candidates, load_project_alias_candidates};
+use ceo_connector::completion_manage::ShellKind;
 use ceo_connector::config::{LocalConfig, LocalTarget};
 use ceo_connector::credential::DeviceCredential;
 use ceo_connector::paths::ConnectorPaths;
@@ -152,11 +153,56 @@ fn parser_accepts_selectors_outside_the_completion_list() {
 }
 
 #[test]
-fn version_flag_reports_2_5_5() {
-    assert_eq!(Cli::command().get_version(), Some("2.5.5"));
+fn parser_exposes_completion_install_status_and_uninstall() {
+    for sub in ["install", "status", "uninstall"] {
+        let cli = Cli::try_parse_from(["ceo-connector", "completion", sub]).unwrap();
+        assert!(
+            matches!(cli.command, Commands::Completion { .. }),
+            "completion {sub} did not parse"
+        );
+    }
+
+    let cli = Cli::try_parse_from([
+        "ceo-connector",
+        "completion",
+        "install",
+        "--shell",
+        "fish",
+        "--profile",
+        "/tmp/p.fish",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Completion {
+            sub: CompletionSubcommands::Install(args),
+        } => {
+            assert_eq!(args.shell, Some(ShellKind::Fish));
+            assert_eq!(args.profile, Some(PathBuf::from("/tmp/p.fish")));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let err = Cli::try_parse_from([
+        "ceo-connector",
+        "completion",
+        "install",
+        "--shell",
+        "nushell",
+    ])
+    .unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(err.to_string().contains("unsupported shell"));
+
+    let status = Cli::try_parse_from(["ceo-connector", "status"]).unwrap();
+    assert!(matches!(status.command, Commands::Status { json: false }));
+}
+
+#[test]
+fn version_flag_reports_2_5_6() {
+    assert_eq!(Cli::command().get_version(), Some("2.5.6"));
     let err = Cli::try_parse_from(["ceo-connector", "--version"]).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
-    assert!(err.to_string().contains("2.5.5"));
+    assert!(err.to_string().contains("2.5.6"));
 }
 
 fn target_wire(id: &str, alias: &str, display_name: &str) -> serde_json::Value {

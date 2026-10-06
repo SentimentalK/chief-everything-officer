@@ -2,6 +2,7 @@ pub mod attempt_convergence;
 pub mod cli;
 pub mod client;
 pub mod completion;
+pub mod completion_manage;
 pub mod config;
 pub mod credential;
 pub mod daemon;

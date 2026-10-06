@@ -1,10 +1,32 @@
 use std::process::ExitCode;
 
-use ceo_connector::cli::{Cli, Commands, JobSubcommands, ProjectSubcommands, TargetSubcommands};
+use ceo_connector::cli::{
+    Cli, Commands, CompletionSubcommands, JobSubcommands, ProjectSubcommands, TargetSubcommands,
+};
+use ceo_connector::completion_manage::{execute_completion, CompletionAction};
 use ceo_connector::jobs::JobListFilters;
 use ceo_connector::paths::ConnectorPaths;
 use ceo_connector::status::{get_status, print_status};
 use clap::Parser;
+
+fn dispatch_completion(sub: CompletionSubcommands) -> ExitCode {
+    let (action, shell, profile) = match sub {
+        CompletionSubcommands::Install(args) => {
+            (CompletionAction::Install, args.shell, args.profile)
+        }
+        CompletionSubcommands::Status(args) => (CompletionAction::Status, args.shell, args.profile),
+        CompletionSubcommands::Uninstall(args) => {
+            (CompletionAction::Uninstall, args.shell, args.profile)
+        }
+    };
+    match execute_completion(action, shell, profile.as_deref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -13,6 +35,12 @@ async fn main() -> ExitCode {
     ceo_connector::completion::serve_shell_completion();
 
     let cli = Cli::parse();
+    // Completion management only edits the shell profile. It must not resolve
+    // Connector paths or migrate config.
+    let command = match cli.command {
+        Commands::Completion { sub } => return dispatch_completion(sub),
+        other => other,
+    };
     let paths = match ConnectorPaths::resolve() {
         Ok(p) => p,
         Err(e) => {
@@ -30,7 +58,10 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match cli.command {
+    match command {
+        Commands::Completion { .. } => {
+            unreachable!("completion commands return before connector path resolution");
+        }
         Commands::Login {
             server,
             name,

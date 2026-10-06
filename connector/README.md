@@ -5,7 +5,7 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **2.5.5**. Check with:
+Current baseline: **2.5.6**. Check with:
 
 ```bash
 ceo-connector --version
@@ -28,7 +28,7 @@ Deterministic binary packages are provided for five supported platforms:
 ### Manual Installation
 
 #### Linux and macOS
-1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.5`).
+1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.6`).
 2. Verify the archive against `SHA256SUMS`:
    ```bash
    sha256sum -c SHA256SUMS --ignore-missing
@@ -45,12 +45,16 @@ Deterministic binary packages are provided for five supported platforms:
 4. Place `ceo-connector` in a directory on your `PATH` (such as `~/.local/bin`) and ensure executable permissions:
    ```bash
    mkdir -p ~/.local/bin
-   cp ceo-connector-2.5.5/ceo-connector ~/.local/bin/ceo-connector
+   cp ceo-connector-2.5.6/ceo-connector ~/.local/bin/ceo-connector
    chmod +x ~/.local/bin/ceo-connector
    ```
 5. Verify the installation:
    ```bash
    ceo-connector --version
+   ```
+6. Install persistent shell completion. This edits only your shell profile; it does not copy the binary or change `PATH`:
+   ```bash
+   ceo-connector completion install
    ```
 
 #### Windows (x86_64)
@@ -64,10 +68,14 @@ Deterministic binary packages are provided for five supported platforms:
    ```powershell
    Expand-Archive -Path ceo-connector-windows-x64.zip -DestinationPath .
    ```
-4. Place `ceo-connector-2.5.5\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
+4. Place `ceo-connector-2.5.6\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
 5. Verify the installation:
    ```cmd
    ceo-connector.exe --version
+   ```
+6. Install persistent shell completion for PowerShell by passing the profile path explicitly:
+   ```powershell
+   ceo-connector completion install --shell powershell --profile $PROFILE
    ```
 
 ### Updating
@@ -87,7 +95,30 @@ Deterministic binary packages are provided for five supported platforms:
 
 ## Shell completion
 
-Completion is generated from the clap command definition. Activate it by evaluating the registration script below. These commands do not edit `.zshrc`, `.bashrc`, `config.fish`, or your PowerShell profile; add one to your own shell startup file if you want it in new sessions.
+`ceo-connector completion` installs persistent completion for the `ceo-connector` command already on `PATH`. It does not copy the binary or edit `PATH`.
+
+```bash
+ceo-connector completion install
+ceo-connector completion status
+ceo-connector completion uninstall
+```
+
+`install` detects bash, zsh, or fish from the basename of `$SHELL`. Override that with `--shell bash`, `--shell zsh`, `--shell fish`, or `--shell powershell`. Override the file with `--profile <path>`. On Windows, pass `--shell powershell`; if the profile path cannot be resolved from this process, also pass `--profile` (the value of `$PROFILE`).
+
+The managed block always invokes the bare command `ceo-connector` through `COMPLETE=<shell>`. It never embeds an absolute executable path. New shells load the block automatically. `install` cannot refresh a shell that is already running; it prints the exact `source` or `.` command for that shell instead.
+
+Default profile files:
+
+- bash: `~/.bashrc`
+- zsh: `~/.zshrc`
+- fish: `~/.config/fish/config.fish`
+- PowerShell on Unix: `~/.config/powershell/Microsoft.PowerShell_profile.ps1`
+
+`install` refuses when `ceo-connector` is missing from `PATH` or when `PATH` resolves a different executable than the one you invoked. It does not try to select or rewrite that other binary. `status` reports the same mismatch without writing. `uninstall` still removes a managed block after the binary has moved.
+
+Generating completion does not require a login. Project alias suggestions are fetched only while a Project selector is being completed, from the Server catalogue, and only for Targets already present in this device's local config.
+
+The registration lines the managed block evaluates are:
 
 zsh:
 
@@ -112,8 +143,6 @@ PowerShell:
 ```powershell
 $env:COMPLETE = "powershell"; ceo-connector | Out-String | Invoke-Expression; Remove-Item Env:\COMPLETE
 ```
-
-Generating the registration script does not require a login. Project alias suggestions are fetched when a Project selector is being completed, from the Server catalogue, and only for Targets already present in this device's local config.
 
 ## Local Config Schema v3 & Authority Split (2.0.0)
 

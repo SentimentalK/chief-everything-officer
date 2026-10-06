@@ -1,5 +1,8 @@
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
+use clap::{Args, Parser, Subcommand};
+
+use crate::completion_manage::{parse_shell_name, ShellKind};
 use crate::jobs::parse_state_filter;
 
 #[derive(Parser, Debug)]
@@ -80,6 +83,12 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Install, inspect, or remove persistent shell completion
+    Completion {
+        #[command(subcommand)]
+        sub: CompletionSubcommands,
+    },
+
     /// Guided, interactive device setup (convergence)
     Setup {
         /// Optional explicit agent runtime path to link
@@ -96,6 +105,30 @@ pub enum Commands {
         #[arg(long)]
         attempt: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CompletionSubcommands {
+    /// Install persistent shell completion for the `ceo-connector` command
+    Install(CompletionArgs),
+    /// Show whether persistent shell completion is installed
+    Status(CompletionArgs),
+    /// Remove persistent shell completion from the shell profile
+    Uninstall(CompletionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionArgs {
+    /// Shell to configure: bash, zsh, fish, or powershell.
+    /// When omitted, Unix uses the basename of `$SHELL`.
+    #[arg(long, value_parser = parse_shell_name)]
+    pub shell: Option<ShellKind>,
+
+    /// Profile file to read or edit.
+    /// Defaults to the per-user startup file for the selected shell.
+    /// Windows PowerShell requires this flag.
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
