@@ -103,6 +103,7 @@ pub enum ProjectSubcommands {
     /// Add an existing Git project to this device and workspace
     Add {
         /// Local filesystem path to the project Git repository (defaults to current directory)
+        #[arg(value_hint = clap::ValueHint::DirPath)]
         path: Option<String>,
 
         /// Optional project name / alias override (defaults to Git remote or directory name)

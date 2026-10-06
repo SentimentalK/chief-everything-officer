@@ -8,6 +8,10 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Shell completion must run before parse, path resolution, config
+    // migration, Doctor, or any other command side effect.
+    ceo_connector::completion::serve_shell_completion();
+
     let cli = Cli::parse();
     let paths = match ConnectorPaths::resolve() {
         Ok(p) => p,

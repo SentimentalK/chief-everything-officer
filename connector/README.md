@@ -5,7 +5,7 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **2.5.4**. Check with:
+Current baseline: **2.5.5**. Check with:
 
 ```bash
 ceo-connector --version
@@ -28,7 +28,7 @@ Deterministic binary packages are provided for five supported platforms:
 ### Manual Installation
 
 #### Linux and macOS
-1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.4`).
+1. Download the matching archive and `SHA256SUMS` from the GitHub Release (`connector-v2.5.5`).
 2. Verify the archive against `SHA256SUMS`:
    ```bash
    sha256sum -c SHA256SUMS --ignore-missing
@@ -45,7 +45,7 @@ Deterministic binary packages are provided for five supported platforms:
 4. Place `ceo-connector` in a directory on your `PATH` (such as `~/.local/bin`) and ensure executable permissions:
    ```bash
    mkdir -p ~/.local/bin
-   cp ceo-connector-2.5.4/ceo-connector ~/.local/bin/ceo-connector
+   cp ceo-connector-2.5.5/ceo-connector ~/.local/bin/ceo-connector
    chmod +x ~/.local/bin/ceo-connector
    ```
 5. Verify the installation:
@@ -64,7 +64,7 @@ Deterministic binary packages are provided for five supported platforms:
    ```powershell
    Expand-Archive -Path ceo-connector-windows-x64.zip -DestinationPath .
    ```
-4. Place `ceo-connector-2.5.4\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
+4. Place `ceo-connector-2.5.5\ceo-connector.exe` into a directory included on your `PATH` (for example, `%USERPROFILE%\bin`).
 5. Verify the installation:
    ```cmd
    ceo-connector.exe --version
@@ -85,6 +85,35 @@ Deterministic binary packages are provided for five supported platforms:
    ```
    *Note: Removing local files never deletes Server-side workspaces, Targets, or job history.*
 
+## Shell completion
+
+Completion is generated from the clap command definition. Activate it by evaluating the registration script below. These commands do not edit `.zshrc`, `.bashrc`, `config.fish`, or your PowerShell profile; add one to your own shell startup file if you want it in new sessions.
+
+zsh:
+
+```zsh
+source <(COMPLETE=zsh ceo-connector)
+```
+
+bash:
+
+```bash
+source <(COMPLETE=bash ceo-connector)
+```
+
+fish:
+
+```fish
+COMPLETE=fish ceo-connector | source
+```
+
+PowerShell:
+
+```powershell
+$env:COMPLETE = "powershell"; ceo-connector | Out-String | Invoke-Expression; Remove-Item Env:\COMPLETE
+```
+
+Generating the registration script does not require a login. Project alias suggestions are fetched when a Project selector is being completed, from the Server catalogue, and only for Targets already present in this device's local config.
 
 ## Local Config Schema v3 & Authority Split (2.0.0)
 
