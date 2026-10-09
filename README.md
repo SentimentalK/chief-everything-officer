@@ -4,6 +4,18 @@
 
 ---
 
+> **Your AI changes. Your context stays.**
+
+CEO connects web-based AI assistants to your own Git-backed context without requiring you to operate a personal MCP server. When you need execution, a configured Connector and Orca can delegate bounded jobs to an agent on your computer or server.
+
+**Built from daily dogfood:** I use it to continue long-running projects across chats, revisit saved articles and videos, and dispatch real coding jobs for local implementation and independent review.
+
+**Why this matters:** a powerful web model can plan and review; a suitable lower-cost local worker can do the implementation. You control the execution environment and can use local files, compute or authorized browser tools. Actual savings depend on subscriptions, token usage, retries and review time.
+
+**Early-access status:** State/Resource are used daily. Zero-state onboarding and Worker compatibility/recovery still have open acceptance gates. Mobile dispatch depends on the AI host supporting the connected MCP tools.
+
+**[Read real-world cases and a transparent token-cost formula](docs/USE-CASES.md)**
+
 Chief Everything Officer (CEO) is a personal long-term system.
 
 It preserves and maintains **what relates to you**: who you are, what you have lived through, what you are currently doing, what you care about, how you make decisions, what you own, and how these states evolve over time.
