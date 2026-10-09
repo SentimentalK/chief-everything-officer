@@ -2,7 +2,8 @@
 
 <p align="center">
   <a href="https://ceo.sentimentalk.com"><img src="https://img.shields.io/badge/Hosted_MCP-ceo.sentimentalk.com-blue?style=flat-square&logo=cloudflare" alt="Hosted MCP" /></a>
-  <a href="https://github.com/SentimentalK/chief-everything-officer/releases"><img src="https://img.shields.io/github/v/release/SentimentalK/chief-everything-officer?filter=connector-v*&label=connector&color=orange&style=flat-square" alt="Connector Version" /></a>
+  <a href="https://github.com/SentimentalK/chief-everything-officer/releases"><img src="https://img.shields.io/github/v/release/SentimentalK/chief-everything-officer?label=connector&color=orange&style=flat-square" alt="Connector Version" /></a>
+  <a href="https://discord.com/channels/1474581075681349655/1474581076616937497"><img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord" /></a>
   <img src="https://img.shields.io/badge/MCP_Protocol-2026--07--28-blueviolet?style=flat-square" alt="MCP Protocol" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" /></a>
   <img src="https://img.shields.io/badge/Architecture-Master_%2F_Worker-teal?style=flat-square" alt="Architecture" />
