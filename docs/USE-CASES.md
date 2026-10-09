@@ -34,7 +34,7 @@ Mobile dispatch is only possible when the mobile AI host exposes the connected M
 
 The creator reports roughly **2 billion tokens of web AI use** during intensive development. This is self-reported host-side usage, not CEO-metered API billing and not measured savings.
 
-As an *illustrative API equivalent*, the public GPT-6 Sol Standard short-context rates on 2026-10-08 were US$2 per 1M input tokens and US$10 per 1M output tokens. At an assumed 90% uncached input / 10% output split:
+As an *illustrative API-equivalent example*, suppose an API model charges US$2 per 1M input tokens and US$10 per 1M output tokens. These are example rates, not a verified current quote for any particular model. At an assumed 90% uncached input / 10% output split:
 
 ```text
 1,800M input / 1M x $2    = $3,600
