@@ -1,6 +1,16 @@
 # Chief Everything Officer (CEO)
 
-[English](README.md) | [简体中文](docs/README.zh-CN.md)
+<p align="center">
+  <a href="https://ceo.sentimentalk.com"><img src="https://img.shields.io/badge/Hosted_MCP-ceo.sentimentalk.com-blue?style=flat-square&logo=cloudflare" alt="Hosted MCP" /></a>
+  <a href="https://github.com/SentimentalK/chief-everything-officer/releases"><img src="https://img.shields.io/github/v/release/SentimentalK/chief-everything-officer?filter=connector-v*&label=connector&color=orange&style=flat-square" alt="Connector Version" /></a>
+  <img src="https://img.shields.io/badge/MCP_Protocol-2026--07--28-blueviolet?style=flat-square" alt="MCP Protocol" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" /></a>
+  <img src="https://img.shields.io/badge/Architecture-Master_%2F_Worker-teal?style=flat-square" alt="Architecture" />
+</p>
+
+<p align="center">
+  <a href="README.md"><b>English</b></a> | <a href="docs/README.zh-CN.md"><b>简体中文</b></a>
+</p>
 
 ---
 
