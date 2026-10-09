@@ -160,6 +160,12 @@ ceo-connector pause
 ceo-connector resume
 ```
 
+### Self-Hosting & Deployment Example
+
+If you prefer full control over your server infrastructure (running your own MCP service and task orchestration backend), reference the official Kubernetes / K3s production deployment setup:
+
+- Deployment manifests & homelab configuration: [k3s-homelab/apps/ceo](https://github.com/SentimentalK/k3s-homelab/tree/master/apps/ceo)
+
 ---
 
 ## Born from Daily Dogfooding

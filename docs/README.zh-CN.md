@@ -160,6 +160,12 @@ ceo-connector pause
 ceo-connector resume
 ```
 
+### 私有化部署示例 (Self-Hosting Example)
+
+如果你倾向于完全掌控服务端基础设施（托管个人 MCP 服务与任务调度后端），可以参考官方的 Kubernetes / K3s 生产部署示例：
+
+- 完整部署清单与配置参考：[k3s-homelab/apps/ceo](https://github.com/SentimentalK/k3s-homelab/tree/master/apps/ceo)
+
 ---
 
 ## 来自真实使用
