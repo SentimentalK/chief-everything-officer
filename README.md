@@ -166,6 +166,11 @@ If you prefer full control over your server infrastructure (running your own MCP
 
 - Deployment manifests & homelab configuration: [k3s-homelab/apps/ceo](https://github.com/SentimentalK/k3s-homelab/tree/master/apps/ceo)
 
+When using a self-hosted backend, authenticate your local `ceo-connector` by specifying the custom origin URL with `--server`:
+```bash
+ceo-connector login --server https://ceo.your-domain.com
+```
+
 ---
 
 ## Born from Daily Dogfooding

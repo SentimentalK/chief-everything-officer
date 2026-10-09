@@ -166,6 +166,11 @@ ceo-connector resume
 
 - 完整部署清单与配置参考：[k3s-homelab/apps/ceo](https://github.com/SentimentalK/k3s-homelab/tree/master/apps/ceo)
 
+在私有化部署环境下，本地 `ceo-connector` 登录时需通过 `--server` 参数指定你的私有服务端地址：
+```bash
+ceo-connector login --server https://ceo.your-domain.com
+```
+
 ---
 
 ## 来自真实使用
