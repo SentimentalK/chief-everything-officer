@@ -173,6 +173,23 @@ ceo-connector login --server https://ceo.your-domain.com
 
 ---
 
+## Data Privacy & Security (An Honest Note)
+
+For those opting to use the pre-built hosted cloud gateway (`ceo.sentimentalk.com`), here is an open and transparent breakdown of data flow and trust boundaries:
+
+1. **Your Canonical Data Lives in Your Own GitHub Repo**: CEO's purpose is keeping context in Git repositories you own. Your code, documents, and memory files remain in your personal storage.
+2. **The Hosted Cloud Service Acts as a Relay**:
+   - Web AI tool calls, job queue dispatching, and audit traces transit through the hosted server to bridge your browser AI to local workstations.
+   - Tasks and logs reside temporarily in the server-side database for asynchronous queueing and audit trails before scheduled cleanups.
+3. **Early-Stage Transparency & "Gentleman's Agreement"**:
+   - In this early-access phase, the server is operated personally by the creator. I will never intentionally inspect, scrape, or snoop on any user's personal data. However, technically data does transit through the hosted backend.
+   - The cloud service is offered **completely free** so anyone can get started immediately without infrastructure hassle. The end-to-end flow for new users has been thoroughly tested and verified.
+   - As adoption grows, stricter tenant isolation and end-to-end encryption will be explored as future milestones.
+4. **Prefer Zero Data Transit? Go Fully Self-Hosted**:
+   - If your workflow involves sensitive enterprise data or strict compliance requirements, use the [K3s Self-Hosting Example](https://github.com/SentimentalK/k3s-homelab/tree/master/apps/ceo) to run the entire backend stack privately on your own hardware.
+
+---
+
 ## Born from Daily Dogfooding
 
 CEO was created to solve real, everyday engineering friction.
