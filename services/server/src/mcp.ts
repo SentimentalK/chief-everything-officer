@@ -75,7 +75,10 @@ function tracedHandler<T>(
       res = result(rawResult);
     } catch (error) {
       status = "error";
-      if (!(error instanceof CeoError)) {
+      if (
+        !(error instanceof CeoError) &&
+        (error as { name?: unknown })?.name !== "JobValidationError"
+      ) {
         console.error(
           `[CEO MCP] unhandled error in tool '${toolName}':`,
           error instanceof Error ? error.stack || error.message : error,
@@ -557,7 +560,12 @@ export function createMcpServer(
             "Default mode=if_missing skips if content.md already exists; mode=refresh re-extracts. " +
             "If the Connector is offline, the Job queues and waits up to 7 days for execution.",
           inputSchema: {
-            request_id: z.string().min(1).describe("Stable UUID for retry-safe idempotency"),
+            request_id: z
+              .string()
+              .min(1)
+              .describe(
+                "Client idempotency key: must be a valid UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or req-<uuid>. Arbitrary strings are not accepted.",
+              ),
             resource_id: z
               .string()
               .regex(/^res-[0-9a-f-]{36}$/i)

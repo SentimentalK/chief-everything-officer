@@ -7,6 +7,7 @@ import { parseMetaMarkdown } from "./meta.js";
 import { getTreeEntry, readBlobUtf8 } from "../git.js";
 import type { SourceType } from "./types.js";
 import type { DefaultAgentRuntimeTargetResolution } from "../connector/control-store.js";
+import { REQUEST_ID_V2_RE } from "../jobs/v2-schema.js";
 
 export const ACQUISITION_TIMEOUT_SECONDS = 3600;
 
@@ -131,6 +132,14 @@ export class ResourceAcquisitionService {
     scope: JobSubmitScopeV2,
     input: ResourceAcquireInput,
   ): Promise<ResourceAcquireResult> {
+    if (!input.request_id || !REQUEST_ID_V2_RE.test(input.request_id)) {
+      throw new CeoError(
+        "VALIDATION_FAILED",
+        "Invalid request_id format: must be a canonical UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or prefixed with 'req-'.",
+        { request_id: input.request_id },
+      );
+    }
+
     const mode = input.mode ?? "if_missing";
 
     // 1. Read Resource acquisition descriptor via snapshot read

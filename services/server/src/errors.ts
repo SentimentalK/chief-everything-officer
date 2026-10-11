@@ -44,6 +44,19 @@ export function safeError(error: unknown): {
   if (error instanceof CeoError) {
     return { ok: false, code: error.code, message: error.message, details: error.details };
   }
+  if (
+    error &&
+    typeof error === "object" &&
+    (error as { name?: unknown }).name === "JobValidationError" &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
+    return {
+      ok: false,
+      code: "VALIDATION_FAILED",
+      message: (error as { message: string }).message,
+      details: {},
+    };
+  }
   return {
     ok: false,
     code: "INTERNAL_ERROR",

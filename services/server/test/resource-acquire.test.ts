@@ -531,4 +531,47 @@ describe("ResourceAcquisitionService & resource_acquire MCP Tool", () => {
     );
     expect(hostJob.target_id).toBe(runtimeTargetId);
   });
+
+  it("fails with VALIDATION_FAILED when request_id is not a valid UUID", async () => {
+    // 1. Service direct call
+    await expect(
+      acquisitionService.acquire(
+        { user_id: userId, workspace_id: workspaceId },
+        {
+          request_id: "pillow-video-acquire-20261011-01",
+          resource_id: urlResourceId,
+          mode: "if_missing",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: expect.stringContaining("Invalid request_id format: must be a canonical UUID"),
+    });
+
+    // 2. Via MCP tool handler
+    const productPolicy = await loadProductPolicy();
+    const server = createMcpServer(workspace, productPolicy, {
+      identity: { user_id: userId, workspace_id: workspaceId },
+      connectorJobs: {
+        coordinator,
+        controlStore,
+        identityStore,
+      },
+      resourceService,
+    });
+
+    const tools = (server as any)._registeredTools;
+    const response = await tools["resource_acquire"].handler({
+      request_id: "pillow-video-acquire-20261011-01",
+      resource_id: urlResourceId,
+      mode: "if_missing",
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toMatchObject({
+      ok: false,
+      code: "VALIDATION_FAILED",
+      message: expect.stringContaining("Invalid request_id format: must be a canonical UUID"),
+    });
+  });
 });

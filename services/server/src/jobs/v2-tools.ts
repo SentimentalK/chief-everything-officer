@@ -138,7 +138,12 @@ const executionTargetsSchema = z
 
 const jobSubmitSchema = z
   .object({
-    request_id: z.string().min(1).describe("Client idempotency key (UUID or req-<uuid>)"),
+    request_id: z
+      .string()
+      .min(1)
+      .describe(
+        "Client idempotency key: must be a valid UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or req-<uuid>. Arbitrary strings are not accepted.",
+      ),
     target_id: z.string().min(1).describe("Execution Target ID (tgt_<uuid>)"),
     prompt: z.string().min(1).describe("Task goal and necessary inputs"),
     acceptance: z.string().min(1).describe("Concrete criteria for task completion"),

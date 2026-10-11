@@ -393,7 +393,9 @@ export class JobCoordinatorV2 {
 
     // Validate request_id
     if (!input.request_id || !REQUEST_ID_V2_RE.test(input.request_id)) {
-      throw new JobValidationError("Invalid request_id format.");
+      throw new JobValidationError(
+        "Invalid request_id format: must be a canonical UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or prefixed with 'req-'.",
+      );
     }
     // Validate target_id
     if (!input.target_id || !TARGET_ID_V2_RE.test(input.target_id)) {
@@ -498,7 +500,9 @@ export class JobCoordinatorV2 {
     assertHostWorkspaceAccess(this.identityStore, scope);
 
     if (!input.request_id || !REQUEST_ID_V2_RE.test(input.request_id)) {
-      throw new JobValidationError("Invalid request_id format.");
+      throw new JobValidationError(
+        "Invalid request_id format: must be a canonical UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or prefixed with 'req-'.",
+      );
     }
     if (typeof input.prompt !== "string" || isWhitespaceOnly(input.prompt)) {
       throw new JobValidationError("Prompt must not be empty or whitespace-only.");
@@ -1089,7 +1093,9 @@ export class JobCoordinatorV2 {
   ): Promise<string | null> {
     assertHostWorkspaceAccess(this.identityStore, scope);
     if (!requestId || !REQUEST_ID_V2_RE.test(requestId)) {
-      throw new JobValidationError("Invalid request_id format.");
+      throw new JobValidationError(
+        "Invalid request_id format: must be a canonical UUID (e.g. '550e8400-e29b-41d4-a716-446655440000') or prefixed with 'req-'.",
+      );
     }
     return this.store.getRequestJobId(scope.user_id, scope.workspace_id, requestId);
   }
