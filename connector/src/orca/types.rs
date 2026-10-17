@@ -143,7 +143,11 @@ pub struct OrcaTerminalItem {
 /// - [`TerminalLiveness::DefinitelyExited`] means Orca authoritatively
 ///   reported the terminal as no longer live (an explicit structured exit
 ///   cause and/or `orphaned: true`), so waiting attempts must be interrupted
-///   immediately instead of polling until the execution deadline.
+///   immediately instead of polling until the execution deadline. The
+///   `orphaned: true` flag without an explicit exit cause classifies as
+///   exited only when `connected` is not `true`: a still-connected PTY wins
+///   because Orca can transiently surface the orphaned flag during a UI
+///   leaf reveal/reattach window.
 /// - [`TerminalLiveness::Unknown`] means the liveness fields are absent or
 ///   ambiguous; callers must retain their existing bounded/retryable
 ///   behavior and must not infer terminal death.
@@ -164,17 +168,22 @@ impl OrcaTerminalItem {
             }
             return TerminalLiveness::DefinitelyExited { reason };
         }
+        if self.connected == Some(true) {
+            // A still-connected PTY is live even when a transient
+            // `orphaned: true` flag is present during a UI leaf
+            // reveal/reattach window; only an explicit exitCause above can
+            // override this.
+            return TerminalLiveness::Live;
+        }
+        // `orphaned: true` without an exit cause classifies as exited only
+        // when the terminal is not confirmed connected.
         if self.orphaned == Some(true) {
             return TerminalLiveness::DefinitelyExited {
                 reason: "orphaned".into(),
             };
         }
         // Note: `writable` alone is deliberately NOT treated as death.
-        if self.connected == Some(true) {
-            TerminalLiveness::Live
-        } else {
-            TerminalLiveness::Unknown
-        }
+        TerminalLiveness::Unknown
     }
 }
 

@@ -1407,21 +1407,54 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         // Inspect the authoritative terminal state as part of every wait
         // tick. Orca may retain a terminal tombstone object (orphaned=true
         // and/or an explicit exitCause like operator_close) instead of
-        // returning a terminal_not_found error; such a terminal must
+        // returning a terminal_not_found error; an explicit exitCause must
         // immediately interrupt the waiting attempt instead of short-polling
-        // until the execution deadline.
+        // until the execution deadline, while an orphaned-only observation is
+        // debounced across short re-observations to survive transient
+        // renderer PTY-binding reattach windows.
         //
         // Transient show/transport failures (and `terminal_not_found`, which
         // the client maps to Ok(None)) are deliberately NOT treated as
         // terminal death here; they fall through to the existing bounded
         // observation below, which retains the current not-found/exited
         // error handling.
-        let shown_terminal = self.client.show_terminal(terminal_id).await.ok().flatten();
+        let mut shown_terminal = self.client.show_terminal(terminal_id).await.ok().flatten();
         if let Some(ref term) = shown_terminal {
             if let TerminalLiveness::DefinitelyExited { reason } = term.liveness() {
-                return Ok(WaitOutcome::Interrupted {
-                    reason: format!("terminal '{terminal_id}' is no longer live: {reason}"),
-                });
+                let has_explicit_exit_cause = term
+                    .exit_cause
+                    .as_ref()
+                    .filter(|c| !c.kind.is_empty())
+                    .is_some();
+                if has_explicit_exit_cause {
+                    return Ok(WaitOutcome::Interrupted {
+                        reason: format!("terminal '{terminal_id}' is no longer live: {reason}"),
+                    });
+                }
+                // Orphaned-only observations (no explicit exit cause) may be
+                // transient while Orca's renderer rebinds the PTY during a UI
+                // leaf reveal/reattach. Confirm the exit across up to 2 short
+                // retries before interrupting; a live re-observation resumes
+                // the normal wait behavior.
+                let mut confirmed_exit_reason = Some(reason);
+                for _ in 0..2 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    shown_terminal = self.client.show_terminal(terminal_id).await.ok().flatten();
+                    match shown_terminal.as_ref().map(|t| t.liveness()) {
+                        Some(TerminalLiveness::DefinitelyExited { reason: r }) => {
+                            confirmed_exit_reason = Some(r);
+                        }
+                        _ => {
+                            confirmed_exit_reason = None;
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = confirmed_exit_reason {
+                    return Ok(WaitOutcome::Interrupted {
+                        reason: format!("terminal '{terminal_id}' is no longer live: {reason}"),
+                    });
+                }
             }
         }
 

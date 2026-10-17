@@ -512,7 +512,7 @@ async fn outbox_delivers_managed_result_before_report() {
         claim_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
         report,
         managed_result: Some(managed_result),
-        managed_result_sha256: Some(payload_sha256),
+        managed_result_sha256: Some(payload_sha256.clone()),
         created_at_ms: 1000,
     };
 
@@ -557,6 +557,20 @@ async fn outbox_delivers_managed_result_before_report() {
     assert!(!paths.active_attempt_file().exists());
     // Verify runtime directory cleaned up
     assert!(!runtime_dir.exists());
+
+    // Verify redelivery receipt persisted on managed-result delivery so
+    // background smart redelivery can skip this candidate in O(1).
+    let receipt_path =
+        ceo_connector::redelivery::receipt_file_path(&paths.results_dir(), job_id, attempt_id);
+    assert!(
+        receipt_path.exists(),
+        "DeliveryReceipt must be written for delivered managed result"
+    );
+    let receipt: ceo_connector::redelivery::DeliveryReceipt =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt.job_id, job_id);
+    assert_eq!(receipt.attempt_id, attempt_id);
+    assert_eq!(receipt.payload_sha256, payload_sha256);
 }
 
 // ---------------------------------------------------------------------------

@@ -183,6 +183,18 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
     // 6. Outbox Recovery
     let _ = flush_outbox(paths, &client, &cred).await;
 
+    // Quiet smart redelivery at startup: once recovery leaves no active
+    // attempt and no flushable outbox record, any preserved but undelivered
+    // managed results (e.g. written after a crash between result finalize and
+    // delivery) are redelivered in the background without disturbing output.
+    if !paths.active_attempt_file().exists()
+        && flushable_outbox_files(paths)
+            .map(|records| records.is_empty())
+            .unwrap_or(true)
+    {
+        let _ = crate::redelivery::run_smart_redeliver_with_options(paths, true).await;
+    }
+
     println!("Connector recovery complete. Entering main polling loop.");
 
     // 7. Main Polling Loop
@@ -235,6 +247,13 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
+
+        // Quiet background smart redelivery: with no active attempt and no
+        // pending outbox records, pick up preserved managed results that were
+        // finalized locally but never delivered (crash windows). The
+        // in-flight guard inside run_smart_redeliver_with_options keeps this
+        // from racing an attempt that starts mid-scan.
+        let _ = crate::redelivery::run_smart_redeliver_with_options(paths, true).await;
 
         // Fresh Server Target Snapshot query
         let server_targets: Vec<ConnectorTargetProjection> =

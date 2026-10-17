@@ -16,8 +16,10 @@ use ceo_connector::projects::{
     ProjectError,
 };
 use ceo_connector::redelivery::{
-    receipt_file_path, run_redeliver, DeliveryReceipt, PreservedResultMeta,
+    receipt_file_path, run_redeliver, run_smart_redeliver_with_options, DeliveryReceipt,
+    PreservedResultMeta,
 };
+use ceo_connector::scheduler::ACTIVE_ATTEMPT_SCHEMA_VERSION;
 use ceo_connector::setup::{
     discover_agent_runtime_candidates, AGENT_RUNTIME_REPO_FULL_NAME, AGENT_RUNTIME_TARGET_ALIAS,
 };
@@ -785,6 +787,205 @@ async fn test_smart_redelivery_server_digest_match_skips_submission() {
     // Local receipt must now exist
     let receipt_path = receipt_file_path(&paths.results_dir(), job_id, attempt_id);
     assert!(receipt_path.exists());
+}
+
+#[tokio::test]
+async fn test_smart_redelivery_skips_active_attempt_and_outbox_records_and_delivers_late_runtime_result(
+) {
+    let server = MockServer::start().await;
+    let (_temp, paths) = setup_test_profile(&server.origin());
+
+    let active_job = "job-active-1";
+    let active_attempt = "att-11111111-1111-1111-1111-111111111111";
+    let late_job = "job-late-1";
+    let late_attempt = "att-22222222-2222-2222-2222-222222222222";
+    let late_resource = "res-late-1";
+    let claim_token = "a111111111111111111111111111111111111111111111111111111111111111";
+
+    let submit_calls = Arc::new(AtomicU32::new(0));
+    let sc = submit_calls.clone();
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.contains("/jobs/job-late-1") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "job_id": "job-late-1",
+                    "request_id": "req-1",
+                    "target_id": "tgt_1",
+                    "target_alias": "app",
+                    "state": "running",
+                    "created_at": "2026-10-01T00:00:00Z",
+                    "result_target": "resource",
+                    "execution_timeout_seconds": 300,
+                }),
+            );
+        }
+        if req.method == "POST" && req.path.contains("/result") {
+            sc.fetch_add(1, Ordering::SeqCst);
+            let body_val: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body_val.get("attempt_id").and_then(|v| v.as_str()),
+                Some(late_attempt),
+                "background smart redelivery must never submit the active attempt's result"
+            );
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-10-01T00:05:00Z",
+                    "resource_id": "res-late-1",
+                    "commit": "git-commit-hash-late"
+                }),
+            );
+        }
+        MockResponse::json(404, &serde_json::json!({ "error": "not found" }))
+    });
+
+    // Candidate A: attempt matches the live active-attempt.json, and it has a
+    // fully deliverable preserved result. The in-flight guard must skip it.
+    let active_meta = PreservedResultMeta {
+        server_origin: server.origin(),
+        device_id: "dev_test_123".to_string(),
+        job_id: active_job.to_string(),
+        attempt_id: active_attempt.to_string(),
+        claim_token: claim_token.to_string(),
+        resource_id: Some("res-active-1".to_string()),
+    };
+    ceo_connector::local_state::atomic_write_json(
+        &paths.preserved_managed_result_meta_file(active_job, active_attempt),
+        &active_meta,
+    )
+    .unwrap();
+    let active_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": active_job,
+        "attempt_id": active_attempt,
+        "resource_id": "res-active-1",
+        "summary": "Active attempt result",
+        "operations": [{ "op": "upsert_content", "content": "active content" }]
+    });
+    ceo_connector::local_state::atomic_write_json(
+        &paths.preserved_managed_result_file(active_job, active_attempt),
+        &active_envelope,
+    )
+    .unwrap();
+
+    ceo_connector::local_state::atomic_write_json(
+        &paths.active_attempt_file(),
+        &serde_json::json!({
+            "schema_version": ACTIVE_ATTEMPT_SCHEMA_VERSION,
+            "server_origin": server.origin(),
+            "device_id": "dev_test_123",
+            "job_id": active_job,
+            "workspace_id": "ws_1",
+            "target_id": "tgt_1",
+            "attempt_id": active_attempt,
+            "claim_token": claim_token,
+            "phase": "finalized_local",
+            "resource_id": "res-active-1",
+            "terminal_report_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }),
+    )
+    .unwrap();
+
+    // Candidate B: finalized attempt with ONLY a preserved meta file; the
+    // runtime managed result is written late (after the first scan).
+    let late_meta = PreservedResultMeta {
+        server_origin: server.origin(),
+        device_id: "dev_test_123".to_string(),
+        job_id: late_job.to_string(),
+        attempt_id: late_attempt.to_string(),
+        claim_token: claim_token.to_string(),
+        resource_id: Some(late_resource.to_string()),
+    };
+    ceo_connector::local_state::atomic_write_json(
+        &paths.preserved_managed_result_meta_file(late_job, late_attempt),
+        &late_meta,
+    )
+    .unwrap();
+
+    // Run 1 (quiet): candidate A skipped via active attempt guard; candidate
+    // B has no deliverable result yet. Nothing redelivered, but no crash.
+    let delivered = run_smart_redeliver_with_options(&paths, true)
+        .await
+        .unwrap();
+    assert_eq!(delivered, 0);
+    assert_eq!(
+        submit_calls.load(Ordering::SeqCst),
+        0,
+        "active-attempt candidate must never be submitted by background redelivery"
+    );
+    assert!(!receipt_file_path(&paths.results_dir(), active_job, active_attempt).exists());
+    assert!(!receipt_file_path(&paths.results_dir(), late_job, late_attempt).exists());
+
+    // The late runtime result finally lands for the finalized attempt B.
+    let late_envelope = serde_json::json!({
+        "schema_version": 1,
+        "job_id": late_job,
+        "attempt_id": late_attempt,
+        "resource_id": late_resource,
+        "summary": "Late runtime result",
+        "operations": [{ "op": "upsert_content", "content": "late content" }]
+    });
+    ceo_connector::local_state::atomic_write_json(
+        &paths.managed_result_file(late_attempt),
+        &late_envelope,
+    )
+    .unwrap();
+
+    // Run 2 (quiet): candidate A still skipped; candidate B is captured from
+    // the late runtime write, preserved, delivered, and receipted.
+    let delivered = run_smart_redeliver_with_options(&paths, true)
+        .await
+        .unwrap();
+    assert_eq!(delivered, 1);
+
+    let preserved = paths.preserved_managed_result_file(late_job, late_attempt);
+    assert!(
+        preserved.exists(),
+        "late runtime managed result must be preserved under results/"
+    );
+
+    let receipt_path = receipt_file_path(&paths.results_dir(), late_job, late_attempt);
+    assert!(
+        receipt_path.exists(),
+        "receipt must be written after background delivery"
+    );
+    let receipt: DeliveryReceipt =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt.job_id, late_job);
+    assert_eq!(receipt.attempt_id, late_attempt);
+
+    let (_, expected_sha256) = ceo_connector::managed_result::read_and_validate_from_file(
+        &preserved,
+        late_job,
+        late_attempt,
+        Some(late_resource),
+    )
+    .unwrap();
+    assert_eq!(receipt.payload_sha256, expected_sha256);
+
+    // The active-attempt candidate was never delivered or receipted, and the
+    // server was hit exactly once (for the late candidate only).
+    assert!(!receipt_file_path(&paths.results_dir(), active_job, active_attempt).exists());
+    assert_eq!(
+        submit_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one background redelivery submission expected"
+    );
+
+    // A third quiet scan must skip both candidates via the local receipts /
+    // in-flight guard (idempotent).
+    let delivered = run_smart_redeliver_with_options(&paths, true)
+        .await
+        .unwrap();
+    assert_eq!(delivered, 0);
+    assert_eq!(
+        submit_calls.load(Ordering::SeqCst),
+        1,
+        "third scan must not resubmit"
+    );
 }
 
 #[tokio::test]

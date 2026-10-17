@@ -3482,6 +3482,25 @@ fn test_terminal_liveness_classification() {
     let legacy: OrcaTerminalItem =
         serde_json::from_str(r#"{"handle":"term_8","tabId":"tab1","leafId":"leaf1"}"#).unwrap();
     assert_eq!(legacy.liveness(), TerminalLiveness::Unknown);
+
+    // 9. Transient orphaned=true during a UI leaf reveal/reattach with the
+    //    underlying PTY still connected classifies as Live: connected wins
+    //    over an orphaned-only flag when there is no explicit exit cause.
+    let reattach: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_reattach","connected":true,"orphaned":true}"#)
+            .unwrap();
+    assert_eq!(reattach.liveness(), TerminalLiveness::Live);
+
+    // 10. orphaned=true with connected=false (and no exit cause) still
+    //     classifies as exited via the orphaned flag.
+    let orphaned_disconnected: OrcaTerminalItem =
+        serde_json::from_str(r#"{"handle":"term_10","orphaned":true,"connected":false}"#).unwrap();
+    match orphaned_disconnected.liveness() {
+        TerminalLiveness::DefinitelyExited { reason } => {
+            assert!(reason.contains("orphaned"), "reason: {reason}");
+        }
+        other => panic!("expected DefinitelyExited, got {other:?}"),
+    }
 }
 
 fn waiting_attempt_without_executor() -> ActiveAttempt {
@@ -3576,6 +3595,60 @@ fi
         other => panic!("expected Interrupted, got {other:?}"),
     }
     assert!(!wait_invoked.contains("WAIT_INVOKED"));
+}
+
+#[tokio::test]
+async fn test_wait_transient_orphaned_reattach_recovers_without_interrupt() {
+    // First show reports an orphaned-only tombstone during a transient
+    // renderer PTY-binding reattach window; subsequent shows report the
+    // terminal re-attached and live (orphaned=false, connected=true). The
+    // orphaned-only observation must be debounced away: wait must NOT be
+    // interrupted and must fall through to the normal tui-idle observation.
+    let temp = tempfile::tempdir().unwrap();
+    let wait_log = temp.path().join("wait_invocations.log");
+    let show_count_file = temp.path().join("show_count");
+    fs::write(&show_count_file, "0").unwrap();
+
+    let script = r#"#!/bin/bash
+SHOW_COUNT_FILE="{SHOW_COUNT}"
+if [ "$1" = "terminal" ] && [ "$2" = "show" ]; then
+    CUR=$(cat "$SHOW_COUNT_FILE")
+    echo "$((CUR+1))" > "$SHOW_COUNT_FILE"
+    if [ "$CUR" = "0" ]; then
+        echo '{"ok":true,"result":{"terminal":{"handle":"term_x","orphaned":true,"connected":false}}}'
+    else
+        echo '{"ok":true,"result":{"terminal":{"handle":"term_x","orphaned":false,"connected":true,"tabId":"t1","leafId":"l1"}}}'
+    fi
+elif [ "$1" = "terminal" ] && [ "$2" = "wait" ]; then
+    echo "WAIT_INVOKED" >> "{WAIT_LOG}"
+    echo '{"ok":true,"result":{"wait":{"handle":"term_x","condition":"tui-idle","satisfied":true,"elapsedMs":100}}}'
+else
+    echo '{"ok":false,"error":{"code":"internal_error","message":"daemon busy"}}'
+fi
+"#;
+    let script = script
+        .replace("{WAIT_LOG}", &wait_log.display().to_string())
+        .replace("{SHOW_COUNT}", &show_count_file.display().to_string());
+
+    let bin = create_mock_orca_script(&temp, &script);
+    let client = OrcaCliClient::new(bin);
+    let adapter = OrcaExecutionAdapter::new(client);
+
+    let attempt = waiting_attempt_without_executor();
+    let outcome = adapter
+        .wait(&attempt, "term_x", Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    match outcome {
+        WaitOutcome::TuiIdle { .. } => {}
+        other => panic!("expected TuiIdle after transient orphaned reattach, got {other:?}"),
+    }
+    let invoked = fs::read_to_string(&wait_log).unwrap_or_default();
+    assert!(
+        invoked.contains("WAIT_INVOKED"),
+        "terminal wait must run after the transient orphaned flag clears"
+    );
 }
 
 #[tokio::test]

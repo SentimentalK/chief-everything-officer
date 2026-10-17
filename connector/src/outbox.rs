@@ -165,7 +165,25 @@ pub async fn deliver_outbox_record(
             .await;
 
         match result_res {
-            Ok(_res) => {}
+            Ok(resp) => {
+                // Persist a local DeliveryReceipt immediately so background
+                // smart redelivery can skip this already-delivered candidate
+                // in O(1) without querying the server.
+                let receipt_path = crate::redelivery::receipt_file_path(
+                    &paths.results_dir(),
+                    &record.job_id,
+                    &record.attempt_id,
+                );
+                let receipt = crate::redelivery::DeliveryReceipt {
+                    job_id: record.job_id.clone(),
+                    attempt_id: record.attempt_id.clone(),
+                    payload_sha256: digest.clone(),
+                    delivered_at: chrono::Utc::now().to_rfc3339(),
+                    resource_id: Some(resp.resource_id),
+                    commit: Some(resp.commit),
+                };
+                let _ = crate::local_state::atomic_write_json(&receipt_path, &receipt);
+            }
             Err(ClientError::Unauthorized) => {
                 return Err(OutboxError::AuthRequired);
             }

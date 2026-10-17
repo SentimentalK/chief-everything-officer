@@ -49,10 +49,26 @@ pub async fn run_redeliver(
 /// or server digest check). Persists local receipt after successful delivery.
 /// Never mutates historical execution report files.
 pub async fn run_smart_redeliver(paths: &ConnectorPaths) -> Result<(), String> {
+    run_smart_redeliver_with_options(paths, false)
+        .await
+        .map(|_| ())
+}
+
+/// Quiet-capable variant of [`run_smart_redeliver`] used by the daemon: with
+/// `quiet_when_empty` it stays silent when there is nothing to redeliver and
+/// returns the number of results actually redelivered. Guards against racing
+/// an in-flight attempt by skipping candidates that have a pending outbox
+/// record or whose attempt matches the active attempt file.
+pub async fn run_smart_redeliver_with_options(
+    paths: &ConnectorPaths,
+    quiet_when_empty: bool,
+) -> Result<usize, String> {
     let results_dir = paths.results_dir();
     if !results_dir.exists() {
-        println!("No pending results to redeliver.");
-        return Ok(());
+        if !quiet_when_empty {
+            println!("No pending results to redeliver.");
+        }
+        return Ok(0);
     }
 
     let cred = match DeviceCredential::load(&paths.credential_file())
@@ -85,16 +101,34 @@ pub async fn run_smart_redeliver(paths: &ConnectorPaths) -> Result<(), String> {
     }
 
     if candidates.is_empty() {
-        println!("No pending results to redeliver.");
-        return Ok(());
+        if !quiet_when_empty {
+            println!("No pending results to redeliver.");
+        }
+        return Ok(0);
     }
 
     // Sort for deterministic processing
     candidates.sort();
 
+    // In-flight safety guard: a candidate whose attempt matches the active
+    // attempt (or has a pending outbox record) belongs to a live or just
+    // finalized execution flow and must never be redelivered from the
+    // background.
+    let active_attempt_id = crate::scheduler::ActiveAttempt::load(&paths.active_attempt_file())
+        .ok()
+        .flatten()
+        .map(|a| a.attempt_id);
+
     let mut delivered_count = 0;
 
     for (job_id, attempt_id) in candidates {
+        if paths.outbox_file(&job_id, &attempt_id).exists() {
+            continue;
+        }
+        if active_attempt_id.as_deref() == Some(attempt_id.as_str()) {
+            continue;
+        }
+
         let meta_path = paths.preserved_managed_result_meta_file(&job_id, &attempt_id);
         if !meta_path.exists() {
             continue;
@@ -218,12 +252,14 @@ pub async fn run_smart_redeliver(paths: &ConnectorPaths) -> Result<(), String> {
     }
 
     if delivered_count == 0 {
-        println!("No pending results to redeliver.");
+        if !quiet_when_empty {
+            println!("No pending results to redeliver.");
+        }
     } else {
         println!("Smart redelivery completed: {delivered_count} result(s) redelivered.");
     }
 
-    Ok(())
+    Ok(delivered_count)
 }
 
 /// Explicit redelivery: replays submission even if already delivered.
