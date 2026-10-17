@@ -198,11 +198,11 @@ fn parser_exposes_completion_install_status_and_uninstall() {
 }
 
 #[test]
-fn version_flag_reports_2_5_6() {
-    assert_eq!(Cli::command().get_version(), Some("2.5.6"));
+fn version_flag_reports_2_5_7() {
+    assert_eq!(Cli::command().get_version(), Some("2.5.7"));
     let err = Cli::try_parse_from(["ceo-connector", "--version"]).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
-    assert!(err.to_string().contains("2.5.6"));
+    assert!(err.to_string().contains("2.5.7"));
 }
 
 fn target_wire(id: &str, alias: &str, display_name: &str) -> serde_json::Value {

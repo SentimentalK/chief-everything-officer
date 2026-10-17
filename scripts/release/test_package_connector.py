@@ -104,6 +104,7 @@ edition = "2021"
                 names,
                 [
                     "ceo-connector-2.4.1",
+                    "ceo-connector-2.4.1/LICENSE",
                     "ceo-connector-2.4.1/README.txt",
                     "ceo-connector-2.4.1/ceo-connector",
                 ],
@@ -160,6 +161,7 @@ edition = "2021"
                 names,
                 [
                     "ceo-connector-2.4.1/",
+                    "ceo-connector-2.4.1/LICENSE",
                     "ceo-connector-2.4.1/README.txt",
                     "ceo-connector-2.4.1/ceo-connector.exe",
                 ],
