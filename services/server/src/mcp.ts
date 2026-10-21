@@ -171,6 +171,13 @@ const appendOperation = z.object({
   expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/),
   content: z.string().describe("Text to append verbatim"),
 });
+const patchOperation = z.object({
+  op: z.literal("patch"),
+  path: z.string().describe("Allowed CEO Markdown path to update in place"),
+  expected_blob_oid: z.string().regex(/^[0-9a-f]{40,64}$/).describe("Blob OID read at base_commit; every patch on the same path in one transaction uses this same base OID"),
+  find: z.string().min(1).describe("Exact existing text to replace; must occur exactly once in the current file content. Several patches on one path apply in order, each against the previous result"),
+  replace: z.string().describe("Replacement text for the matched fragment; empty string deletes it"),
+});
 const deleteOperation = z.object({
   op: z.literal("delete"),
   path: z.string().describe("Allowed CEO Markdown path to delete"),
@@ -187,6 +194,7 @@ const changeOperationSchema = z.discriminatedUnion("op", [
   createOperation,
   replaceOperation,
   appendOperation,
+  patchOperation,
   deleteOperation,
   moveOperation,
 ]);
@@ -349,7 +357,7 @@ export function createMcpServer(
   server.registerTool("apply_change_set", {
     title: "Apply an atomic CEO change set",
     description:
-      "Use this for generic CEO State/workspace Markdown updates outside Resource semantic storage. This tool cannot mutate resources/**. Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them. The server checks optimistic concurrency, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit.",
+      "Use this for generic CEO State/workspace Markdown updates outside Resource semantic storage. This tool cannot mutate resources/**. Use resource_capture to create Resources, resource_apply to modify them, and resource_delete to delete them. The server checks optimistic concurrency, creates one commit, fast-forward pushes main, and verifies the result. Never use it with a stale base commit. Prefer patch to update a current value in place; use append only for stream areas (journal, well-being, decision, etc.) — state areas such as tasks/ and personal/ reject append.",
     inputSchema: {
       request_id: z.uuid().optional().describe("Stable UUID for retry-safe idempotency; reuse it when retrying the identical request"),
       base_commit: z.string().regex(/^[0-9a-f]{40,64}$/),

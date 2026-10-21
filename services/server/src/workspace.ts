@@ -32,7 +32,7 @@ import {
   validatePath,
 } from "./policy.js";
 import { isAllowedResourceSourcePath } from "./resource/security.js";
-import { parseWorkspaceRuleFrontmatter } from "./policy-resolver.js";
+import { WriteModeResolver, areaOfPath, validateWorkspaceRuleContent } from "./write-mode.js";
 
 export interface WorkspaceSnapshot {
   commit: string;
@@ -45,6 +45,7 @@ export type ChangeOperation =
   | { op: "create"; path: string; content: string }
   | { op: "replace"; path: string; expected_blob_oid: string; content: string }
   | { op: "append"; path: string; expected_blob_oid: string; content: string }
+  | { op: "patch"; path: string; expected_blob_oid: string; find: string; replace: string }
   | { op: "delete"; path: string; expected_blob_oid: string }
   | { op: "move"; path: string; expected_blob_oid: string; target: string };
 
@@ -130,6 +131,13 @@ function isTaskFilePath(filePath: string): boolean {
 /** A `rules/<filename>.md` reference, exactly one segment under rules/. */
 export function isRuleFilePath(filePath: string): boolean {
   return /^rules\/[^/]+\.md$/.test(filePath);
+}
+
+/** Occurrences of a non-empty needle, counting overlapping matches so ambiguous patches are rejected. */
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0;
+  for (let index = haystack.indexOf(needle); index !== -1; index = haystack.indexOf(needle, index + 1)) count++;
+  return count;
 }
 
 /** Basename of a valid archived entry, or null when the entry is not a task archive file. */
@@ -803,7 +811,8 @@ export class CeoWorkspace {
 
   validateOperations(operations: ChangeOperation[], matcher: CeoIgnoreMatcher): void {
     let total = 0;
-    const touched = new Set<string>();
+    // A path is changed once per transaction, except that several patch ops may target the same path.
+    const touched = new Map<string, "patch" | "other">();
     for (const operation of operations) {
       const source = validatePath(operation.path);
       if (isPathIgnored(matcher, source)) {
@@ -822,18 +831,42 @@ export class CeoWorkspace {
       if ("content" in operation) {
         total += assertContentSize(operation.content);
         if ((operation.op === "create" || operation.op === "replace") && isRuleFilePath(source)) {
-          parseWorkspaceRuleFrontmatter(operation.content, source);
+          validateWorkspaceRuleContent(operation.content, source);
         }
       }
+      if (operation.op === "patch") {
+        if (typeof operation.find !== "string" || operation.find.length === 0) {
+          throw new CeoError("INVALID_OPERATION", "Patch find must be a non-empty string.", { path: source });
+        }
+        if (typeof operation.replace !== "string") {
+          throw new CeoError("INVALID_OPERATION", "Patch replace must be a string.", { path: source });
+        }
+        assertContentSize(operation.find);
+        total += assertContentSize(operation.replace);
+      }
+      const kind = operation.op === "patch" ? "patch" : "other";
       for (const filePath of paths) {
-        if (touched.has(filePath)) throw new CeoError("INVALID_OPERATION", "A path may be changed only once per transaction.", { path: filePath });
-        touched.add(filePath);
+        const previous = touched.get(filePath);
+        if (previous === "patch" && kind === "patch") continue;
+        if (previous === "patch" || (previous && kind === "patch")) {
+          throw new CeoError("INVALID_OPERATION", "A path changed by patch may only receive further patch operations in the same transaction.", {
+            path: filePath,
+            reason: "PATCH_EXCLUSIVE_PATH",
+          });
+        }
+        if (previous) throw new CeoError("INVALID_OPERATION", "A path may be changed only once per transaction.", { path: filePath });
+        touched.set(filePath, kind);
       }
     }
     if (total > LIMITS.maxTotalWriteBytes) throw new CeoError("VALIDATION_FAILED", `Transaction content exceeds ${Math.round(LIMITS.maxTotalWriteBytes / (1024 * 1024))} MiB.`);
   }
 
   async applyOperations(worktree: string, base: string, operations: ChangeOperation[]): Promise<void> {
+    // Resolve (and cache) write modes against the worktree before any operation mutates rules/**.
+    const writeModes = new WriteModeResolver(worktree);
+    for (const operation of operations) {
+      if (operation.op === "append") await writeModes.resolve(areaOfPath(validatePath(operation.path)));
+    }
     for (const operation of operations) {
       const filePath = validatePath(operation.path);
       await assertNoSymlink(worktree, filePath);
@@ -848,13 +881,43 @@ export class CeoWorkspace {
         await writeFile(absolute, operation.content, "utf8");
       } else if (operation.op === "append") {
         await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
+        const area = areaOfPath(filePath);
+        if (area !== null && (await writeModes.resolve(area)) === "state") {
+          throw new CeoError(
+            "INVALID_OPERATION",
+            `Append is not allowed in state area '${area}/'. Its files hold current values that are rewritten in place: use patch to replace the exact fragment that changed, or replace to rewrite the whole file. Do not create a new file to work around this.`,
+            { path: filePath, area, write_mode: "state", reason: "APPEND_NOT_ALLOWED", use: ["patch", "replace"] },
+          );
+        }
         const current = await this.readUtf8(absolute, filePath);
         assertContentSize(current + operation.content);
         const combined = current + operation.content;
         if (isRuleFilePath(filePath)) {
-          parseWorkspaceRuleFrontmatter(combined, filePath);
+          validateWorkspaceRuleContent(combined, filePath);
         }
         await writeFile(absolute, combined, "utf8");
+      } else if (operation.op === "patch") {
+        // Every patch on a path is checked against the base blob; later patches see earlier results.
+        await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
+        const current = await this.readUtf8(absolute, filePath);
+        const matchCount = countOccurrences(current, operation.find);
+        if (matchCount !== 1) {
+          const message = matchCount === 0
+            ? "Patch find text does not occur in the current file content. Re-read the file and copy the exact fragment to change."
+            : `Patch find text occurs ${matchCount} times in the current file content. Include more surrounding text so it matches exactly once.`;
+          throw new CeoError("INVALID_OPERATION", message, {
+            path: filePath,
+            match_count: matchCount,
+            reason: matchCount === 0 ? "PATCH_NO_MATCH" : "PATCH_AMBIGUOUS_MATCH",
+          });
+        }
+        const index = current.indexOf(operation.find);
+        const patched = current.slice(0, index) + operation.replace + current.slice(index + operation.find.length);
+        assertContentSize(patched);
+        if (isRuleFilePath(filePath)) {
+          validateWorkspaceRuleContent(patched, filePath);
+        }
+        await writeFile(absolute, patched, "utf8");
       } else if (operation.op === "delete") {
         await assertExpectedBlob(this.config, worktree, base, filePath, operation.expected_blob_oid);
         await rm(absolute, { force: true });
@@ -867,7 +930,7 @@ export class CeoWorkspace {
         if (exists) throw new CeoError("INVALID_OPERATION", "Move target already exists.", { target });
         if (isRuleFilePath(target)) {
           const current = await this.readUtf8(absolute, filePath);
-          parseWorkspaceRuleFrontmatter(current, target);
+          validateWorkspaceRuleContent(current, target);
         }
         await mkdir(path.dirname(targetAbsolute), { recursive: true });
         await rename(absolute, targetAbsolute);
@@ -930,7 +993,7 @@ export class CeoWorkspace {
       }
       if (!isDeleted && isRuleFilePath(filePath)) {
         const ruleContent = await readFile(path.join(worktree, filePath), "utf8");
-        parseWorkspaceRuleFrontmatter(ruleContent, filePath);
+        validateWorkspaceRuleContent(ruleContent, filePath);
       }
       if (isPathIgnored(matcher, filePath)) {
         throw new CeoError("ACCESS_DENIED", "Changed path in diff is excluded by .ceoignore.", { path: filePath });
