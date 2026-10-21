@@ -5,7 +5,7 @@ CEO Server jobs to locally managed execution agents.
 
 ## Version
 
-Current baseline: **2.5.7**. Check with:
+Current baseline: **2.6.0**. Check with:
 
 ```bash
 ceo-connector --version

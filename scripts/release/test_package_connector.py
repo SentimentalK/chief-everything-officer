@@ -23,7 +23,7 @@ class TestPackageConnector(unittest.TestCase):
         pathlib.Path(self.cargo_toml).write_text(
             """[package]
 name = "ceo-connector"
-version = "2.4.1"
+version = "2.6.0"
 edition = "2021"
 """,
             encoding="utf-8",
@@ -41,8 +41,8 @@ edition = "2021"
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_validate_tag_success(self):
-        ver = package_connector.validate_tag("connector-v2.4.1", self.cargo_toml)
-        self.assertEqual(ver, "2.4.1")
+        ver = package_connector.validate_tag("connector-v2.6.0", self.cargo_toml)
+        self.assertEqual(ver, "2.6.0")
 
     def test_validate_tag_mismatch(self):
         with self.assertRaises(ValueError) as ctx:
@@ -50,7 +50,7 @@ edition = "2021"
         self.assertIn("version mismatch", str(ctx.exception))
 
     def test_validate_tag_malformed(self):
-        bad_tags = ["v2.4.1", "connector-2.4.1", "connector-v2.4", "release-2.4.1", "connector-v"]
+        bad_tags = ["v2.6.0", "connector-2.6.0", "connector-v2.4", "release-2.6.0", "connector-v"]
         for bad in bad_tags:
             with self.subTest(tag=bad):
                 with self.assertRaises(ValueError) as ctx:
@@ -64,7 +64,7 @@ edition = "2021"
         self.assertNotIn("ceo-connector daemon run", package_connector.DEFAULT_README_TEMPLATE)
 
         # Verify built readme content bytes
-        built = package_connector.build_readme_content("2.4.1").decode("utf-8")
+        built = package_connector.build_readme_content("2.6.0").decode("utf-8")
         self.assertIn("ceo-connector run", built)
         self.assertNotIn("ceo-connector daemon run", built)
 
@@ -77,14 +77,14 @@ edition = "2021"
             platform_key="linux-x64",
             binary_path=self.unix_bin,
             output_dir=out_dir1,
-            version="2.4.1",
+            version="2.6.0",
             source_date_epoch=fixed_epoch,
         )
         p2 = package_connector.package_connector(
             platform_key="linux-x64",
             binary_path=self.unix_bin,
             output_dir=out_dir2,
-            version="2.4.1",
+            version="2.6.0",
             source_date_epoch=fixed_epoch,
         )
 
@@ -103,22 +103,22 @@ edition = "2021"
             self.assertEqual(
                 names,
                 [
-                    "ceo-connector-2.4.1",
-                    "ceo-connector-2.4.1/LICENSE",
-                    "ceo-connector-2.4.1/README.txt",
-                    "ceo-connector-2.4.1/ceo-connector",
+                    "ceo-connector-2.6.0",
+                    "ceo-connector-2.6.0/LICENSE",
+                    "ceo-connector-2.6.0/README.txt",
+                    "ceo-connector-2.6.0/ceo-connector",
                 ],
             )
             # Check permissions
-            dir_member = tar.getmember("ceo-connector-2.4.1")
+            dir_member = tar.getmember("ceo-connector-2.6.0")
             self.assertTrue(dir_member.isdir())
             self.assertEqual(dir_member.mode & 0o777, 0o755)
 
-            bin_member = tar.getmember("ceo-connector-2.4.1/ceo-connector")
+            bin_member = tar.getmember("ceo-connector-2.6.0/ceo-connector")
             self.assertTrue(bin_member.isfile())
             self.assertEqual(bin_member.mode & 0o777, 0o755)
 
-            readme_member = tar.getmember("ceo-connector-2.4.1/README.txt")
+            readme_member = tar.getmember("ceo-connector-2.6.0/README.txt")
             self.assertTrue(readme_member.isfile())
             self.assertEqual(readme_member.mode & 0o777, 0o644)
 
@@ -136,14 +136,14 @@ edition = "2021"
             platform_key="windows-x64",
             binary_path=self.win_bin,
             output_dir=out_dir1,
-            version="2.4.1",
+            version="2.6.0",
             source_date_epoch=fixed_epoch,
         )
         p2 = package_connector.package_connector(
             platform_key="windows-x64",
             binary_path=self.win_bin,
             output_dir=out_dir2,
-            version="2.4.1",
+            version="2.6.0",
             source_date_epoch=fixed_epoch,
         )
 
@@ -160,14 +160,14 @@ edition = "2021"
             self.assertEqual(
                 names,
                 [
-                    "ceo-connector-2.4.1/",
-                    "ceo-connector-2.4.1/LICENSE",
-                    "ceo-connector-2.4.1/README.txt",
-                    "ceo-connector-2.4.1/ceo-connector.exe",
+                    "ceo-connector-2.6.0/",
+                    "ceo-connector-2.6.0/LICENSE",
+                    "ceo-connector-2.6.0/README.txt",
+                    "ceo-connector-2.6.0/ceo-connector.exe",
                 ],
             )
             # Check packaged README.txt contents in zip
-            readme_data = zf.read("ceo-connector-2.4.1/README.txt").decode("utf-8")
+            readme_data = zf.read("ceo-connector-2.6.0/README.txt").decode("utf-8")
             self.assertIn("ceo-connector run", readme_data)
             self.assertNotIn("ceo-connector daemon run", readme_data)
 
@@ -177,7 +177,7 @@ edition = "2021"
             platform_key="linux-x64",
             binary_path=self.unix_bin,
             output_dir=dist_dir,
-            version="2.4.1",
+            version="2.6.0",
             source_date_epoch=1704067200,
         )
 
@@ -191,14 +191,14 @@ edition = "2021"
                             tar.addfile(m, orig_tar.extractfile(m) if m.isfile() else None)
 
                     # Add illicit file
-                    bad = tarfile.TarInfo("ceo-connector-2.4.1/credentials.json")
+                    bad = tarfile.TarInfo("ceo-connector-2.6.0/credentials.json")
                     bad.type = tarfile.REGTYPE
                     bad.size = 14
                     bad.mode = 0o600
                     tar.addfile(bad, io.BytesIO(b'{"secret": 123}'))
 
         with self.assertRaises(ValueError) as ctx:
-            package_connector.verify_archive(tampered_archive, "linux-x64", "2.4.1")
+            package_connector.verify_archive(tampered_archive, "linux-x64", "2.6.0")
         self.assertIn("Unexpected file in archive", str(ctx.exception))
 
     def test_verify_archive_rejects_files_outside_top_dir(self):
@@ -213,7 +213,7 @@ edition = "2021"
                     tar.addfile(ti, io.BytesIO(b"hello"))
 
         with self.assertRaises(ValueError) as ctx:
-            package_connector.verify_archive(tampered_archive, "linux-x64", "2.4.1")
+            package_connector.verify_archive(tampered_archive, "linux-x64", "2.6.0")
         self.assertIn("outside top-level directory", str(ctx.exception))
 
     def test_all_five_platforms_checksum_generation_and_verification(self):
@@ -224,7 +224,7 @@ edition = "2021"
                 platform_key=plat,
                 binary_path=bin_path,
                 output_dir=dist_dir,
-                version="2.4.1",
+                version="2.6.0",
                 source_date_epoch=1704067200,
             )
 
@@ -268,15 +268,15 @@ edition = "2021"
         ).stdout.strip().lower()
 
         # Create annotated tag
-        subprocess.run(["git", "tag", "-a", "connector-v2.4.1", "-m", "Release 2.4.1"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "tag", "-a", "connector-v2.6.0", "-m", "Release 2.6.0"], cwd=repo_dir, check=True)
 
         # 1. Resolve tag commit
-        resolved = package_connector.resolve_tag_commit("connector-v2.4.1", repo_root=repo_dir)
+        resolved = package_connector.resolve_tag_commit("connector-v2.6.0", repo_root=repo_dir)
         self.assertEqual(resolved, commit_sha)
 
         # 2. Verify rerun identity succeeds even when target_commitish is "main"
         verified = package_connector.verify_rerun_identity(
-            tag="connector-v2.4.1",
+            tag="connector-v2.6.0",
             expected_commit=commit_sha,
             release_target_commitish="main",
             repo_root=repo_dir,
@@ -286,7 +286,7 @@ edition = "2021"
         # 3. Verify rerun identity fails when expected_commit differs
         with self.assertRaises(ValueError) as ctx:
             package_connector.verify_rerun_identity(
-                tag="connector-v2.4.1",
+                tag="connector-v2.6.0",
                 expected_commit="0000000000000000000000000000000000000000",
                 release_target_commitish="main",
                 repo_root=repo_dir,

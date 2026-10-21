@@ -205,12 +205,12 @@ mod tests {
 
     #[test]
     fn package_version_is_2_5_7() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.5.7");
-        assert_eq!(Cli::command().get_version(), Some("2.5.7"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.6.0");
+        assert_eq!(Cli::command().get_version(), Some("2.6.0"));
 
         let err = Cli::try_parse_from(["ceo-connector", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
-        assert!(err.to_string().contains("2.5.7"));
+        assert!(err.to_string().contains("2.6.0"));
     }
 
     #[test]
