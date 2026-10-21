@@ -26,3 +26,4 @@ pub mod setup;
 pub mod setup_frontend;
 pub mod status;
 pub mod targets;
+pub mod upgrade;

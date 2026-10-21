@@ -83,6 +83,22 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Upgrade this ceo-connector binary from the latest GitHub Release
+    Upgrade {
+        /// Only check whether a newer release exists; do not modify anything
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Install this exact version (e.g. 2.5.7) instead of the latest; allows downgrade
+        #[arg(long)]
+        version: Option<String>,
+        /// Skip the interactive confirmation prompt
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Output in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Install, inspect, or remove persistent shell completion
     Completion {
         #[command(subcommand)]

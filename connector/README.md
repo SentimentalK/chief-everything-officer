@@ -85,6 +85,12 @@ Deterministic binary packages are provided for five supported platforms:
 2. Replace the existing `ceo-connector` (or `ceo-connector.exe`) executable with the newly verified release binary.
 3. Durable user state under `~/.ceo/connector` (credentials, target mappings, history) is preserved and compatible across minor versions.
 
+### Self-upgrade
+
+`ceo-connector upgrade [--check] [--version X.Y.Z] [--yes] [--json]` installs the latest binary from the GitHub Release `connector-v*`.
+It downloads the matching platform archive, verifies it against the release `SHA256SUMS`, and replaces the current executable; `--check` only reports whether an update exists.
+A running daemon keeps the old version in memory, so restart it with `ceo-connector run` after upgrading.
+
 ### Uninstalling
 1. Delete the `ceo-connector` (or `ceo-connector.exe`) executable from your PATH directory.
 2. *(Optional)* If you wish to erase local device state completely, delete the `~/.ceo/connector` directory:

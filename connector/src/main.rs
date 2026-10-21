@@ -434,6 +434,69 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+        Commands::Upgrade {
+            check,
+            version,
+            yes,
+            json,
+        } => {
+            let exe_path = match std::env::current_exe().and_then(|path| path.canonicalize()) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("Failed to resolve the current executable: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let opts = ceo_connector::upgrade::UpgradeOptions {
+                check_only: check,
+                target_version: version,
+                assume_yes: yes,
+            };
+            let target = ceo_connector::upgrade::InstallTarget {
+                exe_path,
+                verify_new_binary: true,
+            };
+            let source = ceo_connector::upgrade::ReleaseSource::default();
+            match ceo_connector::upgrade::run_upgrade(&paths, &opts, &source, &target).await {
+                Ok(receipt) => {
+                    if json {
+                        match serde_json::to_string_pretty(&receipt) {
+                            Ok(rendered) => println!("{rendered}"),
+                            Err(e) => {
+                                eprintln!("Failed to serialize upgrade receipt: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else if receipt.replaced {
+                        println!(
+                            "Upgraded ceo-connector {} -> {} at {}",
+                            receipt.current_version, receipt.target_version, receipt.installed_path
+                        );
+                        if receipt.restart_required {
+                            println!(
+                                "The daemon is running the old version. Restart it: ceo-connector run"
+                            );
+                        }
+                    } else if receipt.up_to_date {
+                        println!(
+                            "ceo-connector {} (latest: {}, asset: {})",
+                            receipt.current_version, receipt.target_version, receipt.asset
+                        );
+                        println!("Up to date.");
+                    } else if receipt.check_only {
+                        println!(
+                            "ceo-connector {} (latest: {}, asset: {})",
+                            receipt.current_version, receipt.target_version, receipt.asset
+                        );
+                        println!("Update available. Run: ceo-connector upgrade");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Commands::Setup { runtime_path } => {
             // Interactive-terminal contract: when runtime_path is omitted,
             // require an interactive terminal (stdin and stdout attached to a TTY).

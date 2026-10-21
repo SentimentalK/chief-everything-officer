@@ -41,10 +41,12 @@ pub struct DoctorReport {
 }
 
 pub async fn run_doctor(paths: &ConnectorPaths, json_format: bool) -> DoctorReport {
-    run_doctor_with_orca(
+    let release_source = crate::upgrade::ReleaseSource::default();
+    run_doctor_with_orca_and_release(
         paths,
         json_format,
         crate::orca::client::OrcaCliClient::default(),
+        Some(&release_source),
     )
     .await
 }
@@ -53,6 +55,15 @@ pub async fn run_doctor_with_orca(
     paths: &ConnectorPaths,
     json_format: bool,
     orca_client: crate::orca::client::OrcaCliClient,
+) -> DoctorReport {
+    run_doctor_with_orca_and_release(paths, json_format, orca_client, None).await
+}
+
+pub async fn run_doctor_with_orca_and_release(
+    paths: &ConnectorPaths,
+    json_format: bool,
+    orca_client: crate::orca::client::OrcaCliClient,
+    release_source: Option<&crate::upgrade::ReleaseSource>,
 ) -> DoctorReport {
     let mut checks = Vec::new();
 
@@ -91,7 +102,12 @@ pub async fn run_doctor_with_orca(
     // 4. Orca discovery and runtime status
     check_orca_cli(&orca_client, &mut checks).await;
 
-    // 5. Server reachability, identity, workspaces, targets
+    // 5. Connector release freshness (online Doctor only)
+    if let Some(source) = release_source {
+        check_connector_version(source, &mut checks).await;
+    }
+
+    // 6. Server reachability, identity, workspaces, targets
     if let Some(ref c) = cred {
         check_server_integration(paths, c, &orca_client, &mut checks).await;
     } else {
@@ -385,6 +401,72 @@ pub async fn check_orca_cli(
                 name: "Orca CLI & Runtime".into(),
                 severity: DiagnosticSeverity::Fail,
                 message: format!("Orca CLI probe failed: {e}"),
+            });
+        }
+    }
+}
+
+async fn check_connector_version(
+    source: &crate::upgrade::ReleaseSource,
+    checks: &mut Vec<DiagnosticCheck>,
+) {
+    let asset = match crate::upgrade::current_platform_asset() {
+        Ok(asset) => asset,
+        Err(err) => {
+            checks.push(DiagnosticCheck {
+                name: "Connector Version".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!("Could not check the latest release: {err}"),
+            });
+            return;
+        }
+    };
+
+    let http = crate::upgrade::build_http_client(std::time::Duration::from_secs(5));
+    let release = match crate::upgrade::resolve_release(source, &http, None, asset).await {
+        Ok(release) => release,
+        Err(err) => {
+            checks.push(DiagnosticCheck {
+                name: "Connector Version".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!("Could not check the latest release: {err}"),
+            });
+            return;
+        }
+    };
+
+    let current = crate::upgrade::parse_semver(crate::upgrade::CURRENT_VERSION);
+    let latest = crate::upgrade::parse_semver(&release.version);
+    match (current, latest) {
+        (Some(current), Some(latest)) if latest > current => {
+            checks.push(DiagnosticCheck {
+                name: "Connector Version".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!(
+                    "Update available: {} -> {}. Run: ceo-connector upgrade",
+                    crate::upgrade::CURRENT_VERSION,
+                    release.version
+                ),
+            });
+        }
+        (Some(_), Some(_)) => {
+            checks.push(DiagnosticCheck {
+                name: "Connector Version".into(),
+                severity: DiagnosticSeverity::Pass,
+                message: format!(
+                    "ceo-connector {} is the latest release",
+                    crate::upgrade::CURRENT_VERSION
+                ),
+            });
+        }
+        _ => {
+            checks.push(DiagnosticCheck {
+                name: "Connector Version".into(),
+                severity: DiagnosticSeverity::Warn,
+                message: format!(
+                    "Could not check the latest release: invalid version '{}'",
+                    release.version
+                ),
             });
         }
     }
