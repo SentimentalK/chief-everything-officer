@@ -62,6 +62,8 @@ import {
   applyResolverRevisitUpdates,
   buildResolvedMetadataSeed,
   derivePreferredIdentity,
+  normalizeDescription,
+  normalizeThumbnailUrl,
   reconcileResourceKind,
 } from "./resolver-mapping.js";
 import { formatSummaryDocument } from "./summary.js";
@@ -582,6 +584,8 @@ export class ResourceService {
             title: metadataSeed ? metadataSeed.title : null,
             author: metadataSeed ? metadataSeed.author : null,
             published_at: metadataSeed ? metadataSeed.published_at : null,
+            description: metadataSeed ? metadataSeed.description : null,
+            thumbnail_url: metadataSeed ? metadataSeed.thumbnail_url : null,
             first_captured_at: new Date().toISOString(),
             language: metadataSeed ? metadataSeed.language : null,
             topics: input.topics ? [...input.topics] : [],
@@ -657,6 +661,8 @@ export class ResourceService {
           is_revisit: isRevisit,
           source_identity: meta.source_identity,
           title: meta.title,
+          description: meta.description,
+          thumbnail_url: meta.thumbnail_url,
           platform: meta.platform,
           resource_kind: meta.resource_kind,
           stage,
@@ -960,7 +966,14 @@ export class ResourceService {
     meta: ResourceMeta,
     op: Record<string, unknown>,
   ): void {
-    const allowedFields = ["title", "author", "published_at", "language"] as const;
+    const allowedFields = [
+      "title",
+      "author",
+      "published_at",
+      "language",
+      "description",
+      "thumbnail_url",
+    ] as const;
     let updatedAny = false;
 
     for (const field of allowedFields) {
@@ -970,6 +983,22 @@ export class ResourceService {
           continue;
         }
         if (typeof val === "string") {
+          if (field === "description") {
+            const normalized = normalizeDescription(val);
+            if (normalized !== null) {
+              meta.description = normalized;
+              updatedAny = true;
+            }
+            continue;
+          }
+          if (field === "thumbnail_url") {
+            const normalized = normalizeThumbnailUrl(val);
+            if (normalized !== null) {
+              meta.thumbnail_url = normalized;
+              updatedAny = true;
+            }
+            continue;
+          }
           const trimmed = val.trim();
           if (trimmed.length > 0) {
             meta[field] = trimmed;
@@ -987,7 +1016,7 @@ export class ResourceService {
     if (!updatedAny) {
       throw new CeoError(
         "VALIDATION_FAILED",
-        "merge_source_metadata requires at least one non-empty string field among: title, author, published_at, language.",
+        "merge_source_metadata requires at least one non-empty string field among: title, author, published_at, language, description, thumbnail_url.",
       );
     }
 

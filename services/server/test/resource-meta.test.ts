@@ -30,6 +30,8 @@ describe("Resource Metadata & Frontmatter Serialization", () => {
     title: null,
     author: null,
     published_at: null,
+    description: null,
+    thumbnail_url: null,
     first_captured_at: "2026-09-05T12:00:00.000Z",
     language: null,
     topics: ["contract", "employment"],
@@ -61,6 +63,38 @@ describe("Resource Metadata & Frontmatter Serialization", () => {
     expect(parsed.meta.topics).toEqual(["contract", "employment"]);
     expect(parsed.capture_note).toBe("Saved during employment contract review");
     expect(parsed.capture_history).toHaveLength(1);
+  });
+
+  it("round-trips description and thumbnail_url through meta.md", () => {
+    const meta: ResourceMeta = {
+      ...sampleMeta,
+      description: "A short source description.",
+      thumbnail_url: "https://example.com/thumb.png",
+    };
+
+    const parsed = parseMetaMarkdown(formatMetaMarkdown(meta));
+
+    expect(parsed.meta.description).toBe("A short source description.");
+    expect(parsed.meta.thumbnail_url).toBe("https://example.com/thumb.png");
+  });
+
+  it("parses legacy frontmatter without description or thumbnail_url as null", () => {
+    const legacy = [
+      "---",
+      "schema_version: 1",
+      'resource_id: "res-01234567-89ab-cdef-0123-456789abcdef"',
+      'display_name: "Legacy resource"',
+      "naming_source: id",
+      "title: Legacy title",
+      "---",
+      "",
+      "# Legacy resource",
+    ].join("\n");
+
+    const parsed = parseMetaMarkdown(legacy);
+
+    expect(parsed.meta.description).toBeNull();
+    expect(parsed.meta.thumbnail_url).toBeNull();
   });
 
   describe("Artifact-derived stage derivation", () => {

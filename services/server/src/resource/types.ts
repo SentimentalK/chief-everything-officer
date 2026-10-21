@@ -79,6 +79,8 @@ export interface ResourceMeta {
   title: string | null;
   author: string | null;
   published_at: string | null;
+  description: string | null;
+  thumbnail_url: string | null;
   first_captured_at: string;
   language: string | null;
   topics: string[];
@@ -93,6 +95,8 @@ export interface ManagedMergeSourceMetadataOp {
   author?: string | null;
   published_at?: string | null;
   language?: string | null;
+  description?: string | null;
+  thumbnail_url?: string | null;
 }
 
 export type ManagedResultOperation =

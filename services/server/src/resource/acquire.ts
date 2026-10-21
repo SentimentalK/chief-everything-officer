@@ -110,7 +110,7 @@ Resource ID: ${resourceId}
 2. 按 capability 自身说明执行，不要自行重新实现抓取、字幕下载或 ASR。
 3. 成功后读取 capability 生成的 result.json。
 4. 将真实 transcript/content 写入 upsert_content。
-5. result.json 中存在可靠来源 metadata 时，通过 merge_source_metadata 返回（可包含 title、author、published_at、language）。
+5. result.json 中存在可靠来源 metadata 时，通过 merge_source_metadata 返回（可包含 title、author、published_at、language、description、thumbnail_url）。
 6. 不要根据自己的推断补全缺失 metadata。
 7. 不要修改 display_name、topics、note、interactions 或其他用户语义信息。
 8. 不要直接修改 CEO Git 仓库中的 resources/**，不要直接调用 CEO Server API。`,

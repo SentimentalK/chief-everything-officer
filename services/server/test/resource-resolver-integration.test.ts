@@ -7,6 +7,15 @@ import { fixture } from "./helpers.js";
 import { CeoError } from "../src/errors.js";
 import { parseMetaMarkdown } from "../src/resource/meta.js";
 import { resolveResourceLocation } from "../src/resource/locator.js";
+import { normalizeUrlSource } from "../src/resource/identity.js";
+import {
+  MAX_DESCRIPTION_CHARS,
+  applyResolverRevisitUpdates,
+  buildResolvedMetadataSeed,
+  normalizeDescription,
+  normalizeThumbnailUrl,
+} from "../src/resource/resolver-mapping.js";
+import type { ResourceMeta } from "../src/resource/types.js";
 import type {
   ResolveOutcome,
   UrlMetadataResolver,
@@ -50,6 +59,8 @@ describe("Resource Resolver Integration V0", () => {
         canonical_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         source_id: "dQw4w9WgXcQ",
         title: "Never Gonna Give You Up",
+        description: "The official music video.",
+        thumbnail_url: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
         creator: "Rick Astley",
         published_at: "2009-10-25T06:57:33Z",
         language: "en",
@@ -77,6 +88,8 @@ describe("Resource Resolver Integration V0", () => {
     expect(resource.resource_id).toMatch(/^res-[0-9a-f-]{36}$/);
     expect(resource.is_revisit).toBe(false);
     expect(resource.title).toBe("Never Gonna Give You Up");
+    expect(resource.description).toBe("The official music video.");
+    expect(resource.thumbnail_url).toBe("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
     expect(resource.platform).toBe("youtube");
     expect(resource.resource_kind).toBe("video");
     expect(resource.stage).toBe("CAPTURED");
@@ -93,6 +106,10 @@ describe("Resource Resolver Integration V0", () => {
     expect(parsed.meta.title).toBe("Never Gonna Give You Up");
     expect(parsed.meta.author).toBe("Rick Astley");
     expect(parsed.meta.published_at).toBe("2009-10-25T06:57:33Z");
+    expect(parsed.meta.description).toBe("The official music video.");
+    expect(parsed.meta.thumbnail_url).toBe("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg");
+    expect(metaContent).toContain("description:");
+    expect(metaContent).toContain("thumbnail_url:");
     expect(parsed.meta.language).toBe("en");
     expect(parsed.meta.resource_kind).toBe("video");
     expect(parsed.meta.metadata_method).toBe("deterministic_adapter");
@@ -655,5 +672,113 @@ describe("Resource Resolver Integration V0", () => {
       source: { type: "url", url: "https://www.youtube.com/watch?v=vid456" },
     });
     expect((cap3.resource as any).resource_id).toBe(resourceId);
+  });
+});
+
+describe("Resolver metadata mapping (description & thumbnail)", () => {
+  const baseline = normalizeUrlSource("https://www.youtube.com/watch?v=vid999");
+
+  const baseMeta = (overrides: Partial<ResourceMeta> = {}): ResourceMeta => ({
+    schema_version: 1,
+    resource_id: "res-01234567-89ab-cdef-0123-456789abcdef",
+    display_name: "res-01234567-89ab-cdef-0123-456789abcdef",
+    naming_source: "id",
+    source_aliases: [],
+    last_metadata_attempt: null,
+    resource_kind: "video",
+    source_type: "url",
+    source_identity: "youtube:vid999",
+    source_ref: "https://www.youtube.com/watch?v=vid999",
+    canonical_ref: "https://www.youtube.com/watch?v=vid999",
+    platform: "youtube",
+    platform_id: "vid999",
+    original_name: null,
+    media_type: null,
+    format: null,
+    asset_ref: null,
+    source_hash: null,
+    title: "Title",
+    author: "Author",
+    published_at: "2025-01-01T00:00:00Z",
+    description: null,
+    thumbnail_url: null,
+    first_captured_at: "2025-01-01T00:00:00Z",
+    language: null,
+    topics: [],
+    metadata_method: "deterministic_adapter",
+    metadata_fetched_at: "2025-01-01T00:00:00Z",
+    capture_surface: "mcp",
+    ...overrides,
+  });
+
+  it("maps description and thumbnail_url into the resolved metadata seed", () => {
+    const seed = buildResolvedMetadataSeed(baseline, {
+      schema_version: 1,
+      source_type: "youtube",
+      source_url: "https://www.youtube.com/watch?v=vid999",
+      source_id: "vid999",
+      title: "Seed Title",
+      description: "  A useful description.  ",
+      thumbnail_url: "https://example.com/thumb.png",
+      captured_at: "2025-01-01T00:00:00Z",
+    });
+
+    expect(seed.description).toBe("A useful description.");
+    expect(seed.thumbnail_url).toBe("https://example.com/thumb.png");
+  });
+
+  it("rejects invalid thumbnail URLs and accepts only http(s)", () => {
+    expect(normalizeThumbnailUrl("not a url")).toBeNull();
+    expect(normalizeThumbnailUrl("ftp://x/y.png")).toBeNull();
+    expect(normalizeThumbnailUrl("https://x/y.png")).toBe("https://x/y.png");
+
+    const seed = buildResolvedMetadataSeed(baseline, {
+      schema_version: 1,
+      source_type: "youtube",
+      source_url: "https://www.youtube.com/watch?v=vid999",
+      thumbnail_url: "not a url",
+      captured_at: "2025-01-01T00:00:00Z",
+    });
+    expect(seed.thumbnail_url).toBeNull();
+  });
+
+  it("truncates descriptions longer than MAX_DESCRIPTION_CHARS", () => {
+    const longDescription = "x".repeat(MAX_DESCRIPTION_CHARS + 50);
+    expect(normalizeDescription(longDescription)).toHaveLength(MAX_DESCRIPTION_CHARS);
+
+    const seed = buildResolvedMetadataSeed(baseline, {
+      schema_version: 1,
+      source_type: "youtube",
+      source_url: "https://www.youtube.com/watch?v=vid999",
+      description: longDescription,
+      captured_at: "2025-01-01T00:00:00Z",
+    });
+    expect(seed.description).toHaveLength(MAX_DESCRIPTION_CHARS);
+  });
+
+  it("revisit update never erases description and updates it when a new value is provided", () => {
+    const meta = baseMeta({ description: "Existing description" });
+
+    const unchanged = applyResolverRevisitUpdates(meta, {
+      schema_version: 1,
+      source_type: "youtube",
+      source_url: "https://www.youtube.com/watch?v=vid999",
+      source_id: "vid999",
+      description: null,
+      captured_at: "2025-01-02T00:00:00Z",
+    });
+    expect(unchanged).toBe(false);
+    expect(meta.description).toBe("Existing description");
+
+    const changed = applyResolverRevisitUpdates(meta, {
+      schema_version: 1,
+      source_type: "youtube",
+      source_url: "https://www.youtube.com/watch?v=vid999",
+      source_id: "vid999",
+      description: "Fresh description",
+      captured_at: "2025-01-03T00:00:00Z",
+    });
+    expect(changed).toBe(true);
+    expect(meta.description).toBe("Fresh description");
   });
 });

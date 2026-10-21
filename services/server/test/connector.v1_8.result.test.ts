@@ -885,4 +885,127 @@ describe("Connector V1.8 Result Endpoint & Execution Loop", () => {
     expect(json.error).toBe("VALIDATION_FAILED");
     expect(json.message).toContain("rename");
   });
+
+  it("merge_source_metadata persists description into ResourceMeta", async () => {
+    const captureRes = await resourceService.capture({
+      source: {
+        type: "raw_text",
+        text: "Document text",
+        original_name: "doc.txt",
+      },
+    });
+    const resId = String((captureRes.resource as any).resource_id);
+
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Prompt",
+        acceptance: "Acceptance",
+        resource_id: resId,
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    const managedResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resId,
+      summary: "Merge description",
+      operations: [
+        {
+          op: "merge_source_metadata",
+          description: "  A concise source description.  ",
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(managedResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: managedResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const afterGet = await retrievalService.get({ resource_id: resId, view: "metadata" });
+    expect((afterGet as any).metadata.description).toBe("A concise source description.");
+  });
+
+  it("rejects merge_source_metadata with only an invalid thumbnail_url as VALIDATION_FAILED", async () => {
+    const captureRes = await resourceService.capture({
+      source: {
+        type: "raw_text",
+        text: "Document text",
+        original_name: "doc.txt",
+      },
+    });
+    const resId = String((captureRes.resource as any).resource_id);
+
+    const submitRes = await coordinator.submit(
+      { user_id: userId, workspace_id: workspaceId },
+      {
+        request_id: crypto.randomUUID(),
+        target_id: targetId,
+        prompt: "Prompt",
+        acceptance: "Acceptance",
+        resource_id: resId,
+        execution_timeout_seconds: 3600,
+        result_target: "resource",
+      },
+    );
+    const jobId = submitRes.job.job_id;
+    const attemptId = `att-${crypto.randomUUID()}`;
+    const claimToken = crypto.randomBytes(32).toString("hex");
+    await coordinator.claimJob(deviceId, jobId, attemptId, claimToken);
+    await coordinator.startJob(deviceId, jobId, attemptId, claimToken);
+
+    const managedResult = {
+      schema_version: 1,
+      job_id: jobId,
+      attempt_id: attemptId,
+      resource_id: resId,
+      summary: "Invalid thumbnail merge",
+      operations: [
+        {
+          op: "merge_source_metadata",
+          thumbnail_url: "not a url",
+        },
+      ],
+    };
+    const payloadSha256 = computeCanonicalSha256(managedResult);
+
+    const res = await fetch(`${baseUrl}/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${deviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        claim_token: claimToken,
+        result: managedResult,
+        payload_sha256: payloadSha256,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toBe("VALIDATION_FAILED");
+  });
 });

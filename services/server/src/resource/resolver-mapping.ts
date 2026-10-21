@@ -51,6 +51,35 @@ export function derivePreferredIdentity(
   return baselineIdentity;
 }
 
+export const MAX_DESCRIPTION_CHARS = 2000;
+
+/**
+ * Normalizes a resolver description: trims, maps empty to null, and truncates
+ * to MAX_DESCRIPTION_CHARS characters.
+ */
+export function normalizeDescription(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.slice(0, MAX_DESCRIPTION_CHARS);
+}
+
+/**
+ * Normalizes a resolver thumbnail URL: trims and requires an absolute http: or
+ * https: URL; otherwise returns null.
+ */
+export function normalizeThumbnailUrl(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface ResolvedMetadataSeed {
   canonical_ref: string | null;
   platform: string | null;
@@ -58,6 +87,8 @@ export interface ResolvedMetadataSeed {
   title: string | null;
   author: string | null;
   published_at: string | null;
+  description: string | null;
+  thumbnail_url: string | null;
   language: string | null;
   metadata_fetched_at: string | null;
   metadata_method: "deterministic_adapter" | null;
@@ -81,6 +112,8 @@ export function buildResolvedMetadataSeed(
       title: null,
       author: null,
       published_at: null,
+      description: null,
+      thumbnail_url: null,
       language: null,
       metadata_fetched_at: null,
       metadata_method: null,
@@ -112,6 +145,8 @@ export function buildResolvedMetadataSeed(
     title: metadata.title?.trim() || null,
     author: metadata.creator?.trim() || null,
     published_at: metadata.published_at?.trim() || null,
+    description: normalizeDescription(metadata.description),
+    thumbnail_url: normalizeThumbnailUrl(metadata.thumbnail_url),
     language: metadata.language?.trim() || null,
     metadata_fetched_at: metadata.captured_at?.trim() || new Date().toISOString(),
     metadata_method: "deterministic_adapter",
@@ -156,6 +191,20 @@ export function applyResolverRevisitUpdates(
       meta.published_at = newPublishedAt;
       changed = true;
     }
+  }
+
+  // Description: update if new non-null value differs from existing
+  const newDescription = normalizeDescription(metadata.description);
+  if (newDescription !== null && meta.description !== newDescription) {
+    meta.description = newDescription;
+    changed = true;
+  }
+
+  // Thumbnail URL: update if new non-null value differs from existing
+  const newThumbnailUrl = normalizeThumbnailUrl(metadata.thumbnail_url);
+  if (newThumbnailUrl !== null && meta.thumbnail_url !== newThumbnailUrl) {
+    meta.thumbnail_url = newThumbnailUrl;
+    changed = true;
   }
 
   // Language: update if new non-null value differs from existing
