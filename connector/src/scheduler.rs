@@ -370,15 +370,19 @@ impl ActiveAttempt {
                         | AttemptPhase::OutcomeRecorded
                 ) {
                     if let Some(ref exec) = self.executor {
-                        if exec.worktree_id.is_none() || exec.terminal_id.is_none() {
-                            return Err(SchedulerError::CorruptState(
-                                "prepared attempt missing worktree_id or terminal_id".into(),
-                            ));
-                        }
-                        if exec.agent_id.is_none() {
-                            return Err(SchedulerError::CorruptState(
-                                "prepared attempt missing agent_id".into(),
-                            ));
+                        let is_not_started_outcome = self.phase == AttemptPhase::OutcomeRecorded
+                            && exec.runtime_completion_kind.as_deref() == Some("not_started");
+                        if !is_not_started_outcome {
+                            if exec.worktree_id.is_none() || exec.terminal_id.is_none() {
+                                return Err(SchedulerError::CorruptState(
+                                    "prepared attempt missing worktree_id or terminal_id".into(),
+                                ));
+                            }
+                            if exec.agent_id.is_none() {
+                                return Err(SchedulerError::CorruptState(
+                                    "prepared attempt missing agent_id".into(),
+                                ));
+                            }
                         }
 
                         if matches!(

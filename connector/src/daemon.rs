@@ -2071,21 +2071,10 @@ pub async fn drive_active_attempt(
                                 code,
                                 message,
                             } => {
-                                let _lock = ExecutionLock::acquire_with_retry(
-                                    &paths.state_lock_file(),
-                                    Duration::from_secs(5),
-                                    Duration::from_millis(50),
-                                )?;
-                                let mut current =
-                                    match ActiveAttempt::load(&paths.active_attempt_file())? {
-                                        Some(c) if c.attempt_id == active.attempt_id => c,
-                                        _ => return Ok(true),
-                                    };
-                                current.phase = AttemptPhase::RecoveryRequired;
-                                current.save(&paths.active_attempt_file())?;
-                                return Err(DaemonError::RecoveryRequired(format!(
-                                    "{code}: {message}"
-                                )));
+                                eprintln!(
+                                    "Warning: terminal cleanup unverified for '{tid}' ({code}: {message}). Proceeding with terminal_cleanup_verified=false."
+                                );
+                                (false, None)
                             }
                         }
                     } else {
@@ -2289,6 +2278,87 @@ pub async fn drive_active_attempt(
                     reason
                 }
             };
+
+            if let Ok(detail) = client.get_job(cred, &active.job_id, false).await {
+                if detail.state != "terminal"
+                    && detail.execution.as_ref().map(|e| e.attempt_id.as_str())
+                        == Some(active.attempt_id.as_str())
+                {
+                    let server_running = detail.state == "running"
+                        || detail
+                            .execution
+                            .as_ref()
+                            .map(|e| e.phase == "running" || e.started_at.is_some())
+                            .unwrap_or(false);
+
+                    let _lock = ExecutionLock::acquire_with_retry(
+                        &paths.state_lock_file(),
+                        Duration::from_secs(5),
+                        Duration::from_millis(50),
+                    )?;
+                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                        Some(c) if c.attempt_id == active.attempt_id => c,
+                        _ => return Ok(true),
+                    };
+                    let has_captured_resource_result = current.result_target.as_deref()
+                        == Some("resource")
+                        && (paths
+                            .preserved_managed_result_file(&current.job_id, &current.attempt_id)
+                            .exists()
+                            || crate::managed_result::durable_capture_managed_result(
+                                paths, cred, &current,
+                            )
+                            .is_ok());
+
+                    let exec = current
+                        .executor
+                        .get_or_insert_with(crate::scheduler::AttemptExecutorState::new_orca);
+
+                    if server_running {
+                        if exec.runtime_completion_kind.is_some() {
+                            // Preserve existing recorded runtime outcome (e.g. post-completion terminal cleanup failure)
+                        } else if has_captured_resource_result {
+                            exec.runtime_completion_kind = Some("managed_result".to_string());
+                            exec.runtime_completed_at_ms = Some(now_utc_ms());
+                            exec.runtime_error = None;
+                        } else if exec.dispatch_request_id.is_some() {
+                            exec.runtime_completion_kind = Some("interrupted".to_string());
+                            exec.runtime_completed_at_ms = Some(now_utc_ms());
+                            exec.runtime_error = Some(ExecutionReportError {
+                                stage: "runtime".into(),
+                                code: "RECOVERY_TERMINALIZED".into(),
+                                message: "Attempt recovered from local recovery_required state and terminalized as failed to unblock queue".into(),
+                            });
+                        } else {
+                            exec.runtime_completion_kind = Some("not_started".to_string());
+                            exec.runtime_completed_at_ms = Some(now_utc_ms());
+                            exec.runtime_error = Some(ExecutionReportError {
+                                stage: "orchestration".into(),
+                                code: "RECOVERY_TERMINALIZED".into(),
+                                message: "Attempt recovered from local recovery_required state before dispatch and terminalized as blocked to unblock queue".into(),
+                            });
+                        }
+                    } else {
+                        exec.dispatch_request_id = None;
+                        exec.runtime_completion_kind = Some("not_started".to_string());
+                        exec.runtime_completed_at_ms = Some(now_utc_ms());
+                        exec.runtime_error = Some(ExecutionReportError {
+                            stage: "orchestration".into(),
+                            code: "RECOVERY_TERMINALIZED".into(),
+                            message: "Attempt recovered from local recovery_required state while claimed and terminalized as blocked to unblock queue".into(),
+                        });
+                    }
+
+                    current.phase = AttemptPhase::OutcomeRecorded;
+                    current.save(&paths.active_attempt_file())?;
+                    println!(
+                        "Recovered active attempt '{}' for job '{}' from recovery_required to OutcomeRecorded.",
+                        active.attempt_id, active.job_id
+                    );
+                    return Ok(true);
+                }
+            }
+
             Err(DaemonError::RecoveryRequired(format!(
                 "Active attempt is in recovery_required phase: {reason}"
             )))

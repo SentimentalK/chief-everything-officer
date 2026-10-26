@@ -737,3 +737,68 @@ async fn late_report_after_operator_cancel_converges_without_overwrite() {
         serde_json::from_str(&std::fs::read_to_string(&hist).unwrap()).unwrap();
     assert_eq!(parsed["status"], "cancelled");
 }
+
+#[tokio::test]
+async fn recovery_required_self_heals_when_server_still_running_exact_attempt() {
+    let server = MockServer::start().await;
+    let attempt_id = "att-03dca69e-a97f-440f-b56c-42bb79e76d54".to_string();
+    let detail = serde_json::json!({
+        "job_id": "job_mock_1",
+        "request_id": "req-1",
+        "target_id": "tgt_mock",
+        "target_alias": "mock-target",
+        "state": "running",
+        "execution_status": null,
+        "business_outcome": null,
+        "created_at": "2026-09-29T00:00:00.000Z",
+        "expires_at": null,
+        "resource_id": null,
+        "result_target": "none",
+        "execution_timeout_seconds": 60,
+        "execution": {
+            "attempt_id": attempt_id,
+            "phase": "running",
+            "claimed_at": "2026-09-29T00:00:05.000Z",
+            "started_at": "2026-09-29T00:00:06.000Z"
+        }
+    });
+    server.add_handler(move |req| {
+        if req.method == "GET" && req.path.starts_with("/api/connector/jobs/job_mock_1") {
+            return MockResponse::json(200, &detail);
+        }
+        if req.method == "POST" && req.path.contains("/report") {
+            return MockResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "replayed": false,
+                    "server_time": "2026-09-29T00:01:00.000Z"
+                }),
+            );
+        }
+        MockResponse {
+            status: 0,
+            headers: vec![],
+            body: vec![],
+        }
+    });
+
+    let (_temp, paths, res) = drive_recovery_required_attempt(&server, &attempt_id).await;
+    assert!(res.unwrap());
+
+    let recovered = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .expect("attempt should transition to OutcomeRecorded");
+    assert_eq!(recovered.phase, AttemptPhase::OutcomeRecorded);
+
+    // Next pass packages outbox, delivers terminal report, and clears active-attempt.json.
+    let cred = ceo_connector::credential::DeviceCredential::load(&paths.credential_file())
+        .unwrap()
+        .unwrap();
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+    let adapter = Arc::new(MockAdapter::default()) as Arc<dyn ExecutionAdapter>;
+    let res2 =
+        drive_active_attempt(&paths, &client, &cred, &adapter, &DaemonHooks::default()).await;
+    assert!(res2.unwrap());
+    assert!(!paths.active_attempt_file().exists());
+}

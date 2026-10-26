@@ -3917,3 +3917,59 @@ async fn test_in_flight_legacy_logical_attempt_without_positive_dispatch_fails_c
         "Phase must be persisted as RecoveryRequired"
     );
 }
+
+#[tokio::test]
+async fn test_outcome_recorded_stale_terminal_close_does_not_enter_recovery_required() {
+    let (_temp, paths, cred, _config) = setup_test_env("http://127.0.0.1:4000");
+    let attempt_id = format!("att-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut executor = make_default_executor("orca", "1.4.235");
+    executor.worktree_id = Some("wt_test".into());
+    executor.terminal_id = Some("term_stale".into());
+    executor.dispatch_request_id = Some("req_123".into());
+    executor.dispatch_started_at_ms = Some(now - 5000);
+    executor.execution_deadline_ms = Some(now + 30_000);
+    executor.dispatch_turn_started = true;
+    executor.turn_started_observed = true;
+    executor.structured_lifecycle_observed = true;
+    executor.runtime_completion_kind = Some("agent_done".into());
+    executor.runtime_completed_at_ms = Some(now);
+
+    let active = make_test_attempt(
+        &cred,
+        attempt_id,
+        AttemptPhase::OutcomeRecorded,
+        "none",
+        Some(executor),
+    );
+    active.save(&paths.active_attempt_file()).unwrap();
+
+    let adapter = Arc::new(MockAdapter {
+        ready: true,
+        close_result: Some(CleanupOutcome::RecoveryRequired {
+            code: "TERMINAL_HANDLE_STALE".into(),
+            message: "terminal close returned stale handle".into(),
+        }),
+        ..Default::default()
+    });
+    let client = ConnectorClient::new(&cred.server_origin).unwrap();
+
+    let res = drive_active_attempt(
+        &paths,
+        &client,
+        &cred,
+        &(adapter.clone() as Arc<dyn ExecutionAdapter>),
+        &DaemonHooks::default(),
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "Stale terminal close during OutcomeRecorded must not block the queue: {res:?}"
+    );
+
+    let cur = ActiveAttempt::load(&paths.active_attempt_file())
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.phase, AttemptPhase::FinalizedLocal);
+}
