@@ -28,6 +28,11 @@ pub struct ConnectorStatus {
     pub paused: bool,
     pub target_count: usize,
     pub active_attempt_job_id: Option<String>,
+    /// All currently active job IDs across per-Target execution slots
+    /// (PROJECT-056); empty when no attempt is active. Additive and
+    /// append-only on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_attempt_job_ids: Vec<String>,
     pub outbox_pending_count: usize,
     /// Single Connector state root (additive field; contract is append-only).
     pub connector_root: String,
@@ -65,21 +70,68 @@ pub fn get_status(paths: &ConnectorPaths) -> Result<ConnectorStatus, StatusError
 
     let target_count = config.as_ref().map(|c| c.targets.len()).unwrap_or(0);
 
-    let active_attempt_job_id = if paths.active_attempt_file().exists() {
-        if let Ok(content) = fs::read_to_string(paths.active_attempt_file()) {
-            serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|v| {
-                    v.get("job_id")
-                        .and_then(|j| j.as_str())
-                        .map(|s| s.to_string())
-                })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let (active_attempt_job_id, active_attempt_job_ids) =
+        match crate::scheduler::ActiveAttempt::list_all(paths) {
+            Ok(atts) => {
+                let ids: Vec<String> = atts.into_iter().map(|a| a.job_id).collect();
+                let first = ids.first().cloned();
+                (first, ids)
+            }
+            Err(_) => {
+                // Minimal/legacy marker JSON (e.g. `{"schema_version": 1,
+                // "job_id": ...}`) does not parse as a full ActiveAttempt: fall
+                // back to raw `job_id` extraction so status never regresses.
+                let mut ids: Vec<String> = Vec::new();
+                if let Ok(content) = fs::read_to_string(paths.active_attempt_file()) {
+                    if let Some(job_id) = serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("job_id")
+                                .and_then(|j| j.as_str())
+                                .map(|s| s.to_string())
+                        })
+                    {
+                        ids.push(job_id);
+                    }
+                }
+                let mut slot_ids: Vec<String> = Vec::new();
+                if let Ok(entries) = fs::read_dir(paths.active_attempts_dir()) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if !(name.ends_with(".json")
+                            && !name.starts_with('.')
+                            && !name.starts_with('#')
+                            && !name.ends_with(".tmp"))
+                        {
+                            continue;
+                        }
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            if let Some(job_id) =
+                                serde_json::from_str::<serde_json::Value>(&content)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("job_id")
+                                            .and_then(|j| j.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                            {
+                                slot_ids.push(job_id);
+                            }
+                        }
+                    }
+                }
+                slot_ids.sort();
+                ids.extend(slot_ids);
+                let first = ids.first().cloned();
+                (first, ids)
+            }
+        };
 
     let outbox_pending_count = count_files_in_dir(&paths.outbox_dir()).unwrap_or(0);
 
@@ -95,6 +147,7 @@ pub fn get_status(paths: &ConnectorPaths) -> Result<ConnectorStatus, StatusError
         paused,
         target_count,
         active_attempt_job_id,
+        active_attempt_job_ids,
         outbox_pending_count,
         connector_root: paths.root_dir.display().to_string(),
         connector_version: env!("CARGO_PKG_VERSION").to_string(),

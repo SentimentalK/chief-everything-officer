@@ -202,6 +202,11 @@ pub fn check_active_attempt_target_in_use(
     paths: &ConnectorPaths,
     target_id: &str,
 ) -> Result<(), TargetError> {
+    // Per-Target slot (PROJECT-056): the authoritative marker when this
+    // Target owns a concurrent execution.
+    if paths.active_attempt_file_for_target(target_id).exists() {
+        return Err(TargetError::TargetInUse(target_id.to_string()));
+    }
     if paths.active_attempt_file().exists() {
         if let Ok(content) = fs::read_to_string(paths.active_attempt_file()) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -246,8 +251,8 @@ pub async fn check_active_attempt_target_in_use_converged(
     }
 
     // Blocked: one bounded reconciliation (single server read; no polling).
-    match crate::attempt_convergence::reconcile_active_attempt_with_server_operator_cancel(
-        paths, client, cred,
+    match crate::attempt_convergence::reconcile_active_attempt_for_target_with_server_operator_cancel(
+        paths, client, cred, target_id,
     )
     .await
     {

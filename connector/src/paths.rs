@@ -74,6 +74,21 @@ impl ConnectorPaths {
         self.root_dir.join("active-attempt.json")
     }
 
+    /// Per-Target active-attempt slot directory (PROJECT-056): each concurrently
+    /// running Target owns exactly one durable marker file named
+    /// `<target_id>.json` inside this directory, enabling cross-Project
+    /// parallel execution while the single legacy mirror
+    /// ([`Self::active_attempt_file`]) stays synchronized for backward
+    /// compatibility.
+    pub fn active_attempts_dir(&self) -> PathBuf {
+        self.root_dir.join("active-attempts")
+    }
+
+    /// Per-Target active-attempt slot file.
+    pub fn active_attempt_file_for_target(&self, target_id: &str) -> PathBuf {
+        self.active_attempts_dir().join(format!("{target_id}.json"))
+    }
+
     pub fn locks_dir(&self) -> PathBuf {
         self.root_dir.join("locks")
     }
@@ -163,6 +178,7 @@ impl ConnectorPaths {
             &self.results_dir(),
             &self.runtime_dir(),
             &self.tmp_dir(),
+            &self.active_attempts_dir(),
         ] {
             platform::ensure_private_dir(dir)?;
         }
@@ -202,6 +218,7 @@ mod tests {
             paths.results_dir(),
             paths.runtime_dir(),
             paths.tmp_dir(),
+            paths.active_attempts_dir(),
         ] {
             assert!(dir.is_dir(), "directory {:?} must exist", dir);
         }
@@ -224,6 +241,7 @@ mod tests {
             paths.results_dir(),
             paths.runtime_dir(),
             paths.tmp_dir(),
+            paths.active_attempts_dir(),
         ] {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "directory {:?} must be 0700", dir);
@@ -290,6 +308,11 @@ mod tests {
             paths.active_attempt_file(),
             root.join("active-attempt.json")
         );
+        assert_eq!(paths.active_attempts_dir(), root.join("active-attempts"));
+        assert_eq!(
+            paths.active_attempt_file_for_target("tgt_1"),
+            root.join("active-attempts/tgt_1.json")
+        );
         assert_eq!(paths.daemon_lock_file(), root.join("locks/daemon.lock"));
         assert_eq!(paths.state_lock_file(), root.join("locks/state.lock"));
         assert_eq!(paths.history_dir(), root.join("history"));
@@ -316,6 +339,8 @@ mod tests {
             paths.enrollment_file(),
             paths.control_file(),
             paths.active_attempt_file(),
+            paths.active_attempts_dir(),
+            paths.active_attempt_file_for_target("tgt"),
             paths.coordinator_file(),
             paths.locks_dir(),
             paths.daemon_lock_file(),

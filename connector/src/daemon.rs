@@ -175,9 +175,22 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
         Err(e) => eprintln!("Warning: server identity probe failed: {}", e),
     }
 
-    // 5. Active Attempt Recovery
-    if paths.active_attempt_file().exists() {
-        let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
+    // 5. Active Attempt Recovery (per-Target slots, PROJECT-056): advance one
+    // durable step for every transitional attempt; Waiting attempts are left
+    // for the main loop to drive as background waiters.
+    let initial_attempts = ActiveAttempt::list_all(paths)?;
+    for att in initial_attempts {
+        if att.phase != AttemptPhase::Waiting {
+            let _ = drive_active_attempt_for_target(
+                paths,
+                &att.target_id,
+                &client,
+                &cred,
+                &adapter,
+                &hooks,
+            )
+            .await?;
+        }
     }
 
     // 6. Outbox Recovery
@@ -187,7 +200,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
     // attempt and no flushable outbox record, any preserved but undelivered
     // managed results (e.g. written after a crash between result finalize and
     // delivery) are redelivered in the background without disturbing output.
-    if !paths.active_attempt_file().exists()
+    if !ActiveAttempt::has_any(paths)
         && flushable_outbox_files(paths)
             .map(|records| records.is_empty())
             .unwrap_or(true)
@@ -197,11 +210,53 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
 
     println!("Connector recovery complete. Entering main polling loop.");
 
-    // 7. Main Polling Loop
+    // 7. Main Polling Loop (cross-Project parallel execution, PROJECT-056):
+    // transitional attempts are advanced one durable step in the foreground;
+    // attempts parked in the durable Waiting phase run as detached background
+    // waiters so other idle Projects keep being claimed and started.
     let mut iteration_count = 0;
+    let mut in_flight_waiters: std::collections::BTreeMap<
+        String,
+        tokio::task::JoinHandle<Result<bool, DaemonError>>,
+    > = std::collections::BTreeMap::new();
+    let mut idle_wait_polls_since_progress: usize = 0;
     loop {
+        // (a) Reap any completed background waiters first: their result must
+        // never be dropped on the floor (errors abort the daemon).
+        let finished_targets: Vec<String> = in_flight_waiters
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        for tid in finished_targets {
+            if let Some(handle) = in_flight_waiters.remove(&tid) {
+                match handle.await {
+                    Ok(Ok(_)) => {
+                        idle_wait_polls_since_progress = 0;
+                    }
+                    Ok(Err(e)) => {
+                        for (_, h) in in_flight_waiters {
+                            h.abort();
+                        }
+                        return Err(e);
+                    }
+                    Err(join_err) => {
+                        for (_, h) in in_flight_waiters {
+                            h.abort();
+                        }
+                        return Err(DaemonError::RecoveryRequired(format!(
+                            "Background wait task for target '{tid}' failed: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
         if let Some(max) = max_iterations {
             if iteration_count >= max {
+                for (_, h) in in_flight_waiters {
+                    h.abort();
+                }
                 println!(
                     "Reached maximum iterations ({}). Daemon exiting cleanly.",
                     max
@@ -227,9 +282,62 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             continue;
         }
 
-        // Concurrency = 1 guard: if active attempt exists, advance it!
-        if paths.active_attempt_file().exists() {
-            let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
+        // Inspect all per-Target active attempts and split by phase.
+        let all_attempts = ActiveAttempt::list_all(paths)?;
+        let mut waiting_attempts: Vec<ActiveAttempt> = Vec::new();
+        let mut transitional_attempts: Vec<ActiveAttempt> = Vec::new();
+        for att in all_attempts {
+            if att.phase == AttemptPhase::Waiting {
+                waiting_attempts.push(att);
+            } else {
+                transitional_attempts.push(att);
+            }
+        }
+
+        // Spawn a background waiter for every Waiting attempt without one.
+        for att in waiting_attempts {
+            if !in_flight_waiters.contains_key(&att.target_id) {
+                let handle =
+                    spawn_wait_waiter(paths, &att.target_id, &client, &cred, &adapter, &hooks);
+                in_flight_waiters.insert(att.target_id.clone(), handle);
+            }
+        }
+
+        if !transitional_attempts.is_empty() {
+            for att in transitional_attempts {
+                if let Err(e) = drive_active_attempt_for_target(
+                    paths,
+                    &att.target_id,
+                    &client,
+                    &cred,
+                    &adapter,
+                    &hooks,
+                )
+                .await
+                {
+                    for (_, h) in in_flight_waiters {
+                        h.abort();
+                    }
+                    return Err(e);
+                }
+                // If this step just advanced the attempt into Waiting, spawn
+                // its waiter immediately instead of waiting for the next poll.
+                if let Ok(Some(updated)) = ActiveAttempt::load_for_target(paths, &att.target_id) {
+                    if updated.phase == AttemptPhase::Waiting
+                        && !in_flight_waiters.contains_key(&updated.target_id)
+                    {
+                        let handle = spawn_wait_waiter(
+                            paths,
+                            &updated.target_id,
+                            &client,
+                            &cred,
+                            &adapter,
+                            &hooks,
+                        );
+                        in_flight_waiters.insert(updated.target_id.clone(), handle);
+                    }
+                }
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
@@ -248,12 +356,15 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             continue;
         }
 
-        // Quiet background smart redelivery: with no active attempt and no
+        // Quiet background smart redelivery: with no active attempt (no
+        // per-Target slot, no legacy mirror, no background waiter) and no
         // pending outbox records, pick up preserved managed results that were
         // finalized locally but never delivered (crash windows). The
         // in-flight guard inside run_smart_redeliver_with_options keeps this
         // from racing an attempt that starts mid-scan.
-        let _ = crate::redelivery::run_smart_redeliver_with_options(paths, true).await;
+        if in_flight_waiters.is_empty() && !ActiveAttempt::has_any(paths) {
+            let _ = crate::redelivery::run_smart_redeliver_with_options(paths, true).await;
+        }
 
         // Fresh Server Target Snapshot query
         let server_targets: Vec<ConnectorTargetProjection> =
@@ -292,6 +403,27 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
         // Find eligible candidate
         let mut selected_candidate = None;
         let mut selected_candidate_frozen_agent_id: Option<String> = None;
+
+        // Cross-Project parallelism (PROJECT-056): compute the set of Targets
+        // that are currently busy (active attempt or in-flight waiter) and
+        // their canonical local paths so a candidate for a busy Target — or
+        // for a different Target sharing the same workspace — is skipped.
+        let active_now = ActiveAttempt::list_all(paths)?;
+        let mut busy_targets: std::collections::HashSet<String> =
+            in_flight_waiters.keys().cloned().collect();
+        for att in &active_now {
+            busy_targets.insert(att.target_id.clone());
+        }
+        let mut busy_local_paths: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for tid in &busy_targets {
+            if let Some(t) = config.targets.get(tid) {
+                let canon = std::fs::canonicalize(&t.local_path)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&t.local_path));
+                busy_local_paths.insert(canon);
+            }
+        }
+
         // Orca Agent-aware launch-surface capability snapshot for this
         // pending batch. Probing is deferred until a candidate actually
         // needs it (logical-only executor) and always happens OUTSIDE any
@@ -302,11 +434,25 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
         let mut launch_surface = crate::execution_admission::AgentLaunchSurface::Unknown;
         let mut launch_surface_probed = false;
         for cand in &pending {
+            // Skip Targets that already have an active attempt or an in-flight
+            // background waiter: same-Project jobs stay queued on the server.
+            if busy_targets.contains(&cand.target_id) {
+                continue;
+            }
+
             // 1. Is target mapped in local config with configured executor?
             let local_t = match config.targets.get(&cand.target_id) {
                 Some(t) if t.executor.is_some() => t,
                 _ => continue,
             };
+
+            // Two different Targets must never execute concurrently in the
+            // same canonical local workspace (double-agent workspace guard).
+            let cand_canon_path = std::fs::canonicalize(&local_t.local_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&local_t.local_path));
+            if busy_local_paths.contains(&cand_canon_path) {
+                continue;
+            }
 
             // 2. Does target exist in fresh Server Target snapshot?
             let server_t = match target_snapshot.get(&cand.target_id) {
@@ -417,9 +563,9 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             break;
         }
 
-        if let Some(cand) = selected_candidate {
+        if let Some(cand) = &selected_candidate {
             if let Some(ref hook) = hooks.after_candidate_selected {
-                hook(&cand).await;
+                hook(cand).await;
             }
 
             let attempt_id = format!("att-{}", Uuid::new_v4());
@@ -442,7 +588,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             // Reload from disk (Item 9):
             let disk_cred = DeviceCredential::load(&paths.credential_file())?;
             let disk_config = crate::config::LocalConfig::load(&paths.config_file())?;
-            let disk_active = ActiveAttempt::load(&paths.active_attempt_file())?;
+            let disk_active_for_target = ActiveAttempt::load_for_target(paths, &cand.target_id)?;
             let disk_paused = if paths.control_file().exists() {
                 fs::read_to_string(paths.control_file())
                     .ok()
@@ -492,7 +638,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
                 continue;
             }
 
-            if disk_active.is_some() {
+            if disk_active_for_target.is_some() {
                 continue;
             }
 
@@ -501,6 +647,29 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
                 Some(t) => t,
                 None => continue,
             };
+
+            // Same canonical local workspace as any other currently active
+            // Target (different target_id sharing one workspace): refuse the
+            // claim so two Agents never operate on the same git tree.
+            let disk_target_canon = std::fs::canonicalize(&disk_target.local_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&disk_target.local_path));
+            let mut local_path_collision = false;
+            for att in ActiveAttempt::list_all(paths)? {
+                if att.target_id == cand.target_id {
+                    continue;
+                }
+                if let Some(t) = disk_config.targets.get(&att.target_id) {
+                    let canon = std::fs::canonicalize(&t.local_path)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&t.local_path));
+                    if canon == disk_target_canon {
+                        local_path_collision = true;
+                        break;
+                    }
+                }
+            }
+            if local_path_collision {
+                continue;
+            }
 
             // Re-evaluate execution admission against the config reloaded
             // under the state lock, immediately before ClaimIntent
@@ -580,7 +749,7 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             };
 
             // Fsync claim intent BEFORE network call!
-            attempt.save(&paths.active_attempt_file())?;
+            attempt.save_for_target(paths)?;
             drop(_lock);
 
             if let Some(ref hook) = hooks.after_claim_intent_persisted {
@@ -588,10 +757,37 @@ pub async fn run_daemon_with_hooks_and_admission_orca(
             }
 
             // Immediately drive the claim intent to network claim and execution
-            let _ = drive_active_attempt(paths, &client, &cred, &adapter, &hooks).await?;
+            if let Err(e) = drive_active_attempt_for_target(
+                paths,
+                &cand.target_id,
+                &client,
+                &cred,
+                &adapter,
+                &hooks,
+            )
+            .await
+            {
+                for (_, h) in in_flight_waiters {
+                    h.abort();
+                }
+                return Err(e);
+            }
         }
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // End-of-iteration sleep / iteration accounting: while background
+        // waiters are running, poll frequently without burning the iteration
+        // budget so bounded runs still reach a terminal outcome.
+        if selected_candidate.is_none() && !in_flight_waiters.is_empty() {
+            if idle_wait_polls_since_progress < 200 {
+                iteration_count = iteration_count.saturating_sub(1);
+                idle_wait_polls_since_progress += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        } else if selected_candidate.is_some() && !in_flight_waiters.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
 }
 
@@ -629,14 +825,15 @@ pub fn build_attempt_execution_prompt(paths: &ConnectorPaths, attempt: &ActiveAt
     )
 }
 
-pub async fn drive_active_attempt(
+pub async fn drive_active_attempt_for_target(
     paths: &ConnectorPaths,
+    target_id: &str,
     client: &ConnectorClient,
     cred: &DeviceCredential,
     adapter: &Arc<dyn ExecutionAdapter>,
     _hooks: &DaemonHooks,
 ) -> Result<bool, DaemonError> {
-    let active_opt = ActiveAttempt::load(&paths.active_attempt_file())?;
+    let active_opt = ActiveAttempt::load_for_target(paths, target_id)?;
     let active = match active_opt {
         Some(a) => a,
         None => return Ok(false),
@@ -668,12 +865,13 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         return Err(DaemonError::RecoveryRequired(format!(
                             "Claim replay correlation validation failed: {e}"
                         )));
@@ -697,10 +895,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.resource_id = resp.job.resource_id;
                     current.prompt = Some(resp.job.prompt);
                     current.acceptance = Some(resp.job.acceptance);
@@ -713,7 +912,7 @@ pub async fn drive_active_attempt(
                     crate::managed_result::durable_persist_redelivery_meta(paths, cred, &current)?;
 
                     current.phase = AttemptPhase::Claimed;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     println!("Claim intent successfully reconciled to claimed.");
                     Ok(true)
                 }
@@ -728,7 +927,7 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    remove_durable(&paths.active_attempt_file())?;
+                    ActiveAttempt::remove_for_target(paths, &active.target_id)?;
                     println!("Job was consumed by another worker, expired, or operator-cancelled. Cleared local claim intent.");
                     Ok(false)
                 }
@@ -741,12 +940,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     Err(DaemonError::RecoveryRequired(format!(
                         "Idempotency conflict: {message}"
                     )))
@@ -766,12 +966,12 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
             current.phase = AttemptPhase::PrepareIntent;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             Ok(true)
         }
         AttemptPhase::StartIntent => {
@@ -792,12 +992,13 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         return Err(DaemonError::RecoveryRequired(
                             "Start job response reported ok=false or invalid server_time".into(),
                         ));
@@ -808,12 +1009,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::Started;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     println!("Notified server of start for job '{}'", active.job_id);
                     Ok(true)
                 }
@@ -856,12 +1058,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     Err(DaemonError::RecoveryRequired(format!(
                         "Start job failed closed: {message}"
                     )))
@@ -879,12 +1082,12 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
             current.phase = AttemptPhase::Waiting;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             Ok(true)
         }
         AttemptPhase::PrepareIntent => {
@@ -905,12 +1108,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(format!(
                         "Target '{}' no longer mapped locally",
                         active.target_id
@@ -933,7 +1137,7 @@ pub async fn drive_active_attempt(
                     Duration::from_secs(5),
                     Duration::from_millis(50),
                 )?;
-                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                     Some(c) if c.attempt_id == active.attempt_id => c,
                     _ => return Ok(true),
                 };
@@ -949,13 +1153,13 @@ pub async fn drive_active_attempt(
                 if let Some(deadline) = exec.execution_deadline_ms {
                     if now >= deadline {
                         current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         return Err(DaemonError::RecoveryRequired(
                             "WORKER_START_RECONCILIATION_DEADLINE: attempt exceeded execution deadline during worker-start prepare reconciliation".into(),
                         ));
                     }
                 }
-                current.save(&paths.active_attempt_file())?;
+                current.save_for_target(paths)?;
             }
 
             let execution_prompt = build_attempt_execution_prompt(paths, &active);
@@ -968,10 +1172,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     let exec = current
                         .executor
                         .get_or_insert_with(crate::scheduler::AttemptExecutorState::new_orca);
@@ -988,14 +1193,14 @@ pub async fn drive_active_attempt(
                         exec.dispatch_turn_started = dispatch_evidence.turn_started;
                         exec.turn_started_observed = dispatch_evidence.turn_started;
                         current.phase = AttemptPhase::StartIntent;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         println!(
                             "Attempt '{}' prepared and dispatched via worker-start. Advanced to StartIntent.",
                             active.attempt_id
                         );
                     } else {
                         current.phase = AttemptPhase::Prepared;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         println!(
                             "Attempt '{}' prepared with worktree and agent terminal.",
                             active.attempt_id
@@ -1010,10 +1215,11 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         let exec = current
                             .executor
                             .get_or_insert_with(crate::scheduler::AttemptExecutorState::new_orca);
@@ -1021,7 +1227,7 @@ pub async fn drive_active_attempt(
                         exec.worktree_id = Some(ident.worktree_id);
                         exec.terminal_id = Some(ident.terminal_id);
                         exec.agent_id = Some(ident.agent_id);
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                     }
                     eprintln!("Execution prepare retryable: {reason}. Retrying next loop.");
                     Ok(true)
@@ -1032,10 +1238,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     let exec = current
                         .executor
                         .get_or_insert_with(crate::scheduler::AttemptExecutorState::new_orca);
@@ -1051,7 +1258,7 @@ pub async fn drive_active_attempt(
                         message: reason,
                     });
                     current.phase = AttemptPhase::OutcomeRecorded;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     println!(
                         "Agent failed readiness gate for attempt '{}'. Advanced to OutcomeRecorded for verified cleanup.",
                         active.attempt_id
@@ -1064,10 +1271,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     if let Some(ident) = execution {
                         let exec = current
                             .executor
@@ -1078,7 +1286,7 @@ pub async fn drive_active_attempt(
                         exec.agent_id = Some(ident.agent_id);
                     }
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     Err(DaemonError::RecoveryRequired(reason))
                 }
                 Err(e) => {
@@ -1088,12 +1296,13 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         return Err(DaemonError::RecoveryRequired(e));
                     }
                     eprintln!("Execution prepare error: {e}. Will retry.");
@@ -1117,12 +1326,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(
                         "LEGACY_IN_FLIGHT_LOGICAL_ATTEMPT: logical agent attempt found in Prepared without positive dispatch evidence; failing closed to prevent double-dispatch".into(),
                     ));
@@ -1132,12 +1342,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::StartIntent;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Ok(true);
                 }
             }
@@ -1149,7 +1360,7 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
@@ -1162,7 +1373,7 @@ pub async fn drive_active_attempt(
                 }
             }
             current.phase = AttemptPhase::DispatchIntent;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             Ok(true)
         }
         AttemptPhase::DispatchIntent => {
@@ -1181,12 +1392,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(
                         "LEGACY_IN_FLIGHT_LOGICAL_ATTEMPT: logical agent attempt found in DispatchIntent without positive dispatch evidence; failing closed to prevent double-dispatch".into(),
                     ));
@@ -1196,12 +1408,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::StartIntent;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Ok(true);
                 }
             }
@@ -1218,12 +1431,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(
                         "Dispatch intent missing terminal_id".into(),
                     ));
@@ -1246,10 +1460,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     if let Some(ref mut exec) = current.executor {
                         exec.dispatch_request_id = Some(request_id);
                         if exec.dispatch_accepted_at_ms.is_none() {
@@ -1257,7 +1472,7 @@ pub async fn drive_active_attempt(
                         }
                     }
                     current.phase = AttemptPhase::Dispatched;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     Ok(true)
                 }
                 crate::scheduler::DispatchReconciliation::DefinitelyNotDispatched => {
@@ -1277,12 +1492,13 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         current.phase = AttemptPhase::RecoveryRequired;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
                         return Err(DaemonError::RecoveryRequired(
                             "Prior dispatch outcome was ambiguous; cannot safely issue fresh send without manual recovery".into(),
                         ));
@@ -1294,10 +1510,11 @@ pub async fn drive_active_attempt(
                             Duration::from_secs(5),
                             Duration::from_millis(50),
                         )?;
-                        let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                            Some(c) if c.attempt_id == active.attempt_id => c,
-                            _ => return Ok(true),
-                        };
+                        let mut current =
+                            match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                                Some(c) if c.attempt_id == active.attempt_id => c,
+                                _ => return Ok(true),
+                            };
                         if let Some(ref mut exec) = current.executor {
                             exec.runtime_completion_kind = Some("not_started".into());
                             exec.runtime_completed_at_ms = Some(now_utc_ms());
@@ -1308,7 +1525,7 @@ pub async fn drive_active_attempt(
                             });
                         }
                         current.phase = AttemptPhase::OutcomeRecorded;
-                        current.save(&paths.active_attempt_file())?;
+                        current.save_for_target(paths)?;
 
                         println!(
                             "Dispatch retry budget exhausted for attempt '{}'; marked not_started and advanced to OutcomeRecorded for verified cleanup",
@@ -1323,10 +1540,11 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     let baseline_state_started_at = adapter
                         .get_agent_status_baseline(&terminal_id)
                         .await
@@ -1335,7 +1553,7 @@ pub async fn drive_active_attempt(
                         exec.dispatch_send_count += 1;
                         exec.dispatch_baseline_state_started_at = baseline_state_started_at;
                     }
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     drop(_lock);
 
                     let prompt_text = build_attempt_execution_prompt(paths, &active);
@@ -1361,7 +1579,7 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
@@ -1372,7 +1590,7 @@ pub async fn drive_active_attempt(
                                 exec.last_dispatch_outcome = None;
                             }
                             current.phase = AttemptPhase::Dispatched;
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             Ok(true)
                         }
                         crate::scheduler::DispatchOutcome::KnownRejectedBeforeAcceptance {
@@ -1384,14 +1602,14 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
                             if let Some(ref mut exec) = current.executor {
                                 exec.last_dispatch_outcome = Some("known_rejected".into());
                             }
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             eprintln!("Dispatch rejected before acceptance: {reason}. Intent remains for retry/budget check.");
                             Ok(true)
                         }
@@ -1402,12 +1620,12 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
                             current.phase = AttemptPhase::RecoveryRequired;
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             Err(DaemonError::RecoveryRequired(format!("{code}: {message}")))
                         }
                         crate::scheduler::DispatchOutcome::AmbiguousTransportFailure { error } => {
@@ -1417,14 +1635,14 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
                             if let Some(ref mut exec) = current.executor {
                                 exec.last_dispatch_outcome = Some("ambiguous".into());
                             }
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             eprintln!("Ambiguous transport failure during dispatch: {error}. Intent remains for reconciliation.");
                             Ok(true)
                         }
@@ -1436,12 +1654,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     Err(DaemonError::RecoveryRequired(
                         "Ambiguous dispatch state detected: RECOVERY_REQUIRED".into(),
                     ))
@@ -1454,12 +1673,12 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
             current.phase = AttemptPhase::StartIntent;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             Ok(true)
         }
         AttemptPhase::Waiting => {
@@ -1475,12 +1694,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(
                         "Waiting phase missing terminal_id".into(),
                     ));
@@ -1497,12 +1717,12 @@ pub async fn drive_active_attempt(
                     Duration::from_secs(5),
                     Duration::from_millis(50),
                 )?;
-                let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+                let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                     Some(c) if c.attempt_id == active.attempt_id => c,
                     _ => return Ok(true),
                 };
                 current.phase = AttemptPhase::RecoveryRequired;
-                current.save(&paths.active_attempt_file())?;
+                current.save_for_target(paths)?;
                 return Err(DaemonError::RecoveryRequired(
                     "Waiting phase requires dispatch_request_id".into(),
                 ));
@@ -1520,12 +1740,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(
                         "Waiting phase missing execution_deadline_ms".into(),
                     ));
@@ -1615,7 +1836,7 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
@@ -1623,7 +1844,7 @@ pub async fn drive_active_attempt(
                                 exec.turn_started_observed = true;
                                 exec.structured_lifecycle_observed = true;
                             }
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             println!(
                                 "Attempt '{}' agent working state observed; structured Agent lifecycle observation recorded (tui-idle fallback disabled).",
                                 active.attempt_id
@@ -1640,14 +1861,14 @@ pub async fn drive_active_attempt(
                                 Duration::from_millis(50),
                             )?;
                             let mut current =
-                                match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                                     Some(c) if c.attempt_id == active.attempt_id => c,
                                     _ => return Ok(true),
                                 };
                             if let Some(ref mut exec) = current.executor {
                                 exec.structured_lifecycle_observed = true;
                             }
-                            current.save(&paths.active_attempt_file())?;
+                            current.save_for_target(paths)?;
                             println!(
                                 "Attempt '{}' structured Agent lifecycle observation recorded; generic terminal idle must not terminalize.",
                                 active.attempt_id
@@ -1676,14 +1897,15 @@ pub async fn drive_active_attempt(
                                     Duration::from_millis(50),
                                 )?;
                                 let mut current =
-                                    match ActiveAttempt::load(&paths.active_attempt_file())? {
+                                    match ActiveAttempt::load_for_target(paths, &active.target_id)?
+                                    {
                                         Some(c) if c.attempt_id == active.attempt_id => c,
                                         _ => return Ok(true),
                                     };
                                 if let Some(ref mut exec) = current.executor {
                                     exec.structured_lifecycle_observed = true;
                                 }
-                                current.save(&paths.active_attempt_file())?;
+                                current.save_for_target(paths)?;
                             }
                             println!(
                                 "Pre-turn AgentDone observed for attempt '{}' without positive turn-start evidence; waiting for turn start.",
@@ -1852,7 +2074,7 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
@@ -1862,7 +2084,7 @@ pub async fn drive_active_attempt(
                 exec.runtime_error = err;
             }
             current.phase = AttemptPhase::OutcomeRecorded;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             println!(
                 "Attempt '{}' runtime completed. Phase advanced to OutcomeRecorded.",
                 active.attempt_id
@@ -2038,12 +2260,13 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
-                        Some(c) if c.attempt_id == active.attempt_id => c,
-                        _ => return Ok(true),
-                    };
+                    let mut current =
+                        match ActiveAttempt::load_for_target(paths, &active.target_id)? {
+                            Some(c) if c.attempt_id == active.attempt_id => c,
+                            _ => return Ok(true),
+                        };
                     current.phase = AttemptPhase::RecoveryRequired;
-                    current.save(&paths.active_attempt_file())?;
+                    current.save_for_target(paths)?;
                     return Err(DaemonError::RecoveryRequired(format!(
                         "Unknown runtime_completion_kind: {other:?}"
                     )));
@@ -2171,13 +2394,13 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
             current.phase = AttemptPhase::FinalizedLocal;
             current.terminal_report_sha256 = Some(digest);
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             drop(_lock);
 
             let _ = flush_outbox(paths, client, cred).await;
@@ -2232,7 +2455,7 @@ pub async fn drive_active_attempt(
                         Duration::from_secs(5),
                         Duration::from_millis(50),
                     )?;
-                    remove_durable(&paths.active_attempt_file())?;
+                    ActiveAttempt::remove_for_target(paths, &active.target_id)?;
                     println!("Active attempt was already delivered. Completed local active attempt cleanup.");
                     Ok(false)
                 } else {
@@ -2252,13 +2475,13 @@ pub async fn drive_active_attempt(
             // attempt (e.g. prepare failed after the Server authoritatively
             // cancelled the job) would otherwise block this device forever.
             // Converge through the shared owner
-            // (`crate::attempt_convergence::reconcile_active_attempt_with_
-            // server_operator_cancel`), which this project-side convergence
-            // also reuses. Any other server state, missing/ambiguous attempt
-            // identity, transport failure, or attempt mismatch remains
-            // fail-closed recovery_required.
-            let reason = match crate::attempt_convergence::reconcile_active_attempt_with_server_operator_cancel(
-                paths, client, cred,
+            // (`crate::attempt_convergence::reconcile_active_attempt_for_
+            // target_with_server_operator_cancel`), scoped to THIS Target's
+            // slot so concurrent Targets keep running. Any other server
+            // state, missing/ambiguous attempt identity, transport failure,
+            // or attempt mismatch remains fail-closed recovery_required.
+            let reason = match crate::attempt_convergence::reconcile_active_attempt_for_target_with_server_operator_cancel(
+                paths, client, cred, &active.target_id,
             )
             .await
             {
@@ -2369,15 +2592,76 @@ pub async fn drive_active_attempt(
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )?;
-            let mut current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+            let mut current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
                 Some(c) if c.attempt_id == active.attempt_id => c,
                 _ => return Ok(true),
             };
             current.phase = AttemptPhase::RecoveryRequired;
-            current.save(&paths.active_attempt_file())?;
+            current.save_for_target(paths)?;
             Err(DaemonError::RecoveryRequired(
                 "Legacy running attempt migrated to recovery_required".into(),
             ))
         }
     }
+}
+
+/// Legacy single-slot entry point (PROJECT-056 compatibility wrapper).
+///
+/// Resolves which Target to drive from the durable markers — the legacy
+/// mirror (`active-attempt.json`) first, otherwise the first per-Target slot
+/// in deterministic `target_id` order — and delegates to
+/// [`drive_active_attempt_for_target`]. Direct callers (unit/integration
+/// tests, startup recovery) keep identical single-attempt semantics.
+pub async fn drive_active_attempt(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    adapter: &Arc<dyn ExecutionAdapter>,
+    hooks: &DaemonHooks,
+) -> Result<bool, DaemonError> {
+    if paths.active_attempt_file().exists() {
+        if let Some(a) = ActiveAttempt::load(&paths.active_attempt_file())? {
+            return drive_active_attempt_for_target(
+                paths,
+                &a.target_id,
+                client,
+                cred,
+                adapter,
+                hooks,
+            )
+            .await;
+        }
+    }
+    if let Some(first) = ActiveAttempt::list_all(paths)?.into_iter().next() {
+        return drive_active_attempt_for_target(
+            paths,
+            &first.target_id,
+            client,
+            cred,
+            adapter,
+            hooks,
+        )
+        .await;
+    }
+    Ok(false)
+}
+
+/// Spawns a detached background task that drives one Target's attempt while
+/// it sits in the durable `Waiting` phase, so the daemon main loop keeps
+/// polling `pending_jobs` and can start other idle Projects concurrently.
+fn spawn_wait_waiter(
+    paths: &ConnectorPaths,
+    target_id: &str,
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    adapter: &Arc<dyn ExecutionAdapter>,
+    hooks: &DaemonHooks,
+) -> tokio::task::JoinHandle<Result<bool, DaemonError>> {
+    let p = paths.clone();
+    let tid = target_id.to_string();
+    let cl = client.clone();
+    let cr = cred.clone();
+    let ad = adapter.clone();
+    let hk = hooks.clone();
+    tokio::spawn(async move { drive_active_attempt_for_target(&p, &tid, &cl, &cr, &ad, &hk).await })
 }

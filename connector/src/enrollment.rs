@@ -183,7 +183,7 @@ pub async fn login_flow(
         if cfg.server_url != server_origin {
             let has_targets = !cfg.targets.is_empty();
             let has_cred = paths.credential_file().exists();
-            let has_active = paths.active_attempt_file().exists();
+            let has_active = crate::scheduler::ActiveAttempt::has_any(paths);
             let has_outbox =
                 paths.outbox_dir().exists() && fs::read_dir(paths.outbox_dir())?.next().is_some();
 
@@ -465,7 +465,7 @@ pub async fn logout_flow(paths: &ConnectorPaths) -> Result<(), EnrollmentError> 
     let _lock = ExecutionLock::acquire(&paths.state_lock_file())?;
 
     // Check active attempt and outbox
-    if paths.active_attempt_file().exists() {
+    if crate::scheduler::ActiveAttempt::has_any(paths) {
         return Err(EnrollmentError::UnresolvedExecutionState);
     }
 

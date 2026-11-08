@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::client::{ConnectorClient, JobDetail};
 use crate::credential::DeviceCredential;
 use crate::enrollment::now_utc_ms;
-use crate::local_state::{atomic_write_json, remove_durable, ExecutionLock};
+use crate::local_state::{atomic_write_json, ExecutionLock};
 use crate::outbox::{operator_cancel_digest, SanitizedHistoryRecord, HISTORY_SCHEMA_VERSION};
 use crate::paths::ConnectorPaths;
 use crate::scheduler::{ActiveAttempt, SchedulerError};
@@ -67,7 +67,7 @@ pub fn finalize_local_operator_cancelled(
     )?;
 
     // Re-check under the lock: another path may have already cleaned up.
-    let current = match ActiveAttempt::load(&paths.active_attempt_file())? {
+    let current = match ActiveAttempt::load_for_target(paths, &active.target_id)? {
         Some(c) if c.attempt_id == active.attempt_id => c,
         _ => return Ok(()),
     };
@@ -86,7 +86,7 @@ pub fn finalize_local_operator_cancelled(
     let hist_file = paths.history_file(&current.job_id, &current.attempt_id);
     atomic_write_json(&hist_file, &history)?;
 
-    remove_durable(&paths.active_attempt_file())?;
+    ActiveAttempt::remove_for_target(paths, &current.target_id)?;
     Ok(())
 }
 
@@ -106,27 +106,16 @@ pub enum OperatorCancelReconciliation {
     Blocked { reason: String },
 }
 
-/// ONE bounded reconciliation attempt (single server read + at most one
-/// durable finalization): loads the device's local active-attempt marker and
-/// converges it when (and only when) the server proves the exact attempt is
-/// terminal CANCELLED. No polling, no daemon dependency.
-pub async fn reconcile_active_attempt_with_server_operator_cancel(
+/// Shared post-load reconciliation body: identity gate → server truth read →
+/// exact operator-cancel predicate → durable finalization. Callers are
+/// responsible for resolving WHICH active attempt to reconcile (legacy mirror,
+/// per-Target slot, or first of all).
+async fn reconcile_loaded_attempt_with_server_operator_cancel(
     paths: &ConnectorPaths,
     client: &ConnectorClient,
     cred: &DeviceCredential,
+    active: ActiveAttempt,
 ) -> OperatorCancelReconciliation {
-    let active = match ActiveAttempt::load(&paths.active_attempt_file()) {
-        Ok(None) => return OperatorCancelReconciliation::NoMarker,
-        Ok(Some(a)) => a,
-        Err(e) => {
-            return OperatorCancelReconciliation::Blocked {
-                reason: format!(
-                "local active-attempt state is corrupt or unreadable ({e}) (LOCAL_STATE_INVALID)"
-            ),
-            }
-        }
-    };
-
     // A marker belonging to another device/server identity can never be
     // reconciled through this credential's device-scoped read model; the
     // daemon treats the same condition as fail-closed recovery. Keep the
@@ -175,4 +164,74 @@ pub async fn reconcile_active_attempt_with_server_operator_cancel(
             reason: format!("durable operator-cancel finalization failed: {e}"),
         },
     }
+}
+
+/// ONE bounded reconciliation attempt (single server read + at most one
+/// durable finalization): loads the device's local active-attempt marker and
+/// converges it when (and only when) the server proves the exact attempt is
+/// terminal CANCELLED. No polling, no daemon dependency.
+///
+/// Legacy-mirror first: when `active-attempt.json` exists it is authoritative
+/// for the single-slot world; otherwise the first per-Target slot (deterministic
+/// `target_id` order) is reconciled.
+pub async fn reconcile_active_attempt_with_server_operator_cancel(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+) -> OperatorCancelReconciliation {
+    let active = if paths.active_attempt_file().exists() {
+        match ActiveAttempt::load(&paths.active_attempt_file()) {
+            Ok(None) => return OperatorCancelReconciliation::NoMarker,
+            Ok(Some(a)) => a,
+            Err(e) => {
+                return OperatorCancelReconciliation::Blocked {
+                    reason: format!(
+                    "local active-attempt state is corrupt or unreadable ({e}) (LOCAL_STATE_INVALID)"
+                ),
+                }
+            }
+        }
+    } else {
+        match ActiveAttempt::list_all(paths) {
+            Ok(list) => match list.into_iter().next() {
+                Some(a) => a,
+                None => return OperatorCancelReconciliation::NoMarker,
+            },
+            Err(e) => {
+                return OperatorCancelReconciliation::Blocked {
+                    reason: format!(
+                    "local active-attempt state is corrupt or unreadable ({e}) (LOCAL_STATE_INVALID)"
+                ),
+                }
+            }
+        }
+    };
+
+    reconcile_loaded_attempt_with_server_operator_cancel(paths, client, cred, active).await
+}
+
+/// Per-Target variant of
+/// [`reconcile_active_attempt_with_server_operator_cancel`] (PROJECT-056):
+/// reconciles exactly the attempt stored in `target_id`'s slot (falling back
+/// to the legacy mirror when it carries that Target). Other concurrently
+/// running Targets are never touched.
+pub async fn reconcile_active_attempt_for_target_with_server_operator_cancel(
+    paths: &ConnectorPaths,
+    client: &ConnectorClient,
+    cred: &DeviceCredential,
+    target_id: &str,
+) -> OperatorCancelReconciliation {
+    let active = match ActiveAttempt::load_for_target(paths, target_id) {
+        Ok(None) => return OperatorCancelReconciliation::NoMarker,
+        Ok(Some(a)) => a,
+        Err(e) => {
+            return OperatorCancelReconciliation::Blocked {
+                reason: format!(
+                "local active-attempt state is corrupt or unreadable ({e}) (LOCAL_STATE_INVALID)"
+            ),
+            }
+        }
+    };
+
+    reconcile_loaded_attempt_with_server_operator_cancel(paths, client, cred, active).await
 }

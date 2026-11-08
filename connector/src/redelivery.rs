@@ -110,14 +110,16 @@ pub async fn run_smart_redeliver_with_options(
     // Sort for deterministic processing
     candidates.sort();
 
-    // In-flight safety guard: a candidate whose attempt matches the active
-    // attempt (or has a pending outbox record) belongs to a live or just
-    // finalized execution flow and must never be redelivered from the
-    // background.
-    let active_attempt_id = crate::scheduler::ActiveAttempt::load(&paths.active_attempt_file())
-        .ok()
-        .flatten()
-        .map(|a| a.attempt_id);
+    // In-flight safety guard: a candidate whose attempt matches ANY active
+    // attempt (per-Target slot or legacy mirror; PROJECT-056) — or has a
+    // pending outbox record — belongs to a live or just finalized execution
+    // flow and must never be redelivered from the background.
+    let active_attempt_ids: std::collections::HashSet<String> =
+        crate::scheduler::ActiveAttempt::list_all(paths)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.attempt_id)
+            .collect();
 
     let mut delivered_count = 0;
 
@@ -125,7 +127,7 @@ pub async fn run_smart_redeliver_with_options(
         if paths.outbox_file(&job_id, &attempt_id).exists() {
             continue;
         }
-        if active_attempt_id.as_deref() == Some(attempt_id.as_str()) {
+        if active_attempt_ids.contains(attempt_id.as_str()) {
             continue;
         }
 

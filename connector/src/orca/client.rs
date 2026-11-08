@@ -123,6 +123,16 @@ impl OrcaCliClient {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        for var in [
+            "ORCA_TERMINAL_HANDLE",
+            "ORCA_PANE_KEY",
+            "ORCA_TAB_ID",
+            "ORCA_AGENT_PANE",
+            "ORCA_AGENT_LAUNCH",
+            "ORCA_AGENT_LAUNCH_TOKEN",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -504,6 +514,36 @@ impl OrcaCliClient {
         resp.result.map(|r| r.run).ok_or_else(|| {
             OrcaError::Protocol(
                 "run-create returned ok=true but missing run object".into(),
+                String::new(),
+            )
+        })
+    }
+
+    /// Rebinds a coordinator terminal handle to an existing orchestration Run
+    /// (`orchestration run-use`). Required before `worker-start` retries when a
+    /// concurrent Target's `run-create` may have rebound the same coordinator
+    /// handle to a newer Run (`consumer_fenced` otherwise).
+    pub async fn use_run(
+        &self,
+        from_terminal: &str,
+        run_id: &str,
+    ) -> Result<OrcaRunItem, OrcaError> {
+        let args = vec![
+            "orchestration",
+            "run-use",
+            "--id",
+            run_id,
+            "--from",
+            from_terminal,
+            "--json",
+        ];
+        let output = self
+            .execute_command(&args, None, self.default_timeout)
+            .await?;
+        let resp: OrcaRunCreateResponse = parse_orca_json(output)?;
+        resp.result.map(|r| r.run).ok_or_else(|| {
+            OrcaError::Protocol(
+                "run-use returned ok=true but missing run object".into(),
                 String::new(),
             )
         })

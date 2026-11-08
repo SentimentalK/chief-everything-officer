@@ -499,6 +499,174 @@ impl ActiveAttempt {
         atomic_write_json(path, self)?;
         Ok(())
     }
+
+    /// Loads the per-Target active-attempt slot for `target_id` (PROJECT-056),
+    /// falling back to the single legacy mirror
+    /// (`active-attempt.json`) when no dedicated slot exists and the legacy
+    /// marker belongs to this exact Target. Returns `Ok(None)` when neither
+    /// carries an attempt for `target_id`.
+    pub fn load_for_target(
+        paths: &crate::paths::ConnectorPaths,
+        target_id: &str,
+    ) -> Result<Option<Self>, SchedulerError> {
+        let slot_path = paths.active_attempt_file_for_target(target_id);
+        if slot_path.exists() {
+            return Self::load(&slot_path);
+        }
+        if paths.active_attempt_file().exists() {
+            if let Some(att) = Self::load(&paths.active_attempt_file())? {
+                if att.target_id == target_id {
+                    return Ok(Some(att));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collects every active attempt across the per-Target slot directory and
+    /// the legacy mirror, deduplicated by `target_id` and returned in
+    /// deterministic `target_id` order.
+    ///
+    /// Precedence: when a `target_id` exists in BOTH the slot directory and
+    /// the legacy mirror, the legacy mirror wins. `save_for_target` always
+    /// writes the mirror last for its owner Target, so in production the two
+    /// are byte-identical and precedence is immaterial; the rule exists so
+    /// direct writes to `active-attempt.json` (operator tooling and the
+    /// existing single-slot tests, which must keep passing with zero
+    /// behavioral change) are always observed.
+    pub fn list_all(paths: &crate::paths::ConnectorPaths) -> Result<Vec<Self>, SchedulerError> {
+        let mut map: std::collections::BTreeMap<String, ActiveAttempt> =
+            std::collections::BTreeMap::new();
+        let dir = paths.active_attempts_dir();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !is_active_attempt_slot_name(file_name) {
+                    continue;
+                }
+                if let Some(att) = Self::load(&path)? {
+                    map.insert(att.target_id.clone(), att);
+                }
+            }
+        }
+        if paths.active_attempt_file().exists() {
+            if let Some(legacy_att) = Self::load(&paths.active_attempt_file())? {
+                map.insert(legacy_att.target_id.clone(), legacy_att);
+            }
+        }
+        Ok(map.into_values().collect())
+    }
+
+    /// Returns true when any active-attempt marker exists: the legacy mirror
+    /// `active-attempt.json` or at least one well-formed per-Target slot file
+    /// in `active-attempts/`. Deliberately existence-based (never parsing) so
+    /// minimal/legacy markers keep blocking destructive flows exactly as
+    /// before.
+    pub fn has_any(paths: &crate::paths::ConnectorPaths) -> bool {
+        if paths.active_attempt_file().exists() {
+            return true;
+        }
+        let dir = paths.active_attempts_dir();
+        if !dir.exists() {
+            return false;
+        }
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if is_active_attempt_slot_name(name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Persists this attempt into its per-Target slot and keeps the single
+    /// legacy mirror (`active-attempt.json`) synchronized: the mirror is
+    /// written when it is absent or already carries this attempt (identity
+    /// match); a mirror owned by a DIFFERENT concurrently running Target — or
+    /// a corrupt one — is never overwritten.
+    pub fn save_for_target(
+        &self,
+        paths: &crate::paths::ConnectorPaths,
+    ) -> Result<(), SchedulerError> {
+        crate::platform::ensure_private_dir(&paths.active_attempts_dir())?;
+        self.save(&paths.active_attempt_file_for_target(&self.target_id))?;
+
+        // Legacy mirror synchronization: write the mirror when it is absent
+        // (`load` returns Ok(None)) or already carries this attempt (identity
+        // match); never overwrite a mirror owned by another concurrently
+        // running Target or a corrupt one.
+        let mirror = match Self::load(&paths.active_attempt_file()) {
+            Ok(Some(existing)) => {
+                existing.target_id == self.target_id || existing.attempt_id == self.attempt_id
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if mirror {
+            self.save(&paths.active_attempt_file())?;
+        }
+        Ok(())
+    }
+
+    /// Durably removes the per-Target slot for `target_id` and reconciles the
+    /// legacy mirror: if the mirror belonged to this Target (or is
+    /// unreadable/corrupt) it is repointed at another still-active attempt
+    /// when one exists, and removed otherwise.
+    pub fn remove_for_target(
+        paths: &crate::paths::ConnectorPaths,
+        target_id: &str,
+    ) -> std::io::Result<()> {
+        crate::local_state::remove_durable(&paths.active_attempt_file_for_target(target_id))?;
+
+        if paths.active_attempt_file().exists() {
+            let legacy_belongs = match Self::load(&paths.active_attempt_file()) {
+                Ok(Some(att)) => att.target_id == target_id,
+                Ok(None) | Err(_) => true,
+            };
+            if legacy_belongs {
+                let next_att = Self::list_all(paths)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|a| a.target_id != target_id);
+                match next_att {
+                    Some(next) => {
+                        crate::local_state::atomic_write_json(&paths.active_attempt_file(), &next)?;
+                    }
+                    None => {
+                        crate::local_state::remove_durable(&paths.active_attempt_file())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Accepts only well-formed per-Target active-attempt slot file names:
+/// `*.json`, excluding dotfiles, editor backup markers (`#...`) and atomic
+/// write temp siblings (`*.tmp`).
+fn is_active_attempt_slot_name(file_name: &str) -> bool {
+    file_name.ends_with(".json")
+        && !file_name.starts_with('.')
+        && !file_name.starts_with('#')
+        && !file_name.ends_with(".tmp")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

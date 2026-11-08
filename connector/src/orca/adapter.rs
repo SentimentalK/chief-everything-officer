@@ -17,6 +17,12 @@ use crate::scheduler::{
 pub struct OrcaExecutionAdapter {
     pub client: OrcaCliClient,
     pub paths: Option<crate::paths::ConnectorPaths>,
+    /// Serializes the `run-create` + `worker-start` pair inside `prepare`
+    /// across concurrently driven Targets: Orca unbinds older Runs from the
+    /// shared coordinator terminal on `run-create` and fences
+    /// `worker-start` unless the coordinator handle is currently bound to the
+    /// Run being launched, so the pair must never interleave.
+    pub prepare_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for OrcaExecutionAdapter {
@@ -159,6 +165,7 @@ impl OrcaExecutionAdapter {
         Self {
             client,
             paths: crate::paths::ConnectorPaths::resolve().ok(),
+            prepare_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -695,6 +702,11 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
         target: &LocalTarget,
         execution_prompt: &str,
     ) -> Result<PrepareOutcome, String> {
+        // Cross-Project parallelism (PROJECT-056): two Targets can drive
+        // `prepare` concurrently; serialize the run-create + worker-start
+        // mutation pair so the shared coordinator terminal is always bound to
+        // the run currently being launched.
+        let _prepare_guard = self.prepare_lock.lock().await;
         let executor = target.executor.as_ref().ok_or_else(|| {
             "RECOVERY_REQUIRED: target has no agent executor configured".to_string()
         })?;
@@ -1039,6 +1051,15 @@ impl ExecutionAdapter for OrcaExecutionAdapter {
                                 format!("failed to reconcile coordinator terminal: {e}")
                             })?;
                         let model_opt = executor.model.as_deref().filter(|m| *m != "auto");
+                        // Rebind the coordinator handle to this existing run
+                        // before the retried worker-start: a concurrent
+                        // Target's run-create may have rebound the shared
+                        // coordinator terminal to a newer Run, which would
+                        // otherwise fence worker-start (consumer_fenced).
+                        let _ = self
+                            .client
+                            .use_run(&coordinator_handle, &existing_run.id)
+                            .await;
                         match self
                             .launch_worker_and_reconcile(
                                 &coordinator_handle,

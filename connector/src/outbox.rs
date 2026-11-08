@@ -228,35 +228,47 @@ pub async fn deliver_outbox_record(
             )?;
 
             // Verify active attempt correlation (phase finalized_local + digests match)
-            let active_opt = ActiveAttempt::load(&paths.active_attempt_file()).map_err(|e| {
+            let all_active = ActiveAttempt::list_all(paths).map_err(|e| {
                 OutboxError::RecoveryRequired(format!("failed to load active attempt: {e}"))
             })?;
 
-            let active = if let Some(active) = active_opt {
-                if active.job_id != record.job_id || active.attempt_id != record.attempt_id {
-                    return Err(OutboxError::RecoveryRequired(format!(
-                        "Active attempt '{}/{}' does not match outbox '{}/{}'",
-                        active.job_id, active.attempt_id, record.job_id, record.attempt_id
-                    )));
+            let active = match all_active
+                .iter()
+                .find(|a| a.job_id == record.job_id && a.attempt_id == record.attempt_id)
+                .cloned()
+            {
+                Some(a) => a,
+                None => {
+                    // Cross-Project parallelism (PROJECT-056): when exactly one
+                    // active attempt exists anywhere, keep the historical
+                    // single-slot correlation error below.
+                    if all_active.len() == 1 {
+                        all_active.into_iter().next().unwrap()
+                    } else {
+                        return Err(OutboxError::RecoveryRequired(
+                            "Active attempt missing during outbox delivery cleanup".into(),
+                        ));
+                    }
                 }
-                if active.phase != AttemptPhase::FinalizedLocal {
-                    return Err(OutboxError::RecoveryRequired(format!(
-                        "Active attempt phase '{:?}' is not finalized_local",
-                        active.phase
-                    )));
-                }
-                if active.terminal_report_sha256.as_deref() != Some(&report_sha256) {
-                    return Err(OutboxError::RecoveryRequired(format!(
-                        "Active attempt terminal_report_sha256 mismatch: active '{:?}' vs outbox '{}'",
-                        active.terminal_report_sha256, report_sha256
-                    )));
-                }
-                active
-            } else {
-                return Err(OutboxError::RecoveryRequired(
-                    "Active attempt missing during outbox delivery cleanup".into(),
-                ));
             };
+            if active.job_id != record.job_id || active.attempt_id != record.attempt_id {
+                return Err(OutboxError::RecoveryRequired(format!(
+                    "Active attempt '{}/{}' does not match outbox '{}/{}'",
+                    active.job_id, active.attempt_id, record.job_id, record.attempt_id
+                )));
+            }
+            if active.phase != AttemptPhase::FinalizedLocal {
+                return Err(OutboxError::RecoveryRequired(format!(
+                    "Active attempt phase '{:?}' is not finalized_local",
+                    active.phase
+                )));
+            }
+            if active.terminal_report_sha256.as_deref() != Some(&report_sha256) {
+                return Err(OutboxError::RecoveryRequired(format!(
+                    "Active attempt terminal_report_sha256 mismatch: active '{:?}' vs outbox '{}'",
+                    active.terminal_report_sha256, report_sha256
+                )));
+            }
             let target_id = active.target_id.clone();
 
             let status_str = match record.report.execution_status {
@@ -296,7 +308,7 @@ pub async fn deliver_outbox_record(
             remove_durable(outbox_file)?;
 
             // 4. Durably unlink active attempt
-            remove_durable(&paths.active_attempt_file())?;
+            ActiveAttempt::remove_for_target(paths, &active.target_id)?;
 
             // 5. Clean up attempt runtime dir only if COMPLETED (retain for inspection & manual redelivery on failure/timeout)
             if record.report.execution_status
@@ -320,16 +332,11 @@ pub async fn deliver_outbox_record(
             // or churn. Converge locally: record a cancelled history entry and
             // drop the outbox record (deterministic cancel-wins rule).
             if code == "REPORT_CONFLICT" || code == "ATTEMPT_MISMATCH" {
-                let active_opt = ActiveAttempt::load(&paths.active_attempt_file())
-                    .ok()
-                    .flatten();
-                let target_id = active_opt.as_ref().and_then(|a| {
-                    if a.job_id == record.job_id && a.attempt_id == record.attempt_id {
-                        Some(a.target_id.clone())
-                    } else {
-                        None
-                    }
-                });
+                let target_id = ActiveAttempt::list_all(paths)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|a| a.job_id == record.job_id && a.attempt_id == record.attempt_id)
+                    .map(|a| a.target_id);
                 if let Some(target_id) = target_id {
                     if let Ok(detail) = client.get_job(cred, &record.job_id, false).await {
                         if detail.state == "terminal"
@@ -342,7 +349,7 @@ pub async fn deliver_outbox_record(
                                 &target_id,
                             )?;
                             remove_durable(outbox_file)?;
-                            remove_durable(&paths.active_attempt_file())?;
+                            ActiveAttempt::remove_for_target(paths, &target_id)?;
                             return Ok(());
                         }
                     }
