@@ -270,6 +270,15 @@ export class OAuthStore {
     });
   }
 
+  getAuthorizationCodeById(id: string): AuthorizationCodeRecord | null {
+    return this.withDb((db) => {
+      const row = db.prepare(`
+        SELECT * FROM oauth_authorization_codes WHERE id = ? LIMIT 1;
+      `).get(id) as AuthorizationCodeRecord | undefined;
+      return row ?? null;
+    });
+  }
+
   /**
    * Sets the consent nonce digest for a pending authorization request.
    */

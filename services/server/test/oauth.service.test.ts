@@ -445,4 +445,131 @@ describe("OAuthService Core & Security Constraints", () => {
       }),
     ).toThrow(OAuthServerError);
   });
+
+  it("replays duplicate consent approvals and degrades to already_decided after consumption", async () => {
+    const { service, ident, oauthStore } = await setupTestEnv();
+
+    const verifier = "verifier_consent_idempotency_123456789012345678";
+    const challenge = sha256Base64Url(verifier);
+    const reqId = "oar_consent_idempotency";
+    oauthStore.createAuthorizationRequest({
+      id: reqId,
+      client_id: "https://chatgpt.com/client.json",
+      client_name: "ChatGPT",
+      redirect_uri: "https://chatgpt.com/oauth/callback",
+      resource: "https://ceo.sentimentalk.com/mcp",
+      scope: "mcp offline_access",
+      state: "state_idem",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 600000,
+    });
+
+    const nonce = service.createConsentNonce(reqId);
+    const first = service.approveConsentDecision(reqId, nonce, ident.user_id);
+    expect(first.status).toBe("approved");
+    if (first.status !== "approved") return;
+    expect(first.code).toMatch(/^oac_/);
+
+    const replayed = service.approveConsentDecision(reqId, nonce, ident.user_id);
+    expect(replayed.status).toBe("replayed");
+    if (replayed.status !== "replayed") return;
+    expect(replayed.code).toBe(first.code);
+    expect(replayed.redirectUri).toBe(first.redirectUri);
+    expect(replayed.state).toBe("state_idem");
+
+    // A wrong nonce is still a hard 400.
+    expect(() =>
+      service.approveConsentDecision(reqId, "wrong-nonce", ident.user_id),
+    ).toThrow(OAuthServerError);
+
+    // Once the code is consumed, replaying it would be useless: report the decision.
+    service.exchangeAuthorizationCode({
+      clientId: "https://chatgpt.com/client.json",
+      redirectUri: "https://chatgpt.com/oauth/callback",
+      code: first.code,
+      codeVerifier: verifier,
+      resource: "https://ceo.sentimentalk.com/mcp",
+    });
+    expect(service.approveConsentDecision(reqId, nonce, ident.user_id)).toEqual({
+      status: "already_decided",
+      decision: "approved",
+    });
+  });
+
+  it("returns already_decided for duplicate deny and deny-after-approve", async () => {
+    const { service, ident, oauthStore } = await setupTestEnv();
+    const challenge = sha256Base64Url("verifier_deny_idempotency_123456789012345678");
+    const makeRequest = (id: string) => {
+      oauthStore.createAuthorizationRequest({
+        id,
+        client_id: "https://chatgpt.com/client.json",
+        client_name: "ChatGPT",
+        redirect_uri: "https://chatgpt.com/oauth/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp",
+        state: null,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+    };
+
+    makeRequest("oar_deny_twice");
+    const denyNonce = service.createConsentNonce("oar_deny_twice");
+    expect(service.denyConsentDecision("oar_deny_twice", denyNonce).status).toBe("denied");
+    expect(service.denyConsentDecision("oar_deny_twice", denyNonce)).toEqual({
+      status: "already_decided",
+      decision: "denied",
+    });
+
+    makeRequest("oar_deny_after_approve");
+    const approveNonce = service.createConsentNonce("oar_deny_after_approve");
+    expect(
+      service.approveConsentDecision("oar_deny_after_approve", approveNonce, ident.user_id).status,
+    ).toBe("approved");
+    expect(service.denyConsentDecision("oar_deny_after_approve", approveNonce)).toEqual({
+      status: "already_decided",
+      decision: "approved",
+    });
+  });
+
+  it("disables approval replay when approvalReplayTtlMs is zero", async () => {
+    const { ident, identStore, oauthStore } = await setupTestEnv();
+    const service = new OAuthService(oauthStore, identStore, {
+      publicOrigin: "https://ceo.sentimentalk.com",
+      workspaceId: ident.workspace_id,
+      approvalReplayTtlMs: 0,
+      clientResolver: createCimdOnlyClientResolver({
+        allowHttpForTest: true,
+        allowPrivateIpsForTest: true,
+        dnsLookup: async () => [{ address: "127.0.0.1", family: 4 }],
+      }),
+    });
+
+    const challenge = sha256Base64Url("verifier_replay_ttl_zero_123456789012345678");
+    const reqId = "oar_replay_ttl_zero";
+    oauthStore.createAuthorizationRequest({
+      id: reqId,
+      client_id: "https://chatgpt.com/client.json",
+      client_name: "ChatGPT",
+      redirect_uri: "https://chatgpt.com/oauth/callback",
+      resource: "https://ceo.sentimentalk.com/mcp",
+      scope: "mcp",
+      state: null,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 600000,
+    });
+
+    const nonce = service.createConsentNonce(reqId);
+    expect(service.approveConsentDecision(reqId, nonce, ident.user_id).status).toBe("approved");
+    expect(service.approveConsentDecision(reqId, nonce, ident.user_id)).toEqual({
+      status: "already_decided",
+      decision: "approved",
+    });
+  });
 });

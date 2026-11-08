@@ -331,6 +331,107 @@ describe("OAuth HTTP Router Endpoints", () => {
     }
   });
 
+  it("POST /authorize/decision replays a duplicate submit and degrades to a 200 page", async () => {
+    const env = await setupTestApp();
+    try {
+      const userSession = env.sessionManager.createSession({
+        userId: env.ident.user_id,
+        provider: "github",
+        providerSubject: "12345",
+      });
+
+      const verifier = "verifier_duplicate_decision_123456789012345678";
+      const challenge = sha256Base64Url(verifier);
+      const reqId = "oar_duplicate_decision";
+      env.oauthStore.createAuthorizationRequest({
+        id: reqId,
+        client_id: "https://example.com/client.json",
+        client_name: "App",
+        redirect_uri: "https://example.com/callback",
+        resource: "https://ceo.sentimentalk.com/mcp",
+        scope: "mcp",
+        state: "state_dup",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        created_at_ms: Date.now(),
+        expires_at_ms: Date.now() + 600000,
+      });
+
+      const nonce = env.oauthService.createConsentNonce(reqId);
+      const decisionBody = new URLSearchParams({
+        request_id: reqId,
+        consent_nonce: nonce,
+        decision: "approve",
+      }).toString();
+      const headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `ceo_user_session=${userSession.sessionId}`,
+      };
+
+      const first = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers,
+        body: decisionBody,
+        redirect: "manual",
+      });
+      expect(first.status).toBe(302);
+      const firstCode = new URL(first.headers.get("location")!).searchParams.get("code");
+      expect(firstCode).toMatch(/^oac_/);
+
+      // Double submit: replay the same code instead of a 400 page.
+      const second = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers,
+        body: decisionBody,
+        redirect: "manual",
+      });
+      expect(second.status).toBe(302);
+      expect(new URL(second.headers.get("location")!).searchParams.get("code")).toBe(firstCode);
+
+      // A wrong nonce is still rejected.
+      const wrongNonce = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers,
+        body: new URLSearchParams({
+          request_id: reqId,
+          consent_nonce: "wrong-nonce",
+          decision: "approve",
+        }).toString(),
+        redirect: "manual",
+      });
+      expect(wrongNonce.status).toBe(400);
+
+      // Once the code is consumed, a further submit gets a friendly 200 page.
+      const tokenRes = await fetch(`${env.baseUrl}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: "https://example.com/client.json",
+          redirect_uri: "https://example.com/callback",
+          code: firstCode!,
+          code_verifier: verifier,
+          resource: "https://ceo.sentimentalk.com/mcp",
+        }).toString(),
+      });
+      expect(tokenRes.status).toBe(200);
+
+      const third = await fetch(`${env.baseUrl}/authorize/decision`, {
+        method: "POST",
+        headers,
+        body: decisionBody,
+        redirect: "manual",
+      });
+      expect(third.status).toBe(200);
+      expect(third.headers.get("cache-control")).toContain("no-store");
+      const html = await third.text();
+      expect(html).toContain("Already Authorized");
+      expect(html).not.toContain("oac_");
+    } finally {
+      await env.close();
+    }
+  });
+
   it("K. zero-workspace user cannot approve consent for deployment workspace", async () => {
     const env = await setupTestApp();
     try {

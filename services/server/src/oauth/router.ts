@@ -188,6 +188,37 @@ function renderErrorHtml(title: string, message: string): string {
 </html>`;
 }
 
+function renderAlreadyDecidedHtml(
+  decision: "approved" | "denied",
+  clientName?: string
+): string {
+  const client = clientName ? escapeHtml(clientName) : "the application";
+  const title = decision === "approved" ? "Already Authorized" : "Already Denied";
+  const message =
+    decision === "approved"
+      ? `This authorization request was already approved. You can close this window and return to ${client}.`
+      : `This authorization request was already denied. You can close this window and return to ${client}.`;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>${title} - Chief Everything Officer</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #000000; color: #ededed; display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 1rem; }
+    .card { max-width: 420px; width: 100%; background-color: #121212; border: 1px solid #262626; border-radius: 12px; padding: 24px; text-align: center; }
+    h1 { color: #10b981; font-size: 18px; margin-bottom: 8px; }
+    p { color: #a1a1a1; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    <p>${message}</p>
+  </div>
+</body>
+</html>`;
+}
+
 function sendJson(res: Response, body: unknown): void {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=3600");
@@ -344,6 +375,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
       // Logged in: generate consent nonce and render consent screen
       const nonce = oauthService.createConsentNonce(request.id);
       res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
       res.status(200).send(renderConsentHtml(request, nonce));
     } catch (err: any) {
       if (err instanceof OAuthServerError) {
@@ -458,6 +490,7 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
 
     const nonce = oauthService.createConsentNonce(request.id);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
     res.status(200).send(renderConsentHtml(request, nonce));
   });
 
@@ -505,9 +538,25 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
 
       try {
         if (decision === "approve") {
-          const outcome = oauthService.approveConsent(requestId, consent_nonce, session.userId);
+          const outcome = oauthService.approveConsentDecision(requestId, consent_nonce, session.userId);
+          if (outcome.status === "already_decided") {
+            writeOAuthFlowLog("oauth: decision", {
+              outcome: "already_decided",
+              decision: outcome.decision,
+              ...decisionFields(),
+              status: 200,
+            });
+            res.setHeader("Cache-Control", "no-store");
+            res.status(200).send(
+              renderAlreadyDecidedHtml(
+                outcome.decision,
+                oauthService.getAuthorizationRequest(requestId)?.client_name
+              )
+            );
+            return;
+          }
           writeOAuthFlowLog("oauth: decision", {
-            outcome: "approved",
+            outcome: outcome.status,
             ...decisionFields(),
             status: 302,
           });
@@ -519,7 +568,23 @@ export function createOAuthRouter(options: OAuthRouterOptions): Router {
           }
           res.redirect(302, redirectUrl.toString());
         } else {
-          const outcome = oauthService.denyConsent(requestId, consent_nonce);
+          const outcome = oauthService.denyConsentDecision(requestId, consent_nonce);
+          if (outcome.status === "already_decided") {
+            writeOAuthFlowLog("oauth: decision", {
+              outcome: "already_decided",
+              decision: outcome.decision,
+              ...decisionFields(),
+              status: 200,
+            });
+            res.setHeader("Cache-Control", "no-store");
+            res.status(200).send(
+              renderAlreadyDecidedHtml(
+                outcome.decision,
+                oauthService.getAuthorizationRequest(requestId)?.client_name
+              )
+            );
+            return;
+          }
           writeOAuthFlowLog("oauth: decision", {
             outcome: "denied",
             ...decisionFields(),

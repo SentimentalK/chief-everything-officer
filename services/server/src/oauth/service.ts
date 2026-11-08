@@ -34,7 +34,17 @@ export interface OAuthServiceOptions {
   authRequestTtlMs?: number; // default 10m
   accessTokenTtlMs?: number; // default 1h
   refreshTokenTtlMs?: number; // default 30d
+  approvalReplayTtlMs?: number; // default authCodeTtlMs; 0 disables replay
 }
+
+export type ConsentApprovalOutcome =
+  | { status: "approved"; code: string; redirectUri: string; state: string | null }
+  | { status: "replayed"; code: string; redirectUri: string; state: string | null }
+  | { status: "already_decided"; decision: "approved" | "denied" };
+
+export type ConsentDenialOutcome =
+  | { status: "denied"; redirectUri: string; state: string | null }
+  | { status: "already_decided"; decision: "approved" | "denied" };
 
 const DEFAULT_AUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_AUTH_REQUEST_TTL_MS = 10 * 60 * 1000;
@@ -82,6 +92,15 @@ export class OAuthService {
   private readonly authRequestTtlMs: number;
   private readonly accessTokenTtlMs: number;
   private readonly refreshTokenTtlMs: number;
+  private readonly approvalReplayTtlMs: number;
+  private readonly recentApprovals = new Map<string, {
+    code: string;
+    codeId: string;
+    redirectUri: string;
+    state: string | null;
+    userId: string;
+    expiresAtMs: number;
+  }>();
 
   constructor(
     store: OAuthStore,
@@ -98,6 +117,7 @@ export class OAuthService {
     this.authRequestTtlMs = options.authRequestTtlMs ?? DEFAULT_AUTH_REQUEST_TTL_MS;
     this.accessTokenTtlMs = options.accessTokenTtlMs ?? DEFAULT_ACCESS_TOKEN_TTL_MS;
     this.refreshTokenTtlMs = options.refreshTokenTtlMs ?? DEFAULT_REFRESH_TOKEN_TTL_MS;
+    this.approvalReplayTtlMs = options.approvalReplayTtlMs ?? this.authCodeTtlMs;
   }
 
   get identityStoreInstance(): IdentityStore {
@@ -246,11 +266,11 @@ export class OAuthService {
     return nonce;
   }
 
-  approveConsent(
+  approveConsentDecision(
     requestId: string,
     nonce: string,
     userId: string
-  ): { code: string; redirectUri: string; state: string | null } {
+  ): ConsentApprovalOutcome {
     // Re-verify IdentityStore user and workspace
     if (!this.identityStore.isUserActive(userId)) {
       throw new OAuthServerError("access_denied", "User is disabled or inactive", 403);
@@ -286,7 +306,25 @@ export class OAuthService {
       codeExpiresAtMs: now + this.authCodeTtlMs,
     });
 
-    if (!record) {
+    if (record) {
+      const authReq = this.store.getAuthorizationRequest(requestId);
+      const outcome = {
+        code: rawCode,
+        redirectUri: record.redirect_uri,
+        state: authReq?.state ?? null,
+      };
+      this.rememberApproval(requestId, {
+        ...outcome,
+        codeId: record.id,
+        userId,
+      });
+      return { status: "approved", ...outcome };
+    }
+
+    // The store refused the approval. Distinguish a genuine bad request from a
+    // duplicate submit so a double-click / retry does not surface a 400 page.
+    const existing = this.store.getAuthorizationRequest(requestId);
+    if (!existing || existing.consent_nonce_digest !== nonceDigest || existing.decision === null) {
       throw new OAuthServerError(
         "invalid_request",
         "Failed to approve consent: invalid nonce or request expired/already decided",
@@ -294,32 +332,110 @@ export class OAuthService {
       );
     }
 
-    const authReq = this.store.getAuthorizationRequest(requestId);
+    // Replay the original 302 when the first response was lost and the code is
+    // still unused. The code stays single-use at /token; this only re-delivers it.
+    const replay = this.recentApprovals.get(requestId);
+    if (
+      existing.decision === "approved" &&
+      existing.user_id === userId &&
+      replay &&
+      replay.expiresAtMs > now &&
+      this.store.getAuthorizationCodeById(replay.codeId)?.consumed_at_ms === null
+    ) {
+      return {
+        status: "replayed",
+        code: replay.code,
+        redirectUri: replay.redirectUri,
+        state: replay.state,
+      };
+    }
+
+    return { status: "already_decided", decision: existing.decision };
+  }
+
+  approveConsent(
+    requestId: string,
+    nonce: string,
+    userId: string
+  ): { code: string; redirectUri: string; state: string | null } {
+    const outcome = this.approveConsentDecision(requestId, nonce, userId);
+    if (outcome.status === "already_decided") {
+      throw new OAuthServerError(
+        "invalid_request",
+        "Failed to approve consent: invalid nonce or request expired/already decided",
+        400
+      );
+    }
     return {
-      code: rawCode,
-      redirectUri: record.redirect_uri,
-      state: authReq?.state ?? null,
+      code: outcome.code,
+      redirectUri: outcome.redirectUri,
+      state: outcome.state,
     };
   }
 
-  denyConsent(
+  private rememberApproval(
     requestId: string,
-    nonce: string
-  ): { redirectUri: string; state: string | null } {
+    approval: {
+      code: string;
+      codeId: string;
+      redirectUri: string;
+      state: string | null;
+      userId: string;
+    }
+  ): void {
+    const now = Date.now();
+    this.recentApprovals.set(requestId, {
+      ...approval,
+      expiresAtMs: now + this.approvalReplayTtlMs,
+    });
+    if (this.recentApprovals.size > 256) {
+      for (const [key, value] of this.recentApprovals) {
+        if (value.expiresAtMs <= now) {
+          this.recentApprovals.delete(key);
+        }
+      }
+    }
+  }
+
+  denyConsentDecision(requestId: string, nonce: string): ConsentDenialOutcome {
     const authReq = this.store.getAuthorizationRequest(requestId);
     if (!authReq) {
       throw new OAuthServerError("invalid_request", "Authorization request not found", 400);
     }
 
     const nonceDigest = sha256Hex(nonce);
-    const denied = this.store.denyConsent(requestId, nonceDigest, Date.now());
-    if (!denied) {
+    if (authReq.consent_nonce_digest !== nonceDigest) {
       throw new OAuthServerError("invalid_request", "Invalid nonce or request already decided", 400);
     }
 
+    const denied = this.store.denyConsent(requestId, nonceDigest, Date.now());
+    if (denied) {
+      return {
+        status: "denied",
+        redirectUri: authReq.redirect_uri,
+        state: authReq.state,
+      };
+    }
+
+    // Already decided (approved or denied), or expired between the read and the CAS.
+    const latest = this.store.getAuthorizationRequest(requestId);
+    if (latest?.decision) {
+      return { status: "already_decided", decision: latest.decision };
+    }
+    throw new OAuthServerError("invalid_request", "Invalid nonce or request already decided", 400);
+  }
+
+  denyConsent(
+    requestId: string,
+    nonce: string
+  ): { redirectUri: string; state: string | null } {
+    const outcome = this.denyConsentDecision(requestId, nonce);
+    if (outcome.status === "already_decided") {
+      throw new OAuthServerError("invalid_request", "Invalid nonce or request already decided", 400);
+    }
     return {
-      redirectUri: authReq.redirect_uri,
-      state: authReq.state,
+      redirectUri: outcome.redirectUri,
+      state: outcome.state,
     };
   }
 
