@@ -260,11 +260,17 @@ describe("CEO Resource Delete (resource_delete)", () => {
     const resAId = (capA.structuredContent as any).resource.resource_id;
     const staleCommit = (capA.structuredContent as any).commit;
 
-    // 2. Capture Resource B (moves HEAD)
-    await client.callTool({
-      name: "resource_capture",
-      arguments: { source: { type: "url", url: "https://example.com/stale-b" } },
+    // 2. Rename Resource A (moves HEAD and changes A's own files)
+    const renameRes = await client.callTool({
+      name: "resource_apply",
+      arguments: {
+        resource_id: resAId,
+        base_commit: staleCommit,
+        summary: "Rename A",
+        operations: [{ op: "rename", display_name: "Stale A Renamed" }],
+      },
     });
+    expect(renameRes.isError).toBeFalsy();
 
     // 3. Attempt to delete Resource A using staleCommit
     const deleteRes = await client.callTool({

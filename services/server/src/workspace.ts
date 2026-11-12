@@ -52,6 +52,8 @@ export type ChangeOperation =
 interface PendingTransaction {
   request_id: string;
   base_commit: string;
+  /** Client-supplied base when the change set was replayed on a newer remote tip. */
+  requested_base_commit?: string;
   commit: string;
   worktree: string;
   changed_files: string[];
@@ -62,6 +64,7 @@ interface PendingTransaction {
 interface CompletedTransaction {
   request_id: string;
   base_commit: string;
+  requested_base_commit?: string;
   commit: string;
   worktree?: string;
   changed_files: string[];
@@ -82,6 +85,15 @@ export interface LockOwnerMetadata {
   at: string;
   createdAtMs: number;
 }
+
+/**
+ * Reads are served from git objects without the workspace lock, so nothing else
+ * refreshes the local clone when other clients push straight to GitHub. A read
+ * refreshes a private snapshot ref at most this often, and never waits longer
+ * than READ_SNAPSHOT_FETCH_WAIT_MS for the network before using what it has.
+ */
+export const READ_SNAPSHOT_REFRESH_INTERVAL_MS = 5_000;
+export const READ_SNAPSHOT_FETCH_WAIT_MS = 3_000;
 
 export const PROCESS_INSTANCE_ID = randomUUID();
 export const LOCK_SETUP_GRACE_MS = 5_000;
@@ -209,6 +221,10 @@ export class CeoWorkspace {
   private readonly lockDir: string;
   private readonly pendingPath: string;
   private readonly completedDir: string;
+  private readSnapshotRefreshedAtMs = 0;
+  private readSnapshotRefresh: Promise<void> | null = null;
+  /** Newest remote tip seen by any fetch, ordered by when that fetch started. */
+  private latestRemote: { commit: string; fetchStartedAtMs: number } | null = null;
 
   constructor(public readonly config: WorkspaceConfig) {
     this.lockDir = path.join(config.stateDir, "write.lock");
@@ -268,9 +284,82 @@ export class CeoWorkspace {
     if (!exists) {
       throw new CeoError("NOT_READY", "Workspace repository is not initialized.");
     }
-    const commit = await resolveRef(this.config, this.config.repoDir, "HEAD");
+    const commit = await this.resolveReadSnapshotCommit();
     const ignoreMatcher = await this.loadIgnoreMatcherAtCommit(commit);
     return { commit, ignoreMatcher };
+  }
+
+  private get readSnapshotRef(): string {
+    return `refs/ceo/read-snapshot/${this.config.branch}`;
+  }
+
+  private observeRemote(commit: string, fetchStartedAtMs: number): void {
+    if (!this.latestRemote || fetchStartedAtMs >= this.latestRemote.fetchStartedAtMs) {
+      this.latestRemote = { commit, fetchStartedAtMs };
+    }
+  }
+
+  /**
+   * Picks the newest commit a lock-free read may serve: the latest remote tip seen
+   * by either a read refresh or a writer sync, unless local HEAD already contains it.
+   */
+  private async resolveReadSnapshotCommit(): Promise<string> {
+    const head = await resolveRef(this.config, this.config.repoDir, "HEAD");
+    await this.refreshReadSnapshotRef();
+    const latest = this.latestRemote?.commit;
+    if (!latest || latest === head || await this.isAncestor(latest, head)) return head;
+    return latest;
+  }
+
+  /**
+   * Fetches the remote branch into a ref only reads use. It never writes FETCH_HEAD,
+   * origin/<branch> or runs auto gc, so it cannot contend with a writer's fetch.
+   * Failures and slow networks fall back to the last known snapshot.
+   */
+  private async refreshReadSnapshotRef(): Promise<void> {
+    if (Date.now() - this.readSnapshotRefreshedAtMs < READ_SNAPSHOT_REFRESH_INTERVAL_MS) return;
+    if (!this.readSnapshotRefresh) {
+      const startedAtMs = Date.now();
+      this.readSnapshotRefresh = runGit(this.config, this.config.repoDir, [
+        "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-auto-gc", "--refmap=",
+        "origin", `+refs/heads/${this.config.branch}:${this.readSnapshotRef}`,
+      ])
+        .then(async () => {
+          this.readSnapshotRefreshedAtMs = Date.now();
+          this.observeRemote(await resolveRef(this.config, this.config.repoDir, this.readSnapshotRef), startedAtMs);
+        })
+        .catch((error: unknown) => {
+          process.stderr.write(`workspace: read snapshot refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        })
+        .finally(() => { this.readSnapshotRefresh = null; });
+    }
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.readSnapshotRefresh,
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, READ_SNAPSHOT_FETCH_WAIT_MS); }),
+    ]);
+    clearTimeout(timer);
+  }
+
+  private async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    try {
+      await runGit(this.config, this.config.repoDir, ["merge-base", "--is-ancestor", ancestor, descendant]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Paths that differ between a client's base commit and the current remote tip.
+   * Returns null when the base is unknown or not an ancestor (history rewritten),
+   * in which case the caller must treat the request as stale.
+   */
+  private async pathsChangedBetween(base: string, head: string): Promise<Set<string> | null> {
+    if (!/^[0-9a-f]{40,64}$/i.test(base)) return null;
+    if (!(await this.isAncestor(base, head))) return null;
+    const output = (await runGit(this.config, this.config.repoDir, ["diff", "--name-only", "--no-renames", "-z", base, head])).stdout;
+    return new Set(output.split("\0").filter(Boolean));
   }
 
   async loadIgnoreMatcherAtCommit(commit: string): Promise<CeoIgnoreMatcher> {
@@ -613,7 +702,8 @@ export class CeoWorkspace {
     allowEmpty?: boolean;
     resourceDeletePrefix?: string | (() => string | undefined);
     operationResultProducer?: (changedFiles: string[]) => Record<string, unknown>;
-    mutator: (worktree: string, worktreeMatcher: CeoIgnoreMatcher) => Promise<void>;
+    /** `base` is the commit the worktree was created from; it differs from baseCommit when the change set is replayed on a newer remote tip. */
+    mutator: (worktree: string, worktreeMatcher: CeoIgnoreMatcher, base: string) => Promise<void>;
   }): Promise<Record<string, unknown>> {
     const {
       requestId,
@@ -644,20 +734,47 @@ export class CeoWorkspace {
       if (await this.readPending()) throw new CeoError("PUSH_PENDING", "A previous commit is awaiting push verification.");
       await this.syncCleanWorkspace();
       const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
+      // When other writers advanced the branch after the client read, the change set is
+      // replayed on the current tip as long as none of the files it changes were touched
+      // in between. Content checks (expected_blob_oid, patch find text) still apply.
+      let effectiveBase = baseCommit;
+      let remoteChangedPaths: Set<string> | null = null;
       if (remote !== baseCommit) {
-        throw new CeoError("STALE_REVISION", `origin/${this.config.branch} changed since the files were read.`, {
-          expected: baseCommit,
-          remote_head: remote,
-        });
+        remoteChangedPaths = await this.pathsChangedBetween(baseCommit, remote);
+        if (!remoteChangedPaths) {
+          throw new CeoError("STALE_REVISION", `origin/${this.config.branch} changed since the files were read.`, {
+            expected: baseCommit,
+            remote_head: remote,
+          });
+        }
+        effectiveBase = remote;
       }
 
       const worktree = path.join(this.config.txnDir, requestId);
       await rm(worktree, { recursive: true, force: true });
-      await runGit(this.config, this.config.repoDir, ["worktree", "add", "--detach", worktree, baseCommit]);
+      await runGit(this.config, this.config.repoDir, ["worktree", "add", "--detach", worktree, effectiveBase]);
       const worktreeMatcher = await this.loadIgnoreMatcher(worktree);
       let committed = false;
       try {
-        await mutator(worktree, worktreeMatcher);
+        try {
+          await mutator(worktree, worktreeMatcher, effectiveBase);
+        } catch (error) {
+          // On a replayed change set, a content check failing on a file the remote also
+          // changed is the same conflict a strict base check would have reported.
+          if (remoteChangedPaths && error instanceof CeoError) {
+            const conflicting = [error.details.path, error.details.target]
+              .filter((p): p is string => typeof p === "string" && remoteChangedPaths!.has(p));
+            if (conflicting.length > 0) {
+              throw new CeoError("STALE_REVISION", `origin/${this.config.branch} changed files in this change set since they were read.`, {
+                expected: baseCommit,
+                remote_head: remote,
+                conflicting_paths: conflicting,
+                conflict_code: error.code,
+              });
+            }
+          }
+          throw error;
+        }
         const resolvedDeletePrefix =
           typeof resourceDeletePrefix === "function" ? resourceDeletePrefix() : resourceDeletePrefix;
         const changed = await this.validateDiff(
@@ -668,13 +785,25 @@ export class CeoWorkspace {
           resolvedDeletePrefix,
         );
 
+        if (remoteChangedPaths) {
+          const conflicting = changed.filter((filePath) => remoteChangedPaths!.has(filePath));
+          if (conflicting.length > 0) {
+            throw new CeoError("STALE_REVISION", `origin/${this.config.branch} changed files in this change set since they were read.`, {
+              expected: baseCommit,
+              remote_head: remote,
+              conflicting_paths: conflicting,
+            });
+          }
+        }
+
         if (changed.length === 0) {
           await this.discardWorktree(worktree);
           const opRes = operationResultProducer ? operationResultProducer([]) : undefined;
           const completedNoop: CompletedTransaction = {
             request_id: requestId,
-            base_commit: baseCommit,
-            commit: baseCommit,
+            base_commit: effectiveBase,
+            ...(effectiveBase !== baseCommit ? { requested_base_commit: baseCommit } : {}),
+            commit: effectiveBase,
             changed_files: [],
             diff_stat: "",
             pushed: false,
@@ -702,7 +831,8 @@ export class CeoWorkspace {
         const opRes = operationResultProducer ? operationResultProducer(changed) : undefined;
         const pending: PendingTransaction = {
           request_id: requestId,
-          base_commit: baseCommit,
+          base_commit: effectiveBase,
+          ...(effectiveBase !== baseCommit ? { requested_base_commit: baseCommit } : {}),
           commit,
           worktree,
           changed_files: changed,
@@ -712,7 +842,7 @@ export class CeoWorkspace {
         await this.writePending(pending);
         await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
         const latest = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
-        if (latest !== baseCommit) {
+        if (latest !== effectiveBase) {
           await this.archiveStalePending(pending, latest, "REMOTE_HISTORY_REWRITTEN");
           await this.syncCleanWorkspace();
           throw new CeoError("STALE_REVISION", `origin/${this.config.branch} moved during the transaction; the local commit was not pushed.`, {
@@ -757,9 +887,9 @@ export class CeoWorkspace {
       baseCommit: input.base_commit,
       commitMessage: `CEO: ${input.summary.trim()}`,
       allowResourceSourceFiles: false,
-      mutator: async (worktree, worktreeMatcher) => {
+      mutator: async (worktree, worktreeMatcher, base) => {
         this.validateOperations(input.operations, worktreeMatcher);
-        await this.applyOperations(worktree, input.base_commit, input.operations);
+        await this.applyOperations(worktree, base, input.operations);
       },
     });
   }
@@ -792,9 +922,11 @@ export class CeoWorkspace {
   private async syncCleanWorkspace(): Promise<void> {
     const dirty = (await runGit(this.config, this.config.repoDir, ["status", "--porcelain"])).stdout;
     if (dirty) throw new CeoError("WORKSPACE_DIRTY", "Main working copy contains uncommitted changes.");
+    const fetchStartedAtMs = Date.now();
     await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
     const local = await resolveRef(this.config, this.config.repoDir, "HEAD");
     const remote = await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
+    this.observeRemote(remote, fetchStartedAtMs);
     if (local === remote) {
       this.state = "READY";
       return;
@@ -1045,8 +1177,10 @@ export class CeoWorkspace {
   }
 
   private async finalizePending(pending: PendingTransaction, remoteOverride?: string): Promise<void> {
+    const fetchStartedAtMs = Date.now();
     await runGit(this.config, this.config.repoDir, ["fetch", "origin", this.config.branch]);
     const remote = remoteOverride ?? await resolveRef(this.config, this.config.repoDir, `origin/${this.config.branch}`);
+    if (!remoteOverride) this.observeRemote(remote, fetchStartedAtMs);
     const dirty = (await runGit(this.config, this.config.repoDir, ["status", "--porcelain"])).stdout;
     if (dirty) throw new CeoError("WORKSPACE_DIRTY", "Main working copy contains uncommitted changes.");
     const currentBranch = (await runGit(this.config, this.config.repoDir, ["branch", "--show-current"])).stdout.trim();
@@ -1118,6 +1252,7 @@ export class CeoWorkspace {
       request_id: completed.request_id,
       workspace_state: "READY",
       base_commit: completed.base_commit,
+      ...(completed.requested_base_commit ? { requested_base_commit: completed.requested_base_commit } : {}),
       commit: completed.commit,
       pushed: completed.pushed ?? true,
       changed_files: completed.changed_files,

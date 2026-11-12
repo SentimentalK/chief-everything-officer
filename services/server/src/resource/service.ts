@@ -381,7 +381,7 @@ export class ResourceService {
           metadata_enrichment: enrichmentReceipt,
         };
       },
-      mutator: async (worktree, worktreeMatcher) => {
+      mutator: async (worktree, worktreeMatcher, base) => {
         let resourceId: string;
         let isRevisit = false;
         let meta!: ResourceMeta;
@@ -628,7 +628,7 @@ export class ResourceService {
         // Apply optional state_changes atomically
         if (input.state_changes && input.state_changes.length > 0) {
           this.workspace.validateOperations(input.state_changes, worktreeMatcher);
-          await this.workspace.applyOperations(worktree, currentBase, input.state_changes);
+          await this.workspace.applyOperations(worktree, base, input.state_changes);
         }
 
         // Calculate stage
@@ -714,7 +714,7 @@ export class ResourceService {
           new_path: finalCtx ? finalCtx.location.relative_path : initialRelativePath,
         };
       },
-      mutator: async (worktree, worktreeMatcher) => {
+      mutator: async (worktree, worktreeMatcher, base) => {
         const location = await resolveResourceLocation(worktree, input.resource_id);
         if (!location) {
           throw new CeoError("NOT_FOUND", `Resource '${input.resource_id}' does not exist.`, {
@@ -750,7 +750,7 @@ export class ResourceService {
         // Apply optional state changes
         if (input.state_changes && input.state_changes.length > 0) {
           this.workspace.validateOperations(input.state_changes, worktreeMatcher);
-          await this.workspace.applyOperations(worktree, input.base_commit, input.state_changes);
+          await this.workspace.applyOperations(worktree, base, input.state_changes);
         }
 
         const dirFiles = await readdir(ctx.getResDir()).catch(() => []);

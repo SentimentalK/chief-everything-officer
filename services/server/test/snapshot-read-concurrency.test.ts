@@ -130,7 +130,123 @@ describe("Snapshot Read Concurrency & Isolation", () => {
     expect(freshRead.files[0]!.content).toBe("# TODO\n\n- Updated by writer\n");
   });
 
-  it("3. Stale write rejection: reader at snapshot A is rejected when base_commit is stale", async () => {
+  it("3a. Stale base with unrelated concurrent change: write is replayed on the new tip", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const read = (await workspace.readFiles(["TODO.md"])) as {
+      base_commit: string;
+      files: Array<{ blob_oid: string }>;
+    };
+    const commitA = read.base_commit;
+    const originalBlob = read.files[0]!.blob_oid;
+
+    // Writer advances HEAD by touching a different file
+    const advance = await workspace.applyChangeSet({
+      base_commit: commitA,
+      summary: "Writer advance",
+      operations: [
+        { op: "create", path: "tasks/CONCURRENT-WRITER.md", content: "# Created by concurrent writer\n" },
+      ],
+    });
+    const commitB = advance.commit as string;
+
+    const result = await workspace.applyChangeSet({
+      base_commit: commitA,
+      summary: "Stale but unrelated write",
+      operations: [
+        { op: "patch", path: "TODO.md", expected_blob_oid: originalBlob, find: "- Original", replace: "- Patched" },
+      ],
+    });
+    expect(result).toMatchObject({ ok: true, outcome: "COMMITTED", base_commit: commitB, requested_base_commit: commitA });
+    expect(git(item.remote, "rev-parse", `${result.commit as string}^`)).toBe(commitB);
+    expect(git(item.remote, "show", "main:TODO.md")).toBe("# TODO\n\n- Patched");
+    expect(git(item.remote, "show", "main:tasks/CONCURRENT-WRITER.md")).toBe("# Created by concurrent writer");
+  });
+
+  it("3b. Stale base where the remote changed the same file: rejected as STALE_REVISION", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+
+    const read = (await workspace.readFiles(["TODO.md"])) as {
+      base_commit: string;
+      files: Array<{ blob_oid: string }>;
+    };
+    const commitA = read.base_commit;
+    const originalBlob = read.files[0]!.blob_oid;
+
+    await workspace.applyChangeSet({
+      base_commit: commitA,
+      summary: "Writer advance on TODO",
+      operations: [
+        { op: "replace", path: "TODO.md", expected_blob_oid: originalBlob, content: "# TODO\n\n- Original\n- Concurrent\n" },
+      ],
+    });
+
+    // A patch whose find text still matches must not silently merge over the concurrent change.
+    await expect(
+      workspace.applyChangeSet({
+        base_commit: commitA,
+        summary: "Stale patch",
+        operations: [
+          { op: "patch", path: "TODO.md", expected_blob_oid: originalBlob, find: "- Original", replace: "- Stale" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "STALE_REVISION", details: { conflicting_paths: ["TODO.md"] } });
+
+    // A create racing a remote create of the same path is also a conflict.
+    await workspace.applyChangeSet({
+      base_commit: (await workspace.readFiles(["TODO.md"])).base_commit as string,
+      summary: "Remote create",
+      operations: [{ op: "create", path: "tasks/RACE.md", content: "# remote\n" }],
+    });
+    await expect(
+      workspace.applyChangeSet({
+        base_commit: commitA,
+        summary: "Stale create",
+        operations: [{ op: "create", path: "tasks/RACE.md", content: "# stale\n" }],
+      }),
+    ).rejects.toMatchObject({ code: "STALE_REVISION", details: { conflicting_paths: ["tasks/RACE.md"] } });
+  });
+
+  it("3c. Reads see commits pushed directly to the remote by other clients", async () => {
+    const item = await fixture();
+    cleanup.push(item.root);
+    const workspace = new CeoWorkspace(item.config);
+    await workspace.initialize();
+    const before = await workspace.readFiles(["TODO.md"]);
+
+    const other = path.join(item.root, "other");
+    git(item.root, "clone", item.remote, other);
+    await writeFile(path.join(other, "tasks", "EXTERNAL.md"), "# external\n");
+    git(other, "add", "-A");
+    git(other, "commit", "-m", "external push");
+    git(other, "push", "origin", "main");
+    const externalHead = git(other, "rev-parse", "HEAD");
+
+    // Bypass the refresh throttle the way elapsed time would.
+    (workspace as any).readSnapshotRefreshedAtMs = 0;
+    const after = await workspace.readFiles(["tasks/EXTERNAL.md"]);
+    expect(after.base_commit).toBe(externalHead);
+    expect(after.base_commit).not.toBe(before.base_commit);
+    expect((after.files as any[])[0].content).toBe("# external\n");
+
+    // A write built on that fresh read commits without a STALE_REVISION round trip.
+    const todo = await workspace.readFiles(["TODO.md"]);
+    const write = await workspace.applyChangeSet({
+      base_commit: todo.base_commit as string,
+      summary: "Write after external push",
+      operations: [{ op: "replace", path: "TODO.md", expected_blob_oid: (todo.files as any[])[0].blob_oid, content: "# TODO\n\n- Fresh\n" }],
+    });
+    expect(write).toMatchObject({ ok: true, base_commit: externalHead });
+    expect(write.requested_base_commit).toBeUndefined();
+  });
+
+  it("3d. Stale base after a remote history rewrite is still rejected", async () => {
     const item = await fixture();
     cleanup.push(item.root);
     const workspace = new CeoWorkspace(item.config);
@@ -155,8 +271,13 @@ describe("Snapshot Read Concurrency & Isolation", () => {
         },
       ],
     });
+    const other = path.join(item.root, "other");
+    git(item.root, "clone", item.remote, other);
+    git(other, "checkout", "--orphan", "rewrite");
+    git(other, "commit", "-m", "rewritten history");
+    git(other, "push", "--force", "origin", "rewrite:main");
 
-    // Stale writer attempts applyChangeSet with base_commit = commitA
+    // Stale writer attempts applyChangeSet with base_commit = commitA (no longer an ancestor)
     await expect(
       workspace.applyChangeSet({
         base_commit: commitA,
